@@ -456,7 +456,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "blob is not supported!")]
     fn test_blob_not_supported() {
-        let target = OwnedValue::Blob(vec![1, 2, 3]);
+        let target = OwnedValue::from_blob_dynamic(vec![1, 2, 3]);
         let patch = create_text("{}");
         json_patch(&target, &patch).unwrap();
     }

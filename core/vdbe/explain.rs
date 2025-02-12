@@ -642,7 +642,7 @@ pub fn insn_to_str(
                 0,
                 *dest as i32,
                 0,
-                OwnedValue::Blob(value.clone()), // TODO Why not owned blob here?
+                OwnedValue::from_blob_static(value.clone()),
                 0,
                 format!(
                     "r[{}]={} (len={})",

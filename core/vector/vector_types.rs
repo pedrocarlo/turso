@@ -166,7 +166,7 @@ pub fn vector_serialize_f64(x: Vector) -> OwnedValue {
     let mut blob = Vec::with_capacity(x.dims * 8 + 1);
     blob.extend_from_slice(&x.data);
     blob.push(2);
-    OwnedValue::from_blob(blob)
+    OwnedValue::from_blob_dynamic(blob)
 }
 
 pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
@@ -178,7 +178,7 @@ pub fn vector_deserialize_f64(blob: &[u8]) -> Result<Vector> {
 }
 
 pub fn vector_serialize_f32(x: Vector) -> OwnedValue {
-    OwnedValue::from_blob(x.data)
+    OwnedValue::from_blob_dynamic(x.data)
 }
 
 pub fn vector_deserialize_f32(blob: &[u8]) -> Result<Vector> {

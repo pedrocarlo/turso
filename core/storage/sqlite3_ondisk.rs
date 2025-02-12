@@ -1048,7 +1048,7 @@ pub fn read_value(buf: &[u8], serial_type: &SerialType) -> Result<(OwnedValue, u
             if buf.len() < n {
                 crate::bail_corrupt_error!("Invalid Blob value");
             }
-            Ok((OwnedValue::Blob(buf[0..n].to_vec().into()), n))
+            Ok((OwnedValue::from_blob_dynamic(buf[0..n].to_vec().into()), n))
         }
         SerialType::String(n) => {
             if buf.len() < n {
@@ -1417,7 +1417,7 @@ mod tests {
     #[case(&[64, 9, 33, 251, 84, 68, 45, 24], SerialType::BEFloat64, OwnedValue::Float(std::f64::consts::PI))]
     #[case(&[], SerialType::ConstInt0, OwnedValue::Integer(0))]
     #[case(&[], SerialType::ConstInt1, OwnedValue::Integer(1))]
-    #[case(&[1, 2, 3], SerialType::Blob(3), OwnedValue::Blob(vec![1, 2, 3].into()))]
+    #[case(&[1, 2, 3], SerialType::Blob(3), OwnedValue::from_blob_dynamic(vec![1, 2, 3].into()))]
     #[case(&[65, 66, 67], SerialType::String(3), OwnedValue::build_text("ABC"))]
     fn test_read_value(
         #[case] buf: &[u8],

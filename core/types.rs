@@ -9,6 +9,8 @@ use crate::vdbe::sorter::Sorter;
 use crate::vdbe::VTabOpaqueCursor;
 use crate::Result;
 use std::fmt::Display;
+use std::ops::Deref;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value<'a> {
@@ -77,13 +79,64 @@ impl Text {
     }
 }
 
+// TODO for now have clone here
+#[derive(Debug, Clone)]
+pub enum Mode<T> {
+    /// Data is owned by you
+    Dynamic(Rc<T>),
+    /// Data is not owned by you
+    Static(T),
+}
+
+impl<T> Mode<T> {
+    pub fn static_mode(value: T) -> Self {
+        Mode::Static(value)
+    }
+
+    pub fn dynamic_mode(value: T) -> Self {
+        Mode::Dynamic(Rc::new(value))
+    }
+}
+
+impl<T> Deref for Mode<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Mode::Dynamic(v) => v.as_ref(),
+            Mode::Static(v) => v,
+        }
+    }
+}
+
+impl<T> AsRef<T> for Mode<T> {
+    fn as_ref(&self) -> &T {
+        match self {
+            Mode::Dynamic(v) => v.as_ref(),
+            Mode::Static(v) => v,
+        }
+    }
+}
+
+impl<T> PartialEq for Mode<T>
+where
+    T: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Dynamic(l0), Self::Dynamic(r0)) => l0.as_ref() == r0.as_ref(),
+            (Self::Static(l0), Self::Static(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnedValue {
     Null,
     Integer(i64),
     Float(f64),
     Text(Text),
-    Blob(Vec<u8>),
+    Blob(Mode<Vec<u8>>),
     Agg(Box<AggContext>), // TODO(pere): make this without Box. Currently this might cause cache miss but let's leave it for future analysis
     Record(Record),
 }
@@ -101,8 +154,12 @@ impl OwnedValue {
         }
     }
 
-    pub fn from_blob(data: Vec<u8>) -> Self {
-        OwnedValue::Blob(data)
+    pub fn from_blob_dynamic(data: Vec<u8>) -> Self {
+        OwnedValue::Blob(Mode::dynamic_mode(data))
+    }
+
+    pub fn from_blob_static(data: Vec<u8>) -> Self {
+        OwnedValue::Blob(Mode::static_mode(data))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -247,7 +304,7 @@ impl OwnedValue {
                 let Some(blob) = v.to_blob() else {
                     return Ok(OwnedValue::Null);
                 };
-                Ok(OwnedValue::Blob(blob))
+                Ok(OwnedValue::Blob(Mode::static_mode(blob)))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -481,7 +538,7 @@ impl From<Value<'_>> for OwnedValue {
             Value::Integer(i) => OwnedValue::Integer(i),
             Value::Float(f) => OwnedValue::Float(f),
             Value::Text(s) => OwnedValue::Text(Text::from_str(s)),
-            Value::Blob(b) => OwnedValue::Blob(b.to_owned()),
+            Value::Blob(b) => OwnedValue::Blob(Mode::static_mode(b.to_owned())),
         }
     }
 }
@@ -900,7 +957,7 @@ mod tests {
     fn test_serialize_blob() {
         let blob = vec![1, 2, 3, 4, 5];
         let blob_len = blob.len();
-        let record = Record::new(vec![OwnedValue::Blob(blob)]);
+        let record = Record::new(vec![OwnedValue::from_blob_dynamic(blob)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
