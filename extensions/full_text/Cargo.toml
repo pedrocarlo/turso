@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "limbo_full_text"
+repository.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["limbo_ext/static"]
+
+[dependencies]
+limbo_ext = { workspace = true, features = ["static"] }
+tantivy = "0.22.0"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "*", default-features = false }

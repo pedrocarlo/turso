@@ -17,6 +17,7 @@ members = [
     "extensions/series",
     "extensions/time",
     "extensions/uuid",
+    "extensions/full_text",
     "macros",
     "simulator",
     "sqlite3",
