@@ -1,0 +1,11 @@
+[package]
+name = "generate"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.96"
+handlebars = "6.3.1"
