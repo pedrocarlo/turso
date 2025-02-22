@@ -1,13 +1,25 @@
+{{#if agg}}
 mod agg;
+{{/if}}
+{{#if scalar}}
 mod scalar;
+{{/if}}
+{{#if vtab}}
 mod vtab;
+{{/if}}
 
-use limbo_ext::{register_extension, AggFunc, AggregateDerive, Value};
+use limbo_ext::register_extension;
 
 register_extension! {
+    {{#if vtab}}
     vtabs: { vtab::ExampleVTab }
+    {{/if}}
+    {{#if agg}}
     aggregates: { agg::ExampleAggregate }
+    {{/if}}
+    {{#if scalar}}
     scalars: {scalar::example_scalar}
+    {{/if}}
 }
 
 #[cfg(test)]

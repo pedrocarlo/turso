@@ -1,13 +1,19 @@
 [package]
-name = "generate"
-version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+name = "generate"
 repository.workspace = true
+version.workspace = true
 
 [dependencies]
 anyhow = "1.0.96"
-clap = "4.5.30"
+clap = { version = "4.5.30", features = ["derive"] }
 convert_case = "0.7.1"
 handlebars = "6.3.1"
+serde = "1.0.218"
+serde_json = "1.0.139"
+
+[[bin]]
+name = "generate"
+path = "main.rs"
