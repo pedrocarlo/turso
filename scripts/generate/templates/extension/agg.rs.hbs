@@ -1,0 +1,21 @@
+use limbo_ext::{AggFunc, AggregateDerive, Value};
+
+#[derive(AggregateDerive)]
+struct ExampleAggregate;
+
+impl AggFunc for ExampleAggregate {
+    type State = Vec<f64>;
+    const NAME: &'static str = "example"; // TODO change name
+    const ARGS: i32 = 1; // TODO change number of args
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        todo!()
+    }
+
+    fn finalize(state: Self::State) -> Value {
+        todo!();
+    }
+}
+
+#[cfg(test)]
+mod tests {}

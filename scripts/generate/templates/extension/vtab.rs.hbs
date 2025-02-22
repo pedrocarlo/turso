@@ -1,0 +1,67 @@
+use limbo_ext::{ExtensionApi, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, Value};
+
+#[derive(Debug, VTabModuleDerive)]
+struct ExampleVTab; // TODO change name
+
+impl VTabModule for ExampleVTab {
+    type VCursor = ExampleCursor;
+    const NAME: &'static str = "example"; // TODO change name
+
+    fn connect(api: &ExtensionApi) -> ResultCode {
+        // Create table schema
+        // TODO: change schema of your vtable
+        let sql = "CREATE TABLE example(
+            value INTEGER,
+        )";
+        api.declare_virtual_table(Self::NAME, sql)
+    }
+
+    fn open() -> Self::VCursor {
+        ExampleCursor {}
+    }
+
+    fn filter(cursor: &mut Self::VCursor, arg_count: i32, args: &[Value]) -> ResultCode {
+        todo!()
+    }
+
+    fn column(cursor: &Self::VCursor, idx: u32) -> Value {
+        cursor.column(idx)
+    }
+
+    fn next(cursor: &mut Self::VCursor) -> ResultCode {
+        cursor.next()
+    }
+
+    fn eof(cursor: &Self::VCursor) -> bool {
+        cursor.eof()
+    }
+}
+
+/// The cursor for iterating over the generated sequence
+#[derive(Debug)]
+struct ExampleCursor {} // TODO change name
+
+impl ExampleCursor {}
+
+impl VTabCursor for ExampleCursor {
+    type Error = ResultCode;
+
+    fn next(&mut self) -> ResultCode {
+        todo!()
+    }
+
+    fn eof(&self) -> bool {
+        todo!()
+    }
+
+    fn column(&self, idx: u32) -> Value {
+        todo!()
+    }
+
+    fn rowid(&self) -> i64 {
+        todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {}

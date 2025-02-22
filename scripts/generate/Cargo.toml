@@ -8,4 +8,6 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1.0.96"
+clap = "4.5.30"
+convert_case = "0.7.1"
 handlebars = "6.3.1"

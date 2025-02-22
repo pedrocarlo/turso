@@ -1,0 +1,14 @@
+mod agg;
+mod scalar;
+mod vtab;
+
+use limbo_ext::{register_extension, AggFunc, AggregateDerive, Value};
+
+register_extension! {
+    vtabs: { vtab::ExampleVTab }
+    aggregates: { agg::ExampleAggregate }
+    scalars: {scalar::example_scalar}
+}
+
+#[cfg(test)]
+mod tests {}
