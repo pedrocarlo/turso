@@ -1,17 +1,29 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
+use handlebars::Handlebars;
 use serde::{Deserialize, Serialize};
 
-macro_rules! try_out {
-    ($out:expr) => {
-        if !$out.status.success() {
-            let err = String::from_utf8($out.stderr)?;
-            eprintln!("{}", err);
-            return Ok(());
-        }
-    };
+pub struct FileGen {
+    pub filename: String,
+    pub src: PathBuf,
+    pub dest: PathBuf,
 }
 
-pub(crate) use try_out;
+impl FileGen {
+    pub fn new(filename: &str, src_dir: PathBuf, dest_dir: PathBuf) -> Self {
+        Self {
+            src: src_dir.join(format!("{}.hbs", &filename)),
+            dest: dest_dir.join(&filename),
+            filename: filename.to_owned(),
+        }
+    }
+
+    pub fn register_template(&self, hbs: &mut Handlebars) -> anyhow::Result<()> {
+        hbs.register_template_file(&self.filename, &self.src)?;
+        Ok(())
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "generate")]
@@ -39,6 +51,13 @@ pub struct ExtArgs {
         default_value_t = false
     )]
     pub skip_cargo: bool,
+
+    #[clap(
+        long = "skip-templ",
+        help = "Skip template generation",
+        default_value_t = false
+    )]
+    pub skip_templates: bool,
 
     #[clap(short, long, help = "Generate Scalar", default_value_t = false)]
     pub scalar: bool,

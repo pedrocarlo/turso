@@ -1,27 +1,21 @@
+use convert_case::{Case, Casing};
+use handlebars::Handlebars;
+use serde_json::Value;
 use std::{
     env,
     fs::File,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
+use toml_edit::{value, Array, DocumentMut};
 
-use serde_json::Value;
+use crate::app::{ExtArgs, FileGen};
 
-use convert_case::{Case, Casing};
-use handlebars::Handlebars;
-
-use crate::app::{try_out, ExtArgs};
-
-macro_rules! write_to_file {
-    ($text:expr, $path:expr) => {
-        let mut f = File::create($path)?;
-        f.write_all(&$text.as_bytes())?;
-    };
-}
-
+/// Handler for the `generate extension` command
 pub fn handle_extension(mut args: ExtArgs) -> anyhow::Result<()> {
-    // Convert "example text" -> "example_text" and "limbo_example" -> "example"
+    // Convert "example text" -> "example_text" or "limbo_example" -> "example"
+    // or "example_limbo" -> "example"
     args.ext_name = args.ext_name.replace("limbo", "");
     args.ext_name = args
         .ext_name
@@ -34,28 +28,12 @@ pub fn handle_extension(mut args: ExtArgs) -> anyhow::Result<()> {
         .from_case(Case::Lower)
         .to_case(Case::Snake);
 
-    let workspace_root = env::var("CARGO_WORKSPACE_DIR")?;
-    let workspace_root = PathBuf::from(workspace_root); // This variable needs to be set in .cargo/config.toml
-
     if !args.skip_cargo {
-        let mut cargo = Command::new("cargo");
-        let cargo_new = cargo
-            .args([
-                "new",
-                "--lib",
-                format!("extensions/{}", args.ext_name).as_str(),
-            ])
-            .spawn()?;
-        let out = cargo_new.wait_with_output()?;
-
-        try_out!(out);
+        cargo_new(&args.ext_name)?;
     }
 
-    let cargo_toml_key = "Cargo.toml";
-    let lib_key = "lib.rs";
-    let scalar_key = "scalar.rs";
-    let agg_key = "agg.rs";
-    let vtab_key = "vtab.rs";
+    // This env var needs to be set in .cargo/config.toml
+    let workspace_root: PathBuf = env::var("CARGO_WORKSPACE_DIR")?.into();
 
     let template_extension_dir =
         workspace_root.join(Path::new("scripts/generate/templates/extension"));
@@ -64,50 +42,178 @@ pub fn handle_extension(mut args: ExtArgs) -> anyhow::Result<()> {
         workspace_root.join(Path::new(format!("extensions/{}", args.ext_name).as_str()));
     let extension_src_dir = extension_dir.join(Path::new("src"));
 
-    let mut hbs = Handlebars::new();
+    // Super inneficient with cloning everywhere, could change to use references.
+    // But as this is a script this is not a major concern
+    let cargo_toml_file = FileGen::new(
+        "Cargo.toml",
+        template_extension_dir.to_owned(),
+        extension_dir.to_owned(),
+    );
+    let lib_file = FileGen::new(
+        "lib.rs",
+        template_extension_dir.to_owned(),
+        extension_src_dir.to_owned(),
+    );
+    let scalar_file = FileGen::new(
+        "scalar.rs",
+        template_extension_dir.to_owned(),
+        extension_src_dir.to_owned(),
+    );
+    let agg_file = FileGen::new(
+        "agg.rs",
+        template_extension_dir.to_owned(),
+        extension_src_dir.to_owned(),
+    );
+    let vtab_file = FileGen::new(
+        "vtab.rs",
+        template_extension_dir.to_owned(),
+        extension_src_dir.to_owned(),
+    );
 
-    hbs.register_template_file(
-        cargo_toml_key,
-        template_extension_dir.join("Cargo.toml.hbs"),
-    )?;
-    hbs.register_template_file(lib_key, template_extension_dir.join("lib.rs.hbs"))?;
-    hbs.register_template_file(scalar_key, template_extension_dir.join("scalar.rs.hbs"))?;
-    hbs.register_template_file(agg_key, template_extension_dir.join("agg.rs.hbs"))?;
-    hbs.register_template_file(vtab_key, template_extension_dir.join("vtab.rs.hbs"))?;
+    if !args.skip_templates {
+        let mut hbs = Handlebars::new();
 
-    let mut data = serde_json::json!({
-        "struct_prefix":args.ext_name.to_case(Case::Pascal),
-    });
+        register_templates(
+            &mut hbs,
+            vec![
+                &cargo_toml_file,
+                &lib_file,
+                &scalar_file,
+                &agg_file,
+                &vtab_file,
+            ],
+        )?;
 
-    let args_data = serde_json::to_value(&args)?;
+        let mut data = serde_json::json!({
+            "struct_prefix":args.ext_name.to_case(Case::Pascal),
+        });
 
-    merge(&mut data, &args_data);
+        let args_data = serde_json::to_value(&args)?;
 
-    let new_cargo_toml = hbs.render(cargo_toml_key, &data)?;
-    write_to_file!(new_cargo_toml, extension_dir.join(cargo_toml_key));
+        merge(&mut data, &args_data);
 
-    let new_lib = hbs.render(lib_key, &data)?;
-    write_to_file!(new_lib, extension_src_dir.join(lib_key));
+        write_to_file(
+            hbs.render(&cargo_toml_file.filename, &data)?,
+            &cargo_toml_file.dest,
+        )?;
 
-    if args.scalar {
-        let new_scalar = hbs.render(scalar_key, &data)?;
-        write_to_file!(new_scalar, extension_src_dir.join(scalar_key));
+        write_to_file(hbs.render(&lib_file.filename, &data)?, &lib_file.dest)?;
+
+        if args.scalar {
+            write_to_file(hbs.render(&scalar_file.filename, &data)?, &scalar_file.dest)?;
+        }
+
+        if args.aggregate {
+            write_to_file(hbs.render(&agg_file.filename, &data)?, &agg_file.dest)?;
+        }
+
+        if args.vtab {
+            write_to_file(hbs.render(&vtab_file.filename, &data)?, &vtab_file.dest)?;
+        }
     }
 
-    if args.aggregate {
-        let new_agg = hbs.render(agg_key, &data)?;
-        write_to_file!(new_agg, extension_src_dir.join(agg_key));
-    }
+    add_dependency(&args.ext_name, workspace_root)?;
 
-    if args.vtab {
-        let new_vtab = hbs.render(vtab_key, &data)?;
-        write_to_file!(new_vtab, extension_src_dir.join(vtab_key));
+    Ok(())
+}
+
+fn cargo_new(pkg_name: &str) -> anyhow::Result<()> {
+    let mut cargo = Command::new("cargo");
+    let cargo_new = cargo
+        .args(["new", "--lib", format!("extensions/{}", pkg_name).as_str()])
+        .spawn()?;
+    let out = cargo_new.wait_with_output()?;
+
+    if !out.status.success() {
+        let err = String::from_utf8(out.stderr)?;
+        return Err(anyhow::Error::msg(err));
     }
 
     Ok(())
 }
 
-/// Merges b Value in a
+fn register_templates(hbs: &mut Handlebars, files: Vec<&FileGen>) -> anyhow::Result<()> {
+    for file in files {
+        file.register_template(hbs)?;
+    }
+    Ok(())
+}
+
+/// Writes the `text` to the file `path`
+fn write_to_file(text: String, path: &PathBuf) -> anyhow::Result<()> {
+    let mut f = File::create(path)?;
+    f.write_all(&text.as_bytes())?;
+    Ok(())
+}
+
+fn add_dependency(ext_name: &str, root: PathBuf) -> anyhow::Result<()> {
+    let workspace_dest = root.join("Cargo.toml");
+
+    let cargo_toml_workspace = read_toml(&workspace_dest)?;
+
+    add_dependency_workspace(ext_name, cargo_toml_workspace, &workspace_dest)?;
+
+    let core_dest = root.join("core/Cargo.toml");
+    let cargo_toml_core = read_toml(&core_dest)?;
+
+    add_dependency_core(ext_name, cargo_toml_core, &core_dest)?;
+    Ok(())
+}
+
+fn add_dependency_workspace(
+    ext_name: &str,
+    mut cargo_toml: DocumentMut,
+    dest: &PathBuf,
+) -> anyhow::Result<()> {
+    let workspace_version = cargo_toml["workspace"]["package"]["version"].clone();
+
+    cargo_toml["workspace"]["dependencies"][format!("limbo_{ext_name}")]["path"] =
+        value(format!("extensions/{ext_name}"));
+
+    cargo_toml["workspace"]["dependencies"][format!("limbo_{ext_name}")]["version"] =
+        workspace_version;
+
+    let mut f = File::options().write(true).truncate(true).open(dest)?;
+
+    write!(f, "{}", cargo_toml.to_string())?;
+    Ok(())
+}
+
+fn add_dependency_core(
+    ext_name: &str,
+    mut cargo_toml: DocumentMut,
+    dest: &PathBuf,
+) -> anyhow::Result<()> {
+    let dependencies = &mut cargo_toml["dependencies"][format!("limbo_{ext_name}")];
+
+    dependencies["workspace"] = value(true);
+    dependencies["optional"] = value(true);
+
+    let mut features = Array::new();
+    features.push("static");
+    dependencies["features"] = value(features);
+
+    let mut ext_array_features = Array::new();
+    ext_array_features.push(format!("limbo_{ext_name}/static"));
+    cargo_toml["features"][ext_name] = value(ext_array_features);
+
+    let mut f = File::options().write(true).truncate(true).open(dest)?;
+
+    write!(f, "{}", cargo_toml.to_string())?;
+    Ok(())
+}
+
+fn read_toml(dest: &PathBuf) -> anyhow::Result<DocumentMut> {
+    let mut f = File::options().read(true).open(&dest)?;
+
+    let mut contents = String::new();
+    let _ = f.read_to_string(&mut contents)?;
+
+    let doc = contents.parse::<DocumentMut>()?;
+    Ok(doc)
+}
+
+/// Merges `b` Value in `a`
 fn merge(a: &mut Value, b: &Value) {
     match (a, b) {
         (Value::Object(a), Value::Object(b)) => {

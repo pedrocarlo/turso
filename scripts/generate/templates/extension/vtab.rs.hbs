@@ -11,7 +11,7 @@ impl VTabModule for {{struct_prefix}}VTab {
         // Create table schema
         // TODO: change schema of your vtable
         let sql = "CREATE TABLE {{name}}(
-            value INTEGER,
+            value INTEGER
         )";
         api.declare_virtual_table(Self::NAME, sql)
     }
