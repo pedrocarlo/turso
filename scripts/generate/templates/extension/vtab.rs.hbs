@@ -1,23 +1,23 @@
 use limbo_ext::{ExtensionApi, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, Value};
 
 #[derive(Debug, VTabModuleDerive)]
-struct ExampleVTab; // TODO change name
+struct {{struct_prefix}}VTab;
 
-impl VTabModule for ExampleVTab {
-    type VCursor = ExampleCursor;
-    const NAME: &'static str = "example"; // TODO change name
+impl VTabModule for {{struct_prefix}}VTab {
+    type VCursor = {{struct_prefix}}Cursor;
+    const NAME: &'static str = "{{name}}";
 
     fn connect(api: &ExtensionApi) -> ResultCode {
         // Create table schema
         // TODO: change schema of your vtable
-        let sql = "CREATE TABLE example(
+        let sql = "CREATE TABLE {{name}}(
             value INTEGER,
         )";
         api.declare_virtual_table(Self::NAME, sql)
     }
 
     fn open() -> Self::VCursor {
-        ExampleCursor {}
+        {{struct_prefix}}Cursor {}
     }
 
     fn filter(cursor: &mut Self::VCursor, arg_count: i32, args: &[Value]) -> ResultCode {
@@ -37,13 +37,13 @@ impl VTabModule for ExampleVTab {
     }
 }
 
-/// The cursor for iterating over the generated sequence
+/// The cursor for iterating over the generated rows
 #[derive(Debug)]
-struct ExampleCursor {} // TODO change name
+struct {{struct_prefix}}Cursor {}
 
-impl ExampleCursor {}
+impl {{struct_prefix}}Cursor {}
 
-impl VTabCursor for ExampleCursor {
+impl VTabCursor for {{struct_prefix}}Cursor {
     type Error = ResultCode;
 
     fn next(&mut self) -> ResultCode {

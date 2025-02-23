@@ -1,11 +1,11 @@
 use limbo_ext::{AggFunc, AggregateDerive, Value};
 
 #[derive(AggregateDerive)]
-struct ExampleAggregate;
+struct {{struct_prefix}}Aggregate;
 
-impl AggFunc for ExampleAggregate {
+impl AggFunc for {{struct_prefix}}Aggregate {
     type State = Vec<f64>;
-    const NAME: &'static str = "example"; // TODO change name
+    const NAME: &'static str = "{{name}}";
     const ARGS: i32 = 1; // TODO change number of args
 
     fn step(state: &mut Self::State, args: &[Value]) {

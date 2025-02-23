@@ -1,7 +1,7 @@
-use limbo_ext::{scalar, ResultCode, Value};
+use limbo_ext::{scalar, Value};
 
-#[scalar(name = "example_scalar")]
-fn example_scalar(args: &[Value]) -> Value {
+#[scalar(name = "{{name}}_scalar")]
+fn {{name}}_scalar(args: &[Value]) -> Value {
     todo!()
 }
 

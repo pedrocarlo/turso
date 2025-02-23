@@ -1,11 +1,5 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-    process::Command,
-};
-
 use clap::{Args, Parser, Subcommand};
-use handlebars::Handlebars;
+use serde::{Deserialize, Serialize};
 
 macro_rules! try_out {
     ($out:expr) => {
@@ -32,9 +26,29 @@ pub enum Commands {
     Extension(ExtArgs),
 }
 
-#[derive(Args)]
+#[derive(Args, Serialize, Deserialize)]
 pub struct ExtArgs {
-    #[clap(short = 'N', long, help = "Name of extension to generate")]
+    #[serde(rename = "name")]
+    #[clap(short = 'N', long = "name", help = "Name of extension to generate")]
     pub ext_name: String,
-}
 
+    #[clap(
+        short = 'S',
+        long = "skip",
+        help = "Skip cargo new command",
+        default_value_t = false
+    )]
+    pub skip_cargo: bool,
+
+    #[clap(short, long, help = "Generate Scalar", default_value_t = false)]
+    pub scalar: bool,
+    #[clap(
+        short,
+        long = "agg",
+        help = "Generate Aggregate",
+        default_value_t = false
+    )]
+    pub aggregate: bool,
+    #[clap(short, long, help = "Generate Vtable", default_value_t = false)]
+    pub vtab: bool,
+}
