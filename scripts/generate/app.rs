@@ -42,6 +42,8 @@ pub struct ExtArgs {
 
     #[clap(short, long, help = "Generate Scalar", default_value_t = false)]
     pub scalar: bool,
+
+    #[serde(rename = "agg")]
     #[clap(
         short,
         long = "agg",

@@ -1,7 +1,7 @@
 use limbo_ext::{ExtensionApi, ResultCode, VTabCursor, VTabModule, VTabModuleDerive, Value};
 
 #[derive(Debug, VTabModuleDerive)]
-struct {{struct_prefix}}VTab;
+pub struct {{struct_prefix}}VTab;
 
 impl VTabModule for {{struct_prefix}}VTab {
     type VCursor = {{struct_prefix}}Cursor;
@@ -39,7 +39,7 @@ impl VTabModule for {{struct_prefix}}VTab {
 
 /// The cursor for iterating over the generated rows
 #[derive(Debug)]
-struct {{struct_prefix}}Cursor {}
+pub struct {{struct_prefix}}Cursor {}
 
 impl {{struct_prefix}}Cursor {}
 

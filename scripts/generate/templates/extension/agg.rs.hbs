@@ -1,7 +1,7 @@
 use limbo_ext::{AggFunc, AggregateDerive, Value};
 
 #[derive(AggregateDerive)]
-struct {{struct_prefix}}Aggregate;
+pub struct {{struct_prefix}}Aggregate;
 
 impl AggFunc for {{struct_prefix}}Aggregate {
     type State = Vec<f64>;

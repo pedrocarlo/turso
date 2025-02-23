@@ -34,14 +34,22 @@ pub fn handle_extension(mut args: ExtArgs) -> anyhow::Result<()> {
         .from_case(Case::Lower)
         .to_case(Case::Snake);
 
-    let mut cargo = Command::new("cargo");
     let workspace_root = env::var("CARGO_WORKSPACE_DIR")?;
     let workspace_root = PathBuf::from(workspace_root); // This variable needs to be set in .cargo/config.toml
 
-    let cargo_new = cargo.args(["new", "--lib", "extensions/example"]).spawn()?;
-    let out = cargo_new.wait_with_output()?;
+    if !args.skip_cargo {
+        let mut cargo = Command::new("cargo");
+        let cargo_new = cargo
+            .args([
+                "new",
+                "--lib",
+                format!("extensions/{}", args.ext_name).as_str(),
+            ])
+            .spawn()?;
+        let out = cargo_new.wait_with_output()?;
 
-    try_out!(out);
+        try_out!(out);
+    }
 
     let cargo_toml_key = "Cargo.toml";
     let lib_key = "lib.rs";

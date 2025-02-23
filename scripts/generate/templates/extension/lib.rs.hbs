@@ -8,17 +8,27 @@ mod scalar;
 mod vtab;
 {{/if}}
 
+{{#if agg}}
+use agg::{{struct_prefix}}Aggregate;
+{{/if}}
+{{#if scalar}}
+use scalar::register_{{name}}_scalar;
+{{/if}}
+{{#if vtab}}
+use vtab::{{struct_prefix}}VTab;
+{{/if}}
+
 use limbo_ext::register_extension;
 
 register_extension! {
     {{#if vtab}}
-    vtabs: { vtab::{{struct_prefix}}VTab }
+    vtabs: { {{struct_prefix}}VTab }
     {{/if}}
     {{#if agg}}
-    aggregates: { agg::{{struct_prefix}}Aggregate }
+    aggregates: { {{struct_prefix}}Aggregate }
     {{/if}}
     {{#if scalar}}
-    scalars: {scalar::{{name}}_scalar}
+    scalars: { {{name}}_scalar }
     {{/if}}
 }
 

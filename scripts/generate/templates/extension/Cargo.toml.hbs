@@ -1,11 +1,11 @@
 [package]
-name = "limbo_{{name}}"
-version.workspace = true
 authors.workspace = true
+description = "Limbo {{name}} extension"
 edition.workspace = true
 license.workspace = true
+name = "limbo_{{name}}"
 repository.workspace = true
-description = "Limbo {{name}} extension"
+version.workspace = true
 
 [features]
 static = ["limbo_ext/static"]
@@ -19,4 +19,3 @@ limbo_ext = { workspace = true, features = ["static"] }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
-
