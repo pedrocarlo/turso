@@ -654,6 +654,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
         aggregates,
         scalars,
         vtabs,
+        disable_allocator,
     } = input_ast;
 
     let scalar_calls = scalars.iter().map(|scalar_ident| {
@@ -695,11 +696,21 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
     let static_scalars = scalar_calls.clone();
     let static_vtabs = vtab_calls.clone();
 
+    let alloc_tokens = {
+        if disable_allocator {
+            quote! {}
+        } else {
+            quote! {
+                #[cfg(not(target_family = "wasm"))]
+                #[cfg(not(feature = "static"))]
+                #[global_allocator]
+                static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+            }
+        }
+    };
+
     let expanded = quote! {
-    #[cfg(not(target_family = "wasm"))]
-    #[cfg(not(feature = "static"))]
-    #[global_allocator]
-    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    #alloc_tokens
 
             #[cfg(feature = "static")]
             pub unsafe extern "C" fn register_extension_static(api: &::limbo_ext::ExtensionApi) -> ::limbo_ext::ResultCode {

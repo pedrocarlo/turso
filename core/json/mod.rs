@@ -3,6 +3,7 @@ mod error;
 mod json_operations;
 mod json_path;
 mod ser;
+mod json_vtab;
 
 pub use crate::json::de::from_str;
 use crate::json::de::ordered_object;

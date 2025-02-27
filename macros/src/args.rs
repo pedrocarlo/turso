@@ -7,6 +7,7 @@ pub(crate) struct RegisterExtensionInput {
     pub aggregates: Vec<Ident>,
     pub scalars: Vec<Ident>,
     pub vtabs: Vec<Ident>,
+    pub disable_allocator: bool,
 }
 
 impl syn::parse::Parse for RegisterExtensionInput {
@@ -14,12 +15,17 @@ impl syn::parse::Parse for RegisterExtensionInput {
         let mut aggregates = Vec::new();
         let mut scalars = Vec::new();
         let mut vtabs = Vec::new();
+        let mut disable_allocator = false;
         while !input.is_empty() {
             if input.peek(syn::Ident) && input.peek2(Token![:]) {
                 let section_name: Ident = input.parse()?;
                 input.parse::<Token![:]>()?;
-                let names = ["aggregates", "scalars", "vtabs"];
+                let names = ["aggregates", "scalars", "vtabs", "disable_allocator"];
                 if names.contains(&section_name.to_string().as_str()) {
+                    if let Ok(syn::Lit::Bool(b)) = syn::Lit::parse(input) {
+                        disable_allocator = b.value;
+                        continue;
+                    }
                     let content;
                     syn::braced!(content in input);
                     let parsed_items = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
@@ -48,6 +54,7 @@ impl syn::parse::Parse for RegisterExtensionInput {
             aggregates,
             scalars,
             vtabs,
+            disable_allocator,
         })
     }
 }
