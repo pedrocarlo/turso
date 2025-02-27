@@ -2,15 +2,10 @@ use limbo_ext::{
     register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
 };
 
-use crate::json::{
-    self,
-    json_path::{json_path, JsonPath},
-};
+use crate::json::json_path::{json_path, JsonPath};
 
 register_extension! {
     vtabs: { JsonEachVTab }
-    disable_allocator: true,
-    only_static: true,
 }
 
 macro_rules! try_option {

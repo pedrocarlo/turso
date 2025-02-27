@@ -7,8 +7,6 @@ pub(crate) struct RegisterExtensionInput {
     pub aggregates: Vec<Ident>,
     pub scalars: Vec<Ident>,
     pub vtabs: Vec<Ident>,
-    pub disable_allocator: bool,
-    pub only_static: bool,
 }
 
 impl syn::parse::Parse for RegisterExtensionInput {
@@ -16,8 +14,6 @@ impl syn::parse::Parse for RegisterExtensionInput {
         let mut aggregates = Vec::new();
         let mut scalars = Vec::new();
         let mut vtabs = Vec::new();
-        let mut disable_allocator = false;
-        let mut only_static = true;
         while !input.is_empty() {
             if input.peek(syn::Ident) && input.peek2(Token![:]) {
                 let section_name: Ident = input.parse()?;
@@ -30,23 +26,6 @@ impl syn::parse::Parse for RegisterExtensionInput {
                     "only_static",
                 ];
                 if names.contains(&section_name.to_string().as_str()) {
-                    if input.peek(syn::Lit) {
-                        if let syn::Lit::Bool(b) = syn::Lit::parse(input)? {
-                            if &section_name.to_string() == "disable_allocator" {
-                                disable_allocator = b.value;
-                            } else if &section_name.to_string() == "only_static" {
-                                only_static = b.value;
-                            } else {
-                                return Err(input.error(
-                                    "only disable_allocator and only_static can be bool literals",
-                                ));
-                            }
-                            input.parse::<Token![,]>()?;
-                            continue;
-                        } else {
-                            return Err(input.error("only bool literals allowed"));
-                        }
-                    }
                     let content;
                     syn::braced!(content in input);
                     let parsed_items = Punctuated::<Ident, Token![,]>::parse_terminated(&content)?
@@ -75,8 +54,6 @@ impl syn::parse::Parse for RegisterExtensionInput {
             aggregates,
             scalars,
             vtabs,
-            disable_allocator,
-            only_static,
         })
     }
 }
