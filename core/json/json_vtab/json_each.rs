@@ -2,11 +2,15 @@ use limbo_ext::{
     register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
 };
 
-use crate::json::json_path::{json_path, JsonPath};
+use crate::json::{
+    self,
+    json_path::{json_path, JsonPath},
+};
 
 register_extension! {
     vtabs: { JsonEachVTab }
-    disable_allocator: true
+    disable_allocator: true,
+    only_static: true,
 }
 
 macro_rules! try_option {
@@ -33,8 +37,8 @@ enum Columns {
 #[derive(Debug, VTabModuleDerive, Default)]
 struct JsonEachVTab;
 
-impl VTabModule for JsonEachVTab {
-    type VCursor = JsonEachCursor;
+impl<'a> VTabModule<'a> for JsonEachVTab {
+    type VCursor = JsonEachCursor<'a>;
     type Error = ResultCode;
     const NAME: &'static str = "json_each";
     const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
@@ -61,19 +65,28 @@ impl VTabModule for JsonEachVTab {
     }
 
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode {
-        if args.len() != 1 || args.len() != 2 {
+        dbg!(
+            "json_each",
+            &args,
+            args.len(),
+            args.len() != 1,
+            args.len() != 2,
+            args.len() != 1 && args.len() != 2
+        );
+        if args.len() != 1 && args.len() != 2 {
             return ResultCode::InvalidArgs;
         }
         // For now we are not dealing with JSONB
 
         let json_val = try_option!(args[0].to_text(), ResultCode::InvalidArgs).to_string();
-        let path = args[1].to_text().unwrap_or("$").to_string();
+        let path = args[1].to_text().unwrap_or("$");
 
-        let j_path = try_option!(json_path(&path).ok(), ResultCode::InvalidArgs);
+        // let j_path: JsonPath<'_> = try_option!(json_path(&path).ok(), ResultCode::InvalidArgs);
 
-        cursor.path = j_path;
-        cursor.root = path.clone();
+        dbg!("json_each");
 
+        // cursor.path = j_path;
+        cursor.root = path.to_string();
 
         todo!();
 
@@ -99,13 +112,13 @@ impl VTabModule for JsonEachVTab {
 
 /// The cursor for iterating over the generated sequence
 #[derive(Debug)]
-struct JsonEachCursor {
+struct JsonEachCursor<'a> {
     rowid: i64,
     root: String,
-    path: JsonPath<'static>,
+    path: JsonPath<'a>,
 }
 
-impl Default for JsonEachCursor {
+impl Default for JsonEachCursor<'_> {
     fn default() -> Self {
         Self {
             rowid: 0,
@@ -117,7 +130,7 @@ impl Default for JsonEachCursor {
     }
 }
 
-impl VTabCursor for JsonEachCursor {
+impl<'a> VTabCursor<'a> for JsonEachCursor<'_> {
     type Error = ResultCode;
 
     fn next(&mut self) -> ResultCode {

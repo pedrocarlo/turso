@@ -116,8 +116,8 @@ pub enum VTabKind {
     TableValuedFunction,
 }
 
-pub trait VTabModule: 'static {
-    type VCursor: VTabCursor<Error = Self::Error>;
+pub trait VTabModule<'a>: 'static {
+    type VCursor: VTabCursor<'a, Error = Self::Error>;
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
     type Error: std::fmt::Display;
@@ -139,7 +139,7 @@ pub trait VTabModule: 'static {
     }
 }
 
-pub trait VTabCursor: Sized {
+pub trait VTabCursor<'a>: Sized {
     type Error: std::fmt::Display;
     fn rowid(&self) -> i64;
     fn column(&self, idx: u32) -> Result<Value, Self::Error>;

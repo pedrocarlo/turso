@@ -22,7 +22,7 @@ pub struct KVStoreCursor {
     index: Option<usize>,
 }
 
-impl VTabModule for KVStoreVTab {
+impl VTabModule<'_> for KVStoreVTab {
     type VCursor = KVStoreCursor;
     const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
     const NAME: &'static str = "kv_store";
@@ -121,7 +121,7 @@ fn hash_key(key: &str) -> i64 {
     hasher.finish() as i64
 }
 
-impl VTabCursor for KVStoreCursor {
+impl VTabCursor<'_> for KVStoreCursor {
     type Error = String;
 
     fn rowid(&self) -> i64 {
