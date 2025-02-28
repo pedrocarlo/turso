@@ -1,5 +1,5 @@
 use crate::bail_parse_error;
-use std::borrow::Cow;
+use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq)]
 enum PPState {
@@ -20,22 +20,26 @@ enum ArrayIndexState {
 
 /// Describes a JSON path, which is a sequence of keys and/or array locators.
 #[derive(Clone, Debug)]
-pub struct JsonPath<'a> {
-    pub elements: Vec<PathElement<'a>>,
+pub struct JsonPath {
+    elements: Vec<PathElement>,
     path: String,
 }
 
-impl<'a> JsonPath<'a> {
-    //
-    pub fn from_path_elements(elements: Vec<PathElement<'a>>) -> Self {
-        Self {
-            elements,
-            path: "".to_string(), // Field is Not important when JsonPath is constructed from this function
-        }
+impl JsonPath {
+    pub fn new(path: String, elements: Vec<PathElement>) -> Self {
+        Self { elements, path }
+    }
+
+    pub fn elements(&self) -> &Vec<PathElement> {
+        self.elements.as_ref()
+    }
+
+    pub fn path(&self) -> &str {
+        self.path.as_str()
     }
 }
 
-impl Default for JsonPath<'_> {
+impl Default for JsonPath {
     fn default() -> Self {
         Self {
             elements: vec![PathElement::Root()],
@@ -48,11 +52,11 @@ type RawString = bool;
 
 /// PathElement describes a single element of a JSON path.
 #[derive(Clone, Debug, PartialEq)]
-pub enum PathElement<'a> {
+pub enum PathElement {
     /// Root element: '$'
     Root(),
     /// JSON key
-    Key(Cow<'a, str>, RawString),
+    Key(Range<usize>, RawString),
     /// Array locator, eg. [2], [#-5]
     ArrayLocator(Option<i32>),
 }
@@ -80,7 +84,7 @@ fn estimate_path_capacity(input: &str) -> usize {
 }
 
 /// Parses path into a Vec of Strings, where each string is a key or an array locator.
-pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
+pub fn json_path(path: &str) -> crate::Result<JsonPath> {
     if path.is_empty() {
         bail_parse_error!("Bad json path: {}", path)
     }
@@ -196,7 +200,7 @@ fn handle_in_key<'a>(
     index_state: &mut ArrayIndexState,
     key_start: &mut usize,
     index_buffer: &mut i128,
-    path_components: &mut Vec<PathElement<'a>>,
+    path_components: &mut Vec<PathElement>,
     path_iter: &mut std::str::CharIndices,
     path: &'a str,
 ) -> crate::Result<()> {
@@ -204,7 +208,7 @@ fn handle_in_key<'a>(
         (idx, '.' | '[') => {
             let key_end = idx;
             if key_end > *key_start {
-                let key = &path[*key_start..key_end];
+                let range = *key_start..key_end;
                 if ch.1 == '[' {
                     *index_state = ArrayIndexState::Start;
                     *parser_state = PPState::InArrayIndex;
@@ -212,13 +216,13 @@ fn handle_in_key<'a>(
                 } else {
                     *key_start = idx + ch.1.len_utf8();
                 }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
+                path_components.push(PathElement::Key(range, false));
             } else {
                 bail_parse_error!("Bad json path: {}", path)
             }
         }
         (_, '"') => {
-            handle_quoted_key(parser_state, key_start, path_components, path_iter, path)?;
+            handle_quoted_key(parser_state, key_start, path_components, path_iter)?;
         }
         (_, _) => (),
     }
@@ -228,9 +232,8 @@ fn handle_in_key<'a>(
 fn handle_quoted_key<'a>(
     parser_state: &mut PPState,
     key_start: &mut usize,
-    path_components: &mut Vec<PathElement<'a>>,
+    path_components: &mut Vec<PathElement>,
     path_iter: &mut std::str::CharIndices,
-    path: &'a str,
 ) -> crate::Result<()> {
     while let Some((idx, ch)) = path_iter.next() {
         match ch {
@@ -239,8 +242,7 @@ fn handle_quoted_key<'a>(
             }
             '"' => {
                 if *key_start < idx {
-                    let key = &path[*key_start + 1..idx];
-                    path_components.push(PathElement::Key(Cow::Borrowed(key), true));
+                    path_components.push(PathElement::Key(*key_start + 1..idx, true));
                     *parser_state = PPState::ExpectDotOrBracket;
                     return Ok(());
                 }
@@ -256,7 +258,7 @@ fn handle_array_index(
     parser_state: &mut PPState,
     index_state: &mut ArrayIndexState,
     index_buffer: &mut i128,
-    path_components: &mut Vec<PathElement<'_>>,
+    path_components: &mut Vec<PathElement>,
     path_iter: &mut std::str::CharIndices,
     path: &str,
 ) -> crate::Result<()> {
@@ -343,7 +345,7 @@ fn finalize_path<'a>(
     parser_state: PPState,
     key_start: usize,
     path: &'a str,
-    path_components: &mut Vec<PathElement<'a>>,
+    path_components: &mut Vec<PathElement>,
 ) -> crate::Result<()> {
     match parser_state {
         PPState::InArrayIndex => bail_parse_error!("Bad json path: {}", path),
@@ -353,7 +355,7 @@ fn finalize_path<'a>(
                 if key.starts_with('"') & !key.ends_with('"') {
                     bail_parse_error!("Bad json path: {}", path)
                 }
-                path_components.push(PathElement::Key(Cow::Borrowed(key), false));
+                path_components.push(PathElement::Key(key_start..path.len(), false));
             } else {
                 bail_parse_error!("Bad json path: {}", path)
             }
@@ -379,10 +381,7 @@ mod tests {
         let path = json_path("$.x").unwrap();
         assert_eq!(path.elements.len(), 2);
         assert_eq!(path.elements[0], PathElement::Root());
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("x"), false)
-        );
+        assert_eq!(path.elements[1], PathElement::Key(2..3, false));
     }
 
     #[test]
@@ -424,19 +423,10 @@ mod tests {
         let path = json_path("$.store.book[0].title").unwrap();
         assert_eq!(path.elements.len(), 5);
         assert_eq!(path.elements[0], PathElement::Root());
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("store"), false)
-        );
-        assert_eq!(
-            path.elements[2],
-            PathElement::Key(Cow::Borrowed("book"), false)
-        );
+        assert_eq!(path.elements[1], PathElement::Key(2..7, false));
+        assert_eq!(path.elements[2], PathElement::Key(8..12, false));
         assert_eq!(path.elements[3], PathElement::ArrayLocator(Some(0)));
-        assert_eq!(
-            path.elements[4],
-            PathElement::Key(Cow::Borrowed("title"), false)
-        );
+        assert_eq!(path.elements[4], PathElement::Key(16..21, false));
     }
 
     #[test]
@@ -456,10 +446,7 @@ mod tests {
         assert_eq!(path.elements[1], PathElement::ArrayLocator(Some(0)));
         assert_eq!(path.elements[2], PathElement::ArrayLocator(Some(1)));
         assert_eq!(path.elements[3], PathElement::ArrayLocator(Some(2)));
-        assert_eq!(
-            path.elements[4],
-            PathElement::Key(Cow::Borrowed("key"), false)
-        );
+        assert_eq!(path.elements[4], PathElement::Key(11..14, false));
         assert_eq!(path.elements[5], PathElement::ArrayLocator(Some(3)));
     }
 
@@ -492,22 +479,13 @@ mod tests {
     #[test]
     fn test_quoted_keys() {
         let path = json_path(r#"$."key""#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("key"), true)
-        );
+        assert_eq!(path.elements[1], PathElement::Key(3..6, true));
 
         let path = json_path(r#"$."key.with.dots""#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("key.with.dots"), true)
-        );
+        assert_eq!(path.elements[1], PathElement::Key(3..16, true));
 
         let path = json_path(r#"$."key[0]""#).unwrap();
-        assert_eq!(
-            path.elements[1],
-            PathElement::Key(Cow::Borrowed("key[0]"), true)
-        );
+        assert_eq!(path.elements[1], PathElement::Key(3..9, true));
     }
 
     #[test]

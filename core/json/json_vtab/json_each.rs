@@ -32,8 +32,8 @@ enum Columns {
 #[derive(Debug, VTabModuleDerive, Default)]
 struct JsonEachVTab;
 
-impl<'a> VTabModule<'a> for JsonEachVTab {
-    type VCursor = JsonEachCursor<'a>;
+impl VTabModule<'_> for JsonEachVTab {
+    type VCursor = JsonEachCursor;
     type Error = ResultCode;
     const NAME: &'static str = "json_each";
     const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
@@ -107,13 +107,13 @@ impl<'a> VTabModule<'a> for JsonEachVTab {
 
 /// The cursor for iterating over the generated sequence
 #[derive(Debug, Default)]
-struct JsonEachCursor<'a> {
+struct JsonEachCursor {
     rowid: i64,
     root: String,
-    path: JsonPath<'a>,
+    path: JsonPath,
 }
 
-impl<'a> VTabCursor<'a> for JsonEachCursor<'_> {
+impl VTabCursor<'_> for JsonEachCursor {
     type Error = ResultCode;
 
     fn next(&mut self) -> ResultCode {
