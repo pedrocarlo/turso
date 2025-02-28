@@ -2,8 +2,8 @@ mod de;
 mod error;
 mod json_operations;
 mod json_path;
-mod ser;
 pub(crate) mod json_vtab;
+mod ser;
 
 pub use crate::json::de::from_str;
 use crate::json::de::ordered_object;
@@ -438,27 +438,21 @@ fn json_path_from_owned_value(path: &OwnedValue, strict: bool) -> crate::Result<
                 if t.as_str().starts_with("$") {
                     json_path(t.as_str())?
                 } else {
-                    JsonPath {
-                        elements: vec![
-                            PathElement::Root(),
-                            PathElement::Key(Cow::Borrowed(t.as_str()), false),
-                        ],
-                    }
+                    JsonPath::from_path_elements(vec![
+                        PathElement::Root(),
+                        PathElement::Key(Cow::Borrowed(t.as_str()), false),
+                    ])
                 }
             }
             OwnedValue::Null => return Ok(None),
-            OwnedValue::Integer(i) => JsonPath {
-                elements: vec![
-                    PathElement::Root(),
-                    PathElement::ArrayLocator(Some(*i as i32)),
-                ],
-            },
-            OwnedValue::Float(f) => JsonPath {
-                elements: vec![
-                    PathElement::Root(),
-                    PathElement::Key(Cow::Owned(f.to_string()), false),
-                ],
-            },
+            OwnedValue::Integer(i) => JsonPath::from_path_elements(vec![
+                PathElement::Root(),
+                PathElement::ArrayLocator(Some(*i as i32)),
+            ]),
+            OwnedValue::Float(f) => JsonPath::from_path_elements(vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Owned(f.to_string()), false),
+            ]),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
     };
@@ -1227,9 +1221,7 @@ mod tests {
             Val::String("first".to_string()),
             Val::String("second".to_string()),
         ]);
-        let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(Some(0))],
-        };
+        let path = JsonPath::from_path_elements(vec![PathElement::ArrayLocator(Some(0))]);
 
         match find_target(&mut val, &path) {
             Some(Target::Array(_, idx)) => assert_eq!(idx, 0),
@@ -1243,9 +1235,7 @@ mod tests {
             Val::String("first".to_string()),
             Val::String("second".to_string()),
         ]);
-        let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(Some(-1))],
-        };
+        let path = JsonPath::from_path_elements(vec![PathElement::ArrayLocator(Some(-1))]);
 
         match find_target(&mut val, &path) {
             Some(Target::Array(_, idx)) => assert_eq!(idx, 1),
@@ -1256,9 +1246,8 @@ mod tests {
     #[test]
     fn test_find_target_object() {
         let mut val = Val::Object(vec![("key".to_string(), Val::String("value".to_string()))]);
-        let path = JsonPath {
-            elements: vec![PathElement::Key(Cow::Borrowed("key"), false)],
-        };
+        let path =
+            JsonPath::from_path_elements(vec![PathElement::Key(Cow::Borrowed("key"), false)]);
 
         match find_target(&mut val, &path) {
             Some(Target::Value(_)) => {}
@@ -1272,9 +1261,8 @@ mod tests {
             ("key".to_string(), Val::Removed),
             ("key".to_string(), Val::String("value".to_string())),
         ]);
-        let path = JsonPath {
-            elements: vec![PathElement::Key(Cow::Borrowed("key"), false)],
-        };
+        let path =
+            JsonPath::from_path_elements(vec![PathElement::Key(Cow::Borrowed("key"), false)]);
 
         match find_target(&mut val, &path) {
             Some(Target::Value(val)) => assert!(matches!(val, Val::String(_))),
@@ -1285,9 +1273,7 @@ mod tests {
     #[test]
     fn test_mutate_json() {
         let mut val = Val::Array(vec![Val::String("test".to_string())]);
-        let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(Some(0))],
-        };
+        let path = JsonPath::from_path_elements(vec![PathElement::ArrayLocator(Some(0))]);
 
         let result = mutate_json_by_path(&mut val, path, |target| match target {
             Target::Array(arr, idx) => {
@@ -1304,9 +1290,7 @@ mod tests {
     #[test]
     fn test_mutate_json_none() {
         let mut val = Val::Array(vec![]);
-        let path = JsonPath {
-            elements: vec![PathElement::ArrayLocator(Some(0))],
-        };
+        let path = JsonPath::from_path_elements(vec![PathElement::ArrayLocator(Some(0))]);
 
         let result: Option<()> = mutate_json_by_path(&mut val, path, |_| {
             panic!("Should not be called");

@@ -106,23 +106,11 @@ impl<'a> VTabModule<'a> for JsonEachVTab {
 }
 
 /// The cursor for iterating over the generated sequence
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct JsonEachCursor<'a> {
     rowid: i64,
     root: String,
     path: JsonPath<'a>,
-}
-
-impl Default for JsonEachCursor<'_> {
-    fn default() -> Self {
-        Self {
-            rowid: 0,
-            root: "$".to_string(),
-            path: JsonPath {
-                elements: Vec::new(),
-            },
-        }
-    }
 }
 
 impl<'a> VTabCursor<'a> for JsonEachCursor<'_> {

@@ -22,6 +22,26 @@ enum ArrayIndexState {
 #[derive(Clone, Debug)]
 pub struct JsonPath<'a> {
     pub elements: Vec<PathElement<'a>>,
+    path: String,
+}
+
+impl<'a> JsonPath<'a> {
+    //
+    pub fn from_path_elements(elements: Vec<PathElement<'a>>) -> Self {
+        Self {
+            elements,
+            path: "".to_string(), // Field is Not important when JsonPath is constructed from this function
+        }
+    }
+}
+
+impl Default for JsonPath<'_> {
+    fn default() -> Self {
+        Self {
+            elements: vec![PathElement::Root()],
+            path: "$".to_string(),
+        }
+    }
 }
 
 type RawString = bool;
@@ -70,6 +90,9 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     let mut index_buffer: i128 = 0;
     let mut path_components = Vec::with_capacity(estimate_path_capacity(path));
     let mut path_iter = path.char_indices();
+
+    let mut j_path = JsonPath::default();
+    j_path.path = path.to_string();
 
     while let Some(ch) = path_iter.next() {
         match parser_state {
@@ -123,9 +146,8 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     }
 
     finalize_path(parser_state, key_start, path, &mut path_components)?;
-    Ok(JsonPath {
-        elements: path_components,
-    })
+    j_path.elements = path_components;
+    Ok(j_path)
 }
 
 fn handle_start(
