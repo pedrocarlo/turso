@@ -19,7 +19,7 @@ macro_rules! try_option {
 #[derive(Debug, VTabModuleDerive, Default)]
 struct GenerateSeriesVTab;
 
-impl VTabModule<'_> for GenerateSeriesVTab {
+impl VTabModule for GenerateSeriesVTab {
     type VCursor = GenerateSeriesCursor;
     type Error = ResultCode;
     const NAME: &'static str = "generate_series";
@@ -125,7 +125,7 @@ impl GenerateSeriesCursor {
     }
 }
 
-impl VTabCursor<'_> for GenerateSeriesCursor {
+impl VTabCursor for GenerateSeriesCursor {
     type Error = ResultCode;
 
     fn next(&mut self) -> ResultCode {

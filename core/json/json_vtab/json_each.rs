@@ -32,7 +32,7 @@ enum Columns {
 #[derive(Debug, VTabModuleDerive, Default)]
 struct JsonEachVTab;
 
-impl VTabModule<'_> for JsonEachVTab {
+impl VTabModule for JsonEachVTab {
     type VCursor = JsonEachCursor;
     type Error = ResultCode;
     const NAME: &'static str = "json_each";
@@ -113,7 +113,7 @@ struct JsonEachCursor {
     path: JsonPath,
 }
 
-impl VTabCursor<'_> for JsonEachCursor {
+impl VTabCursor for JsonEachCursor {
     type Error = ResultCode;
 
     fn next(&mut self) -> ResultCode {
