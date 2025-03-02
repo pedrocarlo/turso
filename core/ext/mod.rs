@@ -1,4 +1,8 @@
-use crate::{function::ExternalFunc, json::json_vtab::json_each, Database};
+use crate::{
+    function::ExternalFunc,
+    json::json_vtab,
+    Database,
+};
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,
 };
@@ -151,7 +155,7 @@ impl Database {
             return Err("Failed to register series extension".to_string());
         }
         #[cfg(feature = "json")]
-        if unsafe { !json_each::register_extension_static(&ext_api).is_ok() } {
+        if unsafe { !json_vtab::register_extension_static(&ext_api).is_ok() } {
             return Err("Failed to register json vtables".to_string());
         }
         Ok(())
