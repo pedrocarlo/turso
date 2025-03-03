@@ -45,7 +45,7 @@ impl VTabModule for JsonEachVTab {
 
         cursor.json_val = json_val;
 
-        path.push(""); // Add base case so that code is cleaner in next
+        path.push("".to_string()); // Add base case so that code is cleaner in next
         cursor.path = path.path.clone();
         cursor.curr_path = path;
 
@@ -75,7 +75,7 @@ pub struct JsonEachCursor {
     id: i64,        // Arbitrary id of the value,
     increment: i64, // Value to increment id
     eof: bool,
-    ctx: Vec<usize>,
+    array_idx_stack: Vec<usize>,
     path: String, // Requested Path
     curr_path: InPlaceJsonPath,
 }
@@ -90,7 +90,7 @@ impl Default for JsonEachCursor {
             key: "".to_string(),
             val: Val::Null,
             eof: false,
-            ctx: Vec::new(),
+            array_idx_stack: Vec::new(),
             path: "".to_string(),
             curr_path: InPlaceJsonPath::default(),
         }
@@ -107,7 +107,7 @@ impl VTabCursor for JsonEachCursor {
 
         self.rowid += 1;
         self.id += self.increment;
-        let _ = self.curr_path.pop();
+        let _ = self.curr_path.pop(); // Pop to remove last element in path
 
         // TODO Improvement: see a way to first sort the elements so that we can pop from last instead of
         // remove_first and as the Vec shifts every time we remove_first
@@ -115,18 +115,18 @@ impl VTabCursor for JsonEachCursor {
             Val::Array(v) => {
                 if let Some(val) = v.remove_first() {
                     self.key = {
-                        if let Some(idx) = self.ctx.last_mut() {
+                        if let Some(idx) = self.array_idx_stack.last_mut() {
                             *idx += 1;
                             idx.to_string()
                         } else {
-                            self.ctx.push(0);
+                            self.array_idx_stack.push(0);
                             0.to_string()
                         }
                     };
                     self.val = val;
-                    self.curr_path.push(&format!("[{}]", self.key));
+                    self.curr_path.push_array_locator(&self.key);
                 } else {
-                    let _ = self.ctx.pop();
+                    let _ = self.array_idx_stack.pop();
                     self.eof = true;
                     return ResultCode::EOF;
                 }
@@ -135,7 +135,7 @@ impl VTabCursor for JsonEachCursor {
                 if let Some((key, val)) = v.remove_first() {
                     self.val = val;
                     self.key = key;
-                    self.curr_path.push(&format!(".{}", self.key));
+                    self.curr_path.push_key(&self.key);
                 } else {
                     self.eof = true;
                     return ResultCode::EOF;

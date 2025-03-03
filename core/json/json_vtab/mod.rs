@@ -14,9 +14,10 @@ pub mod json_each;
 pub mod json_tree;
 
 use json_each::JsonEachVTab;
+use json_tree::JsonTreeVTab;
 
 register_extension! {
-    vtabs: { JsonEachVTab }
+    vtabs: { JsonEachVTab, JsonTreeVTab }
 }
 
 macro_rules! try_option {
@@ -275,9 +276,17 @@ impl InPlaceJsonPath {
         None
     }
 
-    fn push(&mut self, element: &str) {
+    fn push(&mut self, element: String) {
         self.items_len.push(element.len());
-        self.path.push_str(element);
+        self.path.push_str(&element);
+    }
+
+    fn push_array_locator(&mut self, key: &str) {
+        self.push(format!("[{}]", key));
+    }
+
+    fn push_key(&mut self, key: &str) {
+        self.push(format!(".{}", key));
     }
 }
 
