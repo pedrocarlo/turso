@@ -5,6 +5,10 @@ use limbo_core::{Connection, StepResult};
 use rustyline::completion::{extract_word, Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::{Completer, Helper, Hinter, Validator};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 macro_rules! try_result {
     ($expr:expr, $err:expr) => {
@@ -19,17 +23,67 @@ macro_rules! try_result {
 pub struct LimboHelper {
     #[rustyline(Completer)]
     completer: SqlCompleter,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
 }
 
 impl LimboHelper {
     pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+        // Load only predefined syntax
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
         LimboHelper {
             completer: SqlCompleter::new(conn, io),
+            syntax_set: ps,
+            theme_set: ts,
         }
     }
 }
 
-impl Highlighter for LimboHelper {}
+impl Highlighter for LimboHelper {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        let _ = pos;
+        // TODO use lifetimes to store highlight lines
+        let syntax = self.syntax_set.find_syntax_by_extension("sql").unwrap();
+        let mut h = HighlightLines::new(syntax, &self.theme_set.themes["base16-ocean.dark"]);
+        let mut ret_line = String::new();
+        for new_line in LinesWithEndings::from(line) {
+            let ranges: Vec<(Style, &str)> = h.highlight_line(new_line, &self.syntax_set).unwrap();
+            let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+            ret_line.push_str(&escaped);
+        }
+        // Push this escape sequence to reset 
+        // ret_line.push_str("\x1b[0m");
+        std::borrow::Cow::Owned(ret_line)
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        let _ = default;
+        std::borrow::Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        std::borrow::Cow::Borrowed(hint)
+    }
+
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        completion: rustyline::CompletionType,
+    ) -> std::borrow::Cow<'c, str> {
+        let _ = completion;
+        std::borrow::Cow::Borrowed(candidate)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: rustyline::highlight::CmdKind) -> bool {
+        let _ = (line, pos, kind);
+        true
+    }
+}
 
 pub struct SqlCompleter {
     conn: Rc<Connection>,
