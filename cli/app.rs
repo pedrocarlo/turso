@@ -726,7 +726,9 @@ impl<'a> Limbo<'a> {
                         let header = (0..rows.num_columns())
                             .map(|i| {
                                 let name = rows.get_column_name(i);
-                                Cell::new(name).add_attribute(Attribute::Bold)
+                                Cell::new(name)
+                                    .add_attribute(Attribute::Bold)
+                                    .fg(comfy_table::Color::AnsiValue(49)) // Green color for headers
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
