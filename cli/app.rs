@@ -8,6 +8,7 @@ use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row
 use limbo_core::{Database, LimboError, OwnedValue, Statement, StepResult};
 
 use clap::{Parser, ValueEnum};
+use reedline::{DefaultPrompt, DefaultPromptSegment};
 use rustyline::{history::DefaultHistory, Editor};
 use std::{
     fmt,
@@ -161,7 +162,7 @@ impl FromStr for Command {
 const PROMPT: &str = "limbo> ";
 
 pub struct Limbo<'a> {
-    pub prompt: String,
+    pub prompt: DefaultPrompt,
     io: Arc<dyn limbo_core::IO>,
     writer: Box<dyn Write>,
     conn: Rc<limbo_core::Connection>,
@@ -226,7 +227,10 @@ impl<'a> Limbo<'a> {
             .expect("Error setting Ctrl-C handler");
         }
         let mut app = Self {
-            prompt: PROMPT.to_string(),
+            prompt: DefaultPrompt::new(
+                DefaultPromptSegment::Basic(PROMPT.to_string()),
+                DefaultPromptSegment::Empty,
+            ),
             io,
             writer: get_writer(&opts.output),
             conn,
@@ -257,7 +261,7 @@ impl<'a> Limbo<'a> {
     }
 
     fn set_multiline_prompt(&mut self) {
-        self.prompt = match self.input_buff.chars().fold(0, |acc, c| match c {
+        let prompt = match self.input_buff.chars().fold(0, |acc, c| match c {
             '(' => acc + 1,
             ')' => acc - 1,
             _ => acc,
@@ -267,6 +271,7 @@ impl<'a> Limbo<'a> {
             n if n < 10 => format!("(x{}...> ", n),
             _ => String::from("(.....> "),
         };
+        self.prompt.left_prompt = DefaultPromptSegment::Basic(prompt);
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -390,7 +395,7 @@ impl<'a> Limbo<'a> {
     }
 
     pub fn reset_input(&mut self) {
-        self.prompt = PROMPT.to_string();
+        self.prompt.left_prompt = DefaultPromptSegment::Basic(PROMPT.to_string());
         self.input_buff.clear();
     }
 

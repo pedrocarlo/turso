@@ -4,7 +4,10 @@ mod helper;
 mod import;
 mod input;
 mod opcodes_dictionary;
+mod readline;
+mod readline_utils;
 
+use reedline::{DefaultPrompt, DefaultPromptSegment, Prompt, Reedline};
 use rustyline::{error::ReadlineError, Config, Editor};
 use std::sync::atomic::Ordering;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -16,6 +19,11 @@ fn rustyline_config() -> Config {
 }
 
 fn main() -> anyhow::Result<()> {
+    let mut line_editor = Reedline::create();
+    let prompt = DefaultPrompt::default();
+
+    let sig = line_editor.read_line(&prompt);
+
     let mut rl = Editor::with_config(rustyline_config())?;
     tracing_subscriber::registry()
         .with(
