@@ -1,5 +1,5 @@
 //! Build.rs script to generate a binary syntax set for syntect
-//! based on the SQL.sublime-syntax file. 
+//! based on the SQL.sublime-syntax file.
 
 use std::env;
 use std::path::Path;

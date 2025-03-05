@@ -4,7 +4,7 @@ use crate::{
     input::{get_io, get_writer, DbLocation, Io, OutputMode, Settings, HELP_MSG},
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
 };
-use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
+use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Row, Table};
 use limbo_core::{Database, LimboError, OwnedValue, Statement, StepResult};
 
 use clap::{Parser, ValueEnum};
@@ -740,24 +740,31 @@ impl<'a> Limbo<'a> {
                                 let mut row = Row::new();
                                 row.max_height(1);
                                 for value in record.get_values() {
-                                    let (content, alignment) = match value {
-                                        OwnedValue::Null => {
-                                            (self.opts.null_value.clone(), CellAlignment::Left)
-                                        }
+                                    let (content, alignment, color) = match value {
+                                        OwnedValue::Null => (
+                                            self.opts.null_value.clone(),
+                                            CellAlignment::Left,
+                                            Color::White,
+                                        ),
                                         OwnedValue::Integer(i) => {
-                                            (i.to_string(), CellAlignment::Right)
+                                            (i.to_string(), CellAlignment::Right, Color::DarkRed)
                                         }
                                         OwnedValue::Float(f) => {
-                                            (f.to_string(), CellAlignment::Right)
+                                            (f.to_string(), CellAlignment::Right, Color::DarkRed)
                                         }
-                                        OwnedValue::Text(s) => (s.to_string(), CellAlignment::Left),
+                                        OwnedValue::Text(s) => {
+                                            (s.to_string(), CellAlignment::Left, Color::DarkGreen)
+                                        }
                                         OwnedValue::Blob(b) => (
                                             String::from_utf8_lossy(b).to_string(),
                                             CellAlignment::Left,
+                                            Color::DarkGreen,
                                         ),
                                         _ => unreachable!(),
                                     };
-                                    row.add_cell(Cell::new(content).set_alignment(alignment));
+                                    row.add_cell(
+                                        Cell::new(content).set_alignment(alignment).fg(color),
+                                    );
                                 }
                                 table.add_row(row);
                             }
