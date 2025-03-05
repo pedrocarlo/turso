@@ -233,7 +233,7 @@ impl<'a> Limbo<'a> {
             opts: Settings::from(&opts),
             rl,
         };
-        
+
         if opts.sql.is_some() {
             app.handle_first_input(opts.sql.as_ref().unwrap());
         }

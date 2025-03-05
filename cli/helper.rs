@@ -30,18 +30,12 @@ pub struct LimboHelper {
 
 impl LimboHelper {
     pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
-        // Code commented below is used to create a binary dump for the Sublime Syntax
-
-        // let syntax =
-        //     SyntaxDefinition::load_from_str(include_str!("./SQL.sublime-syntax"), false, None)
-        //         .unwrap();
-        // let mut ps = SyntaxSet::new().into_builder();
-        // ps.add(syntax);
-        // let ps = ps.build();
-        // dump_to_uncompressed_file(&ps, "./SQL_syntax_set_dump.packdump").unwrap();
-
         // Load only predefined syntax
-        let ps = from_uncompressed_data(include_bytes!("./SQL_syntax_set_dump.packdump")).unwrap();
+        let ps = from_uncompressed_data(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/SQL_syntax_set_dump.packdump"
+        )))
+        .unwrap();
         let ts = ThemeSet::load_defaults();
         LimboHelper {
             completer: SqlCompleter::new(conn, io),

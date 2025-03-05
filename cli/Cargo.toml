@@ -41,3 +41,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 [features]
 default = ["io_uring"]
 io_uring = ["limbo_core/io_uring"]
+
+[build-dependencies]
+syntect = "5.2.0"
+

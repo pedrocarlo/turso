@@ -12,7 +12,7 @@ variables:
 
   toplevel_reserved: |-
     (?xi: alter | create | cross | delete | drop | from | grant | group | inner | insert | join
-    | left | on | order | outer | revoke | right | select | set | truncate | union
+    | left | on | order | outer | right | select | set | truncate | union
     | update | where )
   additional_toplevel_reserved: (?!)
 
