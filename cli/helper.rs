@@ -5,9 +5,10 @@ use limbo_core::{Connection, StepResult};
 use rustyline::completion::{extract_word, Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::{Completer, Helper, Hinter, Validator};
+use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{Scope, SyntaxSet};
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 macro_rules! try_result {
@@ -29,8 +30,18 @@ pub struct LimboHelper {
 
 impl LimboHelper {
     pub fn new(conn: Rc<Connection>, io: Arc<dyn limbo_core::IO>) -> Self {
+        // Code commented below is used to create a binary dump for the Sublime Syntax
+
+        // let syntax =
+        //     SyntaxDefinition::load_from_str(include_str!("./SQL.sublime-syntax"), false, None)
+        //         .unwrap();
+        // let mut ps = SyntaxSet::new().into_builder();
+        // ps.add(syntax);
+        // let ps = ps.build();
+        // dump_to_uncompressed_file(&ps, "./SQL_syntax_set_dump.packdump").unwrap();
+
         // Load only predefined syntax
-        let ps = SyntaxSet::load_defaults_newlines();
+        let ps = from_uncompressed_data(include_bytes!("./SQL_syntax_set_dump.packdump")).unwrap();
         let ts = ThemeSet::load_defaults();
         LimboHelper {
             completer: SqlCompleter::new(conn, io),
@@ -44,7 +55,10 @@ impl Highlighter for LimboHelper {
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
         let _ = pos;
         // TODO use lifetimes to store highlight lines
-        let syntax = self.syntax_set.find_syntax_by_extension("sql").unwrap();
+        let syntax = self
+            .syntax_set
+            .find_syntax_by_scope(Scope::new("source.sql").unwrap())
+            .unwrap();
         let mut h = HighlightLines::new(syntax, &self.theme_set.themes["base16-ocean.dark"]);
         let mut ret_line = String::new();
         for new_line in LinesWithEndings::from(line) {
@@ -52,7 +66,7 @@ impl Highlighter for LimboHelper {
             let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
             ret_line.push_str(&escaped);
         }
-        // Push this escape sequence to reset 
+        // Push this escape sequence to reset
         // ret_line.push_str("\x1b[0m");
         std::borrow::Cow::Owned(ret_line)
     }
@@ -63,6 +77,7 @@ impl Highlighter for LimboHelper {
         default: bool,
     ) -> std::borrow::Cow<'b, str> {
         let _ = default;
+        // Make prompt bold
         std::borrow::Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
     }
 
