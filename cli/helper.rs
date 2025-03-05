@@ -4,6 +4,7 @@ use std::sync::Arc;
 use limbo_core::{Connection, StepResult};
 use rustyline::completion::{extract_word, Completer, Pair};
 use rustyline::highlight::Highlighter;
+use rustyline::hint::HistoryHinter;
 use rustyline::{Completer, Helper, Hinter, Validator};
 use syntect::dumps::from_uncompressed_data;
 use syntect::easy::HighlightLines;
@@ -26,6 +27,8 @@ pub struct LimboHelper {
     completer: SqlCompleter,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
+    #[rustyline(Hinter)]
+    hinter: HistoryHinter,
 }
 
 impl LimboHelper {
@@ -41,6 +44,7 @@ impl LimboHelper {
             completer: SqlCompleter::new(conn, io),
             syntax_set: ps,
             theme_set: ts,
+            hinter: HistoryHinter::new(),
         }
     }
 }
@@ -61,7 +65,7 @@ impl Highlighter for LimboHelper {
             ret_line.push_str(&escaped);
         }
         // Push this escape sequence to reset
-        // ret_line.push_str("\x1b[0m");
+        ret_line.push_str("\x1b[0m");
         std::borrow::Cow::Owned(ret_line)
     }
 
@@ -76,7 +80,7 @@ impl Highlighter for LimboHelper {
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        std::borrow::Cow::Borrowed(hint)
+        std::borrow::Cow::Owned(format!("\x1b[1;2;4;246m{hint}\x1b[0m"))
     }
 
     fn highlight_candidate<'c>(
@@ -89,8 +93,8 @@ impl Highlighter for LimboHelper {
     }
 
     fn highlight_char(&self, line: &str, pos: usize, kind: rustyline::highlight::CmdKind) -> bool {
-        let _ = (line, pos, kind);
-        true
+        let _ = (line, pos);
+        !matches!(kind, rustyline::highlight::CmdKind::MoveCursor)
     }
 }
 

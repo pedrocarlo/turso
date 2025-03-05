@@ -196,6 +196,8 @@ macro_rules! query_internal {
     }};
 }
 
+static COLORS: &[Color] = &[Color::DarkRed, Color::DarkGreen, Color::DarkBlue];
+
 impl<'a> Limbo<'a> {
     pub fn new(rl: &'a mut rustyline::Editor<LimboHelper, DefaultHistory>) -> anyhow::Result<Self> {
         let opts = Opts::parse();
@@ -728,7 +730,7 @@ impl<'a> Limbo<'a> {
                                 let name = rows.get_column_name(i);
                                 Cell::new(name)
                                     .add_attribute(Attribute::Bold)
-                                    .fg(comfy_table::Color::AnsiValue(49)) // Green color for headers
+                                    .fg(Color::AnsiValue(49)) // Green color for headers
                             })
                             .collect::<Vec<_>>();
                         table.set_header(header);
@@ -739,31 +741,28 @@ impl<'a> Limbo<'a> {
                                 let record = rows.row().unwrap();
                                 let mut row = Row::new();
                                 row.max_height(1);
-                                for value in record.get_values() {
-                                    let (content, alignment, color) = match value {
-                                        OwnedValue::Null => (
-                                            self.opts.null_value.clone(),
-                                            CellAlignment::Left,
-                                            Color::White,
-                                        ),
+                                for (idx, value) in record.get_values().iter().enumerate() {
+                                    let (content, alignment) = match value {
+                                        OwnedValue::Null => {
+                                            (self.opts.null_value.clone(), CellAlignment::Left)
+                                        }
                                         OwnedValue::Integer(i) => {
-                                            (i.to_string(), CellAlignment::Right, Color::DarkRed)
+                                            (i.to_string(), CellAlignment::Right)
                                         }
                                         OwnedValue::Float(f) => {
-                                            (f.to_string(), CellAlignment::Right, Color::DarkRed)
+                                            (f.to_string(), CellAlignment::Right)
                                         }
-                                        OwnedValue::Text(s) => {
-                                            (s.to_string(), CellAlignment::Left, Color::DarkGreen)
-                                        }
+                                        OwnedValue::Text(s) => (s.to_string(), CellAlignment::Left),
                                         OwnedValue::Blob(b) => (
                                             String::from_utf8_lossy(b).to_string(),
                                             CellAlignment::Left,
-                                            Color::DarkGreen,
                                         ),
                                         _ => unreachable!(),
                                     };
                                     row.add_cell(
-                                        Cell::new(content).set_alignment(alignment).fg(color),
+                                        Cell::new(content)
+                                            .set_alignment(alignment)
+                                            .fg(COLORS[idx & COLORS.len()]),
                                     );
                                 }
                                 table.add_row(row);
