@@ -1745,6 +1745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_opendal"
+version = "0.0.16"
+dependencies = [
+ "limbo_ext",
+ "mimalloc",
+ "tracing",
+]
+
+[[package]]
 name = "limbo_percentile"
 version = "0.0.16"
 dependencies = [

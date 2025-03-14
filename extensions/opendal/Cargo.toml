@@ -1,0 +1,21 @@
+[package]
+authors.workspace = true
+description = "Limbo Opendal extension"
+edition.workspace = true
+license.workspace = true
+name = "limbo_opendal"
+repository.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static = ["limbo_ext/static"]
+
+[dependencies]
+limbo_ext = { workspace = true, features = ["static"] }
+tracing = "0.1.41"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
