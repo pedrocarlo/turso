@@ -15,6 +15,11 @@ static = ["limbo_ext/static"]
 
 [dependencies]
 limbo_ext = { workspace = true, features = ["static"] }
+opendal = { version = "0.52.0", features = [
+    "services-s3",
+    "layers-tracing",
+    "layers-blocking",
+] }
 tracing = "0.1.41"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
