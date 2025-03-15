@@ -23,7 +23,7 @@ members = [
     "simulator",
     "sqlite3",
     "stress",
-    "tests",
+    "tests", "extensions/async_file",
 ]
 exclude = ["perf/latency/limbo"]
 
