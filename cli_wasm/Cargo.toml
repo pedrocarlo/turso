@@ -1,0 +1,10 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "limbo_cli_wasm"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+limbo_core = { workspace = true }

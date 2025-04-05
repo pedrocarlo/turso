@@ -25,6 +25,7 @@ members = [
     "sqlite3",
     "stress",
     "tests",
+    "cli_wasm",
 ]
 exclude = ["perf/latency/limbo"]
 

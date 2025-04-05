@@ -1659,6 +1659,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "limbo_cli_wasm"
+version = "0.0.19-pre.4"
+dependencies = [
+ "limbo_core",
+]
+
+[[package]]
 name = "limbo_completion"
 version = "0.0.19-pre.4"
 dependencies = [
