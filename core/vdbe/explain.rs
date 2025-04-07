@@ -1165,6 +1165,15 @@ pub fn insn_to_str(
                 0,
                 format!("r[{}]=r[{}]", dst_reg, src_reg),
             ),
+            Insn::SCopy { src_reg, dst_reg } => (
+                "SCopy",
+                *src_reg as i32,
+                *dst_reg as i32,
+                0,
+                OwnedValue::build_text(""),
+                0,
+                format!("r[{}]=r[{}]", dst_reg, src_reg),
+            ),
             Insn::CreateBtree { db, root, flags } => (
                 "CreateBtree",
                 *db as i32,

@@ -666,6 +666,11 @@ pub enum Insn {
         amount: usize, // 0 amount means we include src_reg, dst_reg..=dst_reg+amount = src_reg..=src_reg+amount
     },
 
+    SCopy {
+        src_reg: usize,
+        dst_reg: usize,
+    },
+
     /// Allocate a new b-tree.
     CreateBtree {
         /// Allocate b-tree in main database if zero or in temp database if non-zero (P1).
@@ -1347,6 +1352,7 @@ impl Insn {
             Insn::OpenWriteAwait { .. } => execute::op_open_write_await,
 
             Insn::Copy { .. } => execute::op_copy,
+            Insn::SCopy { .. } => execute::op_scopy,
             Insn::CreateBtree { .. } => execute::op_create_btree,
 
             Insn::Destroy { .. } => execute::op_destroy,

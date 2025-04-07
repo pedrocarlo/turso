@@ -211,6 +211,7 @@ pub enum Register {
     OwnedValue(OwnedValue),
     Aggregate(AggContext),
     Record(ImmutableRecord),
+    Reference(*const Register),
 }
 
 /// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore

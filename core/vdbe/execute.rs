@@ -4071,6 +4071,22 @@ pub fn op_copy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_scopy(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Rc<Pager>,
+    mv_store: Option<&Rc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    let Insn::SCopy { src_reg, dst_reg } = insn else {
+        unreachable!("unexpected Insn {:?}", insn)
+    };
+
+    state.registers[*dst_reg] = Register::Reference(&state.registers[*src_reg]);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_create_btree(
     program: &Program,
     state: &mut ProgramState,
