@@ -8,6 +8,7 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+pub(crate) mod alter;
 pub(crate) mod delete;
 pub(crate) mod emitter;
 pub(crate) mod expr;
@@ -35,6 +36,7 @@ use crate::translate::delete::translate_delete;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use alter::translate_alter_table;
 use index::translate_create_index;
 use insert::translate_insert;
 use limbo_sqlite3_parser::ast::{self, Delete, Insert};
@@ -58,7 +60,10 @@ pub fn translate(
     let mut change_cnt_on = false;
 
     let program = match stmt {
-        ast::Stmt::AlterTable(_) => bail_parse_error!("ALTER TABLE not supported yet"),
+        ast::Stmt::AlterTable(alter_table) => {
+            let (tbl_name, body) = *alter_table;
+            translate_alter_table(tbl_name, body, schema, syms, query_mode)?
+        }
         ast::Stmt::Analyze(_) => bail_parse_error!("ANALYZE not supported yet"),
         ast::Stmt::Attach { .. } => bail_parse_error!("ATTACH not supported yet"),
         ast::Stmt::Begin(tx_type, tx_name) => translate_tx_begin(tx_type, tx_name)?,

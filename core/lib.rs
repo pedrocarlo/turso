@@ -676,7 +676,7 @@ impl VirtualTable {
                 implementation: module.implementation.clone(),
                 columns,
                 args: exprs,
-                kind,
+                kind
             });
             return Ok(vtab);
         }
