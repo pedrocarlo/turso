@@ -35,13 +35,14 @@ pub fn translate_insert(
     body: &InsertBody,
     _returning: &Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let mut program = program.unwrap_or(ProgramBuilder::new(ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 30,
         approx_num_labels: 5,
-    });
+    }));
     if with.is_some() {
         crate::bail_parse_error!("WITH clause is not supported");
     }

@@ -51,16 +51,17 @@ pub fn translate_update(
     schema: &Schema,
     body: &mut Update,
     syms: &SymbolTable,
+    program: Option<ProgramBuilder>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(schema, body)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let mut program = program.unwrap_or(ProgramBuilder::new(ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
-    });
+    }));
     emit_program(&mut program, plan, syms)?;
     Ok(program)
 }

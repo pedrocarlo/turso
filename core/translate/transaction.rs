@@ -6,13 +6,14 @@ use limbo_sqlite3_parser::ast::{Name, TransactionType};
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let mut program = program.unwrap_or(ProgramBuilder::new(ProgramBuilderOpts {
         query_mode: QueryMode::Normal,
         num_cursors: 0,
         approx_num_insns: 0,
         approx_num_labels: 0,
-    });
+    }));
     let init_label = program.emit_init();
     let start_offset = program.offset();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
@@ -38,13 +39,16 @@ pub fn translate_tx_begin(
     Ok(program)
 }
 
-pub fn translate_tx_commit(_tx_name: Option<Name>) -> Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+pub fn translate_tx_commit(
+    _tx_name: Option<Name>,
+    program: Option<ProgramBuilder>,
+) -> Result<ProgramBuilder> {
+    let mut program = program.unwrap_or(ProgramBuilder::new(ProgramBuilderOpts {
         query_mode: QueryMode::Normal,
         num_cursors: 0,
         approx_num_insns: 0,
         approx_num_labels: 0,
-    });
+    }));
     let init_label = program.emit_init();
     let start_offset = program.offset();
     program.emit_insn(Insn::AutoCommit {

@@ -20,6 +20,7 @@ pub fn translate_select(
     schema: &Schema,
     select: ast::Select,
     syms: &SymbolTable,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
     let mut select_plan = prepare_select_plan(schema, select, syms, None)?;
     optimize_plan(&mut select_plan, schema)?;
@@ -27,12 +28,12 @@ pub fn translate_select(
         panic!("select_plan is not a SelectPlan");
     };
 
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let mut program = program.unwrap_or(ProgramBuilder::new(ProgramBuilderOpts {
         query_mode,
         num_cursors: count_plan_required_cursors(select),
         approx_num_insns: estimate_num_instructions(select),
         approx_num_labels: estimate_num_labels(select),
-    });
+    }));
     emit_program(&mut program, select_plan, syms)?;
     Ok(program)
 }

@@ -37,6 +37,8 @@ pub struct ProgramBuilder {
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: Vec<TableReference>,
+    pub nested: usize,
+    pub change_count_on: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +97,8 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: Vec::new(),
+            nested: 0,
+            change_count_on: false,
         }
     }
 
@@ -167,10 +171,14 @@ impl ProgramBuilder {
     }
 
     pub fn emit_halt(&mut self) {
-        self.emit_insn(Insn::Halt {
-            err_code: 0,
-            description: String::new(),
-        });
+        // Halt should only be emitted on the outer parser.
+        // When deep parsing we do not emit halt
+        if self.nested == 0 {
+            self.emit_insn(Insn::Halt {
+                err_code: 0,
+                description: String::new(),
+            });
+        }
     }
 
     // no users yet, but I want to avoid someone else in the future
@@ -458,7 +466,6 @@ impl ProgramBuilder {
         mut self,
         database_header: Arc<SpinLock<DatabaseHeader>>,
         connection: Weak<Connection>,
-        change_cnt_on: bool,
     ) -> Program {
         self.resolve_labels();
         assert!(
@@ -476,7 +483,7 @@ impl ProgramBuilder {
             connection,
             parameters: self.parameters,
             n_change: Cell::new(0),
-            change_cnt_on,
+            change_cnt_on: self.change_count_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
         }

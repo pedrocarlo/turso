@@ -22,15 +22,18 @@ pub fn translate_create_index(
     tbl_name: &str,
     columns: &[SortedColumn],
     schema: &Schema,
+    program: Option<ProgramBuilder>,
 ) -> crate::Result<ProgramBuilder> {
     let idx_name = normalize_ident(idx_name);
     let tbl_name = normalize_ident(tbl_name);
-    let mut program = ProgramBuilder::new(crate::vdbe::builder::ProgramBuilderOpts {
-        query_mode: mode,
-        num_cursors: 5,
-        approx_num_insns: 40,
-        approx_num_labels: 5,
-    });
+    let mut program = program.unwrap_or(ProgramBuilder::new(
+        crate::vdbe::builder::ProgramBuilderOpts {
+            query_mode: mode,
+            num_cursors: 5,
+            approx_num_insns: 40,
+            approx_num_labels: 5,
+        },
+    ));
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
