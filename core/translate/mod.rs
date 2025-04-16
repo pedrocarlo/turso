@@ -250,6 +250,7 @@ fn deep_parse(
     } = args;
     program.nested += 1;
     if let Some(Cmd::Stmt(stmt)) = cmd {
+        dbg!(&stmt);
         program = translate_inner(
             TranslateArgs {
                 schema,

@@ -8,7 +8,7 @@ use crate::{
     Result,
 };
 
-use super::{deep_parse, DeepParseArgs};
+use super::{deep_parse, schema::SQLITE_TABLEID, DeepParseArgs};
 
 pub fn translate_alter_table(
     args: DeepParseArgs,
@@ -37,60 +37,112 @@ fn translate_alter_table_rename_to(
         approx_num_labels: 0, // TODO
     }));
 
-    // TODO: use TRANSACTIONS for this type of operation
+    let table_name = tbl_name.name.0.as_str();
 
     // to locate the Table SQLite is a bit more elaborate on how it searches for the table
     // right now we are just defaulting to searching in the schema
     // https://github.com/sqlite/sqlite/blob/master/src/build.c#L471
-    let table = args.schema.get_table(tbl_name.name.0.as_str());
+    let table = args.schema.get_table(table_name);
     if table.is_none() {
-        bail_parse_error!("No such table: {}", tbl_name.name.0.as_str());
+        bail_parse_error!("No such table: {}", table_name);
     }
     // SAFE: Checked above if table is none
     let table = table.unwrap();
 
-    /* START CHECK TABLE NAME */
+    /* START - CHECK TABLE NAME */
     // TODO see difference between what a Shadow Table name is for Virtual Tables
-    // Check that a table, index or virtual table named as 'new_tbl_name' does not already exist
+    // Check that a table, index or virtual table named as 'new_table_name' does not already exist
 
-    let table_key_name = new_tbl_name.0.as_str();
+    let new_table_name = new_tbl_name.0.as_str();
     // Checks for tables and virtual tables
-    if args.schema.get_table(table_key_name).is_some() {
+    if args.schema.get_table(new_table_name).is_some() {
         bail_parse_error!(
             "there is already another table or index with this name: {}",
-            table_key_name
+            new_table_name
         );
     }
-    let indices = args.schema.get_indices(table_key_name);
+    let indices = args.schema.get_indices(new_table_name);
     for index in indices {
-        if index.name == table_key_name {
+        if index.name == new_table_name {
             bail_parse_error!(
                 "there is already another table or index with this name: {}",
-                table_key_name
+                new_table_name
             );
         }
     }
-    /* END CHECK TABLE NAME */
+    /* END - CHECK TABLE NAME */
 
-    /* START CHECK SYSTEM OR RESERVE TABLE */
+    /* START - CHECK SYSTEM OR RESERVE TABLE */
 
     // Make sure it is not a system table being altered, or a reserved name
     // that the table is being renamed to.
 
-    if !is_alterable_table(&table, tbl_name.name.0.as_str()) {
-        bail_parse_error!("table {} may not be altered", tbl_name.name.0.as_str());
+    if !is_alterable_table(&table, table_name) {
+        bail_parse_error!("table {} may not be altered", table_name);
     }
     // TODO: SQLite does a separate object name check here
 
     // TODO: When VIEWs are implemented, should bail here
 
-    /* END CHECK SYSTEM OR RESERVE TABLE */
+    /* END - CHECK SYSTEM OR RESERVE TABLE */
 
-    /* START EXECUTE SQL Staments to rename table */
+    // TODO: when we support many databases, edit this to reference the sqlite_schema from that database only
+    let _db = "0";
+    // TODO: when we support temp table update this value
+    let _is_from_temp_db = 0;
 
-    program = deep_parse(args, program, "".to_owned())?;
+    program.emit_transaction(true);
 
-    /* END EXECUTE SQL Staments to rename table */
+    /* TODO: RENAME REFERENCES TO TABLE
+     * Rewrite all CREATE TABLE, INDEX, TRIGGER or VIEW statements in
+     * the schema to use the new table name. */
+
+    // TODO: implement sqlite_rename_table when we support foreign keys
+
+    // let sql = format!(
+    //     "UPDATE {} SET sql = sqlite_rename_table({}, type, name, sql, {}, {}, {})
+    //     WHERE (type!='index' OR tbl_name={} COLLATE nocase)
+    //     AND name NOT LIKE 'sqliteX_%%' ESCAPE 'X'",
+    //     SQLITE_TABLEID, db, table_name, new_table_name, is_from_temp_db, table_name
+    // );
+
+    // program = deep_parse(args, program, sql)?;
+
+    /* EXECUTE SQL Staments to rename table.
+     * Update the tbl_name and name columns of the sqlite_schema table as required.
+     */
+
+    let sql = format!(
+        "UPDATE {} SET tbl_name = {}, 
+        name = CASE 
+            WHEN type='table' THEN {} 
+            WHEN name LIKE 'sqliteX_autoindex%%' ESCAPE 'X' 
+                AND type='index' THEN 
+            'sqlite_autoindex_' || {} || substr(name,{}+18) 
+            ELSE name END 
+        WHERE tbl_name={} COLLATE nocase AND 
+            (type='table' OR type='index' OR type='trigger');",
+        SQLITE_TABLEID,
+        new_table_name,
+        new_table_name,
+        new_table_name,
+        table_name.len(),
+        table_name
+    );
+    program = deep_parse(args, program, sql)?;
+
+    /* TODO: If the sqlite_sequence table exists in this database, then update
+     * it with the new table name. */
+
+    /* TODO: If the table being renamed is not itself part of the temp database,
+     * edit view and trigger definitions within the temp database
+     * as required. */
+
+    /* TODO: If this is a virtual table, invoke the xRename() function if
+     * one is defined. The xRename() callback will modify the names
+     * of any resources used by the v-table implementation (including other
+     * SQLite tables) that are identified by the name of the virtual table.
+     */
 
     Ok(program)
 }
