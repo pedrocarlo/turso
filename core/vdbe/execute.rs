@@ -520,6 +520,7 @@ pub fn op_eq(
     let cond = *state.registers[lhs].get_owned_value() == *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),
@@ -574,6 +575,7 @@ pub fn op_ne(
     let cond = *state.registers[lhs].get_owned_value() != *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),
@@ -626,6 +628,7 @@ pub fn op_lt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),
@@ -678,6 +681,7 @@ pub fn op_le(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),
@@ -730,6 +734,7 @@ pub fn op_gt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),
@@ -782,6 +787,7 @@ pub fn op_ge(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let collation = collation.unwrap_or_default();
     match (
         state.registers[lhs].get_owned_value(),
         state.registers[rhs].get_owned_value(),

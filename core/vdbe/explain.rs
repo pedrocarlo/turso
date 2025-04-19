@@ -210,13 +210,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Eq",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
@@ -229,13 +230,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Ne",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
@@ -248,13 +250,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Lt",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
             ),
@@ -262,13 +265,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Le",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
@@ -281,13 +285,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Gt",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.to_debug_int()),
             ),
@@ -295,13 +300,14 @@ pub fn insn_to_str(
                 lhs,
                 rhs,
                 target_pc,
+                collation,
                 ..
             } => (
                 "Ge",
                 *lhs as i32,
                 *rhs as i32,
                 target_pc.to_debug_int(),
-                OwnedValue::build_text(""),
+                OwnedValue::build_text(&collation.map_or("".to_string(), |c| c.to_string())),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
