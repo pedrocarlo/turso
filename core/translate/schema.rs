@@ -15,6 +15,8 @@ use crate::{bail_parse_error, Result};
 
 use limbo_sqlite3_parser::ast::{fmt::ToTokens, CreateVirtualTable};
 
+use super::collate::CollationSeq;
+
 pub fn translate_create_table(
     query_mode: QueryMode,
     tbl_name: ast::QualifiedName,
@@ -602,6 +604,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
+        collation: CollationSeq::default(),
     });
     program.emit_insn(Insn::Column {
         cursor_id: sqlite_schema_cursor_id,
@@ -613,6 +616,7 @@ pub fn translate_drop_table(
         rhs: table_type,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
+        collation: CollationSeq::default(),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
