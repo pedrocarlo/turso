@@ -347,6 +347,7 @@ pub fn op_compare(
         start_reg_a,
         start_reg_b,
         count,
+        collation,
     } = insn
     else {
         unreachable!("unexpected Insn {:?}", insn)
@@ -354,6 +355,7 @@ pub fn op_compare(
     let start_reg_a = *start_reg_a;
     let start_reg_b = *start_reg_b;
     let count = *count;
+    let collation = collation.unwrap_or_default();
 
     if start_reg_a + count > start_reg_b {
         return Err(LimboError::InternalError(
@@ -365,7 +367,12 @@ pub fn op_compare(
     for i in 0..count {
         let a = state.registers[start_reg_a + i].get_owned_value();
         let b = state.registers[start_reg_b + i].get_owned_value();
-        cmp = Some(a.cmp(b));
+        cmp = match (a, b) {
+            (OwnedValue::Text(left), OwnedValue::Text(right)) => {
+                Some(collation.compare_strings(left.as_str(), right.as_str()))
+            }
+            _ => Some(a.cmp(b)),
+        };
         if cmp != Some(std::cmp::Ordering::Equal) {
             break;
         }

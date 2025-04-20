@@ -267,6 +267,7 @@ pub fn emit_group_by<'a>(
         start_reg_a: reg_group_exprs_cmp,
         start_reg_b: groups_start_reg,
         count: group_by.exprs.len(),
+        collation: program.curr_collation(),
     });
 
     let agg_step_label = program.allocate_label();
