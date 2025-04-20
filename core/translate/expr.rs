@@ -418,11 +418,11 @@ pub fn translate_expr(
             let e2_reg = e1_reg + 1;
 
             translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-            let left_collation = program.curr_collation_ctx();
+            let left_collation_ctx = program.curr_collation_ctx();
             program.reset_collation();
 
             translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-            let right_collation = program.curr_collation_ctx();
+            let right_collation_ctx = program.curr_collation_ctx();
             program.reset_collation();
 
             /*
@@ -440,14 +440,15 @@ pub fn translate_expr(
              * 3. Otherwise, the BINARY collating function is used for comparison.
              */
             let collation_ctx = {
-                match (left_collation, right_collation) {
+                match (left_collation_ctx, right_collation_ctx) {
                     (Some((c_left, true)), _) => Some((c_left, true)),
-                    (Some((c_left, from_collate_left)), Some((_, false))) => {
-                        Some((c_left, from_collate_left))
-                    }
-                    (Some((_, false)), Some((c_right, true))) => Some((c_right, true)),
+                    (_, Some((c_right, true))) => Some((c_right, true)),
+                    (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
                     (None, Some((c_right, from_collate_right))) => {
                         Some((c_right, from_collate_right))
+                    }
+                    (Some((c_left, from_collate_left)), Some((_, false))) => {
+                        Some((c_left, from_collate_left))
                     }
                     _ => None,
                 }
