@@ -218,6 +218,7 @@ pub fn emit_group_by<'a>(
             is_rowid_alias: false,
             notnull: false,
             default: None,
+            collation: None,
         })
         .collect::<Vec<_>>();
 
