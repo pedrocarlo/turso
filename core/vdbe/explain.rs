@@ -880,21 +880,28 @@ pub fn insn_to_str(
                 cursor_id,
                 columns,
                 order,
+                collation,
             } => {
                 let _p4 = String::new();
-                // TODO: to_print should also print the Collation Sequence
                 let to_print: Vec<String> = order
                     .get_values()
                     .iter()
-                    .map(|v| match v {
-                        OwnedValue::Integer(i) => {
-                            if *i == 0 {
-                                "B".to_string()
-                            } else {
-                                "-B".to_string()
+                    .enumerate()
+                    .map(|(idx, v)| {
+                        if idx == 0 {
+                            collation.unwrap_or_default().to_string()
+                        } else {
+                            match v {
+                                OwnedValue::Integer(i) => {
+                                    if *i == 0 {
+                                        "B".to_string()
+                                    } else {
+                                        "-B".to_string()
+                                    }
+                                }
+                                _ => unreachable!(),
                             }
                         }
-                        _ => unreachable!(),
                     })
                     .collect();
                 (

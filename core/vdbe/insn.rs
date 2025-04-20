@@ -597,6 +597,7 @@ pub enum Insn {
         cursor_id: CursorID, // P1
         columns: usize,      // P2
         order: Record,       // P4. 0 if ASC and 1 if DESC
+        collation: Option<CollationSeq>,
     },
 
     /// Insert a row into the sorter.
