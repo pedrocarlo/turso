@@ -881,6 +881,7 @@ pub fn insn_to_str(
                 order,
             } => {
                 let _p4 = String::new();
+                // TODO: to_print should also print the Collation Sequence
                 let to_print: Vec<String> = order
                     .get_values()
                     .iter()
