@@ -941,7 +941,7 @@ fn emit_seek(
             }
         } else {
             let expr = &seek_def.key[i].0;
-            translate_expr(program, Some(tables), &expr, reg, &t_ctx.resolver)?;
+            translate_expr(program, Some(tables), expr, reg, &t_ctx.resolver)?;
             // If the seek key column is not verifiably non-NULL, we need check whether it is NULL,
             // and if so, jump to the loop end.
             // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,

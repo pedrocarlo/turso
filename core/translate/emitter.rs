@@ -44,10 +44,11 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+    pub fn resolve_cached_expr_reg(&self, expr: impl Into<ast::RefExpr<'a>>) -> Option<usize> {
+        let expr = expr.into();
         self.expr_to_reg_cache
             .iter()
-            .find(|(e, _)| exprs_are_equivalent(expr, e))
+            .find(|(e, _)| exprs_are_equivalent(expr, *e))
             .map(|(_, reg)| *reg)
     }
 }

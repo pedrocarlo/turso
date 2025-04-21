@@ -1,4 +1,4 @@
-use limbo_sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal};
+use limbo_sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal, RefExpr};
 use std::{rc::Rc, sync::Arc};
 
 use crate::{
@@ -310,16 +310,20 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
 ///
 /// *Note*: doesn't attempt to evaluate/compute "constexpr" results
-pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
+pub fn exprs_are_equivalent<'a>(
+    expr1: impl Into<RefExpr<'a>>,
+    expr2: impl Into<RefExpr<'a>>,
+) -> bool {
+    let (expr1, expr2) = (expr1.into(), expr2.into());
     match (expr1, expr2) {
         (
-            Expr::Between {
+            RefExpr::Between {
                 lhs: lhs1,
                 not: not1,
                 start: start1,
                 end: end1,
             },
-            Expr::Between {
+            RefExpr::Between {
                 lhs: lhs2,
                 not: not2,
                 start: start2,
@@ -331,7 +335,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && exprs_are_equivalent(start1, start2)
                 && exprs_are_equivalent(end1, end2)
         }
-        (Expr::Binary(lhs1, op1, rhs1), Expr::Binary(lhs2, op2, rhs2)) => {
+        (RefExpr::Binary(lhs1, op1, rhs1), RefExpr::Binary(lhs2, op2, rhs2)) => {
             op1 == op2
                 && ((exprs_are_equivalent(lhs1, lhs2) && exprs_are_equivalent(rhs1, rhs2))
                     || (op1.is_commutative()
@@ -339,12 +343,12 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                         && exprs_are_equivalent(rhs1, lhs2)))
         }
         (
-            Expr::Case {
+            RefExpr::Case {
                 base: base1,
                 when_then_pairs: pairs1,
                 else_expr: else1,
             },
-            Expr::Case {
+            RefExpr::Case {
                 base: base2,
                 when_then_pairs: pairs2,
                 else_expr: else2,
@@ -358,11 +362,11 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && else1 == else2
         }
         (
-            Expr::Cast {
+            RefExpr::Cast {
                 expr: expr1,
                 type_name: type1,
             },
-            Expr::Cast {
+            RefExpr::Cast {
                 expr: expr2,
                 type_name: type2,
             },
@@ -373,18 +377,18 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     _ => false,
                 }
         }
-        (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2)) => {
+        (RefExpr::Collate(expr1, collation1), RefExpr::Collate(expr2, collation2)) => {
             exprs_are_equivalent(expr1, expr2) && collation1.eq_ignore_ascii_case(collation2)
         }
         (
-            Expr::FunctionCall {
+            RefExpr::FunctionCall {
                 name: name1,
                 distinctness: distinct1,
                 args: args1,
                 order_by: order1,
                 filter_over: filter1,
             },
-            Expr::FunctionCall {
+            RefExpr::FunctionCall {
                 name: name2,
                 distinctness: distinct2,
                 args: args2,
@@ -399,11 +403,11 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 && filter1 == filter2
         }
         (
-            Expr::FunctionCallStar {
+            RefExpr::FunctionCallStar {
                 name: name1,
                 filter_over: filter1,
             },
-            Expr::FunctionCallStar {
+            RefExpr::FunctionCallStar {
                 name: name2,
                 filter_over: filter2,
             },
@@ -430,49 +434,49 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     _ => false,
                 }
         }
-        (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
-        (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
-        (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
-        (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(&id1.0, &id2.0),
-        (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
+        (RefExpr::NotNull(expr1), RefExpr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (RefExpr::IsNull(expr1), RefExpr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (RefExpr::Literal(lit1), RefExpr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
+        (RefExpr::Id(id1), RefExpr::Id(id2)) => check_ident_equivalency(&id1.0, &id2.0),
+        (RefExpr::Unary(op1, expr1), RefExpr::Unary(op2, expr2)) => {
             op1 == op2 && exprs_are_equivalent(expr1, expr2)
         }
         // Variables that are not bound to a specific value, are treated as NULL
         // https://sqlite.org/lang_expr.html#varparam
-        (Expr::Variable(var), Expr::Variable(var2)) if var == "" && var2 == "" => false,
+        (RefExpr::Variable(var), RefExpr::Variable(var2)) if var == "" && var2 == "" => false,
         // Named variables can be compared by their name
-        (Expr::Variable(val), Expr::Variable(val2)) => val == val2,
-        (Expr::Parenthesized(exprs1), Expr::Parenthesized(exprs2)) => {
+        (RefExpr::Variable(val), RefExpr::Variable(val2)) => val == val2,
+        (RefExpr::Parenthesized(exprs1), RefExpr::Parenthesized(exprs2)) => {
             exprs1.len() == exprs2.len()
                 && exprs1
                     .iter()
                     .zip(exprs2)
                     .all(|(e1, e2)| exprs_are_equivalent(e1, e2))
         }
-        (Expr::Parenthesized(exprs1), exprs2) | (exprs2, Expr::Parenthesized(exprs1)) => {
+        (RefExpr::Parenthesized(exprs1), exprs2) | (exprs2, RefExpr::Parenthesized(exprs1)) => {
             exprs1.len() == 1 && exprs_are_equivalent(&exprs1[0], exprs2)
         }
-        (Expr::Qualified(tn1, cn1), Expr::Qualified(tn2, cn2)) => {
+        (RefExpr::Qualified(tn1, cn1), RefExpr::Qualified(tn2, cn2)) => {
             check_ident_equivalency(&tn1.0, &tn2.0) && check_ident_equivalency(&cn1.0, &cn2.0)
         }
-        (Expr::DoublyQualified(sn1, tn1, cn1), Expr::DoublyQualified(sn2, tn2, cn2)) => {
+        (RefExpr::DoublyQualified(sn1, tn1, cn1), RefExpr::DoublyQualified(sn2, tn2, cn2)) => {
             check_ident_equivalency(&sn1.0, &sn2.0)
                 && check_ident_equivalency(&tn1.0, &tn2.0)
                 && check_ident_equivalency(&cn1.0, &cn2.0)
         }
         (
-            Expr::InList {
+            RefExpr::InList {
                 lhs: lhs1,
                 not: not1,
                 rhs: rhs1,
             },
-            Expr::InList {
+            RefExpr::InList {
                 lhs: lhs2,
                 not: not2,
                 rhs: rhs2,
             },
         ) => {
-            *not1 == *not2
+            not1 == not2
                 && exprs_are_equivalent(lhs1, lhs2)
                 && rhs1
                     .as_ref()
@@ -487,7 +491,7 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .unwrap_or(false)
         }
         // fall back to naive equality check
-        _ => expr1 == expr2,
+        (expr1, expr2) => expr1 == expr2,
     }
 }
 

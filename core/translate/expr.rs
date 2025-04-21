@@ -178,16 +178,17 @@ macro_rules! expect_arguments_even {
     }};
 }
 
-pub fn translate_condition_expr(
+pub fn translate_condition_expr<'a>(
     program: &mut ProgramBuilder,
     referenced_tables: &[TableReference],
-    expr: &ast::Expr,
+    expr: impl Into<ast::RefExpr<'a>>,
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    let expr = expr.into();
     match expr {
-        ast::Expr::Between { .. } => todo!(),
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+        ast::RefExpr::Between { .. } => todo!(),
+        ast::RefExpr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
             // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
             // true label.
@@ -212,7 +213,7 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
+        ast::RefExpr::Binary(lhs, ast::Operator::Or, rhs) => {
             // In a binary OR, never jump to the parent 'jump_target_when_false' label on the first condition, because
             // the second condition CAN also be true. Instead we instruct the child expression to jump to a local
             // false label.
@@ -237,7 +238,7 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
-        ast::Expr::Binary(lhs, op, rhs)
+        ast::RefExpr::Binary(lhs, op, rhs)
             if matches!(
                 op,
                 ast::Operator::Greater
@@ -282,22 +283,22 @@ pub fn translate_condition_expr(
                 _ => unreachable!(),
             }
         }
-        ast::Expr::Binary(_, _, _) => {
+        ast::RefExpr::Binary(_, _, _) => {
             let result_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, result_reg);
         }
-        ast::Expr::Literal(_)
-        | ast::Expr::Cast { .. }
-        | ast::Expr::FunctionCall { .. }
-        | ast::Expr::Column { .. }
-        | ast::Expr::RowId { .. }
-        | ast::Expr::Case { .. } => {
+        ast::RefExpr::Literal(_)
+        | ast::RefExpr::Cast { .. }
+        | ast::RefExpr::FunctionCall { .. }
+        | ast::RefExpr::Column { .. }
+        | ast::RefExpr::RowId { .. }
+        | ast::RefExpr::Case { .. } => {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
         }
-        ast::Expr::InList { lhs, not, rhs } => {
+        ast::RefExpr::InList { lhs, not, rhs } => {
             // lhs is e.g. a column reference
             // rhs is an Option<Vec<Expr>>
             // If rhs is None, it means the IN expression is always false, i.e. tbl.id IN ().
@@ -411,10 +412,10 @@ pub fn translate_condition_expr(
                 program.resolve_label(jump_target_when_true, program.offset());
             }
         }
-        ast::Expr::Like { not, .. } => {
+        ast::RefExpr::Like { not, .. } => {
             let cur_reg = program.alloc_register();
             translate_like_base(program, Some(referenced_tables), expr, cur_reg, resolver)?;
-            if !*not {
+            if !not {
                 emit_cond_jump(program, condition_metadata, cur_reg);
             } else if condition_metadata.jump_if_condition_is_true {
                 program.emit_insn(Insn::IfNot {
@@ -430,7 +431,7 @@ pub fn translate_condition_expr(
                 });
             }
         }
-        ast::Expr::Parenthesized(exprs) => {
+        ast::RefExpr::Parenthesized(exprs) => {
             if exprs.len() == 1 {
                 let _ = translate_condition_expr(
                     program,
@@ -445,7 +446,7 @@ pub fn translate_condition_expr(
                 );
             }
         }
-        ast::Expr::NotNull(expr) => {
+        ast::RefExpr::NotNull(expr) => {
             let cur_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
             program.emit_insn(Insn::IsNull {
@@ -453,7 +454,7 @@ pub fn translate_condition_expr(
                 target_pc: condition_metadata.jump_target_when_false,
             });
         }
-        ast::Expr::IsNull(expr) => {
+        ast::RefExpr::IsNull(expr) => {
             let cur_reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, cur_reg, resolver)?;
             program.emit_insn(Insn::NotNull {
@@ -461,7 +462,7 @@ pub fn translate_condition_expr(
                 target_pc: condition_metadata.jump_target_when_false,
             });
         }
-        ast::Expr::Unary(_, _) => {
+        ast::RefExpr::Unary(_, _) => {
             // This is an inefficient implementation for op::NOT, because translate_expr() will emit an Insn::Not,
             // and then we immediately emit an Insn::If/Insn::IfNot for the conditional jump. In reality we would not
             // like to emit the negation instruction Insn::Not at all, since we could just emit the "opposite" jump instruction
@@ -476,13 +477,14 @@ pub fn translate_condition_expr(
     Ok(())
 }
 
-pub fn translate_expr(
+pub fn translate_expr<'a>(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&[TableReference]>,
-    expr: &ast::Expr,
+    expr: impl Into<ast::RefExpr<'a>>,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let expr = expr.into();
     if let Some(reg) = resolver.resolve_cached_expr_reg(expr) {
         program.emit_insn(Insn::Copy {
             src_reg: reg,
@@ -492,8 +494,8 @@ pub fn translate_expr(
         return Ok(target_register);
     }
     match expr {
-        ast::Expr::Between { .. } => todo!(),
-        ast::Expr::Binary(e1, op, e2) => {
+        ast::RefExpr::Between { .. } => todo!(),
+        ast::RefExpr::Binary(e1, op, e2) => {
             // Check if both sides of the expression are equivalent and reuse the same register if so
             if exprs_are_equivalent(e1, e2) {
                 let shared_reg = program.alloc_register();
@@ -512,7 +514,7 @@ pub fn translate_expr(
             emit_binary_insn(program, op, e1_reg, e2_reg, target_register)?;
             Ok(target_register)
         }
-        ast::Expr::Case {
+        ast::RefExpr::Case {
             base,
             when_then_pairs,
             else_expr,
@@ -589,7 +591,7 @@ pub fn translate_expr(
             program.resolve_label(return_label, program.offset());
             Ok(target_register)
         }
-        ast::Expr::Cast { expr, type_name } => {
+        ast::RefExpr::Cast { expr, type_name } => {
             let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             let reg_expr = program.alloc_registers(2);
             translate_expr(program, referenced_tables, expr, reg_expr, resolver)?;
@@ -612,10 +614,10 @@ pub fn translate_expr(
             });
             Ok(target_register)
         }
-        ast::Expr::Collate(_, _) => todo!(),
-        ast::Expr::DoublyQualified(_, _, _) => todo!(),
-        ast::Expr::Exists(_) => todo!(),
-        ast::Expr::FunctionCall {
+        ast::RefExpr::Collate(_, _) => todo!(),
+        ast::RefExpr::DoublyQualified(_, _, _) => todo!(),
+        ast::RefExpr::Exists(_) => todo!(),
+        ast::RefExpr::FunctionCall {
             name,
             distinctness: _,
             args,
@@ -1758,12 +1760,12 @@ pub fn translate_expr(
                 },
             }
         }
-        ast::Expr::FunctionCallStar { .. } => todo!(),
-        ast::Expr::Id(id) => crate::bail_parse_error!(
+        ast::RefExpr::FunctionCallStar { .. } => todo!(),
+        ast::RefExpr::Id(id) => crate::bail_parse_error!(
             "no such column: {} - should this be a string literal in single-quotes?",
             id.0
         ),
-        ast::Expr::Column {
+        ast::RefExpr::Column {
             database: _,
             table,
             column,
@@ -1858,7 +1860,7 @@ pub fn translate_expr(
                 }
             }
         }
-        ast::Expr::RowId { database: _, table } => {
+        ast::RefExpr::RowId { database: _, table } => {
             let table_reference = referenced_tables.as_ref().unwrap().get(*table).unwrap();
             let index = table_reference.op.index();
             let use_covering_index = table_reference.utilizes_covering_index();
@@ -1879,11 +1881,11 @@ pub fn translate_expr(
             }
             Ok(target_register)
         }
-        ast::Expr::InList { .. } => todo!(),
-        ast::Expr::InSelect { .. } => todo!(),
-        ast::Expr::InTable { .. } => todo!(),
-        ast::Expr::IsNull(_) => todo!(),
-        ast::Expr::Like { not, .. } => {
+        ast::RefExpr::InList { .. } => todo!(),
+        ast::RefExpr::InSelect { .. } => todo!(),
+        ast::RefExpr::InTable { .. } => todo!(),
+        ast::RefExpr::IsNull(_) => todo!(),
+        ast::RefExpr::Like { not, .. } => {
             let like_reg = if *not {
                 program.alloc_register()
             } else {
@@ -1898,7 +1900,7 @@ pub fn translate_expr(
             }
             Ok(target_register)
         }
-        ast::Expr::Literal(lit) => match lit {
+        ast::RefExpr::Literal(lit) => match lit {
             ast::Literal::Numeric(val) => {
                 if val.starts_with("0x") || val.starts_with("0X") {
                     // must be a hex decimal
@@ -1957,9 +1959,9 @@ pub fn translate_expr(
             ast::Literal::CurrentTime => todo!(),
             ast::Literal::CurrentTimestamp => todo!(),
         },
-        ast::Expr::Name(_) => todo!(),
-        ast::Expr::NotNull(_) => todo!(),
-        ast::Expr::Parenthesized(exprs) => {
+        ast::RefExpr::Name(_) => todo!(),
+        ast::RefExpr::NotNull(_) => todo!(),
+        ast::RefExpr::Parenthesized(exprs) => {
             if exprs.is_empty() {
                 crate::bail_parse_error!("parenthesized expression with no arguments");
             }
@@ -1978,12 +1980,12 @@ pub fn translate_expr(
             }
             Ok(target_register)
         }
-        ast::Expr::Qualified(_, _) => {
+        ast::RefExpr::Qualified(_, _) => {
             unreachable!("Qualified should be resolved to a Column before translation")
         }
-        ast::Expr::Raise(_, _) => todo!(),
-        ast::Expr::Subquery(_) => todo!(),
-        ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
+        ast::RefExpr::Raise(_, _) => todo!(),
+        ast::RefExpr::Subquery(_) => todo!(),
+        ast::RefExpr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {
                 translate_expr(program, referenced_tables, expr, target_register, resolver)
             }
@@ -2086,7 +2088,7 @@ pub fn translate_expr(
                 Ok(target_register)
             }
         },
-        ast::Expr::Variable(name) => {
+        ast::RefExpr::Variable(name) => {
             let index = program.parameters.push(name);
             program.emit_insn(Insn::Variable {
                 index,
@@ -2344,11 +2346,11 @@ fn emit_binary_insn(
 fn translate_like_base(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&[TableReference]>,
-    expr: &ast::Expr,
+    expr: ast::RefExpr,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let ast::Expr::Like {
+    let ast::RefExpr::Like {
         lhs,
         op,
         rhs,
@@ -2417,6 +2419,7 @@ fn translate_function(
     let mut current_reg = start_reg;
 
     for arg in args.iter() {
+        let arg: ast::RefExpr = arg.into();
         translate_expr(program, referenced_tables, arg, current_reg, resolver)?;
         current_reg += 1;
     }
@@ -2478,15 +2481,17 @@ pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mu
     }
 }
 
-pub fn translate_and_mark(
+pub fn translate_and_mark<'a>(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&[TableReference]>,
-    expr: &ast::Expr,
+    expr: impl Into<ast::RefExpr<'a>>,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    let expr = expr.into();
+    let mark = matches!(expr, ast::RefExpr::Literal(_));
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-    if matches!(expr, ast::Expr::Literal(_)) {
+    if mark {
         program.mark_last_insn_constant();
     }
     Ok(())

@@ -527,6 +527,258 @@ impl Expr {
     }
 }
 
+/// Reference version for Expr
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RefExpr<'a> {
+    /// `BETWEEN`
+    Between {
+        /// expression
+        lhs: &'a Box<Expr>,
+        /// `NOT`
+        not: &'a bool,
+        /// start
+        start: &'a Box<Expr>,
+        /// end
+        end: &'a Box<Expr>,
+    },
+    /// binary expression
+    Binary(&'a Box<Expr>, &'a Operator, &'a Box<Expr>),
+    /// `CASE` expression
+    Case {
+        /// operand
+        base: &'a Option<Box<Expr>>,
+        /// `WHEN` condition `THEN` result
+        when_then_pairs: &'a Vec<(Expr, Expr)>,
+        /// `ELSE` result
+        else_expr: &'a Option<Box<Expr>>,
+    },
+    /// CAST expression
+    Cast {
+        /// expression
+        expr: &'a Box<Expr>,
+        /// `AS` type name
+        type_name: &'a Option<Type>,
+    },
+    /// `COLLATE`: expression
+    Collate(&'a Box<Expr>, &'a str),
+    /// schema-name.table-name.column-name
+    DoublyQualified(&'a Name, &'a Name, &'a Name),
+    /// `EXISTS` subquery
+    Exists(&'a Box<Select>),
+    /// call to a built-in function
+    FunctionCall {
+        /// function name
+        name: &'a Id,
+        /// `DISTINCT`
+        distinctness: &'a Option<Distinctness>,
+        /// arguments
+        args: &'a Option<Vec<Expr>>,
+        /// `ORDER BY`
+        order_by: &'a Option<Vec<SortedColumn>>,
+        /// `FILTER`
+        filter_over: &'a Option<FunctionTail>,
+    },
+    /// Function call expression with '*' as arg
+    FunctionCallStar {
+        /// function name
+        name: &'a Id,
+        /// `FILTER`
+        filter_over: &'a Option<FunctionTail>,
+    },
+    /// Identifier
+    Id(&'a Id),
+    /// Column
+    Column {
+        /// the x in `x.y.z`. index of the db in catalog.
+        database: &'a Option<usize>,
+        /// the y in `x.y.z`. index of the table in catalog.
+        table: &'a usize,
+        /// the z in `x.y.z`. index of the column in the table.
+        column: &'a usize,
+        /// is the column a rowid alias
+        is_rowid_alias: &'a bool,
+    },
+    /// `ROWID`
+    RowId {
+        /// the x in `x.y.z`. index of the db in catalog.
+        database: &'a Option<usize>,
+        /// the y in `x.y.z`. index of the table in catalog.
+        table: &'a usize,
+    },
+    /// `IN`
+    InList {
+        /// expression
+        lhs: &'a Box<Expr>,
+        /// `NOT`
+        not: &'a bool,
+        /// values
+        rhs: &'a Option<Vec<Expr>>,
+    },
+    /// `IN` subselect
+    InSelect {
+        /// expression
+        lhs: &'a Box<Expr>,
+        /// `NOT`
+        not: &'a bool,
+        /// subquery
+        rhs: &'a Box<Select>,
+    },
+    /// `IN` table name / function
+    InTable {
+        /// expression
+        lhs: &'a Box<Expr>,
+        /// `NOT`
+        not: &'a bool,
+        /// table name
+        rhs: &'a QualifiedName,
+        /// table function arguments
+        args: &'a Option<Vec<Expr>>,
+    },
+    /// `IS NULL`
+    IsNull(&'a Box<Expr>),
+    /// `LIKE`
+    Like {
+        /// expression
+        lhs: &'a Box<Expr>,
+        /// `NOT`
+        not: &'a bool,
+        /// operator
+        op: &'a LikeOperator,
+        /// pattern
+        rhs: &'a Box<Expr>,
+        /// `ESCAPE` char
+        escape: &'a Option<Box<Expr>>,
+    },
+    /// Literal expression
+    Literal(&'a Literal),
+    /// Name
+    Name(&'a Name),
+    /// `NOT NULL` or `NOTNULL`
+    NotNull(&'a Box<Expr>),
+    /// Parenthesized subexpression
+    Parenthesized(&'a Vec<Expr>),
+    /// Qualified name
+    Qualified(&'a Name, &'a Name),
+    /// `RAISE` function call
+    Raise(&'a ResolveType, &'a Option<Box<Expr>>),
+    /// Subquery expression
+    Subquery(&'a Box<Select>),
+    /// Unary expression
+    Unary(&'a UnaryOperator, &'a Box<Expr>),
+    /// Parameters
+    Variable(&'a String),
+}
+
+impl<'a> RefExpr<'a> {
+    fn from_ref_expr(expr: &'a Expr) -> RefExpr<'a> {
+        match expr {
+            Expr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            } => RefExpr::Between {
+                lhs,
+                not,
+                start,
+                end,
+            },
+            Expr::Binary(lhs, op, rhs) => RefExpr::Binary(lhs, op, rhs),
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => RefExpr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            },
+            Expr::Cast { expr, type_name } => RefExpr::Cast { expr, type_name },
+            Expr::Collate(expr, name) => RefExpr::Collate(expr, name),
+            Expr::Column {
+                database,
+                table,
+                column,
+                is_rowid_alias,
+            } => RefExpr::Column {
+                database,
+                table,
+                column,
+                is_rowid_alias,
+            },
+            Expr::DoublyQualified(n1, n2, n3) => RefExpr::DoublyQualified(n1, n2, n3),
+            Expr::Exists(expr) => RefExpr::Exists(expr),
+            Expr::FunctionCall {
+                name,
+                distinctness,
+                args,
+                order_by,
+                filter_over,
+            } => RefExpr::FunctionCall {
+                name,
+                distinctness,
+                args,
+                order_by,
+                filter_over,
+            },
+            Expr::FunctionCallStar { name, filter_over } => {
+                RefExpr::FunctionCallStar { name, filter_over }
+            }
+            Expr::Id(id) => RefExpr::Id(id),
+            Expr::InList { lhs, not, rhs } => RefExpr::InList { lhs, not, rhs },
+            Expr::InSelect { lhs, not, rhs } => RefExpr::InSelect { lhs, not, rhs },
+            Expr::InTable {
+                lhs,
+                not,
+                rhs,
+                args,
+            } => RefExpr::InTable {
+                lhs,
+                not,
+                rhs,
+                args,
+            },
+            Expr::IsNull(expr) => RefExpr::IsNull(expr),
+            Expr::Like {
+                lhs,
+                not,
+                op,
+                rhs,
+                escape,
+            } => RefExpr::Like {
+                lhs,
+                not,
+                op,
+                rhs,
+                escape,
+            },
+            Expr::Literal(lit) => RefExpr::Literal(lit),
+            Expr::Name(name) => RefExpr::Name(name),
+            Expr::NotNull(expr) => RefExpr::NotNull(expr),
+            Expr::Parenthesized(expr) => RefExpr::Parenthesized(expr),
+            Expr::Qualified(n1, n2) => RefExpr::Qualified(n1, n2),
+            Expr::Raise(resolve_type, expr) => RefExpr::Raise(resolve_type, expr),
+            Expr::RowId { database, table } => RefExpr::RowId { database, table },
+            Expr::Subquery(query) => RefExpr::Subquery(query),
+            Expr::Unary(op, expr) => RefExpr::Unary(op, expr),
+            Expr::Variable(variable) => RefExpr::Variable(variable),
+        }
+    }
+}
+
+impl<'a, T: AsRef<Expr> + 'a> From<&'a T> for RefExpr<'a> {
+    fn from(value: &'a T) -> Self {
+        let expr = value.as_ref();
+        Self::from_ref_expr(expr)
+    }
+}
+
+impl<'a> From<&'a Expr> for RefExpr<'a> {
+    fn from(value: &'a Expr) -> Self {
+        Self::from_ref_expr(value)
+    }
+}
+
 /// SQL literal
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Literal {
@@ -674,6 +926,42 @@ impl From<YYCODETYPE> for Operator {
             x if x == TK_NOT as YYCODETYPE => Self::IsNot,
             _ => unreachable!(),
         }
+    }
+}
+
+impl From<Operator> for TokenType {
+    fn from(value: Operator) -> Self {
+        match value {
+            Operator::And => TK_AND,
+            Operator::Or => TK_OR,
+            Operator::Less => TK_LT,
+            Operator::Greater => TK_GT,
+            Operator::GreaterEquals => TK_GE,
+            Operator::LessEquals => TK_LE,
+            Operator::Equals => TK_EQ,
+            Operator::NotEquals => TK_NE,
+            Operator::BitwiseAnd => TK_BITAND,
+            Operator::BitwiseOr => TK_BITOR,
+            Operator::BitwiseNot => TK_BITNOT,
+            Operator::LeftShift => TK_LSHIFT,
+            Operator::RightShift => TK_RSHIFT,
+            Operator::Add => TK_ADD,
+            Operator::Subtract => TK_MINUS,
+            Operator::Multiply => TK_STAR,
+            Operator::Divide => TK_SLASH,
+            Operator::Modulus => TK_REM,
+            Operator::Concat => TK_CONCAT,
+            Operator::Is => TK_IS,
+            Operator::IsNot => TK_ISNOT,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<Operator> for YYCODETYPE {
+    fn from(value: Operator) -> Self {
+        let token: TokenType = value.into();
+        token as YYCODETYPE
     }
 }
 
