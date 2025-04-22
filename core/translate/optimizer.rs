@@ -1526,46 +1526,7 @@ fn rewrite_expr(expr: &mut ast::Expr) -> Result<()> {
             }
             Ok(())
         }
-        ast::Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } => {
-            // Convert `y NOT BETWEEN x AND z` to `x > y OR y > z`
-            let (lower_op, upper_op) = if *not {
-                (ast::Operator::Greater, ast::Operator::Greater)
-            } else {
-                // Convert `y BETWEEN x AND z` to `x <= y AND y <= z`
-                (ast::Operator::LessEquals, ast::Operator::LessEquals)
-            };
-
-            rewrite_expr(start)?;
-            rewrite_expr(lhs)?;
-            rewrite_expr(end)?;
-
-            let start = start.take_ownership();
-            let lhs = lhs.take_ownership();
-            let end = end.take_ownership();
-
-            let lower_bound = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs.clone()));
-            let upper_bound = ast::Expr::Binary(Box::new(lhs), upper_op, Box::new(end));
-
-            if *not {
-                *expr = ast::Expr::Binary(
-                    Box::new(lower_bound),
-                    ast::Operator::Or,
-                    Box::new(upper_bound),
-                );
-            } else {
-                *expr = ast::Expr::Binary(
-                    Box::new(lower_bound),
-                    ast::Operator::And,
-                    Box::new(upper_bound),
-                );
-            }
-            Ok(())
-        }
+        ast::Expr::Between { .. } => Ok(()),
         ast::Expr::Parenthesized(ref mut exprs) => {
             for subexpr in exprs.iter_mut() {
                 rewrite_expr(subexpr)?;

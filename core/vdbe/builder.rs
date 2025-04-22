@@ -434,6 +434,11 @@ impl ProgramBuilder {
                 Insn::VFilter { pc_if_empty, .. } => {
                     resolve(pc_if_empty, "VFilter");
                 }
+                Insn::Once {
+                    target_pc_when_reentered,
+                } => {
+                    resolve(target_pc_when_reentered, "Once");
+                }
                 _ => {}
             }
         }

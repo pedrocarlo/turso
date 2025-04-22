@@ -186,7 +186,10 @@ pub fn translate_condition_expr(
     resolver: &Resolver,
 ) -> Result<()> {
     match expr {
-        ast::Expr::Between { .. } => todo!(),
+        ast::Expr::Between { .. } => {
+            let dest_reg = program.alloc_register();
+            translate_between_expr(program, Some(referenced_tables), expr, dest_reg, resolver)?;
+        }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
             // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
@@ -492,7 +495,10 @@ pub fn translate_expr(
         return Ok(target_register);
     }
     match expr {
-        ast::Expr::Between { .. } => todo!(),
+        ast::Expr::Between { .. } => {
+            translate_between_expr(program, referenced_tables, expr, target_register, resolver)?;
+            Ok(target_register)
+        }
         ast::Expr::Binary(e1, op, e2) => {
             // Check if both sides of the expression are equivalent and reuse the same register if so
             if exprs_are_equivalent(e1, e2) {
@@ -2496,4 +2502,98 @@ pub fn translate_and_mark(
 /// and escaping double single quotes
 pub fn sanitize_string(input: &str) -> String {
     input[1..input.len() - 1].replace("''", "'").to_string()
+}
+
+fn translate_between_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&[TableReference]>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    assert!(matches!(expr, ast::Expr::Between { .. }));
+
+    match expr {
+        ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            let mut label = None;
+            if !matches!(lhs.as_ref(), &ast::Expr::Literal(..)) {
+                let curr_label = program.allocate_label();
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: curr_label,
+                });
+                label = Some(curr_label);
+            }
+
+            let lhs_reg = program.alloc_register();
+            translate_and_mark(program, referenced_tables, lhs, lhs_reg, resolver)?;
+
+            if let Some(label) = label {
+                program.resolve_label(label, program.offset());
+            }
+
+            let start_reg;
+            let end_reg;
+
+            // Check if both sides of the expression are equivalent and reuse the same register if so
+            if exprs_are_equivalent(lhs, start) {
+                start_reg = lhs_reg;
+            } else {
+                start_reg = program.alloc_register();
+            }
+
+            translate_and_mark(program, referenced_tables, start, start_reg, resolver)?;
+
+            let ge_reg = program.alloc_register();
+
+            emit_binary_insn(
+                program,
+                &ast::Operator::GreaterEquals,
+                lhs_reg,
+                start_reg,
+                ge_reg,
+            )?;
+
+            if exprs_are_equivalent(lhs, end) {
+                end_reg = lhs_reg;
+            } else if exprs_are_equivalent(start, end) {
+                end_reg = start_reg;
+            } else {
+                end_reg = program.alloc_register();
+            }
+
+            translate_and_mark(program, referenced_tables, end, end_reg, resolver)?;
+
+            let le_reg = program.alloc_register();
+
+            emit_binary_insn(
+                program,
+                &ast::Operator::LessEquals,
+                lhs_reg,
+                end_reg,
+                le_reg,
+            )?;
+
+            let and_reg = if *not {
+                program.alloc_register()
+            } else {
+                target_register
+            };
+
+            emit_binary_insn(program, &ast::Operator::And, ge_reg, le_reg, and_reg)?;
+
+            if *not {
+                program.emit_insn(Insn::Not {
+                    reg: and_reg,
+                    dest: target_register,
+                });
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
