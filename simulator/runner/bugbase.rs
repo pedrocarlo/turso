@@ -9,7 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{InteractionPlan, Paths};
+use crate::{generation::plan::InteractionPlan, Paths};
 
 use super::cli::SimulatorCLI;
 
@@ -31,16 +31,16 @@ pub struct LoadedBug {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct BugRun {
+pub struct BugRun {
     /// Commit hash of the current version of Limbo.
-    pub(crate) hash: String,
+    pub hash: String,
     /// Timestamp of the run.
     #[serde(with = "chrono::serde::ts_seconds")]
-    pub(crate) timestamp: DateTime<Utc>,
+    pub timestamp: DateTime<Utc>,
     /// Error message of the run.
-    pub(crate) error: Option<String>,
+    pub error: Option<String>,
     /// Options
-    pub(crate) cli_options: SimulatorCLI,
+    pub cli_options: SimulatorCLI,
 }
 
 impl Bug {

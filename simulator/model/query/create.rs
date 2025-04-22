@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::table::{Table, Value},
-    SimulatorEnv,
+    runner::env::SimulatorEnv,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct Create {
+pub struct Create {
     pub(crate) table: Table,
 }
 

@@ -3,11 +3,10 @@ use std::sync::{Arc, Mutex};
 use crate::{
     generation::{
         pick_index,
-        plan::{Interaction, InteractionPlanState, ResultSet},
+        plan::{Interaction, InteractionPlan, InteractionPlanState, ResultSet},
     },
     model::{query::Query, table::Value},
     runner::execution::ExecutionContinuation,
-    InteractionPlan,
 };
 
 use super::{

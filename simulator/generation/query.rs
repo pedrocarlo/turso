@@ -4,7 +4,7 @@ use crate::generation::{one_of, Arbitrary, ArbitraryFrom};
 use crate::model::query::select::{Distinctness, Predicate, ResultColumn};
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{Table, Value};
-use crate::SimulatorEnv;
+use crate::runner::env::SimulatorEnv;
 use rand::seq::SliceRandom as _;
 use rand::Rng;
 

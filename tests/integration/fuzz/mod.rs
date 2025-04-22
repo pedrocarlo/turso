@@ -1,4 +1,5 @@
 pub mod grammar_generator;
+pub mod sql_generator;
 
 #[cfg(test)]
 mod tests {

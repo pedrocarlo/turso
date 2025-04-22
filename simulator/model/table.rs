@@ -62,7 +62,7 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Value {
+pub enum Value {
     Null,
     Integer(i64),
     // we use custom serialization to preserve float precision

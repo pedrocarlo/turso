@@ -2,12 +2,12 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::Value, SimulatorEnv};
+use crate::{model::table::Value, runner::env::SimulatorEnv};
 
 use super::select::Select;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Insert {
+pub enum Insert {
     Values {
         table: String,
         values: Vec<Vec<Value>>,

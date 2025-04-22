@@ -2,6 +2,7 @@
 use clap::Parser;
 use generation::plan::{Interaction, InteractionPlan, InteractionPlanState};
 use generation::ArbitraryFrom;
+use limbo_sim_lib::Paths;
 use notify::event::{DataChange, ModifyKind};
 use notify::{EventKind, RecursiveMode, Watcher};
 use rand::prelude::*;
@@ -13,38 +14,13 @@ use runner::{differential, watch};
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 
 mod generation;
 mod model;
 mod runner;
 mod shrink;
-struct Paths {
-    base: PathBuf,
-    db: PathBuf,
-    plan: PathBuf,
-    shrunk_plan: PathBuf,
-    history: PathBuf,
-    doublecheck_db: PathBuf,
-    shrunk_db: PathBuf,
-    diff_db: PathBuf,
-}
-
-impl Paths {
-    fn new(output_dir: &Path) -> Self {
-        Paths {
-            base: output_dir.to_path_buf(),
-            db: PathBuf::from(output_dir).join("test.db"),
-            plan: PathBuf::from(output_dir).join("plan.sql"),
-            shrunk_plan: PathBuf::from(output_dir).join("shrunk.sql"),
-            history: PathBuf::from(output_dir).join("history.txt"),
-            doublecheck_db: PathBuf::from(output_dir).join("double.db"),
-            shrunk_db: PathBuf::from(output_dir).join("shrunk.db"),
-            diff_db: PathBuf::from(output_dir).join("diff.db"),
-        }
-    }
-}
 
 fn main() -> Result<(), String> {
     init_logger();

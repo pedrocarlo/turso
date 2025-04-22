@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     model::table::{Table, Value},
-    SimulatorEnv,
+    runner::env::SimulatorEnv,
 };
 
 /// `SELECT` distinctness
@@ -20,7 +20,7 @@ pub(crate) enum Distinctness {
 /// `SELECT` or `RETURNING` result column
 // https://sqlite.org/syntax/result-column.html
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ResultColumn {
+pub(crate) enum ResultColumn {
     /// expression
     Expr(Predicate),
     /// `*`
@@ -39,7 +39,7 @@ impl Display for ResultColumn {
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Select {
+pub struct Select {
     pub(crate) table: String,
     pub(crate) result_columns: Vec<ResultColumn>,
     pub(crate) predicate: Predicate,
@@ -82,7 +82,7 @@ impl Display for Select {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Predicate {
+pub enum Predicate {
     And(Vec<Predicate>),  // p1 AND p2 AND p3... AND pn
     Or(Vec<Predicate>),   // p1 OR p2 OR p3... OR pn
     Eq(String, Value),    // column = Value

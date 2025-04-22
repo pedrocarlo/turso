@@ -11,8 +11,7 @@ use crate::{
         },
         table::Value,
     },
-    runner::env::SimConnection,
-    SimulatorEnv,
+    runner::env::{SimConnection, SimulatorEnv},
 };
 
 use crate::generation::{frequency, Arbitrary, ArbitraryFrom};
@@ -22,8 +21,8 @@ use super::property::{remaining, Property};
 pub(crate) type ResultSet = Result<Vec<Vec<Value>>>;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct InteractionPlan {
-    pub(crate) plan: Vec<Interactions>,
+pub struct InteractionPlan {
+    pub plan: Vec<Interactions>,
 }
 
 impl InteractionPlan {
@@ -97,7 +96,7 @@ pub(crate) struct InteractionPlanState {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) enum Interactions {
+pub enum Interactions {
     Property(Property),
     Query(Query),
     Fault(Fault),
@@ -250,7 +249,7 @@ pub(crate) struct Assertion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Fault {
+pub enum Fault {
     Disconnect,
 }
 

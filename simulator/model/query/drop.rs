@@ -2,10 +2,10 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::Value, SimulatorEnv};
+use crate::{model::table::Value, runner::env::SimulatorEnv};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Drop {
+pub struct Drop {
     pub(crate) table: String,
 }
 

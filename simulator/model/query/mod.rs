@@ -17,7 +17,7 @@ pub mod select;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum Query {
+pub enum Query {
     Create(Create),
     Select(Select),
     Insert(Insert),

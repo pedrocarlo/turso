@@ -518,6 +518,7 @@ dependencies = [
  "assert_cmd",
  "env_logger 0.10.2",
  "limbo_core",
+ "limbo_sim",
  "log",
  "rand 0.9.0",
  "rand_chacha 0.9.0",

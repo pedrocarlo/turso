@@ -2,12 +2,12 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::Value, SimulatorEnv};
+use crate::{model::table::Value, runner::env::SimulatorEnv};
 
 use super::select::Predicate;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Delete {
+pub struct Delete {
     pub(crate) table: String,
     pub(crate) predicate: Predicate,
 }
