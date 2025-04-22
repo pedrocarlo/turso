@@ -1,0 +1,17 @@
+{
+    "$schema": "./profile-schema.json",
+    
+    "query": {
+        "gen_opts": {
+            "table": {
+                "column_range": {
+                    "end": 3,
+                    "start": 1
+                },
+                "large_table": {
+                    "enable": false
+                }
+            }
+        },
+    }
+}

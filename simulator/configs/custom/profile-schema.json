@@ -1,0 +1,613 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Profile",
+  "type": "object",
+  "properties": {
+    "experimental_mvcc": {
+      "description": "Experimental MVCC feature",
+      "type": "boolean",
+      "default": false
+    },
+    "io": {
+      "$ref": "#/$defs/IOProfile",
+      "default": {
+        "enable": true,
+        "fault": {
+          "enable": true,
+          "prob": 0.2,
+          "read": true,
+          "sync": true,
+          "truncate": true,
+          "write": true,
+          "writev": true
+        },
+        "latency": {
+          "enable": true,
+          "latency_probability": 1,
+          "max_tick": 30,
+          "min_tick": 1
+        }
+      }
+    },
+    "query": {
+      "$ref": "#/$defs/QueryProfile",
+      "default": {
+        "create_index_weight": 5,
+        "create_table_weight": 15,
+        "delete_weight": 20,
+        "drop_table_weight": 2,
+        "gen_opts": {
+          "indexes": true,
+          "query": {
+            "from_clause": {
+              "joins": [
+                {
+                  "num_joins": 0,
+                  "weight": 90
+                },
+                {
+                  "num_joins": 1,
+                  "weight": 7
+                },
+                {
+                  "num_joins": 2,
+                  "weight": 3
+                }
+              ]
+            },
+            "insert": {
+              "max_rows": 10,
+              "min_rows": 1
+            },
+            "select": {
+              "compound_selects": [
+                {
+                  "num_compound_selects": 0,
+                  "weight": 95
+                },
+                {
+                  "num_compound_selects": 1,
+                  "weight": 4
+                },
+                {
+                  "num_compound_selects": 2,
+                  "weight": 1
+                }
+              ],
+              "order_by_prob": 0.3
+            }
+          },
+          "table": {
+            "column_range": {
+              "end": 11,
+              "start": 1
+            },
+            "large_table": {
+              "column_range": {
+                "end": 125,
+                "start": 64
+              },
+              "enable": true,
+              "large_table_prob": 0.1
+            }
+          }
+        },
+        "insert_weight": 30,
+        "select_weight": 60,
+        "update_weight": 20
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "CompoundSelectWeight": {
+      "type": "object",
+      "properties": {
+        "num_compound_selects": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "weight": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "num_compound_selects",
+        "weight"
+      ]
+    },
+    "FaultProfile": {
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true
+        },
+        "prob": {
+          "type": "number",
+          "format": "double",
+          "default": 0.2,
+          "maximum": 1.0,
+          "minimum": 0.0
+        },
+        "read": {
+          "type": "boolean",
+          "default": true
+        },
+        "sync": {
+          "type": "boolean",
+          "default": true
+        },
+        "truncate": {
+          "type": "boolean",
+          "default": true
+        },
+        "write": {
+          "type": "boolean",
+          "default": true
+        },
+        "writev": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "FromClauseOpts": {
+      "type": "object",
+      "properties": {
+        "joins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/JoinWeight"
+          },
+          "minItems": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "joins"
+      ]
+    },
+    "IOProfile": {
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true
+        },
+        "fault": {
+          "$ref": "#/$defs/FaultProfile",
+          "default": {
+            "enable": true,
+            "prob": 0.2,
+            "read": true,
+            "sync": true,
+            "truncate": true,
+            "write": true,
+            "writev": true
+          }
+        },
+        "latency": {
+          "$ref": "#/$defs/LatencyProfile",
+          "default": {
+            "enable": true,
+            "latency_probability": 1,
+            "max_tick": 30,
+            "min_tick": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "InsertOpts": {
+      "type": "object",
+      "properties": {
+        "max_rows": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "min_rows": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "min_rows",
+        "max_rows"
+      ]
+    },
+    "JoinWeight": {
+      "type": "object",
+      "properties": {
+        "num_joins": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "weight": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "num_joins",
+        "weight"
+      ]
+    },
+    "LargeTableOpts": {
+      "description": "Options for generating large tables",
+      "type": "object",
+      "properties": {
+        "column_range": {
+          "description": "Range of numbers of columns to generate",
+          "$ref": "#/$defs/Range_of_uint32",
+          "default": {
+            "end": 125,
+            "start": 64
+          }
+        },
+        "enable": {
+          "type": "boolean",
+          "default": true
+        },
+        "large_table_prob": {
+          "type": "number",
+          "format": "double",
+          "default": 0.1,
+          "maximum": 1.0,
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LatencyProfile": {
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true
+        },
+        "latency_probability": {
+          "description": "Added IO latency probability",
+          "type": "integer",
+          "format": "uint",
+          "default": 1,
+          "maximum": 100,
+          "minimum": 0
+        },
+        "max_tick": {
+          "description": "Maximum tick time in microseconds for simulated time",
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        },
+        "min_tick": {
+          "description": "Minimum tick time in microseconds for simulated time",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Opts": {
+      "type": "object",
+      "properties": {
+        "indexes": {
+          "description": "Indexes enabled",
+          "type": "boolean",
+          "default": true
+        },
+        "query": {
+          "$ref": "#/$defs/QueryOpts",
+          "default": {
+            "from_clause": {
+              "joins": [
+                {
+                  "num_joins": 0,
+                  "weight": 90
+                },
+                {
+                  "num_joins": 1,
+                  "weight": 7
+                },
+                {
+                  "num_joins": 2,
+                  "weight": 3
+                }
+              ]
+            },
+            "insert": {
+              "max_rows": 10,
+              "min_rows": 1
+            },
+            "select": {
+              "compound_selects": [
+                {
+                  "num_compound_selects": 0,
+                  "weight": 95
+                },
+                {
+                  "num_compound_selects": 1,
+                  "weight": 4
+                },
+                {
+                  "num_compound_selects": 2,
+                  "weight": 1
+                }
+              ],
+              "order_by_prob": 0.3
+            }
+          }
+        },
+        "table": {
+          "$ref": "#/$defs/TableOpts",
+          "default": {
+            "column_range": {
+              "end": 11,
+              "start": 1
+            },
+            "large_table": {
+              "column_range": {
+                "end": 125,
+                "start": 64
+              },
+              "enable": true,
+              "large_table_prob": 0.1
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "QueryOpts": {
+      "type": "object",
+      "properties": {
+        "from_clause": {
+          "$ref": "#/$defs/FromClauseOpts",
+          "default": {
+            "joins": [
+              {
+                "num_joins": 0,
+                "weight": 90
+              },
+              {
+                "num_joins": 1,
+                "weight": 7
+              },
+              {
+                "num_joins": 2,
+                "weight": 3
+              }
+            ]
+          }
+        },
+        "insert": {
+          "$ref": "#/$defs/InsertOpts",
+          "default": {
+            "max_rows": 10,
+            "min_rows": 1
+          }
+        },
+        "select": {
+          "$ref": "#/$defs/SelectOpts",
+          "default": {
+            "compound_selects": [
+              {
+                "num_compound_selects": 0,
+                "weight": 95
+              },
+              {
+                "num_compound_selects": 1,
+                "weight": 4
+              },
+              {
+                "num_compound_selects": 2,
+                "weight": 1
+              }
+            ],
+            "order_by_prob": 0.3
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "QueryProfile": {
+      "type": "object",
+      "properties": {
+        "create_index_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 5,
+          "minimum": 0
+        },
+        "create_table_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 15,
+          "minimum": 0
+        },
+        "delete_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 20,
+          "minimum": 0
+        },
+        "drop_table_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 2,
+          "minimum": 0
+        },
+        "gen_opts": {
+          "$ref": "#/$defs/Opts",
+          "default": {
+            "indexes": true,
+            "query": {
+              "from_clause": {
+                "joins": [
+                  {
+                    "num_joins": 0,
+                    "weight": 90
+                  },
+                  {
+                    "num_joins": 1,
+                    "weight": 7
+                  },
+                  {
+                    "num_joins": 2,
+                    "weight": 3
+                  }
+                ]
+              },
+              "insert": {
+                "max_rows": 10,
+                "min_rows": 1
+              },
+              "select": {
+                "compound_selects": [
+                  {
+                    "num_compound_selects": 0,
+                    "weight": 95
+                  },
+                  {
+                    "num_compound_selects": 1,
+                    "weight": 4
+                  },
+                  {
+                    "num_compound_selects": 2,
+                    "weight": 1
+                  }
+                ],
+                "order_by_prob": 0.3
+              }
+            },
+            "table": {
+              "column_range": {
+                "end": 11,
+                "start": 1
+              },
+              "large_table": {
+                "column_range": {
+                  "end": 125,
+                  "start": 64
+                },
+                "enable": true,
+                "large_table_prob": 0.1
+              }
+            }
+          }
+        },
+        "insert_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 30,
+          "minimum": 0
+        },
+        "select_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 60,
+          "minimum": 0
+        },
+        "update_weight": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 20,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Range_of_uint32": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "SelectOpts": {
+      "type": "object",
+      "properties": {
+        "compound_selects": {
+          "type": "array",
+          "default": [
+            {
+              "num_compound_selects": 0,
+              "weight": 95
+            },
+            {
+              "num_compound_selects": 1,
+              "weight": 4
+            },
+            {
+              "num_compound_selects": 2,
+              "weight": 1
+            }
+          ],
+          "items": {
+            "$ref": "#/$defs/CompoundSelectWeight"
+          },
+          "minItems": 1
+        },
+        "order_by_prob": {
+          "type": "number",
+          "format": "double",
+          "default": 0.3,
+          "maximum": 1.0,
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "TableOpts": {
+      "type": "object",
+      "properties": {
+        "column_range": {
+          "description": "Range of numbers of columns to generate",
+          "$ref": "#/$defs/Range_of_uint32",
+          "default": {
+            "end": 11,
+            "start": 1
+          }
+        },
+        "large_table": {
+          "$ref": "#/$defs/LargeTableOpts",
+          "default": {
+            "column_range": {
+              "end": 125,
+              "start": 64
+            },
+            "enable": true,
+            "large_table_prob": 0.1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

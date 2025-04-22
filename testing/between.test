@@ -1,0 +1,48 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Smoke tests for BETWEEN
+
+do_execsql_test between-1 {
+  SELECT 1 BETWEEN 2 AND 3
+} {0}
+
+do_execsql_test between-2 {
+  SELECT 1 BETWEEN 2 AND 2
+} {0}
+
+do_execsql_test between-3 {
+  SELECT 1 BETWEEN 1 AND 2
+} {1}
+
+do_execsql_test between-4 {
+  SELECT 1 BETWEEN 1 AND 1
+} {1}
+
+do_execsql_test between-5 {
+  SELECT 1 BETWEEN 1 AND 0
+} {0}
+
+do_execsql_test between-6 {
+  SELECT 1 BETWEEN 0 AND 0
+} {0}
+
+do_execsql_test between-7 {
+  SELECT 1 BETWEEN 0 AND 1
+} {1}
+
+do_execsql_test between-string-1 {
+  SELECT '1' BETWEEN '0' AND '1';
+} {1}
+
+do_execsql_test between-string-2 {
+  SELECT '1' BETWEEN 0 AND '1';
+} {1}
+
+do_execsql_test between-string-3 {
+  SELECT '1' BETWEEN 0 AND 1;
+} {0}
+
+# Can't test with subqueries yet

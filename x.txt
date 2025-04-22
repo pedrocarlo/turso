@@ -1,0 +1,337 @@
+limbo_sim v0.2.0 (/Users/pedro/Projects/limbo/simulator)
+├── anyhow v1.0.98
+├── bitflags v2.9.4
+│   └── serde v1.0.219
+│       └── serde_derive v1.0.219 (proc-macro)
+│           ├── proc-macro2 v1.0.94
+│           │   └── unicode-ident v1.0.18
+│           ├── quote v1.0.40
+│           │   └── proc-macro2 v1.0.94 (*)
+│           └── syn v2.0.100
+│               ├── proc-macro2 v1.0.94 (*)
+│               ├── quote v1.0.40 (*)
+│               └── unicode-ident v1.0.18
+├── bitmaps v3.2.1
+├── chrono v0.4.42
+│   ├── iana-time-zone v0.1.62
+│   │   └── core-foundation-sys v0.8.7
+│   ├── num-traits v0.2.19
+│   └── serde v1.0.219 (*)
+├── clap v4.5.47
+│   ├── clap_builder v4.5.47
+│   │   ├── anstream v0.6.18
+│   │   │   ├── anstyle v1.0.10
+│   │   │   ├── anstyle-parse v0.2.6
+│   │   │   │   └── utf8parse v0.2.2
+│   │   │   ├── anstyle-query v1.1.2
+│   │   │   ├── colorchoice v1.0.3
+│   │   │   ├── is_terminal_polyfill v1.70.1
+│   │   │   └── utf8parse v0.2.2
+│   │   ├── anstyle v1.0.10
+│   │   ├── clap_lex v0.7.4
+│   │   └── strsim v0.11.1
+│   └── clap_derive v4.5.47 (proc-macro)
+│       ├── heck v0.5.0
+│       ├── proc-macro2 v1.0.94 (*)
+│       ├── quote v1.0.40 (*)
+│       └── syn v2.0.100 (*)
+├── dirs v6.0.0
+│   └── dirs-sys v0.5.0
+│       ├── libc v0.2.172
+│       └── option-ext v0.2.0
+├── either v1.15.0
+├── env_logger v0.11.7
+│   ├── env_filter v0.1.3
+│   │   └── log v0.4.27
+│   └── log v0.4.27
+├── garde v0.22.0
+│   ├── compact_str v0.8.1
+│   │   ├── castaway v0.2.4
+│   │   │   └── rustversion v1.0.20 (proc-macro)
+│   │   ├── cfg-if v1.0.0
+│   │   ├── itoa v1.0.15
+│   │   ├── rustversion v1.0.20 (proc-macro)
+│   │   ├── ryu v1.0.20
+│   │   ├── serde v1.0.219 (*)
+│   │   └── static_assertions v1.1.0
+│   ├── garde_derive v0.22.0 (proc-macro)
+│   │   ├── proc-macro2 v1.0.94 (*)
+│   │   ├── quote v1.0.40 (*)
+│   │   └── syn v2.0.100 (*)
+│   ├── serde v1.0.219 (*)
+│   └── smallvec v1.15.1
+│       └── serde v1.0.219 (*)
+├── hex v0.4.3
+├── indexmap v2.11.1
+│   ├── equivalent v1.0.2
+│   └── hashbrown v0.15.2
+│       └── foldhash v0.1.5
+├── itertools v0.14.0
+│   └── either v1.15.0
+├── json5 v0.4.1
+│   ├── pest v2.8.1
+│   │   ├── memchr v2.7.4
+│   │   ├── thiserror v2.0.16
+│   │   │   └── thiserror-impl v2.0.16 (proc-macro)
+│   │   │       ├── proc-macro2 v1.0.94 (*)
+│   │   │       ├── quote v1.0.40 (*)
+│   │   │       └── syn v2.0.100 (*)
+│   │   └── ucd-trie v0.1.7
+│   ├── pest_derive v2.8.1 (proc-macro)
+│   │   ├── pest v2.8.1 (*)
+│   │   └── pest_generator v2.8.1
+│   │       ├── pest v2.8.1 (*)
+│   │       ├── pest_meta v2.8.1
+│   │       │   └── pest v2.8.1 (*)
+│   │       ├── proc-macro2 v1.0.94 (*)
+│   │       ├── quote v1.0.40 (*)
+│   │       └── syn v2.0.100 (*)
+│   └── serde v1.0.219 (*)
+├── log v0.4.27
+├── notify v8.0.0
+│   ├── bitflags v2.9.4 (*)
+│   ├── filetime v0.2.25
+│   │   ├── cfg-if v1.0.0
+│   │   └── libc v0.2.172
+│   ├── fsevent-sys v4.1.0
+│   │   └── libc v0.2.172
+│   ├── libc v0.2.172
+│   ├── log v0.4.27
+│   ├── notify-types v2.0.0
+│   └── walkdir v2.5.0
+│       └── same-file v1.0.6
+├── parking_lot v0.12.4
+│   ├── lock_api v0.4.13
+│   │   └── scopeguard v1.2.0
+│   └── parking_lot_core v0.9.11
+│       ├── cfg-if v1.0.0
+│       ├── libc v0.2.172
+│       └── smallvec v1.15.1 (*)
+├── rand v0.9.2
+│   ├── rand_chacha v0.9.0
+│   │   ├── ppv-lite86 v0.2.21
+│   │   │   └── zerocopy v0.8.26
+│   │   └── rand_core v0.9.3
+│   │       └── getrandom v0.3.2
+│   │           ├── cfg-if v1.0.0
+│   │           └── libc v0.2.172
+│   └── rand_core v0.9.3 (*)
+├── rand_chacha v0.9.0 (*)
+├── regex v1.11.1
+│   ├── aho-corasick v1.1.3
+│   │   └── memchr v2.7.4
+│   ├── memchr v2.7.4
+│   ├── regex-automata v0.4.9
+│   │   ├── aho-corasick v1.1.3 (*)
+│   │   ├── memchr v2.7.4
+│   │   └── regex-syntax v0.8.5
+│   └── regex-syntax v0.8.5
+├── regex-syntax v0.8.5
+├── rusqlite v0.37.0
+│   ├── bitflags v2.9.4 (*)
+│   ├── fallible-iterator v0.3.0
+│   ├── fallible-streaming-iterator v0.1.9
+│   ├── hashlink v0.10.0
+│   │   └── hashbrown v0.15.2 (*)
+│   ├── libsqlite3-sys v0.35.0
+│   └── smallvec v1.15.1 (*)
+├── schemars v1.0.4
+│   ├── dyn-clone v1.0.19
+│   ├── ref-cast v1.0.24
+│   │   └── ref-cast-impl v1.0.24 (proc-macro)
+│   │       ├── proc-macro2 v1.0.94 (*)
+│   │       ├── quote v1.0.40 (*)
+│   │       └── syn v2.0.100 (*)
+│   ├── schemars_derive v1.0.4 (proc-macro)
+│   │   ├── proc-macro2 v1.0.94 (*)
+│   │   ├── quote v1.0.40 (*)
+│   │   ├── serde_derive_internals v0.29.1
+│   │   │   ├── proc-macro2 v1.0.94 (*)
+│   │   │   ├── quote v1.0.40 (*)
+│   │   │   └── syn v2.0.100 (*)
+│   │   └── syn v2.0.100 (*)
+│   ├── serde v1.0.219 (*)
+│   └── serde_json v1.0.140
+│       ├── itoa v1.0.15
+│       ├── memchr v2.7.4
+│       ├── ryu v1.0.20
+│       └── serde v1.0.219 (*)
+├── serde v1.0.219 (*)
+├── serde_json v1.0.140 (*)
+├── similar v2.7.0
+│   └── unicode-segmentation v1.12.0
+├── similar-asserts v1.7.0
+│   ├── console v0.15.11
+│   │   ├── libc v0.2.172
+│   │   └── once_cell v1.21.3
+│   └── similar v2.7.0 (*)
+├── sql_generation v0.2.0 (/Users/pedro/Projects/limbo/sql_generation)
+│   ├── anarchist-readable-name-generator-lib v0.2.0
+│   │   └── rand v0.9.2 (*)
+│   ├── anyhow v1.0.98
+│   ├── garde v0.22.0 (*)
+│   ├── hex v0.4.3
+│   ├── indexmap v2.11.1 (*)
+│   ├── itertools v0.14.0 (*)
+│   ├── rand v0.9.2 (*)
+│   ├── schemars v1.0.4 (*)
+│   ├── serde v1.0.219 (*)
+│   ├── tracing v0.1.41
+│   │   ├── pin-project-lite v0.2.16
+│   │   ├── tracing-attributes v0.1.28 (proc-macro)
+│   │   │   ├── proc-macro2 v1.0.94 (*)
+│   │   │   ├── quote v1.0.40 (*)
+│   │   │   └── syn v2.0.100 (*)
+│   │   └── tracing-core v0.1.33
+│   │       └── once_cell v1.21.3
+│   ├── turso_core v0.2.0 (/Users/pedro/Projects/limbo/core)
+│   │   ├── aegis v0.9.0
+│   │   ├── aes v0.8.4
+│   │   │   ├── cfg-if v1.0.0
+│   │   │   ├── cipher v0.4.4
+│   │   │   │   ├── crypto-common v0.1.6
+│   │   │   │   │   ├── generic-array v0.14.7
+│   │   │   │   │   │   └── typenum v1.18.0
+│   │   │   │   │   ├── rand_core v0.6.4
+│   │   │   │   │   │   └── getrandom v0.2.15
+│   │   │   │   │   │       ├── cfg-if v1.0.0
+│   │   │   │   │   │       └── libc v0.2.172
+│   │   │   │   │   └── typenum v1.18.0
+│   │   │   │   └── inout v0.1.4
+│   │   │   │       └── generic-array v0.14.7 (*)
+│   │   │   └── cpufeatures v0.2.17
+│   │   │       └── libc v0.2.172
+│   │   ├── aes-gcm v0.10.3
+│   │   │   ├── aead v0.5.2
+│   │   │   │   ├── crypto-common v0.1.6 (*)
+│   │   │   │   └── generic-array v0.14.7 (*)
+│   │   │   ├── aes v0.8.4 (*)
+│   │   │   ├── cipher v0.4.4 (*)
+│   │   │   ├── ctr v0.9.2
+│   │   │   │   └── cipher v0.4.4 (*)
+│   │   │   ├── ghash v0.5.1
+│   │   │   │   ├── opaque-debug v0.3.1
+│   │   │   │   └── polyval v0.6.2
+│   │   │   │       ├── cfg-if v1.0.0
+│   │   │   │       ├── cpufeatures v0.2.17 (*)
+│   │   │   │       ├── opaque-debug v0.3.1
+│   │   │   │       └── universal-hash v0.5.1
+│   │   │   │           ├── crypto-common v0.1.6 (*)
+│   │   │   │           └── subtle v2.6.1
+│   │   │   └── subtle v2.6.1
+│   │   ├── bitflags v2.9.4 (*)
+│   │   ├── bytemuck v1.23.1
+│   │   │   └── bytemuck_derive v1.9.3 (proc-macro)
+│   │   │       ├── proc-macro2 v1.0.94 (*)
+│   │   │       ├── quote v1.0.40 (*)
+│   │   │       └── syn v2.0.100 (*)
+│   │   ├── cfg_block v0.1.1
+│   │   ├── chrono v0.4.42 (*)
+│   │   ├── crossbeam-skiplist v0.1.3
+│   │   │   ├── crossbeam-epoch v0.9.18
+│   │   │   │   └── crossbeam-utils v0.8.21
+│   │   │   └── crossbeam-utils v0.8.21
+│   │   ├── fallible-iterator v0.3.0
+│   │   ├── getrandom v0.2.15 (*)
+│   │   ├── hex v0.4.3
+│   │   ├── intrusive-collections v0.9.7
+│   │   │   └── memoffset v0.9.1
+│   │   ├── julian_day_converter v0.4.5
+│   │   │   └── chrono v0.4.42 (*)
+│   │   ├── libc v0.2.172
+│   │   ├── libloading v0.8.6
+│   │   │   └── cfg-if v1.0.0
+│   │   ├── libm v0.2.11
+│   │   ├── miette v7.6.0
+│   │   │   ├── cfg-if v1.0.0
+│   │   │   ├── miette-derive v7.6.0 (proc-macro)
+│   │   │   │   ├── proc-macro2 v1.0.94 (*)
+│   │   │   │   ├── quote v1.0.40 (*)
+│   │   │   │   └── syn v2.0.100 (*)
+│   │   │   └── unicode-width v0.1.14
+│   │   ├── pack1 v1.0.0
+│   │   │   └── bytemuck v1.23.1 (*)
+│   │   ├── parking_lot v0.12.4 (*)
+│   │   ├── paste v1.0.15 (proc-macro)
+│   │   ├── polling v3.7.4
+│   │   │   ├── cfg-if v1.0.0
+│   │   │   ├── rustix v0.38.44
+│   │   │   │   ├── bitflags v2.9.4 (*)
+│   │   │   │   ├── errno v0.3.10
+│   │   │   │   │   └── libc v0.2.172
+│   │   │   │   └── libc v0.2.172
+│   │   │   └── tracing v0.1.41 (*)
+│   │   ├── rand v0.8.5
+│   │   │   ├── libc v0.2.172
+│   │   │   ├── rand_chacha v0.3.1
+│   │   │   │   ├── ppv-lite86 v0.2.21 (*)
+│   │   │   │   └── rand_core v0.6.4 (*)
+│   │   │   └── rand_core v0.6.4 (*)
+│   │   ├── regex v1.11.1 (*)
+│   │   ├── regex-syntax v0.8.5
+│   │   ├── rustix v1.0.7
+│   │   │   ├── bitflags v2.9.4 (*)
+│   │   │   ├── errno v0.3.10 (*)
+│   │   │   └── libc v0.2.172
+│   │   ├── ryu v1.0.20
+│   │   ├── serde v1.0.219 (*)
+│   │   ├── strum v0.26.3
+│   │   │   └── strum_macros v0.26.4 (proc-macro)
+│   │   │       ├── heck v0.5.0
+│   │   │       ├── proc-macro2 v1.0.94 (*)
+│   │   │       ├── quote v1.0.40 (*)
+│   │   │       ├── rustversion v1.0.20 (proc-macro)
+│   │   │       └── syn v2.0.100 (*)
+│   │   ├── strum_macros v0.26.4 (proc-macro) (*)
+│   │   ├── tempfile v3.20.0
+│   │   │   ├── fastrand v2.3.0
+│   │   │   ├── getrandom v0.3.2 (*)
+│   │   │   ├── once_cell v1.21.3
+│   │   │   └── rustix v1.0.7 (*)
+│   │   ├── thiserror v2.0.16 (*)
+│   │   ├── tracing v0.1.41 (*)
+│   │   ├── turso_ext v0.2.0 (/Users/pedro/Projects/limbo/extensions/core)
+│   │   │   ├── chrono v0.4.42 (*)
+│   │   │   ├── getrandom v0.3.2 (*)
+│   │   │   └── turso_macros v0.2.0 (proc-macro) (/Users/pedro/Projects/limbo/macros)
+│   │   │       ├── proc-macro2 v1.0.94 (*)
+│   │   │       ├── quote v1.0.40 (*)
+│   │   │       └── syn v2.0.100 (*)
+│   │   ├── turso_macros v0.2.0 (proc-macro) (/Users/pedro/Projects/limbo/macros) (*)
+│   │   ├── turso_parser v0.2.0 (/Users/pedro/Projects/limbo/parser)
+│   │   │   ├── bitflags v2.9.4 (*)
+│   │   │   ├── miette v7.6.0 (*)
+│   │   │   ├── serde v1.0.219 (*)
+│   │   │   ├── strum v0.26.3 (*)
+│   │   │   ├── strum_macros v0.26.4 (proc-macro) (*)
+│   │   │   ├── thiserror v2.0.16 (*)
+│   │   │   └── turso_macros v0.2.0 (proc-macro) (/Users/pedro/Projects/limbo/macros) (*)
+│   │   ├── twox-hash v2.1.1
+│   │   │   └── rand v0.9.2 (*)
+│   │   ├── uncased v0.9.10
+│   │   └── uuid v1.17.0
+│   │       ├── getrandom v0.3.2 (*)
+│   │       └── sha1_smol v1.0.1
+│   └── turso_parser v0.2.0 (/Users/pedro/Projects/limbo/parser) (*)
+├── strum v0.26.3 (*)
+├── tracing v0.1.41 (*)
+├── tracing-subscriber v0.3.20
+│   ├── matchers v0.2.0
+│   │   └── regex-automata v0.4.9 (*)
+│   ├── nu-ansi-term v0.50.1
+│   ├── once_cell v1.21.3
+│   ├── regex-automata v0.4.9 (*)
+│   ├── sharded-slab v0.1.7
+│   │   └── lazy_static v1.5.0
+│   ├── smallvec v1.15.1 (*)
+│   ├── thread_local v1.1.8
+│   │   ├── cfg-if v1.0.0
+│   │   └── once_cell v1.21.3
+│   ├── tracing v0.1.41 (*)
+│   ├── tracing-core v0.1.33 (*)
+│   └── tracing-log v0.2.0
+│       ├── log v0.4.27
+│       ├── once_cell v1.21.3
+│       └── tracing-core v0.1.33 (*)
+├── turso_core v0.2.0 (/Users/pedro/Projects/limbo/core) (*)
+└── turso_parser v0.2.0 (/Users/pedro/Projects/limbo/parser) (*)
