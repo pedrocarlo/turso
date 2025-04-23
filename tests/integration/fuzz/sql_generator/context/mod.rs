@@ -1,9 +1,10 @@
 use super::Token;
 
-mod literal;
+mod expr;
 
-trait Neighbour {
+pub trait Neighbour {
     fn neighbours(&self, token_idx: usize, token: Token) -> Vec<Token>;
+    fn start(&self) -> Vec<Token>;
 }
 
 pub enum Context {
@@ -18,22 +19,18 @@ pub enum ResultColumnContext {
 #[derive(Debug, Clone, Copy)]
 pub enum ExprContext {
     SchemaName,
+    UnaryOperator,
     BinaryOperator,
     Function,
     ExprList,
     Cast,
     Collate,
-    Pattern(PatternContext), // Like, Glob, Regexp, Match
+    LikePattern,  // Like,
+    OtherPattern, // Glob, Regexp, Match
     Null,
     Is,
     Between,
     In,
     Exists,
     Case,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PatternContext {
-    Like,
-    Rest,
 }

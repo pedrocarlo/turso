@@ -56,11 +56,11 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "anarchist-readable-name-generator-lib"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18a1e15a87b13ae79e04e07b3714fc41d5f6993dff11662fdbe0b207c6ad0fe0"
+checksum = "64ce9adb4750e64d18a46001b931cd3662957f7eefacae1b9cc3454fa00c2af1"
 dependencies = [
- "rand 0.8.5",
+ "rand 0.9.0",
 ]
 
 [[package]]
@@ -1876,8 +1876,8 @@ dependencies = [
  "limbo_core",
  "log",
  "notify",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
+ "rand 0.9.0",
+ "rand_chacha 0.9.0",
  "regex",
  "regex-syntax 0.8.5",
  "rusqlite",

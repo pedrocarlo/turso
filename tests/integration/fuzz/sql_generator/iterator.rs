@@ -1,6 +1,6 @@
 //! This file attempts to represent the possible next tokens of each Token in a select query
 
-use std::{collections::VecDeque, marker::PhantomData};
+use std::collections::VecDeque;
 
 use super::Token::{self};
 
@@ -25,45 +25,5 @@ impl Iterator for TokenGenerator {
         }
 
         None
-    }
-}
-
-impl Token {
-    fn token_neighbours() {}
-
-    /* Start Result Column Diagram */
-    fn result_column_neighbors() -> Vec<Token> {
-        vec![Token::TableName, Token::Star, Token::Expr]
-    }
-
-    fn result_column_expr_neighbours() -> Vec<Token> {
-        vec![]
-    }
-
-    /* End Result Column Diagram */
-
-    fn expression_neighbours() -> Vec<Token> {
-        vec![
-            Token::Literal,
-            Token::ColumnName,
-            Token::SchemaName,
-            Token::UnaryOperator,
-            Token::Expr,
-            Token::FunctionName,
-            Token::Cast,
-            Token::Not,
-            Token::Exists,
-            Token::Select,
-            Token::Case,
-            // TODO raise function start here
-        ]
-    }
-
-    fn select_neighbours() -> Vec<Token> {
-        vec![Token::All, Token::Distinct, Token::ColumnName]
-    }
-
-    fn distinct_neighbours() -> Vec<Token> {
-        vec![Token::ColumnName]
     }
 }

@@ -1,7 +1,7 @@
 use std::{iter::Sum, ops::SubAssign};
 
 use anarchist_readable_name_generator_lib::readable_name_custom;
-use rand::{distributions::uniform::SampleUniform, Rng};
+use rand::{distr::uniform::SampleUniform, Rng};
 
 pub mod plan;
 pub mod property;
@@ -99,24 +99,24 @@ pub(crate) fn backtrack<'a, T, R: Rng>(
 
 /// pick is a helper function for uniformly picking a random element from a slice
 pub(crate) fn pick<'a, T, R: Rng>(choices: &'a [T], rng: &mut R) -> &'a T {
-    let index = rng.gen_range(0..choices.len());
+    let index = rng.random_range(0..choices.len());
     &choices[index]
 }
 
 /// pick_index is typically used for picking an index from a slice to later refer to the element
 /// at that index.
 pub(crate) fn pick_index<R: Rng>(choices: usize, rng: &mut R) -> usize {
-    rng.gen_range(0..choices)
+    rng.random_range(0..choices)
 }
 
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
 fn gen_random_text<T: Rng>(rng: &mut T) -> String {
-    let big_text = rng.gen_ratio(1, 1000);
+    let big_text = rng.random_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;
         let max_size: u64 = 2 * 1024; // todo: change this back to 2 * 1024 * 1024 * 1024
-        let size = rng.gen_range(1024..max_size);
+        let size = rng.random_range(1024..max_size);
         let mut name = String::new();
         for i in 0..size {
             name.push(((i % 26) as u8 + b'A') as char);
