@@ -10,7 +10,7 @@ use crate::{
 
 /// `SELECT` distinctness
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum Distinctness {
+pub enum Distinctness {
     /// `DISTINCT`
     Distinct,
     /// `ALL`
@@ -20,7 +20,7 @@ pub(crate) enum Distinctness {
 /// `SELECT` or `RETURNING` result column
 // https://sqlite.org/syntax/result-column.html
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum ResultColumn {
+pub enum ResultColumn {
     /// expression
     Expr(Predicate),
     /// `*`
@@ -89,6 +89,8 @@ pub enum Predicate {
     Neq(String, Value),   // column != Value
     Gt(String, Value),    // column > Value
     Lt(String, Value),    // column < Value
+    Le(String, Value),    // column <= Value
+    Ge(String, Value),    // column >= Value
     Like(String, String), // column LIKE Value
 }
 
@@ -153,6 +155,8 @@ impl Predicate {
             Predicate::Neq(column, value) => get_value(column) != Some(value),
             Predicate::Gt(column, value) => get_value(column).map(|v| v > value).unwrap_or(false),
             Predicate::Lt(column, value) => get_value(column).map(|v| v < value).unwrap_or(false),
+            Predicate::Ge(column, value) => get_value(column).map(|v| v >= value).unwrap_or(false),
+            Predicate::Le(column, value) => get_value(column).map(|v| v <= value).unwrap_or(false),
             Predicate::Like(column, value) => get_value(column)
                 .map(|v| exec_like(v.to_string().as_str(), value.as_str()))
                 .unwrap_or(false),
@@ -196,6 +200,8 @@ impl Display for Predicate {
             Self::Neq(name, value) => write!(f, "{} != {}", name, value),
             Self::Gt(name, value) => write!(f, "{} > {}", name, value),
             Self::Lt(name, value) => write!(f, "{} < {}", name, value),
+            Self::Ge(name, value) => write!(f, "{} >= {}", name, value),
+            Self::Le(name, value) => write!(f, "{} <= {}", name, value),
             Self::Like(name, value) => write!(f, "{} LIKE '{}'", name, value),
         }
     }
