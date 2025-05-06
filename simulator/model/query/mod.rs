@@ -13,6 +13,7 @@ pub mod create;
 pub mod delete;
 pub mod drop;
 pub mod insert;
+pub mod predicate;
 pub mod select;
 
 // This type represents the potential queries on the database.

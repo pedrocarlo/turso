@@ -1,7 +1,8 @@
 use crate::generation::table::{GTValue, LTValue};
 use crate::generation::{one_of, Arbitrary, ArbitraryFrom};
 
-use crate::model::query::select::{Distinctness, Predicate, ResultColumn};
+use crate::model::query::predicate::Predicate;
+use crate::model::query::select::{Distinctness, ResultColumn};
 use crate::model::query::{Create, Delete, Drop, Insert, Query, Select};
 use crate::model::table::{Table, Value};
 use crate::SimulatorEnv;
