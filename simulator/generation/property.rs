@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{
         query::{
-            predicate::Predicate,
+            predicate::{Predicate, TestPredicate as _},
             select::{Distinctness, ResultColumn},
             Create, Delete, Drop, Insert, Query, Select,
         },

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{model::table::Value, SimulatorEnv};
 
-use super::predicate::Predicate;
+use super::predicate::{Predicate, TestPredicate as _};
 
 /// `SELECT` distinctness
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

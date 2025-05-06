@@ -1,6 +1,6 @@
-use std::{fmt::Display, ops::Deref};
-
+use limbo_core::numeric::{nonnan::NonNan, Numeric};
 use serde::{Deserialize, Serialize};
+use std::{fmt::Display, ops::Deref};
 
 pub(crate) struct Name(pub(crate) String);
 
@@ -75,6 +75,11 @@ pub(crate) enum Value {
     Blob(Vec<u8>),
 }
 
+impl Value {
+    pub const TRUE: Value = Value::Integer(1);
+    pub const FALSE: Value = Value::Integer(0);
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -109,5 +114,51 @@ impl Display for Value {
             Self::Text(t) => write!(f, "'{}'", t),
             Self::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
+    }
+}
+
+// Copy from limbo_core::numeric::Numeric but for our own value
+impl From<Value> for Numeric {
+    fn from(value: Value) -> Self {
+        Self::from(&value)
+    }
+}
+impl From<&Value> for Numeric {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(v) => Self::Integer(*v),
+            Value::Float(v) => match NonNan::new(*v) {
+                Some(v) => Self::Float(v),
+                None => Self::Null,
+            },
+            Value::Text(text) => Numeric::from(text.as_str()),
+            Value::Blob(blob) => {
+                let text = String::from_utf8_lossy(blob.as_slice());
+                Numeric::from(&text)
+            }
+        }
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        if value {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        }
+    }
+}
+
+impl From<Value> for bool {
+    fn from(value: Value) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl From<&Value> for bool {
+    fn from(value: &Value) -> Self {
+        Numeric::from(value).try_into_bool().unwrap_or(false)
     }
 }

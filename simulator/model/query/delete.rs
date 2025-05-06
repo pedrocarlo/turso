@@ -2,7 +2,10 @@ use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{model::table::Value, SimulatorEnv};
+use crate::{
+    model::{query::predicate::TestPredicate as _, table::Value},
+    SimulatorEnv,
+};
 
 use super::predicate::Predicate;
 
