@@ -1,4 +1,4 @@
-mod binary_operator;
+pub mod binary_operator;
 
 use std::fmt::Display;
 
