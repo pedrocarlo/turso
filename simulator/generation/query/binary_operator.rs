@@ -1,7 +1,7 @@
 use crate::{
     generation::{
         one_of,
-        table::{GTValue, LTValue},
+        table::{GTEValue, GTValue, LTEValue, LTValue},
         ArbitraryFrom,
     },
     model::{
@@ -118,6 +118,7 @@ impl ArbitraryFrom<(&Table, bool)> for CompoundBinaryOperator {
 
 impl ArbitraryFrom<(&str, &Value)> for BinaryOperator {
     fn arbitrary_from<R: rand::Rng>(rng: &mut R, (column_name, value): (&str, &Value)) -> Self {
+        // TODO: (pedrocarlo) I think here we just generate the value randomnly no? Instead of hard coding a value GT or LT
         one_of(
             vec![
                 Box::new(|_| {
@@ -136,6 +137,18 @@ impl ArbitraryFrom<(&str, &Value)> for BinaryOperator {
                     BinaryOperator::Lt(
                         Predicate::Column(column_name.to_string()),
                         Predicate::Literal(LTValue::arbitrary_from(rng, value).0),
+                    )
+                }),
+                Box::new(|rng| {
+                    BinaryOperator::Gte(
+                        Predicate::Column(column_name.to_string()),
+                        Predicate::Literal(GTEValue::arbitrary_from(rng, value).0),
+                    )
+                }),
+                Box::new(|rng| {
+                    BinaryOperator::Lte(
+                        Predicate::Column(column_name.to_string()),
+                        Predicate::Literal(LTEValue::arbitrary_from(rng, value).0),
                     )
                 }),
             ],

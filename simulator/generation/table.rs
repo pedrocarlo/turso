@@ -77,18 +77,24 @@ impl ArbitraryFrom<&ColumnType> for Value {
     }
 }
 
+macro_rules! impl_arbitrary_from_vec_value {
+    ($name:ident) => {
+        impl ArbitraryFrom<&Vec<&Value>> for $name {
+            fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&Value>) -> Self {
+                if values.is_empty() {
+                    return Self(Value::Null);
+                }
+
+                let value = pick(values, rng);
+                Self::arbitrary_from(rng, *value)
+            }
+        }
+    };
+}
+
 pub(crate) struct LTValue(pub(crate) Value);
 
-impl ArbitraryFrom<&Vec<&Value>> for LTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&Value>) -> Self {
-        if values.is_empty() {
-            return Self(Value::Null);
-        }
-
-        let value = pick(values, rng);
-        Self::arbitrary_from(rng, *value)
-    }
-}
+impl_arbitrary_from_vec_value!(LTValue);
 
 impl ArbitraryFrom<&Value> for LTValue {
     fn arbitrary_from<R: Rng>(rng: &mut R, value: &Value) -> Self {
@@ -139,16 +145,7 @@ impl ArbitraryFrom<&Value> for LTValue {
 
 pub(crate) struct GTValue(pub(crate) Value);
 
-impl ArbitraryFrom<&Vec<&Value>> for GTValue {
-    fn arbitrary_from<R: Rng>(rng: &mut R, values: &Vec<&Value>) -> Self {
-        if values.is_empty() {
-            return Self(Value::Null);
-        }
-
-        let value = pick(values, rng);
-        Self::arbitrary_from(rng, *value)
-    }
-}
+impl_arbitrary_from_vec_value!(GTValue);
 
 impl ArbitraryFrom<&Value> for GTValue {
     fn arbitrary_from<R: Rng>(rng: &mut R, value: &Value) -> Self {
@@ -185,6 +182,125 @@ impl ArbitraryFrom<&Value> for GTValue {
                 } else {
                     let index = rng.gen_range(0..b.len());
                     b[index] += 1;
+                    // Mutate the rest of the blob
+                    for i in (index + 1)..b.len() {
+                        b[i] = rng.gen_range(0..=255);
+                    }
+                    Self(Value::Blob(b))
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub(crate) struct GTEValue(pub(crate) Value);
+
+impl_arbitrary_from_vec_value!(GTEValue);
+
+impl ArbitraryFrom<&Value> for GTEValue {
+    fn arbitrary_from<R: Rng>(rng: &mut R, value: &Value) -> Self {
+        match value {
+            Value::Integer(i) => Self(Value::Integer(rng.gen_range(*i..i64::MAX))),
+            Value::Float(f) => Self(Value::Float(rng.gen_range(*f..1e10))),
+            Value::Text(t) => {
+                // Either don't change the string, lengthen the string, or make at least one character smaller and mutate the rest
+                let mut t = t.clone();
+
+                // Freestyle value
+                if rng.gen_bool(0.33) {
+                    return Self(Value::Text(t));
+                }
+                if rng.gen_bool(0.01) {
+                    t.push(rng.gen_range(0..=255) as u8 as char);
+                    Self(Value::Text(t))
+                } else {
+                    let mut t = t.chars().map(|c| c as u32).collect::<Vec<_>>();
+                    let index = rng.gen_range(0..t.len());
+                    t[index] += 1;
+                    // Mutate the rest of the string
+                    for i in (index + 1)..t.len() {
+                        t[i] = rng.gen_range('a' as u32..='z' as u32);
+                    }
+                    let t = t
+                        .into_iter()
+                        .map(|c| char::from_u32(c).unwrap_or('a'))
+                        .collect::<String>();
+                    Self(Value::Text(t))
+                }
+            }
+            Value::Blob(b) => {
+                // Either dont'change the blob, lengthen the blob, or make at least one byte smaller and mutate the rest
+                let mut b = b.clone();
+                // Freestyle value
+                if rng.gen_bool(0.33) {
+                    return Self(Value::Blob(b));
+                }
+                if rng.gen_bool(0.01) {
+                    b.push(rng.gen_range(0..=255));
+                    Self(Value::Blob(b))
+                } else {
+                    let index = rng.gen_range(0..b.len());
+                    b[index] += 1;
+                    // Mutate the rest of the blob
+                    for i in (index + 1)..b.len() {
+                        b[i] = rng.gen_range(0..=255);
+                    }
+                    Self(Value::Blob(b))
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub(crate) struct LTEValue(pub(crate) Value);
+
+impl_arbitrary_from_vec_value!(LTEValue);
+
+impl ArbitraryFrom<&Value> for LTEValue {
+    fn arbitrary_from<R: Rng>(rng: &mut R, value: &Value) -> Self {
+        match value {
+            Value::Integer(i) => Self(Value::Integer(rng.gen_range(i64::MIN..*i - 1))),
+            Value::Float(f) => Self(Value::Float(f - rng.gen_range(0.0..1e10))),
+            Value::Text(t) => {
+                // Either don't change the string, shorten the string, or make at least one character smaller and mutate the rest
+                let mut t = t.clone();
+                // Freestyle value
+                if rng.gen_bool(0.33) {
+                    return Self(Value::Text(t));
+                }
+                if rng.gen_bool(0.01) {
+                    t.pop();
+                    Self(Value::Text(t))
+                } else {
+                    let mut t = t.chars().map(|c| c as u32).collect::<Vec<_>>();
+                    let index = rng.gen_range(0..t.len());
+                    t[index] -= 1;
+                    // Mutate the rest of the string
+                    for i in (index + 1)..t.len() {
+                        t[i] = rng.gen_range('a' as u32..='z' as u32);
+                    }
+                    let t = t
+                        .into_iter()
+                        .map(|c| char::from_u32(c).unwrap_or('z'))
+                        .collect::<String>();
+                    Self(Value::Text(t))
+                }
+            }
+            Value::Blob(b) => {
+                // Either don't change the string, shorten the blob, or make at least one byte smaller and mutate the rest
+                let mut b = b.clone();
+                // Freestyle value
+                if rng.gen_bool(0.33) {
+                    return Self(Value::Blob(b));
+                }
+                if rng.gen_bool(0.01) {
+                    b.pop();
+                    Self(Value::Blob(b))
+                } else {
+                    let index = rng.gen_range(0..b.len());
+                    b[index] -= 1;
                     // Mutate the rest of the blob
                     for i in (index + 1)..b.len() {
                         b[i] = rng.gen_range(0..=255);

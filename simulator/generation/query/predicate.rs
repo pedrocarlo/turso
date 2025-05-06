@@ -3,7 +3,7 @@ use rand::{seq::SliceRandom as _, Rng};
 use crate::{
     generation::{
         backtrack, one_of,
-        table::{GTValue, LTValue, LikeValue},
+        table::{GTEValue, GTValue, LTEValue, LTValue, LikeValue},
         ArbitraryFrom, ArbitraryFromMaybe as _,
     },
     model::{
@@ -103,6 +103,24 @@ fn produce_true_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>)) 
             (
                 1,
                 Box::new(|rng| {
+                    Some(Predicate::BinaryOperator(Box::new(BinaryOperator::Gte(
+                        Predicate::Column(column.name.clone()),
+                        Predicate::Literal(LTEValue::arbitrary_from(rng, value).0),
+                    ))))
+                }),
+            ),
+            (
+                1,
+                Box::new(|rng| {
+                    Some(Predicate::BinaryOperator(Box::new(BinaryOperator::Lte(
+                        Predicate::Column(column.name.clone()),
+                        Predicate::Literal(GTEValue::arbitrary_from(rng, value).0),
+                    ))))
+                }),
+            ),
+            (
+                1,
+                Box::new(|rng| {
                     LikeValue::arbitrary_from_maybe(rng, value)
                         .map(|like| Predicate::Like(column.name.clone(), like.0))
                 }),
@@ -146,6 +164,18 @@ fn produce_false_predicate<R: Rng>(rng: &mut R, (t, row): (&Table, &Vec<Value>))
             }),
             Box::new(|rng| {
                 Predicate::BinaryOperator(Box::new(BinaryOperator::Lt(
+                    Predicate::Column(column.name.clone()),
+                    Predicate::Literal(LTValue::arbitrary_from(rng, value).0),
+                )))
+            }),
+            Box::new(|rng| {
+                Predicate::BinaryOperator(Box::new(BinaryOperator::Gte(
+                    Predicate::Column(column.name.clone()),
+                    Predicate::Literal(GTValue::arbitrary_from(rng, value).0),
+                )))
+            }),
+            Box::new(|rng| {
+                Predicate::BinaryOperator(Box::new(BinaryOperator::Lte(
                     Predicate::Column(column.name.clone()),
                     Predicate::Literal(LTValue::arbitrary_from(rng, value).0),
                 )))

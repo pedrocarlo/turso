@@ -10,6 +10,8 @@ pub enum BinaryOperator {
     Neq(Predicate, Predicate),
     Gt(Predicate, Predicate),
     Lt(Predicate, Predicate),
+    Gte(Predicate, Predicate),
+    Lte(Predicate, Predicate),
 }
 
 impl TestPredicate for BinaryOperator {
@@ -53,6 +55,16 @@ impl TestPredicate for BinaryOperator {
                 let rhs = rhs.reduce_to_value(row, table);
                 (lhs < rhs).into()
             }
+            BinaryOperator::Gte(lhs, rhs) => {
+                let lhs = lhs.reduce_to_value(row, table);
+                let rhs = rhs.reduce_to_value(row, table);
+                (lhs >= rhs).into()
+            }
+            BinaryOperator::Lte(lhs, rhs) => {
+                let lhs = lhs.reduce_to_value(row, table);
+                let rhs = rhs.reduce_to_value(row, table);
+                (lhs <= rhs).into()
+            }
         }
     }
 }
@@ -65,15 +77,19 @@ impl Display for BinaryOperator {
             | BinaryOperator::Eq(lhs, rhs)
             | BinaryOperator::Neq(lhs, rhs)
             | BinaryOperator::Gt(lhs, rhs)
-            | BinaryOperator::Lt(lhs, rhs) => (lhs.to_string(), rhs.to_string()),
+            | BinaryOperator::Lt(lhs, rhs)
+            | BinaryOperator::Gte(lhs, rhs)
+            | BinaryOperator::Lte(lhs, rhs) => (lhs.to_string(), rhs.to_string()),
         };
         match self {
-            BinaryOperator::And(..) => write!(f, "{} AND {}", lhs, rhs),
-            BinaryOperator::Or(..) => write!(f, "{} OR {}", lhs, rhs),
+            BinaryOperator::And(..) => write!(f, "({} AND {})", lhs, rhs),
+            BinaryOperator::Or(..) => write!(f, "({} OR {})", lhs, rhs),
             BinaryOperator::Eq(..) => write!(f, "{} = {}", lhs, rhs),
             BinaryOperator::Neq(..) => write!(f, "{} != {}", lhs, rhs),
             BinaryOperator::Gt(..) => write!(f, "{} > {}", lhs, rhs),
             BinaryOperator::Lt(..) => write!(f, "{} < {}", lhs, rhs),
+            BinaryOperator::Gte(..) => write!(f, "{} >= {}", lhs, rhs),
+            BinaryOperator::Lte(..) => write!(f, "{} <= {}", lhs, rhs),
         }
     }
 }
