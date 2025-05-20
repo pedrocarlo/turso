@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast::{
@@ -99,19 +98,16 @@ pub fn translate_insert(
         })
         .collect::<Vec<(&String, usize, usize)>>();
     let root_page = btree_table.root_page;
-    let values = match body {
+    let inserting_multiple_rows = match body {
         InsertBody::Select(ref mut select, _) => match select.body.select.as_mut() {
-            OneSelect::Values(ref mut values) => values,
-            _ => todo!(),
+            OneSelect::Values(ref mut values) => values.len() > 1,
+            OneSelect::Select(..) => true,
         },
-        InsertBody::DefaultValues => &mut vec![vec![]],
+        InsertBody::DefaultValues => false,
     };
-    let mut param_idx = 1;
-    for expr in values.iter_mut().flat_map(|v| v.iter_mut()) {
-        rewrite_expr(expr, &mut param_idx)?;
-    }
 
-    let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
+    let (column_mappings, values) = resolve_columns_for_insert(&table, columns, body, false)?;
+    dbg!(&column_mappings);
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
     let rowid_alias_index = btree_table.columns.iter().position(|c| c.is_rowid_alias);
@@ -141,8 +137,6 @@ pub fn translate_insert(
     let halt_label = program.allocate_label();
     let loop_start_label = program.allocate_label();
 
-    let inserting_multiple_rows = values.len() > 1;
-
     // Multiple rows - use coroutine for value population
     if inserting_multiple_rows {
         let yield_reg = program.alloc_register();
@@ -156,21 +150,24 @@ pub fn translate_insert(
 
         program.preassign_label_to_next_insn(start_offset_label);
 
-        for value in values.iter() {
-            populate_column_registers(
-                &mut program,
-                value,
-                &column_mappings,
-                column_registers_start,
-                true,
-                rowid_reg,
-                &resolver,
-            )?;
-            program.emit_insn(Insn::Yield {
-                yield_reg,
-                end_offset: halt_label,
-            });
+        if let Some(values) = values {
+            for value in values.iter() {
+                populate_column_registers(
+                    &mut program,
+                    value,
+                    &column_mappings,
+                    column_registers_start,
+                    true,
+                    rowid_reg,
+                    &resolver,
+                )?;
+                program.emit_insn(Insn::Yield {
+                    yield_reg,
+                    end_offset: halt_label,
+                });
+            }
         }
+
         program.emit_insn(Insn::EndCoroutine { yield_reg });
         program.preassign_label_to_next_insn(jump_on_definition_label);
 
@@ -198,7 +195,7 @@ pub fn translate_insert(
 
         populate_column_registers(
             &mut program,
-            &values[0],
+            &values.unwrap()[0],
             &column_mappings,
             column_registers_start,
             false,
@@ -454,15 +451,48 @@ struct ColumnMapping<'a> {
 fn resolve_columns_for_insert<'a>(
     table: &'a Table,
     columns: &Option<DistinctNames>,
-    values: &[Vec<Expr>],
-) -> Result<Vec<ColumnMapping<'a>>> {
-    if values.is_empty() {
-        crate::bail_parse_error!("no values to insert");
+    body: &'a mut InsertBody,
+    is_virtual_table: bool,
+) -> Result<(Vec<ColumnMapping<'a>>, Option<Vec<Vec<Expr>>>)> {
+    if matches!(body, InsertBody::DefaultValues) {}
+
+    let mut values = if is_virtual_table {
+        match body {
+            InsertBody::Select(select, _) => match select.body.select.as_mut() {
+                OneSelect::Values(values) => Some(std::mem::take(values)),
+                _ => {
+                    crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT")
+                }
+            },
+            InsertBody::DefaultValues => None,
+        }
+    } else {
+        match body {
+            InsertBody::Select(ref mut select, _) => match select.body.select.as_mut() {
+                OneSelect::Values(ref mut values) => Some(std::mem::take(values)),
+                // TODO: for now default to empty values here
+                OneSelect::Select(..) => None,
+            },
+            InsertBody::DefaultValues => Some(vec![vec![]]),
+        }
+    };
+
+    if let Some(ref mut values) = values {
+        let mut param_idx = 1;
+        for expr in values.iter_mut().flat_map(|v| v.iter_mut()) {
+            rewrite_expr(expr, &mut param_idx)?;
+        }
     }
+
+    // if values.is_empty() {
+    //     crate::bail_parse_error!("no values to insert");
+    // }
 
     let table_columns = &table.columns();
     // Case 1: No columns specified - map values to columns in order
+
     if columns.is_none() {
+        let values = values.unwrap();
         let num_values = values[0].len();
         if num_values > table_columns.len() {
             crate::bail_parse_error!(
@@ -481,15 +511,18 @@ fn resolve_columns_for_insert<'a>(
         }
 
         // Map each column to either its corresponding value index or None
-        return Ok(table_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| ColumnMapping {
-                column: col,
-                value_index: if i < num_values { Some(i) } else { None },
-                default_value: col.default.as_ref(),
-            })
-            .collect());
+        return Ok((
+            table_columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| ColumnMapping {
+                    column: col,
+                    value_index: if i < num_values { Some(i) } else { None },
+                    default_value: col.default.as_ref(),
+                })
+                .collect(),
+            Some(values),
+        ));
     }
 
     // Case 2: Columns specified - map named columns to their values
@@ -522,7 +555,7 @@ fn resolve_columns_for_insert<'a>(
         mappings[table_index].value_index = Some(value_index);
     }
 
-    Ok(mappings)
+    Ok((mappings, values))
 }
 
 /// Represents how a column in an index should be populated during an INSERT.
@@ -659,7 +692,7 @@ fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
     virtual_table: Rc<VirtualTable>,
     columns: &Option<DistinctNames>,
-    body: &InsertBody,
+    body: &mut InsertBody,
     on_conflict: &Option<ResolveType>,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -669,17 +702,12 @@ fn translate_virtual_table_insert(
     });
     let start_offset = program.offset();
 
-    let values = match body {
-        InsertBody::Select(select, None) => match &select.body.select.deref() {
-            OneSelect::Values(values) => values,
-            _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
-        },
-        InsertBody::DefaultValues => &vec![],
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
-    };
     let table = Table::Virtual(virtual_table.clone());
-    let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
+    let (column_mappings, values) = resolve_columns_for_insert(&table, columns, body, true)?;
     let registers_start = program.alloc_registers(2);
+
+    // TODO: for compiling, unwrap for now
+    let values = values.unwrap();
 
     /* *
      * Inserts for virtual tables are done in a single step.
