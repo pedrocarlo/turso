@@ -34,16 +34,23 @@ pub fn translate_create_table(
     body: ast::CreateTableBody,
     if_not_exists: bool,
     schema: &Schema,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
     if temporary {
         bail_parse_error!("TEMPORARY table not supported yet");
     }
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 30,
         approx_num_labels: 1,
-    });
+    };
+    let mut program = if let Some(mut program) = program {
+        program.extend(&opts);
+        program
+    } else {
+        ProgramBuilder::new(opts)
+    };
     if schema.get_table(tbl_name.name.0.as_str()).is_some() {
         if if_not_exists {
             let init_label = program.emit_init();
@@ -533,6 +540,7 @@ pub fn translate_create_virtual_table(
     schema: &Schema,
     query_mode: QueryMode,
     syms: &SymbolTable,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
     let ast::CreateVirtualTable {
         if_not_exists,
@@ -570,12 +578,18 @@ pub fn translate_create_virtual_table(
         bail_parse_error!("Table {} already exists", tbl_name);
     }
 
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 2,
         approx_num_insns: 40,
         approx_num_labels: 2,
-    });
+    };
+    let mut program = if let Some(mut program) = program {
+        program.extend(&opts);
+        program
+    } else {
+        ProgramBuilder::new(opts)
+    };
     let init_label = program.emit_init();
     let start_offset = program.offset();
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
@@ -648,13 +662,20 @@ pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
     if_exists: bool,
     schema: &Schema,
+    program: Option<ProgramBuilder>,
 ) -> Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 30,
         approx_num_labels: 1,
-    });
+    };
+    let mut program = if let Some(mut program) = program {
+        program.extend(&opts);
+        program
+    } else {
+        ProgramBuilder::new(opts)
+    };
     let table = schema.get_table(tbl_name.name.0.as_str());
     if table.is_none() {
         if if_exists {

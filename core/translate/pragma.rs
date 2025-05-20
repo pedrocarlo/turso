@@ -41,13 +41,20 @@ pub fn translate_pragma(
     body: Option<ast::PragmaBody>,
     database_header: Arc<SpinLock<DatabaseHeader>>,
     pager: Rc<Pager>,
+    program: Option<ProgramBuilder>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 0,
         approx_num_insns: 20,
         approx_num_labels: 0,
-    });
+    };
+    let mut program = if let Some(mut program) = program {
+        program.extend(&opts);
+        program
+    } else {
+        ProgramBuilder::new(opts)
+    };
     let init_label = program.emit_init();
     let start_offset = program.offset();
     let mut write = false;

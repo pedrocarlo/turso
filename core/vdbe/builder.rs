@@ -104,6 +104,13 @@ impl ProgramBuilder {
         }
     }
 
+    pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
+        self.insns.reserve(opts.approx_num_insns);
+        self.cursor_ref.reserve(opts.num_cursors);
+        self.label_to_resolved_offset
+            .reserve(opts.approx_num_labels);
+    }
+
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {

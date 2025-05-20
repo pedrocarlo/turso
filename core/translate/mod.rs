@@ -51,6 +51,8 @@ use std::sync::Arc;
 use transaction::{translate_tx_begin, translate_tx_commit};
 use update::translate_update;
 
+// TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
+// statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
 pub fn translate(
     schema: &Schema,
@@ -60,6 +62,7 @@ pub fn translate(
     connection: Weak<Connection>,
     syms: &SymbolTable,
     query_mode: QueryMode,
+    program: Option<ProgramBuilder>,
 ) -> Result<Program> {
     let mut change_cnt_on = false;
 
@@ -110,6 +113,7 @@ pub fn translate(
                         &mut update,
                         syms,
                         ParseSchema::Reload,
+                        program,
                     )?
                 }
                 _ => todo!(),
@@ -135,6 +139,7 @@ pub fn translate(
                 &tbl_name.0,
                 &columns,
                 schema,
+                program,
             )?
         }
         ast::Stmt::CreateTable {
@@ -149,11 +154,12 @@ pub fn translate(
             *body,
             if_not_exists,
             schema,
+            program,
         )?,
         ast::Stmt::CreateTrigger { .. } => bail_parse_error!("CREATE TRIGGER not supported yet"),
         ast::Stmt::CreateView { .. } => bail_parse_error!("CREATE VIEW not supported yet"),
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(*vtab, schema, query_mode, &syms)?
+            translate_create_virtual_table(*vtab, schema, query_mode, &syms, program)?
         }
         ast::Stmt::Delete(delete) => {
             let Delete {
@@ -163,17 +169,25 @@ pub fn translate(
                 ..
             } = *delete;
             change_cnt_on = true;
-            translate_delete(query_mode, schema, &tbl_name, where_clause, limit, syms)?
+            translate_delete(
+                query_mode,
+                schema,
+                &tbl_name,
+                where_clause,
+                limit,
+                syms,
+                program,
+            )?
         }
         ast::Stmt::Detach(_) => bail_parse_error!("DETACH not supported yet"),
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(query_mode, &idx_name.name.0, if_exists, schema)?,
+        } => translate_drop_index(query_mode, &idx_name.name.0, if_exists, schema, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(query_mode, tbl_name, if_exists, schema)?,
+        } => translate_drop_table(query_mode, tbl_name, if_exists, schema, program)?,
         ast::Stmt::DropTrigger { .. } => bail_parse_error!("DROP TRIGGER not supported yet"),
         ast::Stmt::DropView { .. } => bail_parse_error!("DROP VIEW not supported yet"),
         ast::Stmt::Pragma(name, body) => pragma::translate_pragma(
@@ -183,15 +197,21 @@ pub fn translate(
             body.map(|b| *b),
             database_header.clone(),
             pager,
+            program,
         )?,
         ast::Stmt::Reindex { .. } => bail_parse_error!("REINDEX not supported yet"),
         ast::Stmt::Release(_) => bail_parse_error!("RELEASE not supported yet"),
         ast::Stmt::Rollback { .. } => bail_parse_error!("ROLLBACK not supported yet"),
         ast::Stmt::Savepoint(_) => bail_parse_error!("SAVEPOINT not supported yet"),
-        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms)?,
-        ast::Stmt::Update(mut update) => {
-            translate_update(query_mode, schema, &mut update, syms, ParseSchema::None)?
-        }
+        ast::Stmt::Select(select) => translate_select(query_mode, schema, *select, syms, program)?,
+        ast::Stmt::Update(mut update) => translate_update(
+            query_mode,
+            schema,
+            &mut update,
+            syms,
+            ParseSchema::None,
+            program,
+        )?,
         ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert(insert) => {
             dbg!(&insert);
@@ -214,6 +234,7 @@ pub fn translate(
                 body,
                 returning,
                 syms,
+                program,
             )?
         }
     };

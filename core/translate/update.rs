@@ -52,16 +52,23 @@ pub fn translate_update(
     body: &mut Update,
     syms: &SymbolTable,
     parse_schema: ParseSchema,
+    program: Option<ProgramBuilder>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(schema, body, parse_schema)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
-    let mut program = ProgramBuilder::new(ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,
         approx_num_insns: 20,
         approx_num_labels: 4,
-    });
+    };
+    let mut program = if let Some(mut program) = program {
+        program.extend(&opts);
+        program
+    } else {
+        ProgramBuilder::new(opts)
+    };
     emit_program(&mut program, plan, syms)?;
     Ok(program)
 }
