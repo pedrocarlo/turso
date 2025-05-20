@@ -200,19 +200,19 @@ pub fn translate(
                 or_conflict,
                 tbl_name,
                 columns,
-                mut body,
+                body,
                 returning,
             } = *insert;
             change_cnt_on = true;
             translate_insert(
                 query_mode,
                 schema,
-                &with,
-                &or_conflict,
-                &tbl_name,
-                &columns,
-                &mut body,
-                &returning,
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
                 syms,
             )?
         }

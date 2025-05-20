@@ -1,13 +1,11 @@
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast::{
-    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, Select,
-    With,
+    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
 };
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, Table};
-use crate::translate::select::translate_select;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
@@ -28,12 +26,12 @@ use super::optimizer::rewrite_expr;
 pub fn translate_insert(
     query_mode: QueryMode,
     schema: &Schema,
-    with: &Option<With>,
-    on_conflict: &Option<ResolveType>,
-    tbl_name: &QualifiedName,
-    columns: &Option<DistinctNames>,
-    body: &mut InsertBody,
-    _returning: &Option<Vec<ResultColumn>>,
+    with: Option<With>,
+    on_conflict: Option<ResolveType>,
+    tbl_name: QualifiedName,
+    columns: Option<DistinctNames>,
+    mut body: InsertBody,
+    _returning: Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
 ) -> Result<ProgramBuilder> {
     let mut program = ProgramBuilder::new(ProgramBuilderOpts {
@@ -59,7 +57,7 @@ pub fn translate_insert(
         translate_virtual_table_insert(
             &mut program,
             virtual_table.clone(),
-            columns,
+            &columns,
             body,
             on_conflict,
             &resolver,
@@ -108,7 +106,7 @@ pub fn translate_insert(
         InsertBody::DefaultValues => false,
     };
 
-    let (column_mappings, values) = resolve_columns_for_insert(&table, columns, body, false)?;
+    let (column_mappings, values) = resolve_columns_for_insert(&table, &columns, &mut body, false)?;
     dbg!(&column_mappings);
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
@@ -700,8 +698,8 @@ fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
     virtual_table: Rc<VirtualTable>,
     columns: &Option<DistinctNames>,
-    body: &mut InsertBody,
-    on_conflict: &Option<ResolveType>,
+    mut body: InsertBody,
+    on_conflict: Option<ResolveType>,
     resolver: &Resolver,
 ) -> Result<()> {
     let init_label = program.allocate_label();
@@ -711,7 +709,7 @@ fn translate_virtual_table_insert(
     let start_offset = program.offset();
 
     let table = Table::Virtual(virtual_table.clone());
-    let (column_mappings, values) = resolve_columns_for_insert(&table, columns, body, true)?;
+    let (column_mappings, values) = resolve_columns_for_insert(&table, columns, &mut body, true)?;
     let registers_start = program.alloc_registers(2);
 
     // TODO: for compiling, unwrap for now
