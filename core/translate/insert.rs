@@ -1,11 +1,13 @@
 use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast::{
-    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, With,
+    DistinctNames, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, Select,
+    With,
 };
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, Table};
+use crate::translate::select::translate_select;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
@@ -151,6 +153,7 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(start_offset_label);
 
         if let Some(values) = values {
+            // MULTIPLE VALUES INSERT
             for value in values.iter() {
                 populate_column_registers(
                     &mut program,
@@ -166,6 +169,12 @@ pub fn translate_insert(
                     end_offset: halt_label,
                 });
             }
+        } else {
+            // SELECT STATEMENT INSERT
+            let InsertBody::Select(select, _) = body else {
+                unreachable!("should be of a INSERT INTO <table> <select_stmt>");
+            };
+            todo!()
         }
 
         program.emit_insn(Insn::EndCoroutine { yield_reg });
@@ -454,8 +463,7 @@ fn resolve_columns_for_insert<'a>(
     body: &'a mut InsertBody,
     is_virtual_table: bool,
 ) -> Result<(Vec<ColumnMapping<'a>>, Option<Vec<Vec<Expr>>>)> {
-    if matches!(body, InsertBody::DefaultValues) {}
-
+    // TODO: support upsert
     let mut values = if is_virtual_table {
         match body {
             InsertBody::Select(select, _) => match select.body.select.as_mut() {
@@ -488,7 +496,7 @@ fn resolve_columns_for_insert<'a>(
     //     crate::bail_parse_error!("no values to insert");
     // }
 
-    let table_columns = &table.columns();
+    let table_columns = table.columns();
     // Case 1: No columns specified - map values to columns in order
 
     if columns.is_none() {
