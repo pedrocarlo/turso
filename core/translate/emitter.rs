@@ -154,6 +154,7 @@ fn emit_program_for_select(
         program.epilogue(init_label, start_offset, TransactionMode::Read);
     }
 
+    // TODO: see if we should only modify the result_columns of the program when not in a subquery
     program.result_columns = plan.result_columns;
     program.table_references = plan.table_references;
     Ok(())

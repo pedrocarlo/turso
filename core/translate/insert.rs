@@ -713,6 +713,7 @@ fn populate_column_registers(
     Ok(())
 }
 
+// TODO: see if virtual table insert supports INSERT with SELECT statement
 fn translate_virtual_table_insert(
     program: &mut ProgramBuilder,
     virtual_table: Rc<VirtualTable>,

@@ -410,6 +410,9 @@ pub fn prepare_select_plan<'a>(
             // Return the unoptimized query plan
             Ok(Plan::Select(plan))
         }
+        // TODO: ideally logic for insert with VALUES would be incorporated here to be reused in insert
+        // THE VALUES part from INSERT is basically just a SELECT expr-list or SELECT expr-list1 UNION ALL SELECT expr-list2 ...
+        // https://sqlite.org/lang_select.html#values
         _ => todo!(),
     }
 }
