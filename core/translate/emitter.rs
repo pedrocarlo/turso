@@ -30,12 +30,12 @@ use super::subquery::emit_subqueries;
 
 #[derive(Debug)]
 pub struct Resolver<'a> {
-    pub symbol_table: &'a SymbolTable,
+    pub(crate) symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache: Vec<(&'a ast::Expr, usize)>,
 }
 
 impl<'a> Resolver<'a> {
-    pub fn new(symbol_table: &'a SymbolTable) -> Self {
+    pub(crate) fn new(symbol_table: &'a SymbolTable) -> Self {
         Self {
             symbol_table,
             expr_to_reg_cache: Vec::new(),
@@ -110,75 +110,11 @@ pub enum OperationMode {
     DELETE,
 }
 
-/// Initialize the program with basic setup and return initial metadata and labels
-fn prologue<'a>(
-    program: &mut ProgramBuilder,
-    syms: &'a SymbolTable,
-    table_count: usize,
-    result_column_count: usize,
-) -> Result<(TranslateCtx<'a>, BranchOffset, BranchOffset)> {
-    let init_label = program.allocate_label();
-
-    program.emit_insn(Insn::Init {
-        target_pc: init_label,
-    });
-
-    let start_offset = program.offset();
-
-    let t_ctx = TranslateCtx {
-        labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
-        label_main_loop_end: None,
-        reg_agg_start: None,
-        reg_nonagg_emit_once_flag: None,
-        reg_limit: None,
-        reg_offset: None,
-        reg_limit_offset_sum: None,
-        reg_result_cols_start: None,
-        meta_group_by: None,
-        meta_left_joins: (0..table_count).map(|_| None).collect(),
-        meta_sort: None,
-        result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
-        result_columns_to_skip_in_orderby_sorter: None,
-        resolver: Resolver::new(syms),
-    };
-
-    Ok((t_ctx, init_label, start_offset))
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum TransactionMode {
     None,
     Read,
     Write,
-}
-
-/// Clean up and finalize the program, resolving any remaining labels
-/// Note that although these are the final instructions, typically an SQLite
-/// query will jump to the Transaction instruction via init_label.
-fn epilogue(
-    program: &mut ProgramBuilder,
-    init_label: BranchOffset,
-    start_offset: BranchOffset,
-    txn_mode: TransactionMode,
-) -> Result<()> {
-    program.emit_insn(Insn::Halt {
-        err_code: 0,
-        description: String::new(),
-    });
-    program.preassign_label_to_next_insn(init_label);
-
-    match txn_mode {
-        TransactionMode::Read => program.emit_insn(Insn::Transaction { write: false }),
-        TransactionMode::Write => program.emit_insn(Insn::Transaction { write: true }),
-        TransactionMode::None => {}
-    }
-
-    program.emit_constant_insns();
-    program.emit_insn(Insn::Goto {
-        target_pc: start_offset,
-    });
-
-    Ok(())
 }
 
 /// Main entry point for emitting bytecode for a SQL query
@@ -196,17 +132,13 @@ fn emit_program_for_select(
     mut plan: SelectPlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
-        program,
-        syms,
-        plan.table_references.len(),
-        plan.result_columns.len(),
-    )?;
+    let (mut t_ctx, init_label, start_offset) =
+        program.prologue(syms, plan.table_references.len(), plan.result_columns.len());
 
     // Trivial exit on LIMIT 0
     if let Some(limit) = plan.limit {
         if limit == 0 {
-            epilogue(program, init_label, start_offset, TransactionMode::Read)?;
+            program.epilogue(init_label, start_offset, TransactionMode::Read);
             program.result_columns = plan.result_columns;
             program.table_references = plan.table_references;
             return Ok(());
@@ -217,9 +149,9 @@ fn emit_program_for_select(
 
     // Finalize program
     if plan.table_references.is_empty() {
-        epilogue(program, init_label, start_offset, TransactionMode::None)?;
+        program.epilogue(init_label, start_offset, TransactionMode::None);
     } else {
-        epilogue(program, init_label, start_offset, TransactionMode::Read)?;
+        program.epilogue(init_label, start_offset, TransactionMode::Read);
     }
 
     program.result_columns = plan.result_columns;
@@ -367,16 +299,12 @@ fn emit_program_for_delete(
     mut plan: DeletePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
-        program,
-        syms,
-        plan.table_references.len(),
-        plan.result_columns.len(),
-    )?;
+    let (mut t_ctx, init_label, start_offset) =
+        program.prologue(syms, plan.table_references.len(), plan.result_columns.len());
 
     // exit early if LIMIT 0
     if let Some(0) = plan.limit {
-        epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+        program.epilogue(init_label, start_offset, TransactionMode::Write);
         program.result_columns = plan.result_columns;
         program.table_references = plan.table_references;
         return Ok(());
@@ -427,7 +355,7 @@ fn emit_program_for_delete(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
-    epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+    program.epilogue(init_label, start_offset, TransactionMode::Write);
     program.result_columns = plan.result_columns;
     program.table_references = plan.table_references;
     Ok(())
@@ -538,16 +466,15 @@ fn emit_program_for_update(
     mut plan: UpdatePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
-    let (mut t_ctx, init_label, start_offset) = prologue(
-        program,
+    let (mut t_ctx, init_label, start_offset) = program.prologue(
         syms,
         plan.table_references.len(),
         plan.returning.as_ref().map_or(0, |r| r.len()),
-    )?;
+    );
 
     // Exit on LIMIT 0
     if let Some(0) = plan.limit {
-        epilogue(program, init_label, start_offset, TransactionMode::None)?;
+        program.epilogue(init_label, start_offset, TransactionMode::None);
         program.result_columns = plan.returning.unwrap_or_default();
         program.table_references = plan.table_references;
         return Ok(());
@@ -639,7 +566,7 @@ fn emit_program_for_update(
     program.preassign_label_to_next_insn(after_main_loop_label);
 
     // Finalize program
-    epilogue(program, init_label, start_offset, TransactionMode::Write)?;
+    program.epilogue(init_label, start_offset, TransactionMode::Write);
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references = plan.table_references;
     Ok(())

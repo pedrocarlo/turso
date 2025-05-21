@@ -14,9 +14,11 @@ use crate::{
     storage::sqlite3_ondisk::DatabaseHeader,
     translate::{
         collate::CollationSeq,
+        emitter::{Resolver, TransactionMode, TranslateCtx},
+        main_loop::LoopLabels,
         plan::{ResultSetColumn, TableReference},
     },
-    Connection, VirtualTable,
+    Connection, SymbolTable, VirtualTable,
 };
 
 use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
@@ -43,6 +45,7 @@ pub struct ProgramBuilder {
     pub table_references: Vec<TableReference>,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
+    nested_level: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +104,7 @@ impl ProgramBuilder {
             result_columns: Vec::new(),
             table_references: Vec::new(),
             collation: None,
+            nested_level: 0,
         }
     }
 
@@ -622,6 +626,82 @@ impl ProgramBuilder {
 
     pub fn reset_collation(&mut self) {
         self.collation = None;
+    }
+
+    #[inline]
+    pub fn incr_nesting(&mut self) {
+        self.nested_level += 1;
+    }
+
+    #[inline]
+    pub fn decr_nesting(&mut self) {
+        self.nested_level -= 1;
+    }
+
+    /// Initialize the program with basic setup and return initial metadata and labels
+    pub fn prologue<'a>(
+        &mut self,
+        syms: &'a SymbolTable,
+        table_count: usize,
+        result_column_count: usize,
+    ) -> (TranslateCtx<'a>, BranchOffset, BranchOffset) {
+        let init_label = self.allocate_label();
+
+        if self.nested_level == 0 {
+            self.emit_insn(Insn::Init {
+                target_pc: init_label,
+            });
+        }
+
+        let start_offset = self.offset();
+
+        let t_ctx = TranslateCtx {
+            labels_main_loop: (0..table_count).map(|_| LoopLabels::new(self)).collect(),
+            label_main_loop_end: None,
+            reg_agg_start: None,
+            reg_nonagg_emit_once_flag: None,
+            reg_limit: None,
+            reg_offset: None,
+            reg_limit_offset_sum: None,
+            reg_result_cols_start: None,
+            meta_group_by: None,
+            meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_sort: None,
+            result_column_indexes_in_orderby_sorter: (0..result_column_count).collect(),
+            result_columns_to_skip_in_orderby_sorter: None,
+            resolver: Resolver::new(syms),
+        };
+
+        (t_ctx, init_label, start_offset)
+    }
+
+    /// Clean up and finalize the program, resolving any remaining labels
+    /// Note that although these are the final instructions, typically an SQLite
+    /// query will jump to the Transaction instruction via init_label.
+    pub fn epilogue(
+        &mut self,
+        init_label: BranchOffset,
+        start_offset: BranchOffset,
+        txn_mode: TransactionMode,
+    ) {
+        if self.nested_level == 0 {
+            self.emit_insn(Insn::Halt {
+                err_code: 0,
+                description: String::new(),
+            });
+            self.preassign_label_to_next_insn(init_label);
+
+            match txn_mode {
+                TransactionMode::Read => self.emit_insn(Insn::Transaction { write: false }),
+                TransactionMode::Write => self.emit_insn(Insn::Transaction { write: true }),
+                TransactionMode::None => {}
+            }
+
+            self.emit_constant_insns();
+            self.emit_insn(Insn::Goto {
+                target_pc: start_offset,
+            });
+        }
     }
 
     pub fn build(

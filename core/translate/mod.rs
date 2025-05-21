@@ -214,7 +214,7 @@ pub fn translate(
         )?,
         ast::Stmt::Vacuum(_, _) => bail_parse_error!("VACUUM not supported yet"),
         ast::Stmt::Insert(insert) => {
-            dbg!(&insert);
+            // dbg!(&insert);
             let Insert {
                 with,
                 or_conflict,

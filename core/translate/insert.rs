@@ -114,7 +114,7 @@ pub fn translate_insert(
     };
 
     let (column_mappings, values) = resolve_columns_for_insert(&table, &columns, &mut body, false)?;
-    dbg!(&column_mappings);
+    // dbg!(&column_mappings);
     let index_col_mappings = resolve_indicies_for_insert(schema, table.as_ref(), &column_mappings)?;
     // Check if rowid was provided (through INTEGER PRIMARY KEY as a rowid alias)
     let rowid_alias_index = btree_table.columns.iter().position(|c| c.is_rowid_alias);
