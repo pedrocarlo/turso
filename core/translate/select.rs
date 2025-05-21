@@ -19,14 +19,16 @@ use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use limbo_sqlite3_parser::ast::{self, SortOrder};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
 
-pub fn translate_select(
+pub fn translate_select<'a>(
     query_mode: QueryMode,
     schema: &Schema,
     select: ast::Select,
     syms: &SymbolTable,
     program: Option<ProgramBuilder>,
+    outer_scope: Option<&'a Scope<'a>>,
+    query_type: SelectQueryType,
 ) -> Result<ProgramBuilder> {
-    let mut select_plan = prepare_select_plan(schema, select, syms, None)?;
+    let mut select_plan = prepare_select_plan(schema, select, syms, outer_scope, query_type)?;
     optimize_plan(&mut select_plan, schema)?;
     let Plan::Select(ref select) = select_plan else {
         panic!("select_plan is not a SelectPlan");
@@ -53,6 +55,7 @@ pub fn prepare_select_plan<'a>(
     select: ast::Select,
     syms: &SymbolTable,
     outer_scope: Option<&'a Scope<'a>>,
+    query_type: SelectQueryType,
 ) -> Result<Plan> {
     match *select.body.select {
         ast::OneSelect::Select(select_inner) => {
@@ -115,7 +118,7 @@ pub fn prepare_select_plan<'a>(
                 limit: None,
                 offset: None,
                 contains_constant_false_condition: false,
-                query_type: SelectQueryType::TopLevel,
+                query_type,
             };
 
             let mut aggregate_expressions = Vec::new();

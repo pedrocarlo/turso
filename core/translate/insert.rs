@@ -6,6 +6,7 @@ use limbo_sqlite3_parser::ast::{
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, Table};
+use crate::translate::select::translate_select;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{IdxInsertFlags, RegisterOrLiteral};
@@ -22,6 +23,7 @@ use crate::{Result, SymbolTable, VirtualTable};
 use super::emitter::Resolver;
 use super::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use super::optimizer::rewrite_expr;
+use super::plan::SelectQueryType;
 
 #[allow(clippy::too_many_arguments)]
 pub fn translate_insert(
@@ -180,7 +182,21 @@ pub fn translate_insert(
             let InsertBody::Select(select, _) = body else {
                 unreachable!("should be of a INSERT INTO <table> <select_stmt>");
             };
-            todo!()
+            program.incr_nesting();
+            let query_type = SelectQueryType::Subquery {
+                yield_reg,
+                coroutine_implementation_start: halt_label,
+            };
+            program = translate_select(
+                query_mode,
+                schema,
+                *select,
+                syms,
+                Some(program),
+                None,
+                query_type,
+            )?;
+            program.decr_nesting();
         }
 
         program.emit_insn(Insn::EndCoroutine { yield_reg });
