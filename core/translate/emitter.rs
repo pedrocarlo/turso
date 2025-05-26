@@ -272,6 +272,20 @@ fn emit_program_for_compound_select(
         None
     };
 
+    let is_intersect = rest.get(0).map_or(false, |(_, operator)| {
+        operator == &ast::CompoundOperator::Intersect
+    });
+    let intersect_index = if is_intersect {
+        let intersect_index = get_intersect_ephemeral_index(program, &first);
+        first.query_destination = QueryDestination::EphemeralIndex {
+            cursor_id: intersect_index.0,
+            index: intersect_index.1.clone(),
+        };
+        Some(intersect_index)
+    } else {
+        None
+    };
+
     // Emit the first SELECT
     emit_query(program, &mut first, &mut first_t_ctx)?;
 
@@ -294,7 +308,10 @@ fn emit_program_for_compound_select(
             .iter()
             .any(|(_, operator)| operator == &ast::CompoundOperator::Union);
         let (mut select, operator) = rest.remove(0);
-        if operator != ast::CompoundOperator::UnionAll && operator != ast::CompoundOperator::Union {
+        if operator != ast::CompoundOperator::UnionAll
+            && operator != ast::CompoundOperator::Union
+            && operator != ast::CompoundOperator::Intersect
+        {
             crate::bail_parse_error!("unimplemented compound select operator: {:?}", operator);
         }
 
@@ -322,6 +339,19 @@ fn emit_program_for_compound_select(
                 label_next_select,
             );
         }
+
+        let is_intersect = operator == ast::CompoundOperator::Intersect;
+        let intersect_index = if is_intersect {
+            let intersect_index = get_intersect_ephemeral_index(program, &first);
+            first.query_destination = QueryDestination::EphemeralIndex {
+                cursor_id: intersect_index.0,
+                index: intersect_index.1.clone(),
+            };
+            Some(intersect_index)
+        } else {
+            None
+        };
+
         emit_query(program, &mut select, &mut t_ctx)?;
         program.preassign_label_to_next_insn(label_next_select);
     }
@@ -421,6 +451,44 @@ fn read_deduplicated_union_rows(
         cursor_id: dedupe_cursor_id,
         pc_if_next: label_dedupe_loop_start,
     });
+}
+
+/// Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
+/// that appear before the last UNION operator.
+fn get_intersect_ephemeral_index(
+    program: &mut ProgramBuilder,
+    compound_plan: &SelectPlan,
+) -> (usize, Arc<Index>) {
+    let dedupe_index = Arc::new(Index {
+        columns: compound_plan
+            .result_columns
+            .iter()
+            .map(|c| IndexColumn {
+                name: c
+                    .name(&compound_plan.table_references)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None, // FIXME: this should be inferred
+            })
+            .collect(),
+        name: "intersect_temp_table".to_string(),
+        root_page: 0,
+        ephemeral: true,
+        table_name: String::new(),
+        unique: true,
+        has_rowid: false,
+    });
+    let cursor_id = program.alloc_cursor_id(
+        Some(dedupe_index.name.clone()),
+        CursorType::BTreeIndex(dedupe_index.clone()),
+    );
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false,
+    });
+    (cursor_id, dedupe_index.clone())
 }
 
 fn emit_program_for_select(
