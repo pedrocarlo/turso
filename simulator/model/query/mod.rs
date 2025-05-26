@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{model::table::Value, runner::env::SimulatorEnv};
 
+pub mod ast;
 pub mod create;
 pub mod delete;
 pub mod drop;
 pub mod insert;
 pub mod select;
+pub mod to_sql;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
