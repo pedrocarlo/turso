@@ -12,6 +12,8 @@ use super::property::Remaining;
 use super::table::LikeValue;
 use super::{backtrack, frequency, pick, ArbitraryFromMaybe};
 
+mod expr;
+
 impl Arbitrary for Create {
     fn arbitrary<R: Rng>(rng: &mut R) -> Self {
         Create {
