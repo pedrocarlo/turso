@@ -2021,13 +2021,22 @@ pub fn op_seek_rowid(
         let rowid = match state.registers[*src_reg].get_owned_value() {
             Value::Integer(rowid) => Some(*rowid),
             Value::Null => None,
+            // For non-integer values try to apply affinity and convert them to integer.
             other => {
-                return Err(LimboError::InternalError(format!(
-                    "SeekRowid: the value in the register is not an integer or NULL: {}",
-                    other
-                )));
+                let mut temp_reg = Register::Value(other.clone());
+                let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
+                if converted {
+                    match temp_reg.get_owned_value() {
+                        Value::Integer(i) => Some(*i),
+                        Value::Float(f) => Some(*f as i64),
+                        _ => unreachable!("apply_affinity_char with Numeric should produce an integer if it returns true"),
+                    }
+                } else {
+                    None
+                }
             }
         };
+
         match rowid {
             Some(rowid) => {
                 let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), SeekOp::EQ));
