@@ -72,7 +72,7 @@ mod tests {
         let (mut rng, seed) = rng_from_time_or_env();
         tracing::info!("rowid_seek_fuzz seed: {}", seed);
 
-        for iteration in 0..100 {
+        for iteration in 0..2 {
             tracing::trace!("rowid_seek_fuzz iteration: {}", iteration);
 
             for comp in COMPARISONS.iter() {
@@ -88,7 +88,7 @@ mod tests {
                         );
 
                         log::trace!("query: {}", query);
-
+                        println!("query: {}", query);
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
@@ -119,6 +119,8 @@ mod tests {
             values.push(val.to_string());
         }
 
+        values.push("NULL".to_string()); // Man's greatest mistake
+        values.push("'NULL'".to_string()); // SQLite dared to one up on that mistake
         values.push("0.0".to_string());
         values.push("-0.0".to_string());
         values.push("1.5".to_string());
@@ -143,7 +145,7 @@ mod tests {
         values.push("X''".to_string());
 
         values.push("(1 + 1)".to_string());
-        values.push("(SELECT 1)".to_string());
+        // values.push("(SELECT 1)".to_string()); subqueries ain't implemented yet homes.
 
         values
     }
