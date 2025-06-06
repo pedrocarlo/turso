@@ -554,10 +554,10 @@ pub fn op_eq(
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value == rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -565,10 +565,10 @@ pub fn op_eq(
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         let cond = lhs_value == rhs_value; // Both NULL
         if (nulleq && cond) || (!nulleq && jump_if_null) {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -597,10 +597,10 @@ pub fn op_eq(
     }
 
     if should_jump {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -636,10 +636,10 @@ pub fn op_ne(
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value != rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -647,10 +647,10 @@ pub fn op_ne(
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         let cond = lhs_value != rhs_value; // At least one NULL
         if (nulleq && cond) || (!nulleq && jump_if_null) {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -679,10 +679,10 @@ pub fn op_ne(
     }
 
     if should_jump {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -717,20 +717,20 @@ pub fn op_lt(
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value < rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
     // Handle NULL values
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         if jump_if_null {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -759,10 +759,10 @@ pub fn op_lt(
     }
 
     if should_jump {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -797,20 +797,20 @@ pub fn op_le(
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value <= rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
     // Handle NULL values
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         if jump_if_null {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -839,10 +839,10 @@ pub fn op_le(
     }
 
     if should_jump {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -877,20 +877,20 @@ pub fn op_gt(
     // Fast path for integers
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value > rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
     // Handle NULL values
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         if jump_if_null {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -919,10 +919,10 @@ pub fn op_gt(
     }
 
     if should_jump {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        state.pc = target_pc.to_offset_int();
+    } else {
+        state.pc += 1;
+    }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -960,19 +960,19 @@ pub fn op_ge(
 
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value >= rhs_value {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
     if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
         if jump_if_null {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+            state.pc = target_pc.to_offset_int();
+        } else {
+            state.pc += 1;
+        }
         return Ok(InsnFunctionStepResult::Step);
     }
 
@@ -1018,8 +1018,8 @@ pub fn op_ge(
     if should_jump {
         state.pc = target_pc.to_offset_int();
     } else {
-                state.pc += 1;
-            }
+        state.pc += 1;
+    }
 
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2258,6 +2258,7 @@ pub fn op_seek(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
+    println!("op_seek");
     let (Insn::SeekGE {
         cursor_id,
         start_reg,
@@ -2322,69 +2323,126 @@ pub fn op_seek(
             state.pc += 1;
         }
     } else {
+        println!("Table seek branch ");
         let pc = {
             let original_value = state.registers[*start_reg].get_owned_value().clone();
+            println!("original_value: {:?}", original_value);
             let mut temp_value = original_value.clone();
 
-            if matches!(temp_value, Value::Text(_)) {
+            let conversion_successful = if matches!(temp_value, Value::Text(_)) {
                 let mut temp_reg = Register::Value(temp_value);
-                apply_affinity_char(&mut temp_reg, Affinity::Numeric);
+                let converted = apply_numeric_affinity(&mut temp_reg, false);
                 temp_value = temp_reg.get_owned_value().clone();
-            }
+                converted
+            } else {
+                true // Non-text values don't need conversion
+            };
 
             let int_key = extract_int_value(&temp_value);
-            let lost_precision = !matches!(temp_value, Value::Integer(_));
-
+            println!("int_key: {}", int_key);
+            let lost_precision = !conversion_successful || !matches!(temp_value, Value::Integer(_));
+            println!("lost_precision: {}", lost_precision);
+            println!("temp_value: {:?}", temp_value);
             let actual_op = if lost_precision {
-                match (&temp_value, op) {
-                    (Value::Float(f), op) => {
+                println!("Lost precision, actual_op might change");
+                match &temp_value {
+                    Value::Float(f) => {
                         let int_key_as_float = int_key as f64;
-                        if int_key_as_float > *f {
+                        let c = if int_key_as_float > *f {
+                            1
+                        } else if int_key_as_float < *f {
+                            -1
+                        } else {
+                            0
+                        };
+
+                        if c > 0 {
+                            // If approximation is larger than actual search term
                             match op {
-                                SeekOp::GT => SeekOp::GE,
-                                SeekOp::LE => SeekOp::LE,
+                                SeekOp::GT => SeekOp::GE, // (x > 4.9) -> (x >= 5)
+                                SeekOp::LE => SeekOp::LT, // (x <= 4.9) -> (x < 5)
                                 other => other,
                             }
-                        } else if int_key_as_float < *f {
+                        } else if c < 0 {
+                            // If approximation is smaller than actual search term
                             match op {
-                                SeekOp::GE => SeekOp::GT,
-                                SeekOp::LT => SeekOp::LE,
+                                SeekOp::LT => SeekOp::LE, // (x < 5.1) -> (x <= 5)
+                                SeekOp::GE => SeekOp::GT, // (x >= 5.1) -> (x > 5)
                                 other => other,
                             }
                         } else {
                             op
                         }
                     }
+                    Value::Text(_) => {
+                        match op {
+                            SeekOp::GT | SeekOp::GE => {
+                                // No integers are > or >= non-numeric text, jump to target (empty result)
+                                state.pc = target_pc.to_offset_int();
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+                            SeekOp::LT | SeekOp::LE => {
+                                // All integers are < or <= non-numeric text
+                                // Move to last position and then use the normal seek logic
+                                {
+                                    let mut cursor = state.get_cursor(*cursor_id);
+                                    let cursor = cursor.as_btree_mut();
+                                    return_if_io!(cursor.last());
+                                }
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     _ => op,
                 }
             } else {
+                println!("No precision lost, using original op: {:?}", op);
                 op
             };
+            println!("actual_op: {:?}", actual_op);
 
             let rowid = if matches!(original_value, Value::Null) {
+                println!("NULL value handling");
                 match actual_op {
                     SeekOp::GE | SeekOp::GT => {
+                        println!("NULL + GE/GT -> jumping to target");
                         state.pc = target_pc.to_offset_int();
                         return Ok(InsnFunctionStepResult::Step);
                     }
                     SeekOp::LE | SeekOp::LT => {
+                        println!("NULL + LE/LT -> jumping to target");
+                        // No integers are < NULL, so jump to target
                         state.pc = target_pc.to_offset_int();
-
                         return Ok(InsnFunctionStepResult::Step);
                     }
                     _ => unreachable!(),
                 }
             } else {
+                println!("Using rowid: {}", int_key);
                 int_key
             };
             let mut cursor = state.get_cursor(*cursor_id);
             let cursor = cursor.as_btree_mut();
-
+            println!(
+                "About to call cursor.seek with rowid={}, actual_op={:?}",
+                rowid, actual_op
+            );
             let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), actual_op));
+            println!("cursor.seek returned found={}", found);
 
             if !found {
+                println!(
+                    "Not found, jumping to target_pc={}",
+                    target_pc.to_offset_int()
+                );
                 target_pc.to_offset_int()
             } else {
+                println!(
+                    "Not found, jumping to target_pc={}",
+                    target_pc.to_offset_int()
+                );
                 state.pc + 1
             }
         };
