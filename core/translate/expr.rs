@@ -455,16 +455,6 @@ pub fn translate_expr(
         }
         ast::Expr::Binary(e1, op, e2) => {
             // Check if both sides of the expression are equivalent and reuse the same register if so
-            println!("expr: {:?}", &expr);
-            println!("e1: {:?}, e2: {:?}, op: {:?}", e1, e2, op);
-            println!(
-                "expr affinity: {:?}",
-                get_expr_affinity(e1, referenced_tables)
-            );
-            println!(
-                "expr affinity: {:?}",
-                get_expr_affinity(e2, referenced_tables)
-            );
             if exprs_are_equivalent(e1, e2) {
                 let shared_reg = program.alloc_register();
                 translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
@@ -2244,7 +2234,6 @@ fn emit_binary_insn(
     ) {
         affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
     }
-    println!("emit_binary affinity: {:?}", affinity);
     match op {
         ast::Operator::NotEquals => {
             let if_true_label = program.allocate_label();

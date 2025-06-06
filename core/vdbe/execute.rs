@@ -547,7 +547,6 @@ pub fn op_eq(
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -684,7 +683,6 @@ pub fn op_ne(
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -820,7 +818,6 @@ pub fn op_lt(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -955,7 +952,6 @@ pub fn op_le(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -1090,7 +1086,6 @@ pub fn op_gt(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -1225,14 +1220,10 @@ pub fn op_ge(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let affinity = flags.get_affinity();
-    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
     let rhs_value = state.registers[rhs].get_owned_value();
-
-    println!("lhs_value: {:?}, rhs_value: {:?}", lhs_value, rhs_value);
-    println!("jump_if_null: {}", jump_if_null);
 
     if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
         if lhs_value >= rhs_value {
@@ -1309,15 +1300,7 @@ pub fn op_ge(
 
         Affinity::Blob => {} // Do nothing for blob affinity.
     }
-    println!(
-        "lhs_converted: {}, rhs_converted: {}",
-        lhs_converted, rhs_converted
-    );
-    println!(
-        "converted_lhs: {:?}, converted_rhs: {:?}",
-        lhs_temp_reg.get_owned_value(),
-        rhs_temp_reg.get_owned_value()
-    );
+
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
         rhs_temp_reg.get_owned_value(),
@@ -2586,7 +2569,6 @@ pub fn op_seek(
     pager: &Rc<Pager>,
     mv_store: Option<&Rc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
-    println!("op_seek");
     let (Insn::SeekGE {
         cursor_id,
         start_reg,
@@ -2651,10 +2633,8 @@ pub fn op_seek(
             state.pc += 1;
         }
     } else {
-        println!("Table seek branch ");
         let pc = {
             let original_value = state.registers[*start_reg].get_owned_value().clone();
-            println!("original_value: {:?}", original_value);
             let mut temp_value = original_value.clone();
 
             let conversion_successful = if matches!(temp_value, Value::Text(_)) {
@@ -2667,12 +2647,8 @@ pub fn op_seek(
             };
 
             let int_key = extract_int_value(&temp_value);
-            println!("int_key: {}", int_key);
             let lost_precision = !conversion_successful || !matches!(temp_value, Value::Integer(_));
-            println!("lost_precision: {}", lost_precision);
-            println!("temp_value: {:?}", temp_value);
             let actual_op = if lost_precision {
-                println!("Lost precision, actual_op might change");
                 match &temp_value {
                     Value::Float(f) => {
                         let int_key_as_float = int_key as f64;
@@ -2726,21 +2702,16 @@ pub fn op_seek(
                     _ => op,
                 }
             } else {
-                println!("No precision lost, using original op: {:?}", op);
                 op
             };
-            println!("actual_op: {:?}", actual_op);
 
             let rowid = if matches!(original_value, Value::Null) {
-                println!("NULL value handling");
                 match actual_op {
                     SeekOp::GE | SeekOp::GT => {
-                        println!("NULL + GE/GT -> jumping to target");
                         state.pc = target_pc.to_offset_int();
                         return Ok(InsnFunctionStepResult::Step);
                     }
                     SeekOp::LE | SeekOp::LT => {
-                        println!("NULL + LE/LT -> jumping to target");
                         // No integers are < NULL, so jump to target
                         state.pc = target_pc.to_offset_int();
                         return Ok(InsnFunctionStepResult::Step);
@@ -2748,29 +2719,15 @@ pub fn op_seek(
                     _ => unreachable!(),
                 }
             } else {
-                println!("Using rowid: {}", int_key);
                 int_key
             };
             let mut cursor = state.get_cursor(*cursor_id);
             let cursor = cursor.as_btree_mut();
-            println!(
-                "About to call cursor.seek with rowid={}, actual_op={:?}",
-                rowid, actual_op
-            );
             let found = return_if_io!(cursor.seek(SeekKey::TableRowId(rowid), actual_op));
-            println!("cursor.seek returned found={}", found);
 
             if !found {
-                println!(
-                    "Not found, jumping to target_pc={}",
-                    target_pc.to_offset_int()
-                );
                 target_pc.to_offset_int()
             } else {
-                println!(
-                    "Not found, jumping to target_pc={}",
-                    target_pc.to_offset_int()
-                );
                 state.pc + 1
             }
         };

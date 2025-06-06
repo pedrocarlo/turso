@@ -1252,7 +1252,6 @@ fn emit_seek_termination(
             Some(Affinity::Numeric)
         };
     }
-    println!("#### emit_seek affinity####: {:?}", affinity);
     match (is_index, termination.op) {
         (true, SeekOp::GE) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,

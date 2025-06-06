@@ -88,7 +88,6 @@ mod tests {
                         );
 
                         log::trace!("query: {}", query);
-                        println!("query: {}", query);
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
