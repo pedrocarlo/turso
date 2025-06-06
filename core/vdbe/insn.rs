@@ -6,7 +6,7 @@ use std::{
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
-    schema::{BTreeTable, Index},
+    schema::{Affinity, BTreeTable, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::collate::CollationSeq,
 };
@@ -20,6 +20,7 @@ pub struct CmpInsFlags(usize);
 impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
+    const AFFINITY_MASK: usize = 0x0F;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -41,6 +42,17 @@ impl CmpInsFlags {
 
     pub fn has_nulleq(&self) -> bool {
         self.has(CmpInsFlags::NULL_EQ)
+    }
+
+    pub fn with_affinity(mut self, affinity: Affinity) -> Self {
+        let aff_code = affinity.to_char_code() as usize;
+        self.0 = (self.0 & !Self::AFFINITY_MASK) | aff_code;
+        self
+    }
+
+    pub fn get_affinity(&self) -> Affinity {
+        let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
+        Affinity::from_char_code(aff_code).unwrap_or(Affinity::Blob)
     }
 }
 
