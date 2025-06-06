@@ -4,7 +4,7 @@ use limbo_sqlite3_parser::ast::{self, SortOrder};
 use std::sync::Arc;
 
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{Affinity, Index, IndexColumn, Table},
     translate::{
         plan::{DistinctCtx, Distinctness},
         result_row::emit_select_result,
@@ -1230,14 +1230,29 @@ fn emit_seek_termination(
     }
     program.preassign_label_to_next_insn(loop_start);
     let mut rowid_reg = None;
+    let mut affinity = None;
     if !is_index {
         rowid_reg = Some(program.alloc_register());
         program.emit_insn(Insn::RowId {
             cursor_id: seek_cursor_id,
             dest: rowid_reg.unwrap(),
         });
-    }
 
+        affinity = if let Some(table_ref) = tables
+            .joined_tables()
+            .iter()
+            .find(|t| t.columns().iter().any(|c| c.is_rowid_alias))
+        {
+            if let Some(rowid_col_idx) = table_ref.columns().iter().position(|c| c.is_rowid_alias) {
+                Some(table_ref.columns()[rowid_col_idx].affinity())
+            } else {
+                Some(Affinity::Numeric)
+            }
+        } else {
+            Some(Affinity::Numeric)
+        };
+    }
+    println!("#### emit_seek affinity####: {:?}", affinity);
     match (is_index, termination.op) {
         (true, SeekOp::GE) => program.emit_insn(Insn::IdxGE {
             cursor_id: seek_cursor_id,
@@ -1267,28 +1282,36 @@ fn emit_seek_termination(
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::GT) => program.emit_insn(Insn::Gt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::LE) => program.emit_insn(Insn::Le {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (false, SeekOp::LT) => program.emit_insn(Insn::Lt {
             lhs: rowid_reg.unwrap(),
             rhs: start_reg,
             target_pc: loop_end,
-            flags: CmpInsFlags::default().jump_if_null(),
+            flags: CmpInsFlags::default()
+                .jump_if_null()
+                .with_affinity(affinity.unwrap()),
             collation: program.curr_collation(),
         }),
         (_, SeekOp::EQ) => {
