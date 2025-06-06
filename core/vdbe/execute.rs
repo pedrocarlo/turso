@@ -2702,7 +2702,7 @@ pub fn op_seek(
                             op
                         }
                     }
-                    Value::Text(_) => {
+                    Value::Text(_) | Value::Blob(_) => {
                         match op {
                             SeekOp::GT | SeekOp::GE => {
                                 // No integers are > or >= non-numeric text, jump to target (empty result)
