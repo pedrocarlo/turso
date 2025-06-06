@@ -544,37 +544,64 @@ pub fn op_eq(
     let lhs = *lhs;
     let rhs = *rhs;
     let target_pc = *target_pc;
-    let cond = *state.registers[lhs].get_owned_value() == *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
-    ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if (nulleq && cond) || (!nulleq && jump_if_null) {
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    // Fast path for integers
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value == rhs_value {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
             }
-        }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_eq() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        (lhs, rhs) => {
-            if *lhs == *rhs {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    // Handle NULL values
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        let cond = lhs_value == rhs_value; // Both NULL
+        if (nulleq && cond) || (!nulleq && jump_if_null) {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
+    ) {
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_eq()
+        }
+        (lhs, rhs) => *lhs == *rhs,
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
+    }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -599,37 +626,64 @@ pub fn op_ne(
     let lhs = *lhs;
     let rhs = *rhs;
     let target_pc = *target_pc;
-    let cond = *state.registers[lhs].get_owned_value() != *state.registers[rhs].get_owned_value();
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
-    ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if (nulleq && cond) || (!nulleq && jump_if_null) {
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    // Fast path for integers
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value != rhs_value {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
             }
-        }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_ne() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        (lhs, rhs) => {
-            if *lhs != *rhs {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    // Handle NULL values
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        let cond = lhs_value != rhs_value; // At least one NULL
+        if (nulleq && cond) || (!nulleq && jump_if_null) {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
+    ) {
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_ne()
+        }
+        (lhs, rhs) => *lhs != *rhs,
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
+    }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -656,33 +710,60 @@ pub fn op_lt(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
-    ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if jump_if_null {
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    // Fast path for integers
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value < rhs_value {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
             }
-        }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_lt() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        (lhs, rhs) => {
-            if *lhs < *rhs {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    // Handle NULL values
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        if jump_if_null {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
+    ) {
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_lt()
+        }
+        (lhs, rhs) => *lhs < *rhs,
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
+    }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -709,33 +790,60 @@ pub fn op_le(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
-    ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if jump_if_null {
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    // Fast path for integers
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value <= rhs_value {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
             }
-        }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_le() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        (lhs, rhs) => {
-            if *lhs <= *rhs {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    // Handle NULL values
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        if jump_if_null {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
+    ) {
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_le()
+        }
+        (lhs, rhs) => *lhs <= *rhs,
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
+    }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -762,33 +870,59 @@ pub fn op_gt(
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
-    ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if jump_if_null {
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    // Fast path for integers
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value > rhs_value {
                 state.pc = target_pc.to_offset_int();
             } else {
                 state.pc += 1;
             }
-        }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_gt() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        (lhs, rhs) => {
-            if *lhs > *rhs {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+        return Ok(InsnFunctionStepResult::Step);
     }
+
+    // Handle NULL values
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        if jump_if_null {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
+    ) {
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_gt()
+        }
+        (lhs, rhs) => *lhs > *rhs,
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
+    }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
     Ok(InsnFunctionStepResult::Step)
 }
 
@@ -807,41 +941,86 @@ pub fn op_ge(
         collation,
     } = insn
     else {
-        unreachable!("unexpected Insn {:?}", insn)
+        unreachable!("unexpected Insn: {:?}", insn)
     };
+
     assert!(target_pc.is_offset());
+
     let lhs = *lhs;
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
     let collation = collation.unwrap_or_default();
-    match (
-        state.registers[lhs].get_owned_value(),
-        state.registers[rhs].get_owned_value(),
+
+    let lhs_value = state.registers[lhs].get_owned_value();
+    let rhs_value = state.registers[rhs].get_owned_value();
+
+    println!("lhs_value: {:?}, rhs_value: {:?}", lhs_value, rhs_value);
+    println!("jump_if_null: {}", jump_if_null);
+
+    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+        if lhs_value >= rhs_value {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+        if jump_if_null {
+                state.pc = target_pc.to_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    let mut lhs_temp_reg = state.registers[lhs].clone();
+    let mut rhs_temp_reg = state.registers[rhs].clone();
+
+    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    println!(
+        "lhs_converted: {}, rhs_converted: {}",
+        lhs_converted, rhs_converted
+    );
+    println!(
+        "converted_lhs: {:?}, converted_rhs: {:?}",
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value()
+    );
+    let should_jump = match (
+        lhs_temp_reg.get_owned_value(),
+        rhs_temp_reg.get_owned_value(),
     ) {
-        (_, Value::Null) | (Value::Null, _) => {
-            if jump_if_null {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
+        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
+            let order = collation.compare_strings(lhs_text.as_str(), rhs_text.as_str());
+            order.is_ge()
         }
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            let order = collation.compare_strings(lhs.as_str(), rhs.as_str());
-            if order.is_ge() {
-                state.pc = target_pc.to_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
+
         (lhs, rhs) => {
             if *lhs >= *rhs {
-                state.pc = target_pc.to_offset_int();
+                true
             } else {
-                state.pc += 1;
+                false
             }
         }
+    };
+
+    if lhs_converted {
+        state.registers[lhs] = lhs_temp_reg;
     }
+    if rhs_converted {
+        state.registers[rhs] = rhs_temp_reg;
+    }
+
+    if should_jump {
+        state.pc = target_pc.to_offset_int();
+    } else {
+                state.pc += 1;
+            }
+
     Ok(InsnFunctionStepResult::Step)
 }
 
