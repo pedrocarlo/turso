@@ -20,7 +20,7 @@ pub struct CmpInsFlags(usize);
 impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
-    const AFFINITY_MASK: usize = 0x0F;
+    const AFFINITY_MASK: usize = 0x47;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
