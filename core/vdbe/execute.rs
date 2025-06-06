@@ -546,6 +546,8 @@ pub fn op_eq(
     let target_pc = *target_pc;
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -575,8 +577,61 @@ pub fn op_eq(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
 
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
@@ -628,6 +683,8 @@ pub fn op_ne(
     let target_pc = *target_pc;
     let nulleq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -657,8 +714,61 @@ pub fn op_ne(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
 
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
@@ -709,6 +819,8 @@ pub fn op_lt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -737,8 +849,61 @@ pub fn op_lt(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
 
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
@@ -789,6 +954,8 @@ pub fn op_le(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -817,8 +984,61 @@ pub fn op_le(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
 
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
@@ -869,6 +1089,8 @@ pub fn op_gt(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -897,8 +1119,60 @@ pub fn op_gt(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
 
     let should_jump = match (
         lhs_temp_reg.get_owned_value(),
@@ -950,6 +1224,8 @@ pub fn op_ge(
     let rhs = *rhs;
     let target_pc = *target_pc;
     let jump_if_null = flags.has_jump_if_null();
+    let affinity = flags.get_affinity();
+    println!("execute affinity: {:?}", affinity);
     let collation = collation.unwrap_or_default();
 
     let lhs_value = state.registers[lhs].get_owned_value();
@@ -979,8 +1255,60 @@ pub fn op_ge(
     let mut lhs_temp_reg = state.registers[lhs].clone();
     let mut rhs_temp_reg = state.registers[rhs].clone();
 
-    let lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
-    let rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+    let mut lhs_converted = false;
+    let mut rhs_converted = false;
+
+    match affinity {
+        Affinity::Numeric | Affinity::Integer => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if lhs_is_text {
+                    lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+                }
+                if rhs_is_text {
+                    rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+                }
+            }
+        }
+
+        Affinity::Text => {
+            let lhs_is_text = matches!(lhs_temp_reg.get_owned_value(), Value::Text(_));
+            let rhs_is_text = matches!(rhs_temp_reg.get_owned_value(), Value::Text(_));
+
+            if lhs_is_text || rhs_is_text {
+                if is_numeric_value(&lhs_temp_reg) {
+                    lhs_converted = stringify_register(&mut lhs_temp_reg);
+                }
+
+                if is_numeric_value(&rhs_temp_reg) {
+                    rhs_converted = stringify_register(&mut rhs_temp_reg);
+                }
+            }
+        }
+
+        Affinity::Real => {
+            if matches!(lhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                lhs_converted = apply_numeric_affinity(&mut lhs_temp_reg, false);
+            }
+            if matches!(rhs_temp_reg.get_owned_value(), Value::Text(_)) {
+                rhs_converted = apply_numeric_affinity(&mut rhs_temp_reg, false);
+            }
+
+            if let Value::Integer(i) = lhs_temp_reg.get_owned_value() {
+                lhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                lhs_converted = true;
+            }
+
+            if let Value::Integer(i) = rhs_temp_reg.get_owned_value() {
+                rhs_temp_reg = Register::Value(Value::Float(*i as f64));
+                rhs_converted = true;
+            }
+        }
+
+        Affinity::Blob => {} // Do nothing for blob affinity.
+    }
     println!(
         "lhs_converted: {}, rhs_converted: {}",
         lhs_converted, rhs_converted
@@ -6642,6 +6970,24 @@ pub fn apply_numeric_affinity(register: &mut Register, try_for_int: bool) -> boo
                 false
             }
         }
+    }
+}
+
+fn is_numeric_value(reg: &Register) -> bool {
+    matches!(reg.get_owned_value(), Value::Integer(_) | Value::Float(_))
+}
+
+fn stringify_register(reg: &mut Register) -> bool {
+    match reg.get_owned_value() {
+        Value::Integer(i) => {
+            *reg = Register::Value(Value::build_text(&i.to_string()));
+            true
+        }
+        Value::Float(f) => {
+            *reg = Register::Value(Value::build_text(&f.to_string()));
+            true
+        }
+        Value::Text(_) | Value::Null | Value::Blob(_) => false,
     }
 }
 
