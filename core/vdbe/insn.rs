@@ -942,12 +942,12 @@ impl Insn {
             Insn::Move { .. } => execute::op_move,
             Insn::IfPos { .. } => execute::op_if_pos,
             Insn::NotNull { .. } => execute::op_not_null,
-            Insn::Eq { .. } => execute::op_eq,
-            Insn::Ne { .. } => execute::op_ne,
-            Insn::Lt { .. } => execute::op_lt,
-            Insn::Le { .. } => execute::op_le,
-            Insn::Gt { .. } => execute::op_gt,
-            Insn::Ge { .. } => execute::op_ge,
+            Insn::Eq { .. }
+            | Insn::Ne { .. }
+            | Insn::Lt { .. }
+            | Insn::Le { .. }
+            | Insn::Gt { .. }
+            | Insn::Ge { .. } => execute::op_comparison,
             Insn::If { .. } => execute::op_if,
             Insn::IfNot { .. } => execute::op_if_not,
             Insn::OpenRead { .. } => execute::op_open_read,
