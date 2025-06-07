@@ -983,10 +983,10 @@ impl Insn {
             Insn::IdxRowId { .. } => execute::op_idx_row_id,
             Insn::SeekRowid { .. } => execute::op_seek_rowid,
             Insn::DeferredSeek { .. } => execute::op_deferred_seek,
-            Insn::SeekGE { .. } => execute::op_seek,
-            Insn::SeekGT { .. } => execute::op_seek,
-            Insn::SeekLE { .. } => execute::op_seek,
-            Insn::SeekLT { .. } => execute::op_seek,
+            Insn::SeekGE { .. }
+            | Insn::SeekGT { .. }
+            | Insn::SeekLE { .. }
+            | Insn::SeekLT { .. } => execute::op_seek,
             Insn::SeekEnd { .. } => execute::op_seek_end,
             Insn::IdxGE { .. } => execute::op_idx_ge,
             Insn::IdxGT { .. } => execute::op_idx_gt,
