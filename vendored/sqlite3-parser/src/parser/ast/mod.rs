@@ -731,6 +731,21 @@ impl Operator {
                 | Operator::NotEquals
         )
     }
+
+    /// Returns true if this operator is a comparison operator that may need affinity conversion
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            Self::Equals
+                | Self::NotEquals
+                | Self::Less
+                | Self::LessEquals
+                | Self::Greater
+                | Self::GreaterEquals
+                | Self::Is
+                | Self::IsNot
+        )
+    }
 }
 
 /// Unary operators

@@ -2221,19 +2221,10 @@ fn emit_binary_insn(
     referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
     let mut affinity = Affinity::Blob;
-    if matches!(
-        op,
-        ast::Operator::Equals
-            | ast::Operator::NotEquals
-            | ast::Operator::Less
-            | ast::Operator::LessEquals
-            | ast::Operator::Greater
-            | ast::Operator::GreaterEquals
-            | ast::Operator::Is
-            | ast::Operator::IsNot
-    ) {
+    if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables);
     }
+
     match op {
         ast::Operator::NotEquals => {
             let if_true_label = program.allocate_label();
