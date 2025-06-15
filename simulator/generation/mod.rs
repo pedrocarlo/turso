@@ -9,6 +9,7 @@ mod predicate;
 pub mod property;
 pub mod query;
 pub mod table;
+mod value;
 
 /// Arbitrary trait for generating random values
 /// An implementation of arbitrary is assumed to be a uniform sampling of
