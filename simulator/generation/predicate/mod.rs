@@ -74,11 +74,11 @@ impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
 
         // Produce some true and false predicates
         let mut true_predicates = (1..=rng.gen_range(1..=4))
-            .map(|_| Predicate::true_binary(rng, t, row))
+            .map(|_| SimplePredicate::arbitrary_from(rng, (t, row, true)).0)
             .collect::<Vec<_>>();
 
         let false_predicates = (0..=rng.gen_range(0..=3))
-            .map(|_| Predicate::false_binary(rng, t, row))
+            .map(|_| SimplePredicate::arbitrary_from(rng, (t, row, false)).0)
             .collect::<Vec<_>>();
 
         // Start building a top level predicate from a true predicate
