@@ -1801,6 +1801,7 @@ dependencies = [
 name = "limbo_core"
 version = "0.0.22"
 dependencies = [
+ "antithesis_sdk",
  "bitflags 2.9.0",
  "built",
  "cfg_block",
