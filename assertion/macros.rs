@@ -185,8 +185,9 @@ macro_rules! valueset {
         {
             #[allow(unused_imports)]
             use $crate::field::{debug, display, Value};
-            let mut iter = $fields.iter();
-            $fields.value_set($crate::valueset!(
+            let fields = $fields;
+            let mut iter = fields.iter();
+            fields.value_set($crate::valueset!(
                 @ { },
                 core::iter::Iterator::next(&mut iter).expect("FieldSet corrupted (this is a bug)"),
                 $($kvs)+
@@ -205,10 +206,7 @@ macro_rules! valueset {
 macro_rules! fieldset {
     // == base case ==
     (@ { $(,)* $($out:expr),* $(,)* } $(,)*) => {
-        {
-            const FIELDS: &[&str] = &[ $($out),* ];
-            FIELDS
-        }
+        &[ $($out),* ]
     };
 
     // == recursive cases (more tts) ==
@@ -283,7 +281,11 @@ macro_rules! __assert_stringify {
 #[macro_export]
 macro_rules! event {
     ({ $($fields:tt)* } )=> ({
-        $crate::valueset!($crate::field::FieldSet::new($crate::fieldset!( $($fields)* )), $($fields)*)
+        static FIELDS: $crate::field::FieldSet = $crate::field::FieldSet::new($crate::fieldset!( $($fields)* ));
+        (|value_set: $crate::field::ValueSet| {
+            dbg!(&value_set);
+            assert!(true);
+        })($crate::valueset!(&FIELDS, $($fields)*));
     });
     ({ $($fields:tt)* }, $($arg:tt)+ ) => (
         $crate::event!(
@@ -319,13 +321,24 @@ macro_rules! event {
 #[cfg(test)]
 mod tests {
 
+    #[derive(Debug)]
+    struct Test {
+        a: &'static str,
+        b: Vec<String>,
+        c: std::time::Instant,
+    }
+
     #[test]
     fn test1() {
         let val = 1;
-        let test = 10;
+        let test = "test";
 
-        let x = event!(val);
-        let y = event!(test);
-        dbg!(&x);
+        let new_test = Test {
+            a: "legit test",
+            b: vec!["uhm".to_string(), "sjdkfns".to_string()],
+            c: std::time::Instant::now(),
+        };
+
+        event!(val, a = test, debug_struct = ?new_test);
     }
 }

@@ -162,6 +162,7 @@ pub struct FieldSet {
 /// A set of fields and values for a span.
 pub struct ValueSet<'a> {
     values: &'a [(&'a Field, Option<&'a (dyn Value + 'a)>)],
+    #[allow(dead_code)]
     fields: &'a FieldSet,
 }
 
@@ -351,6 +352,7 @@ where
 
 /// Wraps a type implementing `fmt::Debug` as a `Value` that can be
 /// recorded using its `Debug` implementation.
+#[allow(dead_code)]
 pub fn debug<T>(t: T) -> DebugValue<T>
 where
     T: fmt::Debug,
@@ -843,12 +845,6 @@ impl Iterator for Iter {
 }
 
 // ===== impl ValueSet =====
-
-impl ValueSet<'_> {
-    pub(crate) fn field_set(&self) -> &FieldSet {
-        self.fields
-    }
-}
 
 impl fmt::Debug for ValueSet<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
