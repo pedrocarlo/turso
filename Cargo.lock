@@ -187,6 +187,9 @@ dependencies = [
 [[package]]
 name = "assertion"
 version = "0.0.22"
+dependencies = [
+ "once_cell",
+]
 
 [[package]]
 name = "autocfg"
