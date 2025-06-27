@@ -36,6 +36,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::storage::{header_accessor, wal::DummyWAL};
 use crate::translate::optimizer::optimize_plan;
+use crate::types::CursorResult;
 use crate::vtab::VirtualTable;
 use core::str;
 pub use error::LimboError;
@@ -247,11 +248,13 @@ impl Database {
                 self.init_lock.clone(),
             )?);
 
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as u32;
-            let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+            let page_size =
+                CursorResult::block_on(&*pager.io, || header_accessor::get_page_size(&pager))
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
+            let default_cache_size = CursorResult::block_on(&*pager.io, || {
+                header_accessor::get_default_page_cache_size(&pager)
+            })
+            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
             pager.buffer_pool.set_page_size(page_size as usize);
             let conn = Arc::new(Connection {
                 _db: self.clone(),
@@ -286,10 +289,13 @@ impl Database {
             is_empty,
             Arc::new(Mutex::new(())),
         )?;
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
-        let default_cache_size = header_accessor::get_default_page_cache_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
+        let page_size =
+            CursorResult::block_on(&*pager.io, || header_accessor::get_page_size(&pager))
+                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as u32;
+        let default_cache_size = CursorResult::block_on(&*pager.io, || {
+            header_accessor::get_default_page_cache_size(&pager)
+        })
+        .unwrap_or(storage::sqlite3_ondisk::DEFAULT_CACHE_SIZE);
 
         let wal_path = format!("{}-wal", self.path);
         let file = self.io.open_file(&wal_path, OpenFlags::Create, false)?;

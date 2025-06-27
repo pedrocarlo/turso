@@ -1541,6 +1541,21 @@ pub enum CursorResult<T> {
     IO,
 }
 
+impl<T> CursorResult<T> {
+    /// While `predicate` is true, we will run `io` once.
+    pub fn block_on(
+        io: &dyn crate::IO,
+        predicate: impl Fn() -> crate::Result<Self>,
+    ) -> crate::Result<T> {
+        loop {
+            match predicate()? {
+                CursorResult::Ok(t) => return Ok(t),
+                CursorResult::IO => io.run_once()?,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 /// The match condition of a table/index seek.
 pub enum SeekOp {

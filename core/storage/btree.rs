@@ -3027,7 +3027,10 @@ impl BTreeCursor {
                     assert_eq!(left_pointer, page.get().get().id as u32);
                     // FIXME: remove this lock
                     assert!(
-                        left_pointer <= header_accessor::get_database_size(&self.pager)?,
+                        left_pointer
+                            <= CursorResult::block_on(&*self.pager.io, || {
+                                header_accessor::get_database_size(&self.pager)
+                            })?,
                         "invalid page number divider left pointer {} > database number of pages",
                         left_pointer,
                     );
@@ -4662,7 +4665,9 @@ impl BTreeCursor {
                 OverflowState::ProcessPage { next_page } => {
                     if next_page < 2
                         || next_page as usize
-                            > header_accessor::get_database_size(&self.pager)? as usize
+                            > CursorResult::block_on(&*self.pager.io, || {
+                                header_accessor::get_database_size(&self.pager)
+                            })? as usize
                     {
                         self.overflow_state = None;
                         return Err(LimboError::Corrupt("Invalid overflow page number".into()));
@@ -7418,7 +7423,10 @@ mod tests {
             pager.allocate_page().unwrap();
         }
 
-        header_accessor::set_page_size(&pager, page_size as u16).unwrap();
+        CursorResult::block_on(&*pager.io, || {
+            header_accessor::set_page_size(&pager, page_size as u16)
+        })
+        .unwrap();
 
         pager
     }
@@ -7441,7 +7449,8 @@ mod tests {
             let drop_fn = Rc::new(|_buf| {});
             #[allow(clippy::arc_with_non_send_sync)]
             let buf = Arc::new(RefCell::new(Buffer::allocate(
-                header_accessor::get_page_size(&pager)? as usize,
+                CursorResult::block_on(&*pager.io, || header_accessor::get_page_size(&pager))?
+                    as usize,
                 drop_fn,
             )));
             let write_complete = Box::new(|_| {});
@@ -7484,20 +7493,25 @@ mod tests {
             payload_size: large_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages =
+            CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(&pager))?;
         // Clear overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
         match clear_result {
             CursorResult::Ok(_) => {
                 // Verify proper number of pages were added to freelist
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
+                    CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(
+                        &pager
+                    ))?,
                     initial_freelist_pages + 3,
                     "Expected 3 pages to be added to freelist"
                 );
 
                 // If this is first trunk page
-                let trunk_page_id = header_accessor::get_freelist_trunk_page(&pager)?;
+                let trunk_page_id = CursorResult::block_on(&*pager.io, || {
+                    header_accessor::get_freelist_trunk_page(&pager)
+                })?;
                 if trunk_page_id > 0 {
                     // Verify trunk page structure
                     let trunk_page = cursor.read_page(trunk_page_id as usize)?;
@@ -7540,7 +7554,8 @@ mod tests {
             payload_size: small_payload.len() as u64,
         });
 
-        let initial_freelist_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_freelist_pages =
+            CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(&pager))?;
 
         // Try to clear non-existent overflow pages
         let clear_result = cursor.clear_overflow_pages(&leaf_cell)?;
@@ -7548,14 +7563,18 @@ mod tests {
             CursorResult::Ok(_) => {
                 // Verify freelist was not modified
                 assert_eq!(
-                    header_accessor::get_freelist_pages(&pager)?,
+                    CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(
+                        &pager
+                    ))?,
                     initial_freelist_pages,
                     "Freelist should not change when no overflow pages exist"
                 );
 
                 // Verify trunk page wasn't created
                 assert_eq!(
-                    header_accessor::get_freelist_trunk_page(&pager)?,
+                    CursorResult::block_on(&*pager.io, || {
+                        header_accessor::get_freelist_trunk_page(&pager)
+                    })?,
                     0,
                     "No trunk page should be created when no overflow pages exist"
                 );
@@ -7625,18 +7644,21 @@ mod tests {
 
         // Verify structure before destruction
         assert_eq!(
-            header_accessor::get_database_size(&pager)?,
+            CursorResult::block_on(&*pager.io, || header_accessor::get_database_size(&pager))?,
             4, // We should have pages 1-4
             "Database should have 4 pages total"
         );
 
         // Track freelist state before destruction
-        let initial_free_pages = header_accessor::get_freelist_pages(&pager)?;
+        let initial_free_pages =
+            CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(&pager))?;
         assert_eq!(initial_free_pages, 0, "should start with no free pages");
 
         run_until_done(|| cursor.btree_destroy(), pager.deref())?;
 
-        let pages_freed = header_accessor::get_freelist_pages(&pager)? - initial_free_pages;
+        let pages_freed =
+            CursorResult::block_on(&*pager.io, || header_accessor::get_freelist_pages(&pager))?
+                - initial_free_pages;
         assert_eq!(pages_freed, 3, "should free 3 pages (root + 2 leaves)");
 
         Ok(())

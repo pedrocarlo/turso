@@ -3,6 +3,7 @@
 
 use limbo_sqlite3_parser::ast::PragmaName;
 use limbo_sqlite3_parser::ast::{self, Expr};
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -10,6 +11,7 @@ use crate::schema::Schema;
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::sqlite3_ondisk::MIN_PAGE_CACHE_SIZE;
 use crate::storage::wal::CheckpointMode;
+use crate::types::CursorResult;
 use crate::util::{normalize_ident, parse_signed_number};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::{Cookie, Insn};
@@ -342,11 +344,10 @@ fn query_pragma(
             program.emit_result_row(register, 1);
         }
         PragmaName::PageSize => {
-            program.emit_int(
-                header_accessor::get_page_size(&pager)
-                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64,
-                register,
-            );
+            let page_size =
+                CursorResult::block_on(pager.io.deref(), || header_accessor::get_page_size(&pager))
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
+            program.emit_int(page_size, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
         }
@@ -379,7 +380,9 @@ fn update_auto_vacuum_mode(
     largest_root_page_number: u32,
     pager: Rc<Pager>,
 ) -> crate::Result<()> {
-    header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)?;
+    CursorResult::block_on(&*pager.io, || {
+        header_accessor::set_vacuum_mode_largest_root_page(&pager, largest_root_page_number)
+    })?;
     pager.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
@@ -392,9 +395,10 @@ fn update_cache_size(
     let mut cache_size_unformatted: i64 = value;
     let mut cache_size = if cache_size_unformatted < 0 {
         let kb = cache_size_unformatted.abs() * 1024;
-        let page_size = header_accessor::get_page_size(&pager)
-            .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
-        kb / page_size as i64
+        let page_size =
+            CursorResult::block_on(pager.io.deref(), || header_accessor::get_page_size(&pager))
+                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as i64;
+        kb / page_size
     } else {
         value
     } as usize;

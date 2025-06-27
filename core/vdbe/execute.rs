@@ -3700,7 +3700,9 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SqliteVersion => {
-                let version_integer: i64 = header_accessor::get_version_number(pager)? as i64;
+                let version_integer: i64 = CursorResult::block_on(&*pager.io, || {
+                    header_accessor::get_version_number(pager)
+                })? as i64;
                 let version = execute_sqlite_version(version_integer);
                 state.registers[*dest] = Register::Value(Value::build_text(version));
             }
@@ -4905,7 +4907,8 @@ pub fn op_page_count(
         // TODO: implement temp databases
         todo!("temp databases not implemented yet");
     }
-    let count = header_accessor::get_database_size(pager)?.into();
+    let count =
+        CursorResult::block_on(&*pager.io, || header_accessor::get_database_size(pager))?.into();
     state.registers[*dest] = Register::Value(Value::Integer(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4982,11 +4985,16 @@ pub fn op_read_cookie(
         todo!("temp databases not implemented yet");
     }
     let cookie_value = match cookie {
-        Cookie::UserVersion => header_accessor::get_user_version(pager)?.into(),
-        Cookie::SchemaVersion => header_accessor::get_schema_cookie(pager)?.into(),
-        Cookie::LargestRootPageNumber => {
-            header_accessor::get_vacuum_mode_largest_root_page(pager)?.into()
+        Cookie::UserVersion => {
+            CursorResult::block_on(&*pager.io, || header_accessor::get_user_version(pager))?.into()
         }
+        Cookie::SchemaVersion => {
+            CursorResult::block_on(&*pager.io, || header_accessor::get_schema_cookie(pager))?.into()
+        }
+        Cookie::LargestRootPageNumber => CursorResult::block_on(&*pager.io, || {
+            header_accessor::get_vacuum_mode_largest_root_page(pager)
+        })?
+        .into(),
         cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
     };
     state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
@@ -5015,13 +5023,19 @@ pub fn op_set_cookie(
     }
     match cookie {
         Cookie::UserVersion => {
-            header_accessor::set_user_version(pager, *value)?;
+            CursorResult::block_on(&*pager.io, || {
+                header_accessor::set_user_version(pager, *value)
+            })?;
         }
         Cookie::LargestRootPageNumber => {
-            header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)?;
+            CursorResult::block_on(&*pager.io, || {
+                header_accessor::set_vacuum_mode_largest_root_page(pager, *value as u32)
+            })?;
         }
         Cookie::IncrementalVacuum => {
-            header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)?;
+            CursorResult::block_on(&*pager.io, || {
+                header_accessor::set_incremental_vacuum_enabled(pager, *value as u32)
+            })?;
         }
         cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
     }
@@ -5231,9 +5245,9 @@ pub fn op_open_ephemeral(
                 Arc::new(Mutex::new(())),
             )?);
 
-            let page_size = header_accessor::get_page_size(&pager)
-                .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE)
-                as usize;
+            let page_size =
+                CursorResult::block_on(&*pager.io, || header_accessor::get_page_size(&pager))
+                    .unwrap_or(storage::sqlite3_ondisk::DEFAULT_PAGE_SIZE) as usize;
             buffer_pool.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
