@@ -4,6 +4,7 @@ use crate::{
         pager::{PageRef, Pager},
         sqlite3_ondisk::DATABASE_HEADER_PAGE_ID,
     },
+    types::CursorResult,
     LimboError, Result,
 };
 use std::sync::atomic::Ordering;
@@ -32,37 +33,72 @@ const HEADER_OFFSET_APPLICATION_ID: usize = 68;
 const HEADER_OFFSET_VERSION_VALID_FOR: usize = 92;
 const HEADER_OFFSET_VERSION_NUMBER: usize = 96;
 
+#[derive(Debug, Default)]
+pub enum GetHeaderState {
+    #[default]
+    Start,
+    IO {
+        page: std::sync::Arc<crate::Page>,
+    },
+}
+
 // Helper to get a read-only reference to the header page.
-fn get_header_page(pager: &Pager) -> Result<PageRef> {
-    if pager.is_empty.load(Ordering::SeqCst) < 2 {
-        return Err(LimboError::InternalError(
-            "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
-        ));
-    }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    while !page.is_loaded() || page.is_locked() {
-        // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
-        pager.io.run_once()?;
-    }
-    Ok(page)
+fn get_header_page(pager: &Pager) -> Result<CursorResult<PageRef>> {
+    let mut header_state = pager.get_header_state.borrow_mut();
+    let page = loop {
+        match &mut *header_state {
+            GetHeaderState::Start => {
+                if pager.is_empty.load(Ordering::SeqCst) < 2 {
+                    return Err(LimboError::InternalError(
+                        "Database is empty, header does not exist - page 1 should've been allocated before this".to_string(),
+                    ));
+                }
+                let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
+                *header_state = GetHeaderState::IO { page };
+            }
+            GetHeaderState::IO { page } => {
+                if !page.is_loaded() || page.is_locked() {
+                    pager.io.run_once()?;
+                    return Ok(CursorResult::IO);
+                } else {
+                    break page.clone();
+                }
+            }
+        };
+    };
+    *header_state = GetHeaderState::Start;
+    Ok(CursorResult::Ok(page))
 }
 
 // Helper to get a writable reference to the header page and mark it dirty.
-fn get_header_page_for_write(pager: &Pager) -> Result<PageRef> {
-    if pager.is_empty.load(Ordering::SeqCst) < 2 {
-        // This should not be called on an empty DB for writing, as page 1 is allocated on first transaction.
-        return Err(LimboError::InternalError(
-            "Cannot write to header of an empty database - page 1 should've been allocated before this".to_string(),
-        ));
-    }
-    let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
-    while !page.is_loaded() || page.is_locked() {
-        // FIXME: LETS STOP DOING THESE SYNCHRONOUS IO HACKS
-        pager.io.run_once()?;
-    }
-    page.set_dirty();
-    pager.add_dirty(DATABASE_HEADER_PAGE_ID);
-    Ok(page)
+fn get_header_page_for_write(pager: &Pager) -> Result<CursorResult<PageRef>> {
+    let mut header_state = pager.get_header_state.borrow_mut();
+    let page = loop {
+        match &mut *header_state {
+            GetHeaderState::Start => {
+                if pager.is_empty.load(Ordering::SeqCst) < 2 {
+                    // This should not be called on an empty DB for writing, as page 1 is allocated on first transaction.
+                    return Err(LimboError::InternalError(
+                        "Cannot write to header of an empty database - page 1 should've been allocated before this".to_string(),
+                    ));
+                }
+                let page = pager.read_page(DATABASE_HEADER_PAGE_ID)?;
+                *header_state = GetHeaderState::IO { page };
+            }
+            GetHeaderState::IO { page } => {
+                if !page.is_loaded() || page.is_locked() {
+                    pager.io.run_once()?;
+                    return Ok(CursorResult::IO);
+                } else {
+                    page.set_dirty();
+                    pager.add_dirty(DATABASE_HEADER_PAGE_ID);
+                    break page.clone();
+                }
+            }
+        };
+    };
+    *header_state = GetHeaderState::Start;
+    Ok(CursorResult::Ok(page))
 }
 
 /// Helper macro to implement getters and setters for header fields.
@@ -87,11 +123,14 @@ macro_rules! impl_header_field_accessor {
     ($field_name:ident, $type:ty, $offset:expr $(, $ifzero:expr)?) => {
         paste::paste! {
             #[allow(dead_code)]
-            pub fn [<get_ $field_name>](pager: &Pager) -> Result<$type> {
+            pub fn [<get_ $field_name>](pager: &Pager) -> Result<CursorResult<$type>> {
                 if pager.is_empty.load(Ordering::SeqCst) < 2 {
                     return Err(LimboError::InternalError(format!("Database is empty, header does not exist - page 1 should've been allocated before this")));
                 }
-                let page = get_header_page(pager)?;
+                let page = match get_header_page(pager)? {
+                    CursorResult::Ok(p) => p,
+                    CursorResult::IO => return Ok(CursorResult::IO),
+                };
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
                 let buf = page_content.buffer.borrow();
@@ -101,15 +140,18 @@ macro_rules! impl_header_field_accessor {
                 let value = <$type>::from_be_bytes(bytes);
                 $(
                     if value == 0 {
-                        return Ok($ifzero);
+                        return Ok(CursorResult::Ok($ifzero));
                     }
                 )?
-                Ok(value)
+                Ok(CursorResult::Ok(value))
             }
 
             #[allow(dead_code)]
-            pub fn [<set_ $field_name>](pager: &Pager, value: $type) -> Result<()> {
-                let page = get_header_page_for_write(pager)?;
+            pub fn [<set_ $field_name>](pager: &Pager, value: $type) -> Result<CursorResult<()>> {
+                let page = match get_header_page_for_write(pager)? {
+                    CursorResult::Ok(p) => p,
+                    CursorResult::IO => return Ok(CursorResult::IO),
+                };
                 let page_inner = page.get();
                 let page_content = page_inner.contents.as_ref().unwrap();
                 let mut buf = page_content.buffer.borrow_mut();
@@ -117,7 +159,7 @@ macro_rules! impl_header_field_accessor {
                 buf_slice[$offset..$offset + std::mem::size_of::<$type>()].copy_from_slice(&value.to_be_bytes());
                 page.set_dirty();
                 pager.add_dirty(1);
-                Ok(())
+                Ok(CursorResult::Ok(()))
             }
         }
     };

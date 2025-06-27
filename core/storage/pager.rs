@@ -2,7 +2,7 @@ use crate::result::LimboResult;
 use crate::storage::btree::BTreePageInner;
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
-use crate::storage::header_accessor;
+use crate::storage::header_accessor::{self, GetHeaderState};
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal, WalFsyncStatus};
 use crate::types::CursorResult;
@@ -222,6 +222,7 @@ pub struct Pager {
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     allocate_page1_state: RefCell<AllocatePage1State>,
+    pub get_header_state: core::cell::RefCell<GetHeaderState>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -286,6 +287,7 @@ impl Pager {
             is_empty,
             init_lock,
             allocate_page1_state,
+            get_header_state: core::cell::RefCell::new(GetHeaderState::Start),
         })
     }
 
