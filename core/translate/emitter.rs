@@ -558,6 +558,7 @@ fn emit_delete_insns(
                     cursor_id: main_table_cursor_id,
                     dest: start_reg + num_regs - 1,
                 });
+                dbg!(start_reg, num_regs);
                 program.emit_insn(Insn::IdxDelete {
                     start_reg,
                     num_regs,

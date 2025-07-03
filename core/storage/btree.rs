@@ -5107,6 +5107,7 @@ impl BTreeCursor {
     }
 
     /// If context is defined, restore it and set it None on success
+    #[instrument(skip_all, level = Level::TRACE)]
     fn restore_context(&mut self) -> Result<CursorResult<()>> {
         if self.context.is_none() || !matches!(self.valid_state, CursorValidState::RequireSeek) {
             return Ok(CursorResult::Ok(()));
