@@ -26,3 +26,22 @@ do_execsql_test values-in-join {
   select * from (values(1, 2)) join (values(3, 4), (5, 6));
 } {1|2|3|4
   1|2|5|6};
+
+# Regression tests for double-quoted strings in VALUES statements
+do_execsql_test_on_specific_db {:memory:} values-double-quotes-simple {
+    VALUES ("double_quoted_string");
+} {double_quoted_string}
+
+do_execsql_test_on_specific_db {:memory:} values-double-quotes-multiple {
+    VALUES ("first", "second"), ("third", "fourth");
+} {first|second
+third|fourth}
+
+do_execsql_test_on_specific_db {:memory:} values-mixed-quotes {
+    VALUES ("double", 'single'), ('single', "double");
+} {double|single
+single|double}
+
+do_execsql_test_on_specific_db {:memory:} values-double-quotes-subquery {
+    SELECT * FROM (VALUES ("subquery_string"));
+} {subquery_string}
