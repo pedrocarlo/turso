@@ -660,8 +660,17 @@ mod tests {
             }
 
             loop {
-                if let IOResult::IO = sorter.sort().expect("Failed to sort the records") {
-                    io.run_once().expect("Failed to run the IO");
+                if let IOResult::IO(io_c) = sorter.sort().expect("Failed to sort the records") {
+                    match io_c {
+                        IOCompletions::Single(c) => {
+                            io.wait_for_completion(c).expect("Failed to run the IO")
+                        }
+                        IOCompletions::Many(completions) => {
+                            for c in completions {
+                                io.wait_for_completion(c).expect("Failed to run the IO");
+                            }
+                        }
+                    }
                     continue;
                 }
                 break;
@@ -678,8 +687,17 @@ mod tests {
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
                 loop {
-                    if let IOResult::IO = sorter.next().expect("Failed to get the next record") {
-                        io.run_once().expect("Failed to run the IO");
+                    if let IOResult::IO(io_c) = sorter.sort().expect("Failed to sort the records") {
+                        match io_c {
+                            IOCompletions::Single(c) => {
+                                io.wait_for_completion(c).expect("Failed to run the IO")
+                            }
+                            IOCompletions::Many(completions) => {
+                                for c in completions {
+                                    io.wait_for_completion(c).expect("Failed to run the IO");
+                                }
+                            }
+                        }
                         continue;
                     }
                     break;
