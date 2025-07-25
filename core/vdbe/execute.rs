@@ -58,7 +58,7 @@ use crate::{
     vector::{vector32, vector64, vector_distance_cos, vector_distance_l2, vector_extract},
 };
 
-use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState};
+use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, TransactionState};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -1880,11 +1880,8 @@ pub fn halt(
         }
     }
     match program.commit_txn(pager.clone(), state, mv_store, false)? {
-        StepResult::Done => Ok(InsnFunctionStepResult::Done),
-        StepResult::IO => Ok(InsnFunctionStepResult::IO),
-        StepResult::Row => Ok(InsnFunctionStepResult::Row),
-        StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-        StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -1928,11 +1925,8 @@ pub fn op_halt(
     tracing::trace!("op_halt(auto_commit={})", auto_commit);
     if auto_commit {
         match program.commit_txn(pager.clone(), state, mv_store, false)? {
-            StepResult::Done => Ok(InsnFunctionStepResult::Done),
-            StepResult::IO => Ok(InsnFunctionStepResult::IO),
-            StepResult::Row => Ok(InsnFunctionStepResult::Row),
-            StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-            StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+            IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+            IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
         }
     } else {
         Ok(InsnFunctionStepResult::Done)
@@ -2048,11 +2042,8 @@ pub fn op_auto_commit(
     let conn = program.connection.clone();
     if state.commit_state == CommitState::Committing {
         return match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
-            super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
-            super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
-            super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
-            super::StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-            super::StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+            IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+            IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
         };
     }
     let schema_did_change =
@@ -2084,11 +2075,8 @@ pub fn op_auto_commit(
         ));
     }
     match program.commit_txn(pager.clone(), state, mv_store, *rollback)? {
-        super::StepResult::Done => Ok(InsnFunctionStepResult::Done),
-        super::StepResult::IO => Ok(InsnFunctionStepResult::IO),
-        super::StepResult::Row => Ok(InsnFunctionStepResult::Row),
-        super::StepResult::Interrupt => Ok(InsnFunctionStepResult::Interrupt),
-        super::StepResult::Busy => Ok(InsnFunctionStepResult::Busy),
+        IOResult::Done(_) => Ok(InsnFunctionStepResult::Done),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -3597,7 +3585,7 @@ pub fn op_sorter_insert(
             _ => unreachable!("SorterInsert on non-record register"),
         };
         match cursor.insert(record)? {
-            IOResult::Done(_) => {},
+            IOResult::Done(_) => {}
             IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
         }
     }
