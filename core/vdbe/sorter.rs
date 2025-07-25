@@ -601,6 +601,8 @@ enum SortedChunkIOState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::translate::collate::CollationSeq;
     use crate::types::{ImmutableRecord, RefValue, Value, ValueType};
@@ -651,12 +653,9 @@ mod tests {
                 values.append(&mut generate_values(&mut rng, &value_types));
                 let record = ImmutableRecord::from_values(&values, values.len());
 
-                sorter.insert(&record).expect("Failed to insert the record");
-                initial_records.push(record);
-            }
-
-            loop {
-                if let IOResult::IO(io_c) = sorter.sort().expect("Failed to sort the records") {
+                while let IOResult::IO(io_c) =
+                    sorter.insert(&record).expect("Failed to insert the record")
+                {
                     match io_c {
                         IOCompletions::Single(c) => {
                             io.wait_for_completion(c).expect("Failed to run the IO")
@@ -667,9 +666,21 @@ mod tests {
                             }
                         }
                     }
-                    continue;
                 }
-                break;
+                initial_records.push(record);
+            }
+
+            while let IOResult::IO(io_c) = sorter.sort().expect("Failed to sort the records") {
+                match io_c {
+                    IOCompletions::Single(c) => {
+                        io.wait_for_completion(c).expect("Failed to run the IO")
+                    }
+                    IOCompletions::Many(completions) => {
+                        for c in completions {
+                            io.wait_for_completion(c).expect("Failed to run the IO");
+                        }
+                    }
+                }
             }
 
             assert!(!sorter.is_empty());
