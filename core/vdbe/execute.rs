@@ -2329,11 +2329,13 @@ pub fn op_row_id(
                 rowid,
                 table_cursor_id,
             } => {
-                let mut table_cursor = state.get_cursor(table_cursor_id);
-                let table_cursor = table_cursor.as_btree_mut();
-                return_if_io!(
-                    table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                );
+                {
+                    let mut table_cursor = state.get_cursor(table_cursor_id);
+                    let table_cursor = table_cursor.as_btree_mut();
+                    return_if_io!(
+                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                    );
+                }
                 state.op_row_id_state = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
@@ -2570,16 +2572,15 @@ pub fn op_seek(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(SeekInternalResult::IO) => Ok(InsnFunctionStepResult::IO),
+        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => Err(e),
     }
 }
 
-#[derive(Debug, PartialEq)]
 pub enum SeekInternalResult {
     Found,
     NotFound,
-    IO,
+    IO(IOCompletions),
 }
 pub enum RecordSource {
     Unpacked { start_reg: usize, num_regs: usize },
@@ -2733,16 +2734,16 @@ pub fn seek_internal(
                         let mut cursor = state.get_cursor(cursor_id);
                         let cursor = cursor.as_btree_mut();
                         let seek_key = match key {
-                        OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
-                        OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
-                        OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
-                            Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
-                        }
-                    };
+                            OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
+                            OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
+                            OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
+                                Register::Record(ref record) => SeekKey::IndexKey(record),
+                                _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                            }
+                        };
                         match cursor.seek(seek_key, *op)? {
                             IOResult::Done(seek_result) => seek_result,
-                            IOResult::IO => return Ok(SeekInternalResult::IO),
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
                     let found = match seek_result {
@@ -2788,7 +2789,7 @@ pub fn seek_internal(
                         };
                         match result {
                             IOResult::Done(found) => found,
-                            IOResult::IO => return Ok(SeekInternalResult::IO),
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
                     return Ok(if found {
@@ -2802,7 +2803,7 @@ pub fn seek_internal(
                     let cursor = cursor.as_btree_mut();
                     match cursor.last()? {
                         IOResult::Done(()) => {}
-                        IOResult::IO => return Ok(SeekInternalResult::IO),
+                        IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                     }
                     // the MoveLast variant is only used for SeekOp::LT and SeekOp::LE when the seek condition is always true,
                     // so we have always found what we were looking for.
@@ -2822,7 +2823,7 @@ pub fn seek_internal(
         is_index,
         op,
     );
-    if !matches!(result, Ok(SeekInternalResult::IO)) {
+    if !matches!(result, Ok(SeekInternalResult::IO(..))) {
         state.seek_state = OpSeekState::Start;
     }
     result
@@ -5095,7 +5096,7 @@ pub fn op_idx_delete(
                 ) {
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO) => return Ok(InsnFunctionStepResult::IO),
+                    Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     Err(e) => return Err(e),
                 };
 
@@ -5216,7 +5217,7 @@ pub fn op_idx_insert(
                     state.op_idx_insert_state = OpIdxInsertState::Insert { moved_before: true };
                     Ok(InsnFunctionStepResult::Step)
                 }
-                SeekInternalResult::IO => Ok(InsnFunctionStepResult::IO),
+                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
             }
         }
         OpIdxInsertState::UniqueConstraintCheck => {
@@ -5570,7 +5571,7 @@ pub fn op_no_conflict(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        SeekInternalResult::IO => Ok(InsnFunctionStepResult::IO),
+        SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
     }
 }
 
@@ -6373,7 +6374,7 @@ pub fn op_found(
     ) {
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
-        Ok(SeekInternalResult::IO) => return Ok(InsnFunctionStepResult::IO),
+        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
         Err(e) => return Err(e),
     };
 
