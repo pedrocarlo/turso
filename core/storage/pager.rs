@@ -1788,7 +1788,7 @@ impl Pager {
                         trunk_page,
                         current_db_size: new_db_size,
                     };
-                    return Ok(IOResult::IO);
+                    // return Ok(IOResult::IO);
                 }
                 AllocatePageState::SearchAvailableFreeListLeaf {
                     trunk_page,
