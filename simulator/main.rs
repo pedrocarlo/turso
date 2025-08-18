@@ -28,6 +28,7 @@ mod generation;
 mod model;
 mod runner;
 mod shrink;
+mod tui;
 
 fn main() -> anyhow::Result<()> {
     init_logger();
