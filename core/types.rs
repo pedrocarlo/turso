@@ -6,6 +6,7 @@ use turso_parser::ast::SortOrder;
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::numeric::format_float;
+use crate::io::CompletionBuilder;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::BTreeCursor;
@@ -2468,7 +2469,7 @@ impl IOCompletions {
 #[must_use]
 pub enum IOResult<T> {
     Done(T),
-    IO(IOCompletions),
+    IO(CompletionBuilder),
 }
 
 impl<T> IOResult<T> {
