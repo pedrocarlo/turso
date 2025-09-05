@@ -1,6 +1,6 @@
 #![allow(unused_variables)]
 use crate::function::AlterTableFunc;
-use crate::io::CompletionBuilder;
+use crate::io::CompletionFuture;
 use crate::numeric::{NullableInteger, Numeric};
 use crate::schema::Table;
 use crate::storage::btree::{
@@ -155,7 +155,7 @@ fn compare_with_collation(
 
 pub enum InsnFunctionStepResult {
     Done,
-    IO(CompletionBuilder),
+    IO(CompletionFuture),
     Row,
     Interrupt,
     Busy,
@@ -2780,7 +2780,7 @@ pub fn op_seek(
 pub enum SeekInternalResult {
     Found,
     NotFound,
-    IO(CompletionBuilder),
+    IO(CompletionFuture),
 }
 #[derive(Clone, Copy)]
 pub enum RecordSource {
