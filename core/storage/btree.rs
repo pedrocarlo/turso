@@ -527,7 +527,7 @@ pub struct BTreeCursor {
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
     /// State machine for [BTreeCursor::is_empty_table]
-    is_empty_table_state: RefCell<EmptyTableState>,
+    is_empty_table_state: EmptyTableState,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
     /// If we know the rightmost page id and are already on that page, we can skip a seek.
     move_to_right_state: (MoveToRightState, Option<usize>),
@@ -607,7 +607,7 @@ impl BTreeCursor {
             seek_state: CursorSeekState::Start,
             read_overflow_state: RefCell::new(None),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
-            is_empty_table_state: RefCell::new(EmptyTableState::Start),
+            is_empty_table_state: EmptyTableState::Start,
             move_to_right_state: (MoveToRightState::Start, None),
             seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
@@ -669,9 +669,9 @@ impl BTreeCursor {
     /// Check if the table is empty.
     /// This is done by checking if the root page has no cells.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn is_empty_table(&self) -> Result<IOResult<bool>> {
+    fn is_empty_table(&mut self) -> Result<IOResult<bool>> {
         loop {
-            let state = self.is_empty_table_state.borrow().clone();
+            let state = self.is_empty_table_state.clone();
             match state {
                 EmptyTableState::Start => {
                     if let Some(mv_cursor) = &self.mv_cursor {
@@ -679,7 +679,7 @@ impl BTreeCursor {
                         return Ok(IOResult::Done(mv_cursor.is_empty()));
                     }
                     let (page, c) = self.pager.read_page(self.root_page)?;
-                    *self.is_empty_table_state.borrow_mut() = EmptyTableState::ReadPage { page };
+                    self.is_empty_table_state = EmptyTableState::ReadPage { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
