@@ -29,6 +29,7 @@ members = [
     "sync/engine",
     "sync/javascript",
     "sql_generation",
+    "whopper",
 ]
 exclude = ["perf/latency/limbo"]
 
