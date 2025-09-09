@@ -2226,7 +2226,7 @@ pub fn op_transaction(
     match res {
         Ok(header_schema_cookie) => {
             if header_schema_cookie != *schema_cookie {
-                tracing::info!(
+                tracing::debug!(
                     "schema changed, force reprepare: {} != {}",
                     header_schema_cookie,
                     *schema_cookie
