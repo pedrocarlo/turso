@@ -55,7 +55,7 @@ impl Drop for SimulatorIO {
             }
         } else {
             for path in paths.iter() {
-                println!("Keeping file: {}", path);
+                println!("Keeping file: {path}");
             }
         }
     }
@@ -164,12 +164,12 @@ impl SimulatorFile {
             let fd = open(c_path.as_ptr(), O_CREAT | O_RDWR, 0o644);
             if fd == -1 {
                 let errno = std::io::Error::last_os_error();
-                panic!("Failed to create file {}: {}", file_path, errno);
+                panic!("Failed to create file {file_path}: {errno}");
             }
 
             if ftruncate(fd, FILE_SIZE as i64) == -1 {
                 let errno = std::io::Error::last_os_error();
-                panic!("Failed to truncate file {}: {}", file_path, errno);
+                panic!("Failed to truncate file {file_path}: {errno}");
             }
 
             let data = mmap(
@@ -183,7 +183,7 @@ impl SimulatorFile {
 
             if data == libc::MAP_FAILED as *mut u8 {
                 let errno = std::io::Error::last_os_error();
-                panic!("mmap failed for file {}: {}", file_path, errno);
+                panic!("mmap failed for file {file_path}: {errno}");
             }
 
             Self {

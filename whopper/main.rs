@@ -80,7 +80,7 @@ fn main() -> anyhow::Result<()> {
         });
 
     println!("mode = {}", args.mode);
-    println!("seed = {}", seed);
+    println!("seed = {seed}");
 
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
@@ -266,7 +266,7 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
     let num_tables = rng.random_range(1..=5);
 
     for i in 0..num_tables {
-        let table_name = format!("table_{}", i);
+        let table_name = format!("table_{i}");
 
         // Generate random number of columns (2-8)
         let num_columns = rng.random_range(2..=8);
@@ -289,7 +289,7 @@ fn create_initial_schema(rng: &mut ChaCha8Rng) -> Vec<Create> {
             };
 
             columns.push(Column {
-                name: format!("col_{}", j),
+                name: format!("col_{j}"),
                 column_type: col_type,
                 primary: false,
                 unique: rng.random_bool(0.2), // 20% chance of unique
@@ -402,7 +402,7 @@ fn perform_work(
                     let select = Select::arbitrary(rng, context);
                     if let Ok(stmt) = context.fibers[fiber_idx]
                         .connection
-                        .prepare(&select.to_string())
+                        .prepare(select.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                     }
@@ -413,7 +413,7 @@ fn perform_work(
                     let insert = Insert::arbitrary(rng, context);
                     if let Ok(stmt) = context.fibers[fiber_idx]
                         .connection
-                        .prepare(&insert.to_string())
+                        .prepare(insert.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.inserts += 1;
@@ -425,7 +425,7 @@ fn perform_work(
                     let update = Update::arbitrary(rng, context);
                     if let Ok(stmt) = context.fibers[fiber_idx]
                         .connection
-                        .prepare(&update.to_string())
+                        .prepare(update.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.updates += 1;
@@ -437,7 +437,7 @@ fn perform_work(
                     let delete = Delete::arbitrary(rng, context);
                     if let Ok(stmt) = context.fibers[fiber_idx]
                         .connection
-                        .prepare(&delete.to_string())
+                        .prepare(delete.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.deletes += 1;
