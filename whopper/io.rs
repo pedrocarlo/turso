@@ -1,25 +1,43 @@
 use libc::{
     MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, close, ftruncate, mmap, munmap, open,
 };
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashSet;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use tracing::debug;
 use turso_core::{Clock, Completion, File, IO, Instant, OpenFlags, Result};
 
+#[derive(Debug, Clone)]
+pub struct IOFaultConfig {
+    /// Probability of a cosmic ray bit flip on write (0.0-1.0)
+    pub cosmic_ray_probability: f64,
+}
+
+impl Default for IOFaultConfig {
+    fn default() -> Self {
+        Self {
+            cosmic_ray_probability: 0.0,
+        }
+    }
+}
+
 pub struct SimulatorIO {
-    files: Mutex<HashSet<String>>,
+    files: Mutex<Vec<(String, Weak<SimulatorFile>)>>,
     keep_files: bool,
     rng: Mutex<ChaCha8Rng>,
+    fault_config: IOFaultConfig,
 }
 
 impl SimulatorIO {
-    pub fn new(keep_files: bool, rng: ChaCha8Rng) -> Self {
+    pub fn new(keep_files: bool, rng: ChaCha8Rng, fault_config: IOFaultConfig) -> Self {
+        debug!("SimulatorIO fault config: {:?}", fault_config);
         Self {
-            files: Mutex::new(HashSet::new()),
+            files: Mutex::new(Vec::new()),
             keep_files,
             rng: Mutex::new(rng),
+            fault_config,
         }
     }
 }
@@ -27,15 +45,16 @@ impl SimulatorIO {
 impl Drop for SimulatorIO {
     fn drop(&mut self) {
         let files = self.files.lock().unwrap();
+        let paths: HashSet<String> = files.iter().map(|(path, _)| path.clone()).collect();
         if !self.keep_files {
-            for path in files.iter() {
+            for path in paths.iter() {
                 unsafe {
                     let c_path = std::ffi::CString::new(path.clone()).unwrap();
                     libc::unlink(c_path.as_ptr());
                 }
             }
         } else {
-            for path in files.iter() {
+            for path in paths.iter() {
                 println!("Keeping file: {}", path);
             }
         }
@@ -51,26 +70,70 @@ impl Clock for SimulatorIO {
 impl IO for SimulatorIO {
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
         let file = Arc::new(SimulatorFile::new(path));
-        self.files.lock().unwrap().insert(path.to_string());
-        Ok(file)
+
+        // Store weak reference to avoid keeping files open forever
+        let mut files = self.files.lock().unwrap();
+        files.push((path.to_string(), Arc::downgrade(&file)));
+
+        Ok(file as Arc<dyn File>)
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
         let mut files = self.files.lock().unwrap();
-        if files.remove(path) {
-            // File descriptor and mmap will be cleaned up when the Arc<SimulatorFile> is dropped
-            if !self.keep_files {
-                unsafe {
-                    let c_path = std::ffi::CString::new(path).unwrap();
-                    libc::unlink(c_path.as_ptr());
-                }
+        files.retain(|(p, _)| p != path);
+
+        // File descriptor and mmap will be cleaned up when the Arc<SimulatorFile> is dropped
+        if !self.keep_files {
+            unsafe {
+                let c_path = std::ffi::CString::new(path).unwrap();
+                libc::unlink(c_path.as_ptr());
             }
         }
         Ok(())
     }
 
     fn step(&self) -> Result<()> {
-        // No-op for now
+        // Inject cosmic ray faults with configured probability
+        if self.fault_config.cosmic_ray_probability > 0.0 {
+            let mut rng = self.rng.lock().unwrap();
+            if rng.random::<f64>() < self.fault_config.cosmic_ray_probability {
+                // Clean up dead weak references and collect live files
+                let mut files = self.files.lock().unwrap();
+                files.retain(|(_, weak)| weak.strong_count() > 0);
+
+                // Collect files that are still alive
+                let open_files: Vec<_> = files
+                    .iter()
+                    .filter_map(|(path, weak)| weak.upgrade().map(|file| (path.clone(), file)))
+                    .collect();
+
+                if !open_files.is_empty() {
+                    let file_idx = rng.random_range(0..open_files.len());
+                    let (path, file) = &open_files[file_idx];
+
+                    // Get the actual file size (not the mmap size)
+                    let file_size = *file.size.lock().unwrap();
+                    if file_size > 0 {
+                        // Pick a random offset within the actual file size
+                        let byte_offset = rng.random_range(0..file_size);
+                        let bit_idx = rng.random_range(0..8);
+
+                        unsafe {
+                            let old_byte = *file.data.add(byte_offset);
+                            *file.data.add(byte_offset) ^= 1 << bit_idx;
+                            println!(
+                                "Cosmic ray! File: {} - Flipped bit {} at offset {} (0x{:02x} -> 0x{:02x})",
+                                path,
+                                bit_idx,
+                                byte_offset,
+                                old_byte,
+                                *file.data.add(byte_offset)
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -89,7 +152,7 @@ const FILE_SIZE: usize = 1 << 30; // 1 GiB
 
 struct SimulatorFile {
     data: *mut u8,
-    size: usize,
+    size: Mutex<usize>,
     fd: i32,
 }
 
@@ -123,7 +186,11 @@ impl SimulatorFile {
                 panic!("mmap failed for file {}: {}", file_path, errno);
             }
 
-            Self { data, size: 0, fd }
+            Self {
+                data,
+                size: Mutex::new(0),
+                fd,
+            }
         }
     }
 }
@@ -170,6 +237,11 @@ impl File for SimulatorFile {
         unsafe {
             if pos + len <= FILE_SIZE {
                 ptr::copy_nonoverlapping(buffer.as_ptr(), self.data.add(pos), len);
+                // Update the file size if we wrote beyond the current size
+                let mut size = self.size.lock().unwrap();
+                if pos + len > *size {
+                    *size = pos + len;
+                }
                 c.complete(len as i32);
             } else {
                 c.complete(0);
@@ -200,6 +272,15 @@ impl File for SimulatorFile {
             }
         }
 
+        // Update the file size if we wrote beyond the current size
+        if total_written > 0 {
+            let mut size = self.size.lock().unwrap();
+            let end_pos = (pos as usize) + total_written;
+            if end_pos > *size {
+                *size = end_pos;
+            }
+        }
+
         c.complete(total_written as i32);
         Ok(c)
     }
@@ -210,8 +291,9 @@ impl File for SimulatorFile {
         Ok(c)
     }
 
-    fn truncate(&self, _len: u64, c: Completion) -> Result<Completion> {
-        // Simple truncate implementation
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        let mut size = self.size.lock().unwrap();
+        *size = len as usize;
         c.complete(0);
         Ok(c)
     }
@@ -227,6 +309,6 @@ impl File for SimulatorFile {
     }
 
     fn size(&self) -> Result<u64> {
-        Ok(self.size as u64)
+        Ok(*self.size.lock().unwrap() as u64)
     }
 }

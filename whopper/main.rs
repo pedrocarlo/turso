@@ -18,13 +18,13 @@ use turso_core::{Connection, Database, IO, Statement};
 use turso_parser::ast::SortOrder;
 
 mod io;
-use io::SimulatorIO;
+use io::{IOFaultConfig, SimulatorIO};
 
 #[derive(Parser)]
 #[command(name = "turso_whopper")]
 #[command(about = "The Turso Whopper Simulator")]
 struct Args {
-    /// Simulation mode
+    /// Simulation mode (fast, chaos, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
     /// Keep mmap I/O files on disk after run
@@ -35,6 +35,7 @@ struct Args {
 struct SimulatorConfig {
     max_connections: usize,
     max_steps: usize,
+    cosmic_ray_probability: f64,
 }
 
 #[derive(Debug)]
@@ -88,7 +89,15 @@ fn main() -> anyhow::Result<()> {
 
     let config = gen_config(&mut rng, &args.mode)?;
 
-    let io = Arc::new(SimulatorIO::new(args.keep, io_rng)) as Arc<dyn IO>;
+    let fault_config = IOFaultConfig {
+        cosmic_ray_probability: config.cosmic_ray_probability,
+    };
+
+    if config.cosmic_ray_probability > 0.0 {
+        println!("cosmic ray probability = {}", config.cosmic_ray_probability);
+    }
+
+    let io = Arc::new(SimulatorIO::new(args.keep, io_rng, fault_config)) as Arc<dyn IO>;
 
     let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
 
@@ -191,10 +200,17 @@ fn gen_config(rng: &mut ChaCha8Rng, mode: &str) -> anyhow::Result<SimulatorConfi
         "fast" => Ok(SimulatorConfig {
             max_connections: rng.random_range(1..=8) as usize,
             max_steps: 100000,
+            cosmic_ray_probability: 0.0,
         }),
         "chaos" => Ok(SimulatorConfig {
             max_connections: rng.random_range(1..=8) as usize,
             max_steps: 10000000,
+            cosmic_ray_probability: 0.0,
+        }),
+        "ragnarök" | "ragnarok" => Ok(SimulatorConfig {
+            max_connections: rng.random_range(1..=8) as usize,
+            max_steps: 1000000,
+            cosmic_ray_probability: 0.0001,
         }),
         _ => Err(anyhow::anyhow!("Unknown mode: {}", mode)),
     }
