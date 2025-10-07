@@ -2764,7 +2764,7 @@ mod ptrmap_tests {
     use super::*;
     use crate::io::{MemoryIO, OpenFlags, IO};
     use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::database::{DatabaseFile, DatabaseStorage};
+    use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::PageCache;
     use crate::storage::pager::Pager;
     use crate::storage::sqlite3_ondisk::PageSize;
