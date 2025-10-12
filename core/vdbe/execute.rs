@@ -388,7 +388,7 @@ pub fn op_checkpoint_inner(
             true,
         ));
         loop {
-            let result = ckpt_sm.step(&())?;
+            let result = ckpt_sm.step(&mut ())?;
             match result {
                 IOResult::IO(io) => {
                     pager.io.step()?;
