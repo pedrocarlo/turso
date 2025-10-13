@@ -2,7 +2,6 @@ use std::{
     fmt::{Debug, Display},
     ops::{Deref, DerefMut},
     path::Path,
-    rc::Rc,
     sync::Arc,
     vec,
 };
@@ -333,7 +332,7 @@ impl InteractionPlan {
         }
     }
 
-    pub fn static_iterator(&self) -> impl InteractionPlanIterator {
+    pub fn static_iterator(&self) -> impl InteractionPlanIterator + use<> {
         PlanIterator {
             iter: self.interactions_list().into_iter(),
         }
@@ -732,11 +731,12 @@ impl Display for InteractionStats {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
+type AssertionFunc =
+    dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + Send + Sync;
 
 #[derive(Clone)]
 pub struct Assertion {
-    pub func: Rc<AssertionFunc>,
+    pub func: Arc<AssertionFunc>,
     pub name: String, // For display purposes in the plan
 }
 
@@ -751,10 +751,13 @@ impl Debug for Assertion {
 impl Assertion {
     pub fn new<F>(name: String, func: F) -> Self
     where
-        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
+        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>
+            + Send
+            + Sync
+            + 'static,
     {
         Self {
-            func: Rc::new(func),
+            func: Arc::new(func),
             name,
         }
     }
