@@ -256,6 +256,17 @@ impl Property {
         )
     }
 
+    pub fn has_extensional_queries(&self) -> bool {
+        matches!(
+            self,
+            Property::InsertValuesSelect { .. }
+                | Property::DoubleCreateFailure { .. }
+                | Property::DeleteSelect { .. }
+                | Property::DropSelect { .. }
+                | Property::Queries { .. }
+        )
+    }
+
     pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
         match self {
             Property::InsertValuesSelect { queries, .. }

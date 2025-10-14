@@ -543,22 +543,24 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                         .find(|idx| env.conn_in_transaction(*idx))
                         .map(|conn_index| {
                             let query = Query::Commit(Commit);
-                            let interaction = Interactions::new(
-                                conn_index,
-                                InteractionsType::Query(query.clone()),
-                            );
 
                             // Connections are queued for commit on `generate_next_interaction` if Interactions::Query or Interactions::Property produce a DDL statement.
                             // This means that the only way we will reach here, is if the DDL statement was created later in the extensional query of a Property
                             let queries = self
                                 .plan
-                                .last_mut()
+                                .iter_mut()
+                                .rev()
+                                .find(|interactions| interactions.has_extensional_queries())
                                 .unwrap()
                                 .get_extensional_queries()
                                 .unwrap();
-                            queries.insert(0, query.clone());
 
-                            self.plan.push(interaction);
+                            let last_ddl_idx = queries
+                                .iter()
+                                .rev()
+                                .position(|query| query.is_ddl())
+                                .unwrap();
+                            queries.insert(last_ddl_idx + 1, query.clone());
 
                             Interaction::new(conn_index, InteractionType::Query(query))
                         });
@@ -622,6 +624,10 @@ impl Interactions {
             connection_index,
             interactions,
         }
+    }
+
+    pub fn has_extensional_queries(&self) -> bool {
+        matches!(&self.interactions, InteractionsType::Property(property) if property.has_extensional_queries())
     }
 
     pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
