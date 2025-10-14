@@ -1,7 +1,6 @@
 use std::{
     fmt::{Debug, Display},
     ops::{Deref, DerefMut},
-    path::Path,
     rc::Rc,
     sync::Arc,
     vec,
@@ -20,7 +19,6 @@ use sql_generation::{
         table::SimValue,
     },
 };
-use tracing::error;
 use turso_core::{Connection, Result, StepResult};
 
 use crate::{
@@ -38,7 +36,7 @@ use super::property::{Property, remaining};
 
 pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
     plan: Vec<Interactions>,
     pub mvcc: bool,
@@ -129,72 +127,6 @@ impl InteractionPlan {
         };
         self.plan.retain(f);
         self.len = self.new_len();
-    }
-
-    /// Compute via diff computes a a plan from a given `.plan` file without the need to parse
-    /// sql. This is possible because there are two versions of the plan file, one that is human
-    /// readable and one that is serialized as JSON. Under watch mode, the users will be able to
-    /// delete interactions from the human readable file, and this function uses the JSON file as
-    /// a baseline to detect with interactions were deleted and constructs the plan from the
-    /// remaining interactions.
-    pub(crate) fn compute_via_diff(plan_path: &Path) -> impl InteractionPlanIterator {
-        let interactions = std::fs::read_to_string(plan_path).unwrap();
-        let interactions = interactions.lines().collect::<Vec<_>>();
-
-        let plan: InteractionPlan = serde_json::from_str(
-            std::fs::read_to_string(plan_path.with_extension("json"))
-                .unwrap()
-                .as_str(),
-        )
-        .unwrap();
-
-        let mut plan = plan
-            .plan
-            .into_iter()
-            .map(|i| i.interactions())
-            .collect::<Vec<_>>();
-
-        let (mut i, mut j) = (0, 0);
-
-        while i < interactions.len() && j < plan.len() {
-            if interactions[i].starts_with("-- begin")
-                || interactions[i].starts_with("-- end")
-                || interactions[i].is_empty()
-            {
-                i += 1;
-                continue;
-            }
-
-            // interactions[i] is the i'th line in the human readable plan
-            // plan[j][k] is the k'th interaction in the j'th property
-            let mut k = 0;
-
-            while k < plan[j].len() {
-                if i >= interactions.len() {
-                    let _ = plan.split_off(j + 1);
-                    let _ = plan[j].split_off(k);
-                    break;
-                }
-                error!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
-                if interactions[i].contains(plan[j][k].to_string().as_str()) {
-                    i += 1;
-                    k += 1;
-                } else {
-                    plan[j].remove(k);
-                    panic!("Comparing '{}' with '{}'", interactions[i], plan[j][k]);
-                }
-            }
-
-            if plan[j].is_empty() {
-                plan.remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        let _ = plan.split_off(j);
-        PlanIterator {
-            iter: plan.into_iter().flatten(),
-        }
     }
 
     pub fn interactions_list(&self) -> Vec<Interaction> {
