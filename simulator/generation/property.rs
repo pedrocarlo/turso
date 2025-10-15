@@ -232,7 +232,7 @@ impl Property {
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
-            | Property::UNIONAllPreservesCardinality { .. }
+            | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
@@ -1017,7 +1017,7 @@ impl Property {
                     Interaction::new(connection_index, assertion),
                 ]
             }
-            Property::UNIONAllPreservesCardinality {
+            Property::UnionAllPreservesCardinality {
                 select,
                 where_clause,
             } => {
@@ -1412,7 +1412,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
         Distinctness::All,
     );
 
-    Property::UNIONAllPreservesCardinality {
+    Property::UnionAllPreservesCardinality {
         select,
         where_clause: p2,
     }
@@ -1461,7 +1461,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::DropSelect => property_drop_select,
             PropertyDiscriminants::SelectSelectOptimizer => property_select_select_optimizer,
             PropertyDiscriminants::WhereTrueFalseNull => property_where_true_false_null,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
@@ -1544,7 +1544,7 @@ impl PropertyDiscriminants {
                     0
                 }
             }
-            PropertyDiscriminants::UNIONAllPreservesCardinality => {
+            PropertyDiscriminants::UnionAllPreservesCardinality => {
                 if opts.indexes
                     && !env.opts.disable_union_all_preserves_cardinality
                     && !ctx.tables().is_empty()
@@ -1608,7 +1608,7 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
-            PropertyDiscriminants::UNIONAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),

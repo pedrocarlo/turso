@@ -185,7 +185,7 @@ impl InteractionPlan {
                             .collect();
                     }
                     Property::WhereTrueFalseNull { .. }
-                    | Property::UNIONAllPreservesCardinality { .. }
+                    | Property::UnionAllPreservesCardinality { .. }
                     | Property::SelectLimit { .. }
                     | Property::SelectSelectOptimizer { .. }
                     | Property::FaultyQuery { .. }
@@ -309,7 +309,7 @@ impl InteractionPlan {
                             Property::SelectLimit { .. }
                             | Property::SelectSelectOptimizer { .. }
                             | Property::WhereTrueFalseNull { .. }
-                            | Property::UNIONAllPreservesCardinality { .. }
+                            | Property::UnionAllPreservesCardinality { .. }
                             | Property::ReadYourUpdatesBack { .. }
                             | Property::TableHasExpectedContent { .. } => {}
                         }

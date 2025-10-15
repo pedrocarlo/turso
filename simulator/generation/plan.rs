@@ -19,7 +19,7 @@ use crate::{
         Query,
         interactions::{
             Fault, Interaction, InteractionPlan, InteractionPlanIterator, InteractionStats,
-            InteractionType, Interactions, InteractionsType,
+            InteractionType, Interactions, InteractionsSpan, InteractionsType, Span,
         },
         metrics::Remaining,
         property::Property,
@@ -27,22 +27,6 @@ use crate::{
 };
 
 impl InteractionPlan {
-    pub fn init_plan(env: &mut SimulatorEnv) -> Self {
-        let mut plan = InteractionPlan::new(env.profile.experimental_mvcc);
-
-        // First create at least one table
-        let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
-
-        // initial query starts at 0th connection
-        let interactions =
-            Interactions::new(0, InteractionsType::Query(Query::Create(create_query)));
-
-        plan.append_interactions(interactions.interactions());
-        plan.set_last_interactions(interactions);
-
-        plan
-    }
-
     pub fn generator<'a>(
         &'a mut self,
         rng: &'a mut impl rand::Rng,
@@ -63,6 +47,17 @@ impl InteractionPlan {
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
+        // First interaction
+        if self.len() == 0 {
+            // First create at least one table
+            let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
+
+            // initial query starts at 0th connection
+            let interactions =
+                Interactions::new(0, InteractionsType::Query(Query::Create(create_query)));
+            return Some(interactions);
+        }
+
         let num_interactions = env.opts.max_interactions as usize;
         // If last interaction needs to check all db tables, generate the Property to do so
         if let Some(i) = self.last_interactions()
@@ -131,9 +126,26 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                 // stop generating
                 let interactions = self.plan.generate_next_interaction(self.rng, env)?;
 
-                self.plan.push(interactions.clone());
+                let mut iter = interactions.interactions();
 
+                assert!(!iter.is_empty());
+
+                let id = self.plan.next_property_id();
+
+                // Add a span to the interactions
+                if iter.len() == 1 {
+                    iter.first_mut().unwrap().span =
+                        Some(InteractionsSpan::new(&interactions, Span::StartEnd, id))
+                } else {
+                    iter.first_mut().unwrap().span =
+                        Some(InteractionsSpan::new(&interactions, Span::Start, id));
+                    iter.last_mut().unwrap().span =
+                        Some(InteractionsSpan::new(&interactions, Span::End, id));
+                }
                 let mut iter = interactions.interactions().into_iter();
+
+                self.plan.push(interactions);
+
                 let next = iter.next();
                 self.iter = iter;
 

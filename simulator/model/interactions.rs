@@ -32,6 +32,7 @@ pub(crate) struct InteractionPlan {
     /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
     len_properties: usize,
+    next_interaction_id: usize,
 }
 
 impl InteractionPlan {
@@ -42,6 +43,7 @@ impl InteractionPlan {
             mvcc,
             len: 0,
             len_properties: 0,
+            next_interaction_id: 0,
         }
     }
 
@@ -52,6 +54,7 @@ impl InteractionPlan {
             mvcc,
             len: 0,
             len_properties: 0,
+            next_interaction_id: 0,
         }
     }
 
@@ -73,6 +76,12 @@ impl InteractionPlan {
     #[inline]
     pub fn len_properties(&self) -> usize {
         self.len_properties
+    }
+
+    pub fn next_property_id(&mut self) -> usize {
+        let id = self.next_interaction_id;
+        self.next_interaction_id += 1;
+        id
     }
 
     pub fn last_interactions(&self) -> Option<&Interactions> {
@@ -186,7 +195,7 @@ impl InteractionPlan {
             }
         }
         for interaction in &self.plan {
-            // TODO: see how to skip counting the
+            // TODO: see how to skip counting of the
             // if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
             //     // Skip Property::AllTableHaveExpectedContent when counting stats
             //     // this allows us to generate more relevant interactions as we count less Select's to the Stats
@@ -370,24 +379,30 @@ impl Interactions {
     }
 }
 
-// FIXME: for the sql display come back and add connection index as a comment
 impl Display for InteractionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for interactions in &self.plan {
-            match &interactions.interactions {
-                InteractionsType::Property(property) => {
-                    let name = property.name();
+        const PAD: usize = 4;
+        let mut indentation_level = 0;
+        for interaction in &self.plan {
+            if let Some(span) = &interaction.span {
+                if let Some(name) = span.property.map(|p| p.name())
+                    && span.span.start()
+                {
+                    indentation_level += 1;
                     writeln!(f, "-- begin testing '{name}'")?;
-                    for interaction in property.interactions(interactions.connection_index) {
-                        writeln!(f, "\t{interaction}")?;
-                    }
+                }
+            }
+            if indentation_level > 0 {
+                let padding = " ".repeat(indentation_level * PAD);
+                f.pad(&padding)?;
+            }
+            writeln!(f, "{interaction}")?;
+            if let Some(span) = &interaction.span {
+                if let Some(name) = span.property.map(|p| p.name())
+                    && span.span.end()
+                {
+                    indentation_level -= 1;
                     writeln!(f, "-- end testing '{name}'")?;
-                }
-                InteractionsType::Fault(fault) => {
-                    writeln!(f, "-- FAULT '{fault}'")?;
-                }
-                InteractionsType::Query(query) => {
-                    writeln!(f, "{query}; -- {}", interactions.connection_index)?;
                 }
             }
         }
@@ -479,11 +494,48 @@ impl Display for Fault {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Span {
+    Start,
+    End,
+    // Both start and end
+    StartEnd,
+}
+
+impl Span {
+    fn start(&self) -> bool {
+        matches!(self, Self::Start | Self::StartEnd)
+    }
+
+    fn end(&self) -> bool {
+        matches!(self, Self::End | Self::StartEnd)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct InteractionsSpan {
+    property: Option<PropertyDiscriminants>,
+    span: Span,
+    id: usize,
+}
+
+impl InteractionsSpan {
+    pub fn new(interactions: &Interactions, span: Span, id: usize) -> Self {
+        let property = if let InteractionsType::Property(property) = &interactions.interactions {
+            Some(property.into())
+        } else {
+            None
+        };
+        Self { property, span, id }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
     pub ignore_error: bool,
+    pub span: Option<InteractionsSpan>,
 }
 
 impl Deref for Interaction {
@@ -506,6 +558,7 @@ impl Interaction {
             connection_index,
             interaction,
             ignore_error: false,
+            span: None,
         }
     }
 
@@ -514,6 +567,7 @@ impl Interaction {
             connection_index,
             interaction,
             ignore_error: true,
+            span: None,
         }
     }
 }
