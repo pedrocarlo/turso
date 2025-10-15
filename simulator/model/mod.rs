@@ -15,9 +15,15 @@ use sql_generation::model::{
     },
     table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
+use turso_core::Result;
 use turso_parser::ast::Distinctness;
 
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
+
+pub mod interactions;
+pub mod metrics;
+
+pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 // This type represents the potential queries on the database.
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]

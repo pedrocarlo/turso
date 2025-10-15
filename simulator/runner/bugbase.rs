@@ -11,7 +11,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Paths, generation::plan::InteractionPlan};
+use crate::{Paths, model::interactions::InteractionPlan};
 
 use super::cli::SimulatorCLI;
 

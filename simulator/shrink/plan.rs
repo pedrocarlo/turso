@@ -2,11 +2,11 @@ use indexmap::IndexSet;
 
 use crate::{
     SandboxedResult, SimulatorEnv,
-    generation::{
-        plan::{InteractionPlan, InteractionType, Interactions, InteractionsType},
-        property::Property,
+    generation::property::Property,
+    model::{
+        Query,
+        interactions::{InteractionPlan, InteractionType, Interactions, InteractionsType},
     },
-    model::Query,
     run_simulation,
     runner::execution::Execution,
 };
