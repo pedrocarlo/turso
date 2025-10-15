@@ -1,6 +1,7 @@
 use std::{
     fmt::{Debug, Display},
     ops::{Deref, DerefMut},
+    panic::RefUnwindSafe,
     rc::Rc,
     sync::Arc,
     vec,
@@ -38,27 +39,36 @@ pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
-    plan: Vec<Interactions>,
+    plan: Vec<Interaction>,
+    // In the future, this should probably be a stack of interactions
+    // so we can have nested properties
+    last_interactions: Option<Interactions>,
     pub mvcc: bool,
-    // Len should not count transactions statements, just so we can generate more meaningful interactions per run
     len: usize,
+    /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
+    /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
+    len_properties: usize,
 }
 
 impl InteractionPlan {
     pub(crate) fn new(mvcc: bool) -> Self {
         Self {
             plan: Vec::new(),
+            last_interactions: None,
             mvcc,
             len: 0,
+            len_properties: 0,
         }
     }
 
-    pub fn new_with(plan: Vec<Interactions>, mvcc: bool) -> Self {
-        let len = plan
-            .iter()
-            .filter(|interaction| !interaction.ignore())
-            .count();
-        Self { plan, mvcc, len }
+    pub fn new_with(plan: Vec<Interaction>, mvcc: bool) -> Self {
+        Self {
+            plan,
+            last_interactions: None,
+            mvcc,
+            len: 0,
+            len_properties: 0,
+        }
     }
 
     #[inline]
@@ -69,30 +79,37 @@ impl InteractionPlan {
             .count()
     }
 
-    /// Length of interactions that are not transaction statements
+    /// Count of interactions that are not transaction statements
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Count of properties in the plan
+    #[inline]
+    pub fn len_properties(&self) -> usize {
+        self.len_properties
     }
 
     pub fn push(&mut self, interactions: Interactions) {
         if !interactions.ignore() {
             self.len += 1;
         }
-        self.plan.push(interactions);
+        self.last_interactions = Some(interactions);
     }
 
-    pub fn remove(&mut self, index: usize) -> Interactions {
+    pub fn truncate_properties(&mut self, len: usize) {
+        self.plan.truncate(len);
+        self.len = self.new_len();
+    }
+
+    /// Used to remove a particular [Interactions]
+    pub fn remove_property(&mut self, index: usize) -> Interactions {
         let interactions = self.plan.remove(index);
         if !interactions.ignore() {
             self.len -= 1;
         }
         interactions
-    }
-
-    pub fn truncate(&mut self, len: usize) {
-        self.plan.truncate(len);
-        self.len = self.new_len();
     }
 
     pub fn retain_mut<F>(&mut self, mut f: F)
@@ -130,11 +147,7 @@ impl InteractionPlan {
     }
 
     pub fn interactions_list(&self) -> Vec<Interaction> {
-        self.plan
-            .clone()
-            .into_iter()
-            .flat_map(|interactions| interactions.interactions().into_iter())
-            .collect()
+        self.plan.clone()
     }
 
     pub fn interactions_list_with_secondary_index(&self) -> Vec<(usize, Interaction)> {
@@ -152,6 +165,7 @@ impl InteractionPlan {
     }
 
     pub(crate) fn stats(&self) -> InteractionStats {
+        // TODO: do incremental stats and metrics
         let mut stats = InteractionStats::default();
 
         fn query_stat(q: &Query, stats: &mut InteractionStats) {
@@ -171,24 +185,15 @@ impl InteractionPlan {
                 Query::Placeholder => {}
             }
         }
-        for interactions in &self.plan {
-            match &interactions.interactions {
-                InteractionsType::Property(property) => {
-                    if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
-                        // Skip Property::AllTableHaveExpectedContent when counting stats
-                        // this allows us to generate more relevant interactions as we count less Select's to the Stats
-                        continue;
-                    }
-                    for interaction in &property.interactions(interactions.connection_index) {
-                        if let InteractionType::Query(query) = &interaction.interaction {
-                            query_stat(query, &mut stats);
-                        }
-                    }
-                }
-                InteractionsType::Query(query) => {
-                    query_stat(query, &mut stats);
-                }
-                InteractionsType::Fault(_) => {}
+        for interaction in &self.plan {
+            // TODO: see how to skip counting the
+            // if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
+            //     // Skip Property::AllTableHaveExpectedContent when counting stats
+            //     // this allows us to generate more relevant interactions as we count less Select's to the Stats
+            //     continue;
+            // }
+            if let InteractionType::Query(query) = &interaction.interaction {
+                query_stat(query, &mut stats);
             }
         }
 
@@ -202,10 +207,11 @@ impl InteractionPlan {
         let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
 
         // initial query starts at 0th connection
-        plan.push(Interactions::new(
-            0,
-            InteractionsType::Query(Query::Create(create_query)),
-        ));
+        let interactions =
+            Interactions::new(0, InteractionsType::Query(Query::Create(create_query)));
+
+        plan.plan.append(&mut interactions.interactions());
+        plan.last_interactions = Some(interactions);
 
         plan
     }
@@ -215,10 +221,10 @@ impl InteractionPlan {
         &mut self,
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
-    ) -> Option<Vec<Interaction>> {
+    ) -> Option<Interactions> {
         let num_interactions = env.opts.max_interactions as usize;
         // If last interaction needs to check all db tables, generate the Property to do so
-        if let Some(i) = self.plan.last()
+        if let Some(i) = &self.last_interactions
             && i.check_tables()
         {
             let check_all_tables = Interactions::new(
@@ -233,10 +239,7 @@ impl InteractionPlan {
                 }),
             );
 
-            let out_interactions = check_all_tables.interactions();
-
-            self.push(check_all_tables);
-            return Some(out_interactions);
+            return Some(check_all_tables);
         }
 
         if self.len() < num_interactions {
@@ -258,42 +261,14 @@ impl InteractionPlan {
 
             tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
 
-            let mut out_interactions = interactions.interactions();
-
-            assert!(!out_interactions.is_empty());
-
-            let out_interactions = if self.mvcc
-                && out_interactions
-                    .iter()
-                    .any(|interaction| interaction.is_ddl())
-            {
-                // DDL statements must be serial, so commit all connections and then execute the DDL
-                let mut commit_interactions = (0..env.connections.len())
-                    .filter(|&idx| env.conn_in_transaction(idx))
-                    .map(|idx| {
-                        let query = Query::Commit(Commit);
-                        let interaction = Interactions::new(idx, InteractionsType::Query(query));
-                        let out_interactions = interaction.interactions();
-                        self.push(interaction);
-                        out_interactions
-                    })
-                    .fold(
-                        Vec::with_capacity(env.connections.len()),
-                        |mut accum, mut curr| {
-                            accum.append(&mut curr);
-                            accum
-                        },
-                    );
-                commit_interactions.append(&mut out_interactions);
-                commit_interactions
-            } else {
-                out_interactions
-            };
-
-            self.push(interactions);
-            Some(out_interactions)
+            Some(interactions)
         } else {
-            None
+            // after we generated all interactions if some connection is still in a transaction, commit
+            (0..env.connections.len())
+                .find(|idx| env.conn_in_transaction(*idx))
+                .map(|conn_index| {
+                    Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)))
+                })
         }
     }
 
@@ -315,50 +290,6 @@ impl InteractionPlan {
         PlanIterator {
             iter: self.interactions_list().into_iter(),
         }
-    }
-}
-
-impl Deref for InteractionPlan {
-    type Target = Vec<Interactions>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.plan
-    }
-}
-
-impl DerefMut for InteractionPlan {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.plan
-    }
-}
-
-impl IntoIterator for InteractionPlan {
-    type Item = Interactions;
-
-    type IntoIter = <Vec<Interactions> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a InteractionPlan {
-    type Item = &'a Interactions;
-
-    type IntoIter = <&'a Vec<Interactions> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut InteractionPlan {
-    type Item = &'a mut Interactions;
-
-    type IntoIter = <&'a mut Vec<Interactions> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.plan.iter_mut()
     }
 }
 
@@ -388,12 +319,11 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                 // Iterator ended, try to create a new iterator
                 // This will not be an infinte sequence because generate_next_interaction will eventually
                 // stop generating
-                let mut iter = self
-                    .plan
-                    .generate_next_interaction(self.rng, env)
-                    .map_or(Vec::new().into_iter(), |interactions| {
-                        interactions.into_iter()
-                    });
+                let interactions = self.plan.generate_next_interaction(self.rng, env)?;
+
+                self.plan.push(interactions.clone());
+
+                let mut iter = interactions.interactions().into_iter();
                 let next = iter.next();
                 self.iter = iter;
 
@@ -415,8 +345,11 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         &conn_ctx,
                     );
 
-                    let InteractionsType::Property(property) =
-                        &mut self.plan.last_mut().unwrap().interactions
+                    let Some(InteractionsType::Property(property)) = &mut self
+                        .plan
+                        .last_interactions
+                        .as_mut()
+                        .map(|interactions| &mut interactions.interactions)
                     else {
                         unreachable!("only properties have extensional queries");
                     };
@@ -469,35 +402,16 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
         match self.peek(env) {
             Some(peek_interaction) => {
                 if mvcc && peek_interaction.is_ddl() {
-                    // try to commit a transaction as we cannot execute DDL statements in concurrent mode
+                    // if any connection is in a transaction,
+                    // try to commit the transaction as we cannot execute DDL statements in concurrent mode
 
-                    let commit_connection = (0..env.connections.len())
-                        .find(|idx| env.conn_in_transaction(*idx))
-                        .map(|conn_index| {
-                            let query = Query::Commit(Commit);
-
-                            // Connections are queued for commit on `generate_next_interaction` if Interactions::Query or Interactions::Property produce a DDL statement.
-                            // This means that the only way we will reach here, is if the DDL statement was created later in the extensional query of a Property
-                            let queries = self
-                                .plan
-                                .iter_mut()
-                                .rev()
-                                .find(|interactions| interactions.has_extensional_queries())
-                                .unwrap()
-                                .get_extensional_queries()
-                                .unwrap();
-
-                            let last_ddl_idx = queries
-                                .iter()
-                                .rev()
-                                .position(|query| query.is_ddl())
-                                .unwrap();
-                            queries.insert(last_ddl_idx + 1, query.clone());
-
-                            Interaction::new(conn_index, InteractionType::Query(query))
-                        });
-                    if commit_connection.is_some() {
-                        return commit_connection;
+                    if let Some(conn_index) =
+                        (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
+                    {
+                        return Some(Interaction::new(
+                            conn_index,
+                            InteractionType::Query(Query::Commit(Commit)),
+                        ));
                     }
                 }
 
@@ -621,7 +535,7 @@ impl InteractionsType {
 
 impl Interactions {
     pub(crate) fn interactions(&self) -> Vec<Interaction> {
-        match &self.interactions {
+        let ret = match &self.interactions {
             InteractionsType::Property(property) => property.interactions(self.connection_index),
             InteractionsType::Query(query) => vec![Interaction::new(
                 self.connection_index,
@@ -631,7 +545,10 @@ impl Interactions {
                 self.connection_index,
                 InteractionType::Fault(*fault),
             )],
-        }
+        };
+
+        assert!(!ret.is_empty());
+        ret
     }
 
     pub(crate) fn dependencies(&self) -> IndexSet<String> {
@@ -732,7 +649,8 @@ impl Display for InteractionStats {
     }
 }
 
-type AssertionFunc = dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>;
+type AssertionFunc =
+    dyn Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + RefUnwindSafe;
 
 #[derive(Clone)]
 pub struct Assertion {
@@ -751,7 +669,9 @@ impl Debug for Assertion {
 impl Assertion {
     pub fn new<F>(name: String, func: F) -> Self
     where
-        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>> + 'static,
+        F: Fn(&Vec<ResultSet>, &mut SimulatorEnv) -> Result<Result<(), String>>
+            + 'static
+            + RefUnwindSafe,
     {
         Self {
             func: Rc::new(func),

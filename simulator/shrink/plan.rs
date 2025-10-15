@@ -70,17 +70,17 @@ impl InteractionPlan {
             }
         }
 
-        let before = self.len();
+        let before = self.len_properties();
 
         // Remove all properties after the failing one
-        plan.truncate(secondary_interactions_index + 1);
+        plan.truncate_properties(secondary_interactions_index + 1);
 
         // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
         if !depending_tables.is_empty() {
             plan.remove_properties(&depending_tables, secondary_interactions_index);
         }
 
-        let after = plan.len();
+        let after = plan.len_properties();
 
         tracing::info!(
             "Shrinking interaction plan from {} to {} properties",
@@ -89,6 +89,184 @@ impl InteractionPlan {
         );
 
         plan
+    }
+
+    /// Create a smaller interaction plan by deleting a property
+    pub(crate) fn brute_shrink_interaction_plan(
+        &self,
+        result: &SandboxedResult,
+        env: Arc<Mutex<SimulatorEnv>>,
+    ) -> InteractionPlan {
+        let failing_execution = match result {
+            SandboxedResult::Panicked {
+                error: _,
+                last_execution: e,
+            } => e,
+            SandboxedResult::FoundBug {
+                error: _,
+                history: _,
+                last_execution: e,
+            } => e,
+            SandboxedResult::Correct => {
+                unreachable!("shrink is never called on correct result")
+            }
+        };
+
+        let mut plan = self.clone();
+        let all_interactions = self.interactions_list_with_secondary_index();
+        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
+
+        {
+            let mut idx = failing_execution.interaction_index;
+            loop {
+                if all_interactions[idx].0 != secondary_interactions_index {
+                    // Stop when we reach a different property
+                    break;
+                }
+                match &all_interactions[idx].1.interaction {
+                    // Fault does not depend on
+                    InteractionType::Fault(..) => break,
+                    _ => {
+                        // In principle we should never fail this checked_sub.
+                        // But if there is a bug in how we count the secondary index
+                        // we may panic if we do not use a checked_sub.
+                        if let Some(new_idx) = idx.checked_sub(1) {
+                            idx = new_idx;
+                        } else {
+                            tracing::warn!("failed to find error query");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let before = self.len_properties();
+
+        plan.truncate_properties(secondary_interactions_index + 1);
+
+        // phase 1: shrink extensions
+        for interaction in &mut plan {
+            if let InteractionsType::Property(property) = &mut interaction.interactions {
+                match property {
+                    Property::InsertValuesSelect { queries, .. }
+                    | Property::DoubleCreateFailure { queries, .. }
+                    | Property::DeleteSelect { queries, .. }
+                    | Property::DropSelect { queries, .. }
+                    | Property::Queries { queries } => {
+                        let mut temp_plan = InteractionPlan::new_with(
+                            queries
+                                .iter()
+                                .map(|q| {
+                                    Interactions::new(
+                                        interaction.connection_index,
+                                        InteractionsType::Query(q.clone()),
+                                    )
+                                })
+                                .collect(),
+                            self.mvcc,
+                        );
+
+                        temp_plan = InteractionPlan::iterative_shrink(
+                            temp_plan,
+                            failing_execution,
+                            result,
+                            env.clone(),
+                            secondary_interactions_index,
+                        );
+                        //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
+
+                        *queries = temp_plan
+                            .into_iter()
+                            .filter_map(|i| match i.interactions {
+                                InteractionsType::Query(q) => Some(q),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                    Property::WhereTrueFalseNull { .. }
+                    | Property::UNIONAllPreservesCardinality { .. }
+                    | Property::SelectLimit { .. }
+                    | Property::SelectSelectOptimizer { .. }
+                    | Property::FaultyQuery { .. }
+                    | Property::FsyncNoWait { .. }
+                    | Property::ReadYourUpdatesBack { .. }
+                    | Property::TableHasExpectedContent { .. }
+                    | Property::AllTableHaveExpectedContent { .. } => {}
+                }
+            }
+        }
+
+        // phase 2: shrink the entire plan
+        plan = Self::iterative_shrink(
+            plan,
+            failing_execution,
+            result,
+            env,
+            secondary_interactions_index,
+        );
+
+        let after = plan.len_properties();
+
+        tracing::info!(
+            "Shrinking interaction plan from {} to {} properties",
+            before,
+            after
+        );
+
+        plan
+    }
+
+    /// shrink a plan by removing one interaction at a time (and its deps) while preserving the error
+    fn iterative_shrink(
+        mut plan: InteractionPlan,
+        failing_execution: &Execution,
+        old_result: &SandboxedResult,
+        env: Arc<Mutex<SimulatorEnv>>,
+        secondary_interaction_index: usize,
+    ) -> InteractionPlan {
+        for i in (0..plan.len_properties()).rev() {
+            if i == secondary_interaction_index {
+                continue;
+            }
+            let mut test_plan = plan.clone();
+
+            // TODO: change
+            test_plan.remove_property(i);
+
+            if Self::test_shrunk_plan(&test_plan, failing_execution, old_result, env.clone()) {
+                plan = test_plan;
+            }
+        }
+        plan
+    }
+
+    fn test_shrunk_plan(
+        test_plan: &InteractionPlan,
+        failing_execution: &Execution,
+        old_result: &SandboxedResult,
+        env: Arc<Mutex<SimulatorEnv>>,
+    ) -> bool {
+        let last_execution = Arc::new(Mutex::new(*failing_execution));
+        let result = SandboxedResult::from(
+            std::panic::catch_unwind(|| {
+                let plan = test_plan.static_iterator();
+
+                run_simulation(env.clone(), plan, last_execution.clone())
+            }),
+            last_execution,
+        );
+        match (old_result, &result) {
+            (
+                SandboxedResult::Panicked { error: e1, .. },
+                SandboxedResult::Panicked { error: e2, .. },
+            )
+            | (
+                SandboxedResult::FoundBug { error: e1, .. },
+                SandboxedResult::FoundBug { error: e2, .. },
+            ) => e1 == e2,
+            _ => false,
+        }
     }
 
     /// Remove all properties that do not use the failing tables
@@ -240,182 +418,5 @@ impl InteractionPlan {
             idx += 1;
             retain
         });
-    }
-
-    /// Create a smaller interaction plan by deleting a property
-    pub(crate) fn brute_shrink_interaction_plan(
-        &self,
-        result: &SandboxedResult,
-        env: Arc<Mutex<SimulatorEnv>>,
-    ) -> InteractionPlan {
-        let failing_execution = match result {
-            SandboxedResult::Panicked {
-                error: _,
-                last_execution: e,
-            } => e,
-            SandboxedResult::FoundBug {
-                error: _,
-                history: _,
-                last_execution: e,
-            } => e,
-            SandboxedResult::Correct => {
-                unreachable!("shrink is never called on correct result")
-            }
-        };
-
-        let mut plan = self.clone();
-        let all_interactions = self.interactions_list_with_secondary_index();
-        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
-
-        {
-            let mut idx = failing_execution.interaction_index;
-            loop {
-                if all_interactions[idx].0 != secondary_interactions_index {
-                    // Stop when we reach a different property
-                    break;
-                }
-                match &all_interactions[idx].1.interaction {
-                    // Fault does not depend on
-                    InteractionType::Fault(..) => break,
-                    _ => {
-                        // In principle we should never fail this checked_sub.
-                        // But if there is a bug in how we count the secondary index
-                        // we may panic if we do not use a checked_sub.
-                        if let Some(new_idx) = idx.checked_sub(1) {
-                            idx = new_idx;
-                        } else {
-                            tracing::warn!("failed to find error query");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let before = self.len();
-
-        plan.truncate(secondary_interactions_index + 1);
-
-        // phase 1: shrink extensions
-        for interaction in &mut plan {
-            if let InteractionsType::Property(property) = &mut interaction.interactions {
-                match property {
-                    Property::InsertValuesSelect { queries, .. }
-                    | Property::DoubleCreateFailure { queries, .. }
-                    | Property::DeleteSelect { queries, .. }
-                    | Property::DropSelect { queries, .. }
-                    | Property::Queries { queries } => {
-                        let mut temp_plan = InteractionPlan::new_with(
-                            queries
-                                .iter()
-                                .map(|q| {
-                                    Interactions::new(
-                                        interaction.connection_index,
-                                        InteractionsType::Query(q.clone()),
-                                    )
-                                })
-                                .collect(),
-                            self.mvcc,
-                        );
-
-                        temp_plan = InteractionPlan::iterative_shrink(
-                            temp_plan,
-                            failing_execution,
-                            result,
-                            env.clone(),
-                            secondary_interactions_index,
-                        );
-                        //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
-
-                        *queries = temp_plan
-                            .into_iter()
-                            .filter_map(|i| match i.interactions {
-                                InteractionsType::Query(q) => Some(q),
-                                _ => None,
-                            })
-                            .collect();
-                    }
-                    Property::WhereTrueFalseNull { .. }
-                    | Property::UNIONAllPreservesCardinality { .. }
-                    | Property::SelectLimit { .. }
-                    | Property::SelectSelectOptimizer { .. }
-                    | Property::FaultyQuery { .. }
-                    | Property::FsyncNoWait { .. }
-                    | Property::ReadYourUpdatesBack { .. }
-                    | Property::TableHasExpectedContent { .. }
-                    | Property::AllTableHaveExpectedContent { .. } => {}
-                }
-            }
-        }
-
-        // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(
-            plan,
-            failing_execution,
-            result,
-            env,
-            secondary_interactions_index,
-        );
-
-        let after = plan.len();
-
-        tracing::info!(
-            "Shrinking interaction plan from {} to {} properties",
-            before,
-            after
-        );
-
-        plan
-    }
-
-    /// shrink a plan by removing one interaction at a time (and its deps) while preserving the error
-    fn iterative_shrink(
-        mut plan: InteractionPlan,
-        failing_execution: &Execution,
-        old_result: &SandboxedResult,
-        env: Arc<Mutex<SimulatorEnv>>,
-        secondary_interaction_index: usize,
-    ) -> InteractionPlan {
-        for i in (0..plan.len()).rev() {
-            if i == secondary_interaction_index {
-                continue;
-            }
-            let mut test_plan = plan.clone();
-
-            test_plan.remove(i);
-
-            if Self::test_shrunk_plan(&test_plan, failing_execution, old_result, env.clone()) {
-                plan = test_plan;
-            }
-        }
-        plan
-    }
-
-    fn test_shrunk_plan(
-        test_plan: &InteractionPlan,
-        failing_execution: &Execution,
-        old_result: &SandboxedResult,
-        env: Arc<Mutex<SimulatorEnv>>,
-    ) -> bool {
-        let last_execution = Arc::new(Mutex::new(*failing_execution));
-        let result = SandboxedResult::from(
-            std::panic::catch_unwind(|| {
-                let plan = test_plan.static_iterator();
-
-                run_simulation(env.clone(), plan, last_execution.clone())
-            }),
-            last_execution,
-        );
-        match (old_result, &result) {
-            (
-                SandboxedResult::Panicked { error: e1, .. },
-                SandboxedResult::Panicked { error: e2, .. },
-            )
-            | (
-                SandboxedResult::FoundBug { error: e1, .. },
-                SandboxedResult::FoundBug { error: e2, .. },
-            ) => e1 == e2,
-            _ => false,
-        }
     }
 }
