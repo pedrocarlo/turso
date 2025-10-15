@@ -22,10 +22,9 @@ use crate::{
             InteractionType, Interactions, InteractionsType,
         },
         metrics::Remaining,
+        property::Property,
     },
 };
-
-use super::property::Property;
 
 impl InteractionPlan {
     pub fn init_plan(env: &mut SimulatorEnv) -> Self {

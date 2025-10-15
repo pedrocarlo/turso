@@ -12,8 +12,11 @@ use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
 
 use crate::{
-    generation::{Shadow, property::Property},
-    model::{Query, ResultSet},
+    generation::Shadow,
+    model::{
+        Query, ResultSet,
+        property::{Property, PropertyDiscriminants},
+    },
     runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
 };
 
@@ -24,6 +27,7 @@ pub(crate) struct InteractionPlan {
     // so we can have nested properties
     last_interactions: Option<Interactions>,
     pub mvcc: bool,
+    /// Counts [Interaction]
     len: usize,
     /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field

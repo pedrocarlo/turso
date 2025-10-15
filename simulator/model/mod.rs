@@ -22,6 +22,7 @@ use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 pub mod interactions;
 pub mod metrics;
+pub mod property;
 
 pub(crate) type ResultSet = Result<Vec<Vec<SimValue>>>;
 
