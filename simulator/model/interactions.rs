@@ -1,7 +1,7 @@
 use std::{
     fmt::{Debug, Display},
     num::NonZeroUsize,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Range},
     panic::RefUnwindSafe,
     rc::Rc,
     sync::Arc,
@@ -113,7 +113,74 @@ impl InteractionPlan {
         self.set_last_interactions(interactions);
     }
 
-    pub fn truncate_properties(&mut self, len: usize) {
+    /// Finds the range of interactions that are contained between the start and end spans for a given ID.
+    pub fn find_interactions_range(&self, id: NonZeroUsize) -> Range<usize> {
+        let interactions = self.interactions_list();
+        let idx = interactions
+            .binary_search_by_key(&id, |interaction| interaction.id())
+            .map_err(|_| format!("Interaction containing id `{id}` should be present"))
+            .unwrap();
+        let interaction = &interactions[idx];
+
+        let backward = || -> usize {
+            interactions
+                .iter()
+                .rev()
+                .skip(interactions.len() - idx)
+                .position(|interaction| {
+                    interaction.id() == id
+                        && interaction
+                            .span
+                            .as_ref()
+                            .is_some_and(|span| matches!(span.span, Span::Start))
+                })
+                .expect("A start span should have been emitted")
+        };
+
+        let forward = || -> usize {
+            interactions
+                .iter()
+                .skip(idx + 1)
+                .position(|interaction| {
+                    interaction.id() == id
+                        && interaction
+                            .span
+                            .as_ref()
+                            .is_some_and(|span| matches!(span.span, Span::End))
+                })
+                .expect("An end span should have been emitted")
+        };
+
+        if let Some(span) = &interaction.span {
+            match span.span {
+                Span::Start => {
+                    // go forward and find the end span
+                    let end_idx = forward();
+                    idx..end_idx + 1
+                }
+                Span::End => {
+                    // go backward and find the start span
+                    let start_idx = backward();
+                    start_idx..idx + 1
+                }
+                Span::StartEnd => idx..idx + 1,
+            }
+        } else {
+            // go forward and find the end span
+            let start_idx = forward();
+            // go backward and find the start span
+            let end_idx = backward();
+            start_idx..end_idx + 1
+        }
+    }
+
+    pub fn find_interactions(&self, id: NonZeroUsize) -> core::slice::Iter<'_, Interaction> {
+        let range = self.find_interactions_range(id);
+        self.interactions_list()[range].iter()
+    }
+
+    /// Truncates up to a particular interaction
+    pub fn truncate(&mut self, len: usize) {
         self.plan.truncate(len);
         self.len = self.new_len();
     }
@@ -127,38 +194,20 @@ impl InteractionPlan {
         interactions
     }
 
-    pub fn retain_mut<F>(&mut self, mut f: F)
+    pub fn retain_mut<F>(&mut self, f: F)
     where
-        F: FnMut(&mut Interactions) -> bool,
+        F: FnMut(&mut Interaction) -> bool,
     {
-        let f = |t: &mut Interactions| {
-            let ignore = t.ignore();
-            let retain = f(t);
-            // removed an interaction that was not previously ignored
-            if !retain && !ignore {
-                self.len -= 1;
-            }
-            retain
-        };
+        // let f = |t: &mut Interaction| {
+        //     let ignore = t.ignore();
+        //     let retain = f(t);
+        //     // removed an interaction that was not previously ignored
+        //     if !retain && !ignore {
+        //         self.len -= 1;
+        //     }
+        //     retain
+        // };
         self.plan.retain_mut(f);
-    }
-
-    #[expect(dead_code)]
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&Interactions) -> bool,
-    {
-        let f = |t: &Interactions| {
-            let ignore = t.ignore();
-            let retain = f(t);
-            // removed an interaction that was not previously ignored
-            if !retain && !ignore {
-                self.len -= 1;
-            }
-            retain
-        };
-        self.plan.retain(f);
-        self.len = self.new_len();
     }
 
     #[inline]
@@ -507,8 +556,8 @@ impl Span {
 
 #[derive(Debug, Clone, Copy)]
 pub struct InteractionsSpan {
-    property: Option<PropertyDiscriminants>,
-    span: Span,
+    pub property: Option<PropertyDiscriminants>,
+    pub span: Span,
 }
 
 impl InteractionsSpan {
@@ -574,6 +623,15 @@ impl Interaction {
     pub fn set_span_id(&mut self, span: Option<InteractionsSpan>, id: NonZeroUsize) {
         self.span = span;
         self.id = id.get();
+    }
+
+    pub fn uses(&self) -> Vec<String> {
+        match &self.interaction {
+            InteractionType::Query(query)
+            | InteractionType::FsyncQuery(query)
+            | InteractionType::FaultyQuery(query) => query.uses(),
+            _ => vec![],
+        }
     }
 }
 

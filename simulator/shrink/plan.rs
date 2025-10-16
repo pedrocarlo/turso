@@ -1,11 +1,13 @@
+use either::Either;
 use indexmap::IndexSet;
+use itertools::Itertools;
 
 use crate::{
     SandboxedResult, SimulatorEnv,
     model::{
         Query,
-        interactions::{InteractionPlan, InteractionType, Interactions, InteractionsType},
-        property::Property,
+        interactions::{InteractionPlan, InteractionType, Interactions, InteractionsType, Span},
+        property::{Property, PropertyDiscriminants},
     },
     run_simulation,
     runner::execution::Execution,
@@ -35,49 +37,37 @@ impl InteractionPlan {
         let mut plan = self.clone();
 
         let all_interactions = self.interactions_list();
-        let secondary_interactions_index = &all_interactions[failing_execution.interaction_index];
+        let failing_interaction = &all_interactions[failing_execution.interaction_index];
 
-        // Index of the parent property where the interaction originated from
-        let failing_property = &self[secondary_interactions_index];
-        let mut depending_tables = failing_property.dependencies();
+        let range = self.find_interactions_range(failing_interaction.id());
 
-        {
-            let mut idx = failing_execution.interaction_index;
-            loop {
-                if all_interactions[idx].0 != secondary_interactions_index {
-                    // Stop when we reach a different property
-                    break;
-                }
-                match &all_interactions[idx].1.interaction {
+        // Interactions that are part of the failing overall property
+        let mut failing_property = all_interactions
+            [range.start..=failing_execution.interaction_index]
+            .iter()
+            .rev();
+
+        let depending_tables = failing_property
+            .find_map(|interaction| {
+                match &interaction.interaction {
                     InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
-                        depending_tables = query.dependencies();
-                        break;
+                        Some(query.dependencies())
                     }
                     // Fault does not depend on
-                    InteractionType::Fault(..) => break,
-                    _ => {
-                        // In principle we should never fail this checked_sub.
-                        // But if there is a bug in how we count the secondary index
-                        // we may panic if we do not use a checked_sub.
-                        if let Some(new_idx) = idx.checked_sub(1) {
-                            idx = new_idx;
-                        } else {
-                            tracing::warn!("failed to find error query");
-                            break;
-                        }
-                    }
+                    InteractionType::Fault(..) => Some(IndexSet::new()),
+                    _ => None,
                 }
-            }
-        }
+            })
+            .unwrap_or_else(|| IndexSet::new());
 
         let before = self.len_properties();
 
         // Remove all properties after the failing one
-        plan.truncate_properties(secondary_interactions_index + 1);
+        plan.truncate(failing_execution.interaction_index + 1);
 
         // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
         if !depending_tables.is_empty() {
-            plan.remove_properties(&depending_tables, secondary_interactions_index);
+            plan.remove_properties(&depending_tables, failing_execution.interaction_index);
         }
 
         let after = plan.len_properties();
@@ -113,37 +103,12 @@ impl InteractionPlan {
         };
 
         let mut plan = self.clone();
-        let all_interactions = self.interactions_list_with_secondary_index();
-        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
-
-        {
-            let mut idx = failing_execution.interaction_index;
-            loop {
-                if all_interactions[idx].0 != secondary_interactions_index {
-                    // Stop when we reach a different property
-                    break;
-                }
-                match &all_interactions[idx].1.interaction {
-                    // Fault does not depend on
-                    InteractionType::Fault(..) => break,
-                    _ => {
-                        // In principle we should never fail this checked_sub.
-                        // But if there is a bug in how we count the secondary index
-                        // we may panic if we do not use a checked_sub.
-                        if let Some(new_idx) = idx.checked_sub(1) {
-                            idx = new_idx;
-                        } else {
-                            tracing::warn!("failed to find error query");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let all_interactions = self.interactions_list();
+        let property_id = all_interactions[failing_execution.interaction_index].id();
 
         let before = self.len_properties();
 
-        plan.truncate_properties(secondary_interactions_index + 1);
+        plan.truncate(failing_execution.interaction_index + 1);
 
         // phase 1: shrink extensions
         for interaction in &mut plan {
@@ -275,91 +240,80 @@ impl InteractionPlan {
         depending_tables: &IndexSet<String>,
         failing_interaction_index: usize,
     ) {
-        let mut idx = 0;
-        // Remove all properties that do not use the failing tables
-        self.retain_mut(|interactions| {
-            let retain = if idx == failing_interaction_index {
-                true
-            } else {
-                let mut has_table = interactions
-                    .uses()
-                    .iter()
-                    .any(|t| depending_tables.contains(t));
+        // First pass - mark indexes that should be retained
+        let mut retain_map = Vec::with_capacity(self.len());
+        let mut iter = self.interactions_list().iter().enumerate().peekable();
+        while let Some((idx, interaction)) = iter.next() {
+            let id = interaction.id();
+            // get interactions from a particular property
+            let span = interaction
+                .span
+                .as_ref()
+                .expect("we should loop on interactions that a span");
 
-                if has_table {
-                    // will contain extensional queries that reference the depending tables
-                    let mut extensional_queries = Vec::new();
+            let first = std::iter::once((idx, interaction));
 
-                    // Remove the extensional parts of the properties
-                    if let InteractionsType::Property(p) = &mut interactions.interactions {
-                        match p {
-                            Property::InsertValuesSelect { queries, .. }
-                            | Property::DoubleCreateFailure { queries, .. }
-                            | Property::DeleteSelect { queries, .. }
-                            | Property::DropSelect { queries, .. }
-                            | Property::Queries { queries } => {
-                                // Remove placeholder queries
-                                queries.retain(|query| !matches!(query, Query::Placeholder));
-                                extensional_queries.append(queries);
-                            }
-                            Property::AllTableHaveExpectedContent { tables } => {
-                                tables.retain(|table| depending_tables.contains(table));
-                            }
-                            Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => {}
-                            Property::SelectLimit { .. }
-                            | Property::SelectSelectOptimizer { .. }
-                            | Property::WhereTrueFalseNull { .. }
-                            | Property::UnionAllPreservesCardinality { .. }
-                            | Property::ReadYourUpdatesBack { .. }
-                            | Property::TableHasExpectedContent { .. } => {}
-                        }
-                    }
-                    // Check again after query clear if the interactions still uses the failing table
-                    has_table = interactions
+            let property_interactions = match span.span {
+                Span::Start => {
+                    Either::Left(first.chain(iter.peeking_take_while(|(_, interaction)| {
+                        interaction.id() == id
+                            && interaction
+                                .span
+                                .as_ref()
+                                .is_some_and(|span| matches!(span.span, Span::End))
+                    })))
+                }
+                Span::End => panic!("we should always be at the start of an interaction"),
+                Span::StartEnd => Either::Right(first),
+            };
+
+            for (idx, interaction) in property_interactions.into_iter() {
+                let retain = if idx == failing_interaction_index {
+                    true
+                } else {
+                    let has_table = interaction
                         .uses()
                         .iter()
                         .any(|t| depending_tables.contains(t));
 
-                    // means the queries in the original property are present in the depending tables regardless of the extensional queries
-                    if has_table {
-                        if let Some(queries) = interactions.get_extensional_queries() {
-                            retain_relevant_queries(&mut extensional_queries, depending_tables);
-                            queries.append(&mut extensional_queries);
-                        }
-                    } else {
-                        // original property without extensional queries does not reference the tables so convert the property to
-                        // `Property::Queries` if `extensional_queries` is not empty
-                        retain_relevant_queries(&mut extensional_queries, depending_tables);
-                        if !extensional_queries.is_empty() {
-                            has_table = true;
-                            *interactions = Interactions::new(
-                                interactions.connection_index,
-                                InteractionsType::Property(Property::Queries {
-                                    queries: extensional_queries,
-                                }),
+                    let is_fault = matches!(&interaction.interaction, InteractionType::Fault(..));
+                    let is_transaction = matches!(
+                        &interaction.interaction,
+                        InteractionType::Query(Query::Begin(..))
+                            | InteractionType::Query(Query::Commit(..))
+                            | InteractionType::Query(Query::Rollback(..))
+                    );
+
+                    let mut skip_interaction = matches!(
+                        &interaction.interaction,
+                        InteractionType::Query(Query::Select(_))
+                    );
+
+                    if let Some(property) = span.property {
+                        skip_interaction = skip_interaction
+                            || matches!(
+                                property,
+                                PropertyDiscriminants::AllTableHaveExpectedContent
+                                    | PropertyDiscriminants::SelectLimit
+                                    | PropertyDiscriminants::SelectSelectOptimizer
+                                    | PropertyDiscriminants::TableHasExpectedContent
+                                    | PropertyDiscriminants::UnionAllPreservesCardinality
+                                    | PropertyDiscriminants::WhereTrueFalseNull
                             );
-                        }
                     }
-                }
-                let is_fault = matches!(interactions.interactions, InteractionsType::Fault(..));
-                let is_transaction = matches!(
-                    interactions.interactions,
-                    InteractionsType::Query(Query::Begin(..))
-                        | InteractionsType::Query(Query::Commit(..))
-                        | InteractionsType::Query(Query::Rollback(..))
-                );
-                is_fault
-                    || is_transaction
-                    || (has_table
-                        && !matches!(
-                            interactions.interactions,
-                            InteractionsType::Query(Query::Select(_))
-                                | InteractionsType::Property(Property::SelectLimit { .. })
-                                | InteractionsType::Property(
-                                    Property::SelectSelectOptimizer { .. }
-                                )
-                        ))
-            };
+
+                    is_fault || is_transaction || (has_table && !skip_interaction)
+                };
+                retain_map.push(retain);
+            }
+        }
+
+        debug_assert!(self.len() == retain_map.len());
+
+        let mut idx = 0;
+        // Remove all properties that do not use the failing tables
+        self.retain_mut(|_| {
+            let retain = retain_map[idx];
             idx += 1;
             retain
         });
@@ -369,23 +323,23 @@ impl InteractionPlan {
         // Comprises of idxs of Commit and Rollback intereactions
         let mut end_tx_idx: HashMap<usize, Vec<usize>> = HashMap::new();
 
-        for (idx, interactions) in self.iter().enumerate() {
-            match &interactions.interactions {
-                InteractionsType::Query(Query::Begin(..)) => {
+        for (idx, interaction) in self.interactions_list().into_iter().enumerate() {
+            match &interaction.interaction {
+                InteractionType::Query(Query::Begin(..)) => {
                     begin_idx
-                        .entry(interactions.connection_index)
+                        .entry(interaction.connection_index)
                         .or_insert_with(|| vec![idx]);
                 }
-                InteractionsType::Query(Query::Commit(..))
-                | InteractionsType::Query(Query::Rollback(..)) => {
+                InteractionType::Query(Query::Commit(..))
+                | InteractionType::Query(Query::Rollback(..)) => {
                     let last_begin = begin_idx
-                        .get(&interactions.connection_index)
+                        .get(&interaction.connection_index)
                         .and_then(|list| list.last())
                         .unwrap()
                         + 1;
                     if last_begin == idx {
                         end_tx_idx
-                            .entry(interactions.connection_index)
+                            .entry(interaction.connection_index)
                             .or_insert_with(|| vec![idx]);
                     }
                 }
