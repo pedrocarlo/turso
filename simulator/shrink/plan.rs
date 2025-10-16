@@ -34,8 +34,8 @@ impl InteractionPlan {
         // - Shrink properties by removing their extensions, or shrinking their values
         let mut plan = self.clone();
 
-        let all_interactions = self.interactions_list_with_secondary_index();
-        let secondary_interactions_index = all_interactions[failing_execution.interaction_index].0;
+        let all_interactions = self.interactions_list();
+        let secondary_interactions_index = &all_interactions[failing_execution.interaction_index];
 
         // Index of the parent property where the interaction originated from
         let failing_property = &self[secondary_interactions_index];

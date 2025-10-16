@@ -31,7 +31,7 @@ impl InteractionPlan {
         &'a mut self,
         rng: &'a mut impl rand::Rng,
     ) -> impl InteractionPlanIterator {
-        let interactions = self.interactions_list();
+        let interactions = self.interactions_list().to_vec();
         let iter = interactions.into_iter();
         PlanGenerator {
             plan: self,
@@ -132,16 +132,28 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
 
                 let id = self.plan.next_property_id();
 
+                let len = iter.len();
+
                 // Add a span to the interactions
-                if iter.len() == 1 {
-                    iter.first_mut().unwrap().span =
-                        Some(InteractionsSpan::new(&interactions, Span::StartEnd, id))
+                if len == 1 {
+                    iter.first_mut().unwrap().set_span_id(
+                        Some(InteractionsSpan::new(&interactions, Span::StartEnd)),
+                        id,
+                    )
                 } else {
-                    iter.first_mut().unwrap().span =
-                        Some(InteractionsSpan::new(&interactions, Span::Start, id));
-                    iter.last_mut().unwrap().span =
-                        Some(InteractionsSpan::new(&interactions, Span::End, id));
+                    iter.iter_mut().enumerate().for_each(|(idx, interaction)| {
+                        let span = if idx == 0 {
+                            Some(InteractionsSpan::new(&interactions, Span::Start))
+                        } else if idx == len - 1 {
+                            Some(InteractionsSpan::new(&interactions, Span::End))
+                        } else {
+                            None
+                        };
+
+                        interaction.set_span_id(span, id)
+                    });
                 }
+
                 let mut iter = interactions.interactions().into_iter();
 
                 self.plan.push(interactions);
@@ -240,16 +252,38 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
             }
             None => {
                 // after we generated all interactions if some connection is still in a transaction, commit
-                (0..env.connections.len())
+                let commit = (0..env.connections.len())
                     .find(|idx| env.conn_in_transaction(*idx))
                     .map(|conn_index| {
                         let query = Query::Commit(Commit);
-                        let interaction =
+                        let interactions =
                             Interactions::new(conn_index, InteractionsType::Query(query));
-                        self.plan.push(interaction);
 
-                        Interaction::new(conn_index, InteractionType::Query(Query::Commit(Commit)))
-                    })
+                        let mut interaction = Interaction::new(
+                            conn_index,
+                            InteractionType::Query(Query::Commit(Commit)),
+                        );
+
+                        interaction.set_span_id(
+                            Some(InteractionsSpan::new(&interactions, Span::StartEnd)),
+                            self.plan.next_property_id(),
+                        );
+
+                        self.plan.push(interactions);
+
+                        interaction
+                    });
+
+                #[cfg(debug_assertions)]
+                if commit.is_none() {
+                    // Do a final sanity check to make sure that all interactions are sorted by ids
+                    assert!(
+                        self.plan
+                            .interactions_list()
+                            .is_sorted_by(|a, b| a.id() <= b.id())
+                    );
+                }
+                commit
             }
         }
     }

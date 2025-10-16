@@ -1,5 +1,6 @@
 use std::{
     fmt::{Debug, Display},
+    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     panic::RefUnwindSafe,
     rc::Rc,
@@ -32,7 +33,7 @@ pub(crate) struct InteractionPlan {
     /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
     len_properties: usize,
-    next_interaction_id: usize,
+    next_interaction_id: NonZeroUsize,
 }
 
 impl InteractionPlan {
@@ -43,10 +44,12 @@ impl InteractionPlan {
             mvcc,
             len: 0,
             len_properties: 0,
-            next_interaction_id: 0,
+            next_interaction_id: NonZeroUsize::new(1).unwrap(),
         }
     }
 
+    /// Should only be used when creating a plan that should use static iteration.
+    /// TODO: find a way to use a typestate or something else to enforce this
     pub fn new_with(plan: Vec<Interaction>, mvcc: bool) -> Self {
         Self {
             plan,
@@ -54,7 +57,7 @@ impl InteractionPlan {
             mvcc,
             len: 0,
             len_properties: 0,
-            next_interaction_id: 0,
+            next_interaction_id: NonZeroUsize::new(1).unwrap(),
         }
     }
 
@@ -78,9 +81,12 @@ impl InteractionPlan {
         self.len_properties
     }
 
-    pub fn next_property_id(&mut self) -> usize {
+    pub fn next_property_id(&mut self) -> NonZeroUsize {
         let id = self.next_interaction_id;
-        self.next_interaction_id += 1;
+        self.next_interaction_id = self
+            .next_interaction_id
+            .checked_add(1)
+            .expect("Generated too many interactions, that overflowed ID generation");
         id
     }
 
@@ -155,22 +161,9 @@ impl InteractionPlan {
         self.len = self.new_len();
     }
 
-    pub fn interactions_list(&self) -> Vec<Interaction> {
-        self.plan.clone()
-    }
-
-    pub fn interactions_list_with_secondary_index(&self) -> Vec<(usize, Interaction)> {
-        self.plan
-            .clone()
-            .into_iter()
-            .enumerate()
-            .flat_map(|(idx, interactions)| {
-                interactions
-                    .interactions()
-                    .into_iter()
-                    .map(move |interaction| (idx, interaction))
-            })
-            .collect()
+    #[inline]
+    pub fn interactions_list(&self) -> &[Interaction] {
+        &self.plan
     }
 
     pub(crate) fn stats(&self) -> InteractionStats {
@@ -211,7 +204,7 @@ impl InteractionPlan {
 
     pub fn static_iterator(&self) -> impl InteractionPlanIterator {
         PlanIterator {
-            iter: self.interactions_list().into_iter(),
+            iter: self.interactions_list().to_vec().into_iter(),
         }
     }
 }
@@ -516,17 +509,16 @@ impl Span {
 pub struct InteractionsSpan {
     property: Option<PropertyDiscriminants>,
     span: Span,
-    id: usize,
 }
 
 impl InteractionsSpan {
-    pub fn new(interactions: &Interactions, span: Span, id: usize) -> Self {
+    pub fn new(interactions: &Interactions, span: Span) -> Self {
         let property = if let InteractionsType::Property(property) = &interactions.interactions {
             Some(property.into())
         } else {
             None
         };
-        Self { property, span, id }
+        Self { property, span }
     }
 }
 
@@ -536,6 +528,8 @@ pub struct Interaction {
     pub interaction: InteractionType,
     pub ignore_error: bool,
     pub span: Option<InteractionsSpan>,
+    /// 0 id means the ID was not set
+    id: usize,
 }
 
 impl Deref for Interaction {
@@ -559,6 +553,7 @@ impl Interaction {
             interaction,
             ignore_error: false,
             span: None,
+            id: 0,
         }
     }
 
@@ -568,7 +563,17 @@ impl Interaction {
             interaction,
             ignore_error: true,
             span: None,
+            id: 0,
         }
+    }
+
+    pub fn id(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.id).expect("Id for interaction was not set")
+    }
+
+    pub fn set_span_id(&mut self, span: Option<InteractionsSpan>, id: NonZeroUsize) {
+        self.span = span;
+        self.id = id.get();
     }
 }
 
