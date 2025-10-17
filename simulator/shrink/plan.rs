@@ -14,6 +14,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
+    ops::Range,
     sync::{Arc, Mutex},
 };
 
@@ -67,7 +68,7 @@ impl InteractionPlan {
 
         // means we errored in some fault on transaction statement so just maintain the statements from before the failing one
         if !depending_tables.is_empty() {
-            plan.remove_properties(&depending_tables, failing_execution.interaction_index);
+            plan.remove_properties(&depending_tables, range);
         }
 
         let after = plan.len_properties();
@@ -238,7 +239,7 @@ impl InteractionPlan {
     fn remove_properties(
         &mut self,
         depending_tables: &IndexSet<String>,
-        failing_interaction_index: usize,
+        failing_interaction_range: Range<usize>,
     ) {
         // First pass - mark indexes that should be retained
         let mut retain_map = Vec::with_capacity(self.len());
@@ -254,7 +255,7 @@ impl InteractionPlan {
 
             let property_interactions = match span {
                 Span::Start => {
-                    Either::Left(first.chain(iter.peeking_take_while(|(_, interaction)| {
+                    Either::Left(first.chain(iter.peeking_take_while(|(_idx, interaction)| {
                         interaction.id() == id
                             && interaction
                                 .span
@@ -267,7 +268,7 @@ impl InteractionPlan {
             };
 
             for (idx, interaction) in property_interactions.into_iter() {
-                let retain = if idx == failing_interaction_index {
+                let retain = if failing_interaction_range.contains(&idx) {
                     true
                 } else {
                     let has_table = interaction
@@ -282,26 +283,32 @@ impl InteractionPlan {
                             | InteractionType::Query(Query::Commit(..))
                             | InteractionType::Query(Query::Rollback(..))
                     );
-
-                    let mut skip_interaction = matches!(
+                    let is_assertion = matches!(
                         &interaction.interaction,
-                        InteractionType::Query(Query::Select(_))
+                        InteractionType::Assertion(..) | InteractionType::Assumption(..)
                     );
 
-                    if let Some(property_meta) = interaction.property_meta {
-                        skip_interaction = skip_interaction
-                            || matches!(
-                                property_meta.property,
-                                PropertyDiscriminants::AllTableHaveExpectedContent
-                                    | PropertyDiscriminants::SelectLimit
-                                    | PropertyDiscriminants::SelectSelectOptimizer
-                                    | PropertyDiscriminants::TableHasExpectedContent
-                                    | PropertyDiscriminants::UnionAllPreservesCardinality
-                                    | PropertyDiscriminants::WhereTrueFalseNull
-                            );
-                    }
+                    let skip_interaction = if let Some(property_meta) = interaction.property_meta
+                        && matches!(
+                            property_meta.property,
+                            PropertyDiscriminants::AllTableHaveExpectedContent
+                                | PropertyDiscriminants::SelectLimit
+                                | PropertyDiscriminants::SelectSelectOptimizer
+                                | PropertyDiscriminants::TableHasExpectedContent
+                                | PropertyDiscriminants::UnionAllPreservesCardinality
+                                | PropertyDiscriminants::WhereTrueFalseNull
+                        ) {
+                        // Theses properties only emit select queries, so they can be discarded entirely
+                        true
+                    } else {
+                        // Standalone Select query
+                        matches!(
+                            &interaction.interaction,
+                            InteractionType::Query(Query::Select(_))
+                        )
+                    };
 
-                    is_fault || is_transaction || (has_table && !skip_interaction)
+                    !skip_interaction && (is_fault || is_transaction || is_assertion || has_table)
                 };
                 retain_map.push(retain);
             }
