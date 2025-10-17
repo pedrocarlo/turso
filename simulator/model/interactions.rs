@@ -1,5 +1,6 @@
 use std::{
     fmt::{Debug, Display},
+    marker::PhantomData,
     num::NonZeroUsize,
     ops::{Deref, DerefMut, Range},
     panic::RefUnwindSafe,
@@ -154,7 +155,8 @@ impl InteractionPlan {
     /// Used to remove a particular [Interactions]
     pub fn remove_property(&mut self, id: NonZeroUsize) {
         let range = self.find_interactions_range(id);
-        self.plan.drain(range);
+        // Consume the drain iterator just to be sure
+        for _interaction in self.plan.drain(range) {}
     }
 
     pub fn retain_mut<F>(&mut self, f: F)
@@ -171,10 +173,27 @@ impl InteractionPlan {
 
     pub fn iter_properties(
         &self,
-    ) -> IterProperty<std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>>
-    {
+    ) -> IterProperty<
+        std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>,
+        Forward,
+    > {
         IterProperty {
             iter: self.interactions_list().iter().enumerate().peekable(),
+            _direction: PhantomData,
+        }
+    }
+
+    pub fn rev_iter_properties(
+        &self,
+    ) -> IterProperty<
+        std::iter::Peekable<
+            std::iter::Enumerate<std::iter::Rev<std::slice::Iter<'_, Interaction>>>,
+        >,
+        Backward,
+    > {
+        IterProperty {
+            iter: self.interactions_list().iter().rev().enumerate().peekable(),
+            _direction: PhantomData,
         }
     }
 
@@ -193,11 +212,15 @@ impl InteractionPlan {
     }
 }
 
-pub struct IterProperty<I> {
+pub struct Forward;
+pub struct Backward;
+
+pub struct IterProperty<I, Dir> {
     iter: I,
+    _direction: PhantomData<Dir>,
 }
 
-impl<'a, I> IterProperty<I>
+impl<'a, I> IterProperty<I, Forward>
 where
     I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext + std::fmt::Debug,
 {
@@ -207,7 +230,7 @@ where
         // get interactions from a particular property
         let span = interaction
             .span
-            .expect("we should loop on interactions that a span");
+            .expect("we should loop on interactions that have a span");
 
         let first = std::iter::once((idx, interaction));
 
@@ -223,6 +246,37 @@ where
         };
 
         Some(property_interactions)
+    }
+}
+
+impl<'a, I> IterProperty<I, Backward>
+where
+    I: Iterator<Item = (usize, &'a Interaction)>
+        + DoubleEndedIterator
+        + itertools::PeekingNext
+        + std::fmt::Debug,
+{
+    pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
+        let (idx, interaction) = self.iter.next()?;
+        let id = interaction.id();
+        // get interactions from a particular property
+        let span = interaction
+            .span
+            .expect("we should loop on interactions that have a span");
+
+        let first = std::iter::once((idx, interaction));
+
+        let property_interactions = match span {
+            Span::Start => panic!("we should always be at the end of an interaction"),
+            Span::End => Either::Left(
+                self.iter
+                    .peeking_take_while(move |(_idx, interaction)| interaction.id() == id)
+                    .chain(first),
+            ),
+            Span::StartEnd => Either::Right(first),
+        };
+
+        Some(property_interactions.into_iter())
     }
 }
 

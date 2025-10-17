@@ -121,13 +121,14 @@ impl InteractionPlan {
         env: Arc<Mutex<SimulatorEnv>>,
         failing_property_id: NonZeroUsize,
     ) -> InteractionPlan {
-        let mut iter_properties = plan.iter_properties();
+        let mut iter_properties = plan.rev_iter_properties();
 
         let mut ret_plan = plan.clone();
 
-        while let Some(mut property_interactions) = iter_properties.next_property() {
+        while let Some(property_interactions) = iter_properties.next_property() {
             // get the overall property id and try to remove it
-            if let Some((_, interaction)) = property_interactions.next()
+            // need to consume the iterator, to advance outer iterator
+            if let Some((_, interaction)) = property_interactions.last()
                 && interaction.id() != failing_property_id
             {
                 // try to remove the property
