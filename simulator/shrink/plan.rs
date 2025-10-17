@@ -248,19 +248,18 @@ impl InteractionPlan {
             // get interactions from a particular property
             let span = interaction
                 .span
-                .as_ref()
                 .expect("we should loop on interactions that a span");
 
             let first = std::iter::once((idx, interaction));
 
-            let property_interactions = match span.span {
+            let property_interactions = match span {
                 Span::Start => {
                     Either::Left(first.chain(iter.peeking_take_while(|(_, interaction)| {
                         interaction.id() == id
                             && interaction
                                 .span
                                 .as_ref()
-                                .is_some_and(|span| matches!(span.span, Span::End))
+                                .is_some_and(|span| matches!(span, Span::End))
                     })))
                 }
                 Span::End => panic!("we should always be at the start of an interaction"),
@@ -289,10 +288,10 @@ impl InteractionPlan {
                         InteractionType::Query(Query::Select(_))
                     );
 
-                    if let Some(property) = span.property {
+                    if let Some(property_meta) = interaction.property_meta {
                         skip_interaction = skip_interaction
                             || matches!(
-                                property,
+                                property_meta.property,
                                 PropertyDiscriminants::AllTableHaveExpectedContent
                                     | PropertyDiscriminants::SelectLimit
                                     | PropertyDiscriminants::SelectSelectOptimizer

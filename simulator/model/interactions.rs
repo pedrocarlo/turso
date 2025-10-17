@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
@@ -131,8 +130,7 @@ impl InteractionPlan {
                     interaction.id() == id
                         && interaction
                             .span
-                            .as_ref()
-                            .is_some_and(|span| matches!(span.span, Span::Start))
+                            .is_some_and(|span| matches!(span, Span::Start))
                 })
                 .expect("A start span should have been emitted")
         };
@@ -146,13 +144,13 @@ impl InteractionPlan {
                         && interaction
                             .span
                             .as_ref()
-                            .is_some_and(|span| matches!(span.span, Span::End))
+                            .is_some_and(|span| matches!(span, Span::End))
                 })
                 .expect("An end span should have been emitted")
         };
 
-        if let Some(span) = &interaction.span {
-            match span.span {
+        if let Some(span) = interaction.span {
+            match span {
                 Span::Start => {
                     // go forward and find the end span
                     let end_idx = forward();
@@ -369,55 +367,35 @@ impl InteractionsType {
 }
 
 impl Interactions {
-    pub(crate) fn interactions(&self) -> Vec<Interaction> {
+    pub(crate) fn interactions(&self, id: NonZeroUsize) -> Vec<Interaction> {
         let ret = match &self.interactions {
-            InteractionsType::Property(property) => property.interactions(self.connection_index),
-            InteractionsType::Query(query) => vec![Interaction::new(
-                self.connection_index,
-                InteractionType::Query(query.clone()),
-            )],
-            InteractionsType::Fault(fault) => vec![Interaction::new(
-                self.connection_index,
-                InteractionType::Fault(*fault),
-            )],
+            InteractionsType::Property(property) => {
+                property.interactions(self.connection_index, id)
+            }
+            InteractionsType::Query(query) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::Query(query.clone()));
+                builder
+                    .connection_index(self.connection_index)
+                    .id(id)
+                    .span(Span::StartEnd);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
+            InteractionsType::Fault(fault) => {
+                let mut builder =
+                    InteractionBuilder::with_interaction(InteractionType::Fault(*fault));
+                builder
+                    .connection_index(self.connection_index)
+                    .id(id)
+                    .span(Span::StartEnd);
+                let interaction = builder.build().unwrap();
+                vec![interaction]
+            }
         };
 
         assert!(!ret.is_empty());
         ret
-    }
-
-    pub(crate) fn dependencies(&self) -> IndexSet<String> {
-        match &self.interactions {
-            InteractionsType::Property(property) => property
-                .interactions(self.connection_index)
-                .iter()
-                .fold(IndexSet::new(), |mut acc, i| match &i.interaction {
-                    InteractionType::Query(q) => {
-                        acc.extend(q.dependencies());
-                        acc
-                    }
-                    _ => acc,
-                }),
-            InteractionsType::Query(query) => query.dependencies(),
-            InteractionsType::Fault(_) => IndexSet::new(),
-        }
-    }
-
-    pub(crate) fn uses(&self) -> Vec<String> {
-        match &self.interactions {
-            InteractionsType::Property(property) => property
-                .interactions(self.connection_index)
-                .iter()
-                .fold(vec![], |mut acc, i| match &i.interaction {
-                    InteractionType::Query(q) => {
-                        acc.extend(q.uses());
-                        acc
-                    }
-                    _ => acc,
-                }),
-            InteractionsType::Query(query) => query.uses(),
-            InteractionsType::Fault(_) => vec![],
-        }
     }
 }
 
@@ -426,26 +404,23 @@ impl Display for InteractionPlan {
         const PAD: usize = 4;
         let mut indentation_level = 0;
         for interaction in &self.plan {
-            if let Some(span) = &interaction.span {
-                if let Some(name) = span.property.map(|p| p.name())
-                    && span.span.start()
-                {
-                    indentation_level += 1;
-                    writeln!(f, "-- begin testing '{name}'")?;
-                }
+            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                && interaction.span.is_some_and(|span| span.start())
+            {
+                indentation_level += 1;
+                writeln!(f, "-- begin testing '{name}'")?;
             }
+
             if indentation_level > 0 {
                 let padding = " ".repeat(indentation_level * PAD);
                 f.pad(&padding)?;
             }
             writeln!(f, "{interaction}")?;
-            if let Some(span) = &interaction.span {
-                if let Some(name) = span.property.map(|p| p.name())
-                    && span.span.end()
-                {
-                    indentation_level -= 1;
-                    writeln!(f, "-- end testing '{name}'")?;
-                }
+            if let Some(name) = interaction.property_meta.map(|p| p.property.name())
+                && interaction.span.is_some_and(|span| span.end())
+            {
+                indentation_level -= 1;
+                writeln!(f, "-- end testing '{name}'")?;
             }
         }
 
@@ -555,30 +530,76 @@ impl Span {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct InteractionsSpan {
-    pub property: Option<PropertyDiscriminants>,
-    pub span: Span,
+pub struct PropertyMetadata {
+    pub property: PropertyDiscriminants,
+    // If the query is an extension query
+    pub extension: bool,
 }
 
-impl InteractionsSpan {
-    pub fn new(interactions: &Interactions, span: Span) -> Self {
-        let property = if let InteractionsType::Property(property) = &interactions.interactions {
-            Some(property.into())
-        } else {
-            None
-        };
-        Self { property, span }
+impl PropertyMetadata {
+    pub fn new(property: &Property, extension: bool) -> PropertyMetadata {
+        Self {
+            property: property.into(),
+            extension,
+        }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, derive_builder::Builder)]
+#[builder(build_fn(validate = "Self::validate"))]
 pub struct Interaction {
     pub connection_index: usize,
     pub interaction: InteractionType,
+    #[builder(default)]
     pub ignore_error: bool,
-    pub span: Option<InteractionsSpan>,
+    #[builder(setter(strip_option), default)]
+    pub property_meta: Option<PropertyMetadata>,
+    #[builder(setter(strip_option), default)]
+    pub span: Option<Span>,
     /// 0 id means the ID was not set
-    id: usize,
+    id: NonZeroUsize,
+}
+
+impl InteractionBuilder {
+    pub fn from_interaction(interaction: &Interaction) -> Self {
+        let mut builder = Self::default();
+        builder
+            .connection_index(interaction.connection_index)
+            .id(interaction.id())
+            .ignore_error(interaction.ignore_error)
+            .interaction(interaction.interaction.clone());
+        if let Some(property_meta) = interaction.property_meta {
+            builder.property_meta(property_meta);
+        }
+        if let Some(span) = interaction.span {
+            builder.span(span);
+        }
+        builder
+    }
+
+    pub fn with_interaction(interaction: InteractionType) -> Self {
+        let mut builder = Self::default();
+        builder.interaction(interaction);
+        builder
+    }
+
+    /// Checks to see if the property metadata was already set
+    pub fn has_property_meta(&self) -> bool {
+        self.property_meta.is_some()
+    }
+
+    fn validate(&self) -> Result<(), InteractionBuilderError> {
+        // Cannot have span and property_meta.extension being true at the same time
+        if let Some(property_meta) = self.property_meta.flatten()
+            && property_meta.extension
+            && self.span.flatten().is_some()
+        {
+            return Err(InteractionBuilderError::ValidationError(
+                "cannot have a span set with an extension query".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Deref for Interaction {
@@ -596,33 +617,8 @@ impl DerefMut for Interaction {
 }
 
 impl Interaction {
-    pub fn new(connection_index: usize, interaction: InteractionType) -> Self {
-        Self {
-            connection_index,
-            interaction,
-            ignore_error: false,
-            span: None,
-            id: 0,
-        }
-    }
-
-    pub fn new_ignore_error(connection_index: usize, interaction: InteractionType) -> Self {
-        Self {
-            connection_index,
-            interaction,
-            ignore_error: true,
-            span: None,
-            id: 0,
-        }
-    }
-
     pub fn id(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.id).expect("Id for interaction was not set")
-    }
-
-    pub fn set_span_id(&mut self, span: Option<InteractionsSpan>, id: NonZeroUsize) {
-        self.span = span;
-        self.id = id.get();
+        self.id
     }
 
     pub fn uses(&self) -> Vec<String> {

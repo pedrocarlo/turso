@@ -18,8 +18,8 @@ use crate::{
     model::{
         Query,
         interactions::{
-            Fault, Interaction, InteractionPlan, InteractionPlanIterator, InteractionStats,
-            InteractionType, Interactions, InteractionsSpan, InteractionsType, Span,
+            Fault, Interaction, InteractionBuilder, InteractionPlan, InteractionPlanIterator,
+            InteractionStats, InteractionType, Interactions, InteractionsType, Span,
         },
         metrics::Remaining,
         property::Property,
@@ -126,35 +126,13 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                 // stop generating
                 let interactions = self.plan.generate_next_interaction(self.rng, env)?;
 
-                let mut iter = interactions.interactions();
+                let id = self.plan.next_property_id();
+
+                let iter = interactions.interactions(id);
 
                 assert!(!iter.is_empty());
 
-                let id = self.plan.next_property_id();
-
-                let len = iter.len();
-
-                // Add a span to the interactions
-                if len == 1 {
-                    iter.first_mut().unwrap().set_span_id(
-                        Some(InteractionsSpan::new(&interactions, Span::StartEnd)),
-                        id,
-                    )
-                } else {
-                    iter.iter_mut().enumerate().for_each(|(idx, interaction)| {
-                        let span = if idx == 0 {
-                            Some(InteractionsSpan::new(&interactions, Span::Start))
-                        } else if idx == len - 1 {
-                            Some(InteractionsSpan::new(&interactions, Span::End))
-                        } else {
-                            None
-                        };
-
-                        interaction.set_span_id(span, id)
-                    });
-                }
-
-                let mut iter = interactions.interactions().into_iter();
+                let mut iter = iter.into_iter();
 
                 self.plan.push(interactions);
 
@@ -210,10 +188,11 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         }
                         count += 1;
                     };
-                    Interaction::new(
-                        interaction.connection_index,
-                        InteractionType::Query(new_query),
-                    )
+
+                    InteractionBuilder::from_interaction(&interaction)
+                        .interaction(InteractionType::Query(new_query))
+                        .build()
+                        .unwrap()
                 } else {
                     interaction
                 }
@@ -241,10 +220,13 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                     if let Some(conn_index) =
                         (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
                     {
-                        return Some(Interaction::new(
-                            conn_index,
-                            InteractionType::Query(Query::Commit(Commit)),
-                        ));
+                        return Some(
+                            InteractionBuilder::from_interaction(peek_interaction)
+                                .interaction(InteractionType::Query(Query::Commit(Commit)))
+                                .connection_index(conn_index)
+                                .build()
+                                .unwrap(),
+                        );
                     }
                 }
 
@@ -259,15 +241,14 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                         let interactions =
                             Interactions::new(conn_index, InteractionsType::Query(query));
 
-                        let mut interaction = Interaction::new(
-                            conn_index,
+                        let interaction = InteractionBuilder::with_interaction(
                             InteractionType::Query(Query::Commit(Commit)),
-                        );
-
-                        interaction.set_span_id(
-                            Some(InteractionsSpan::new(&interactions, Span::StartEnd)),
-                            self.plan.next_property_id(),
-                        );
+                        )
+                        .connection_index(conn_index)
+                        .id(self.plan.next_property_id())
+                        .span(Span::StartEnd)
+                        .build()
+                        .unwrap();
 
                         self.plan.push(interactions);
 
