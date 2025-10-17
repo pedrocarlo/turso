@@ -17,6 +17,7 @@ use crate::{
     generation::Shadow,
     model::{
         Query, ResultSet,
+        metrics::InteractionStats,
         property::{Property, PropertyDiscriminants},
     },
     runner::env::{ShadowTablesMut, SimConnection, SimulationType, SimulatorEnv},
@@ -25,6 +26,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct InteractionPlan {
     plan: Vec<Interaction>,
+    stats: InteractionStats,
     // In the future, this should probably be a stack of interactions
     // so we can have nested properties
     last_interactions: Option<Interactions>,
@@ -41,19 +43,7 @@ impl InteractionPlan {
     pub(crate) fn new(mvcc: bool) -> Self {
         Self {
             plan: Vec::new(),
-            last_interactions: None,
-            mvcc,
-            len: 0,
-            len_properties: 0,
-            next_interaction_id: NonZeroUsize::new(1).unwrap(),
-        }
-    }
-
-    /// Should only be used when creating a plan that should use static iteration.
-    /// TODO: find a way to use a typestate or something else to enforce this
-    pub fn new_with(plan: Vec<Interaction>, mvcc: bool) -> Self {
-        Self {
-            plan,
+            stats: InteractionStats::default(),
             last_interactions: None,
             mvcc,
             len: 0,
@@ -93,10 +83,6 @@ impl InteractionPlan {
 
     pub fn set_last_interactions(&mut self, interactions: Interactions) {
         self.last_interactions = Some(interactions);
-    }
-
-    pub fn append_interactions(&mut self, mut interactions: Vec<Interaction>) {
-        self.plan.append(&mut interactions);
     }
 
     pub fn push(&mut self, interactions: Interactions) {
@@ -166,11 +152,6 @@ impl InteractionPlan {
         }
     }
 
-    pub fn find_interactions(&self, id: NonZeroUsize) -> core::slice::Iter<'_, Interaction> {
-        let range = self.find_interactions_range(id);
-        self.interactions_list()[range].iter()
-    }
-
     /// Truncates up to a particular interaction
     pub fn truncate(&mut self, len: usize) {
         self.plan.truncate(len);
@@ -189,10 +170,6 @@ impl InteractionPlan {
         self.plan.retain_mut(f);
     }
 
-    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, Interaction> {
-        self.plan.iter_mut()
-    }
-
     #[inline]
     pub fn interactions_list(&self) -> &[Interaction] {
         &self.plan
@@ -209,40 +186,12 @@ impl InteractionPlan {
         }
     }
 
-    pub(crate) fn stats(&self) -> InteractionStats {
-        // TODO: do incremental stats and metrics
-        let mut stats = InteractionStats::default();
+    pub fn stats(&self) -> &InteractionStats {
+        &self.stats
+    }
 
-        fn query_stat(q: &Query, stats: &mut InteractionStats) {
-            match q {
-                Query::Select(_) => stats.select_count += 1,
-                Query::Insert(_) => stats.insert_count += 1,
-                Query::Delete(_) => stats.delete_count += 1,
-                Query::Create(_) => stats.create_count += 1,
-                Query::Drop(_) => stats.drop_count += 1,
-                Query::Update(_) => stats.update_count += 1,
-                Query::CreateIndex(_) => stats.create_index_count += 1,
-                Query::Begin(_) => stats.begin_count += 1,
-                Query::Commit(_) => stats.commit_count += 1,
-                Query::Rollback(_) => stats.rollback_count += 1,
-                Query::AlterTable(_) => stats.alter_table_count += 1,
-                Query::DropIndex(_) => stats.drop_index_count += 1,
-                Query::Placeholder => {}
-            }
-        }
-        for interaction in &self.plan {
-            // TODO: see how to skip counting of the
-            // if matches!(property, Property::AllTableHaveExpectedContent { .. }) {
-            //     // Skip Property::AllTableHaveExpectedContent when counting stats
-            //     // this allows us to generate more relevant interactions as we count less Select's to the Stats
-            //     continue;
-            // }
-            if let InteractionType::Query(query) = &interaction.interaction {
-                query_stat(query, &mut stats);
-            }
-        }
-
-        stats
+    pub fn stats_mut(&mut self) -> &mut InteractionStats {
+        &mut self.stats
     }
 
     pub fn static_iterator(&self) -> impl InteractionPlanIterator {
@@ -337,17 +286,6 @@ impl Interactions {
         Self {
             connection_index,
             interactions,
-        }
-    }
-
-    pub fn has_extensional_queries(&self) -> bool {
-        matches!(&self.interactions, InteractionsType::Property(property) if property.has_extensional_queries())
-    }
-
-    pub fn get_extensional_queries(&mut self) -> Option<&mut Vec<Query>> {
-        match &mut self.interactions {
-            InteractionsType::Property(property) => property.get_extensional_queries(),
-            InteractionsType::Query(..) | InteractionsType::Fault(..) => None,
         }
     }
 
@@ -460,43 +398,6 @@ impl Display for InteractionPlan {
         }
 
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct InteractionStats {
-    pub select_count: u32,
-    pub insert_count: u32,
-    pub delete_count: u32,
-    pub update_count: u32,
-    pub create_count: u32,
-    pub create_index_count: u32,
-    pub drop_count: u32,
-    pub begin_count: u32,
-    pub commit_count: u32,
-    pub rollback_count: u32,
-    pub alter_table_count: u32,
-    pub drop_index_count: u32,
-}
-
-impl Display for InteractionStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
-            self.select_count,
-            self.insert_count,
-            self.delete_count,
-            self.update_count,
-            self.create_count,
-            self.create_index_count,
-            self.drop_count,
-            self.begin_count,
-            self.commit_count,
-            self.rollback_count,
-            self.alter_table_count,
-            self.drop_index_count,
-        )
     }
 }
 

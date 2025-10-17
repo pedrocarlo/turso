@@ -193,11 +193,6 @@ pub struct InteractiveQueryInfo {
 }
 
 impl Property {
-    pub(crate) fn name(&self) -> &'static str {
-        // Uses strum::IntoStaticStr
-        self.into()
-    }
-
     /// Property Does some sort of fault injection
     pub fn check_tables(&self) -> bool {
         matches!(
@@ -239,5 +234,12 @@ impl Property {
 impl PropertyDiscriminants {
     pub fn name(&self) -> &'static str {
         self.into()
+    }
+
+    pub fn check_tables(&self) -> bool {
+        matches!(
+            self,
+            Self::AllTableHaveExpectedContent | Self::TableHasExpectedContent
+        )
     }
 }

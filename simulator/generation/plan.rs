@@ -19,9 +19,9 @@ use crate::{
         Query,
         interactions::{
             Fault, Interaction, InteractionBuilder, InteractionPlan, InteractionPlanIterator,
-            InteractionStats, InteractionType, Interactions, InteractionsType, Span,
+            InteractionType, Interactions, InteractionsType, Span,
         },
-        metrics::Remaining,
+        metrics::{InteractionStats, Remaining},
         property::Property,
     },
 };
@@ -211,7 +211,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
-        match self.peek(env) {
+        let next_interaction = match self.peek(env) {
             Some(peek_interaction) => {
                 if mvcc && peek_interaction.is_ddl() {
                     // if any connection is in a transaction,
@@ -258,15 +258,22 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                 #[cfg(debug_assertions)]
                 if commit.is_none() {
                     // Do a final sanity check to make sure that all interactions are sorted by ids
-                    assert!(
-                        self.plan
-                            .interactions_list()
-                            .is_sorted_by(|a, b| a.id() <= b.id())
-                    );
+                    assert!(self.plan.interactions_list().is_sorted_by_key(|a| a.id()));
                 }
                 commit
             }
+        };
+        // intercept interaction to update metrics
+        if let Some(next_interaction) = next_interaction.as_ref() {
+            // Skip counting queries that come from Properties that only exist to check tables
+            if let Some(property_meta) = next_interaction.property_meta
+                && !property_meta.property.check_tables()
+            {
+                self.plan.stats_mut().update(next_interaction);
+            }
         }
+
+        next_interaction
     }
 }
 
@@ -284,16 +291,16 @@ fn random_fault<R: rand::Rng + ?Sized>(
     Interactions::new(conn_index, InteractionsType::Fault(fault))
 }
 
-impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
+impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
     fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
         rng: &mut R,
         conn_ctx: &C,
-        (env, stats, conn_index): (&SimulatorEnv, InteractionStats, usize),
+        (env, stats, conn_index): (&SimulatorEnv, &InteractionStats, usize),
     ) -> Self {
         let remaining_ = Remaining::new(
             env.opts.max_interactions,
             &env.profile.query,
-            &stats,
+            stats,
             env.profile.experimental_mvcc,
             conn_ctx,
         );
