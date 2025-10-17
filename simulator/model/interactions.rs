@@ -7,6 +7,8 @@ use std::{
     sync::Arc,
 };
 
+use either::Either;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
 use turso_core::{Connection, Result, StepResult};
@@ -58,14 +60,6 @@ impl InteractionPlan {
             len_properties: 0,
             next_interaction_id: NonZeroUsize::new(1).unwrap(),
         }
-    }
-
-    #[inline]
-    fn new_len(&self) -> usize {
-        self.plan
-            .iter()
-            .filter(|interaction| !interaction.ignore())
-            .count()
     }
 
     /// Count of interactions that are not transaction statements
@@ -180,37 +174,39 @@ impl InteractionPlan {
     /// Truncates up to a particular interaction
     pub fn truncate(&mut self, len: usize) {
         self.plan.truncate(len);
-        self.len = self.new_len();
     }
 
     /// Used to remove a particular [Interactions]
-    pub fn remove_property(&mut self, index: usize) -> Interactions {
-        let interactions = self.plan.remove(index);
-        if !interactions.ignore() {
-            self.len -= 1;
-        }
-        interactions
+    pub fn remove_property(&mut self, id: NonZeroUsize) {
+        let range = self.find_interactions_range(id);
+        self.plan.drain(range);
     }
 
     pub fn retain_mut<F>(&mut self, f: F)
     where
         F: FnMut(&mut Interaction) -> bool,
     {
-        // let f = |t: &mut Interaction| {
-        //     let ignore = t.ignore();
-        //     let retain = f(t);
-        //     // removed an interaction that was not previously ignored
-        //     if !retain && !ignore {
-        //         self.len -= 1;
-        //     }
-        //     retain
-        // };
         self.plan.retain_mut(f);
+    }
+
+    pub fn iter_mut(&mut self) -> core::slice::IterMut<'_, Interaction> {
+        self.plan.iter_mut()
     }
 
     #[inline]
     pub fn interactions_list(&self) -> &[Interaction] {
         &self.plan
+    }
+
+    pub fn iter_properties(
+        &self,
+    ) -> IterProperty<
+        '_,
+        std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>,
+    > {
+        IterProperty {
+            iter: self.interactions_list().iter().enumerate().peekable(),
+        }
     }
 
     pub(crate) fn stats(&self) -> InteractionStats {
@@ -253,6 +249,45 @@ impl InteractionPlan {
         PlanIterator {
             iter: self.interactions_list().to_vec().into_iter(),
         }
+    }
+}
+
+pub struct IterProperty<'a, I>
+where
+    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext,
+{
+    iter: I,
+}
+
+impl<'a, I> IterProperty<'a, I>
+where
+    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext,
+{
+    pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
+        let (idx, interaction) = self.iter.next()?;
+        let id = interaction.id();
+        // get interactions from a particular property
+        let span = interaction
+            .span
+            .expect("we should loop on interactions that a span");
+
+        let first = std::iter::once((idx, interaction));
+
+        let property_interactions = match span {
+            Span::Start => Either::Left(first.chain(self.iter.peeking_take_while(
+                move |(_idx, interaction)| {
+                    interaction.id() == id
+                        && interaction
+                            .span
+                            .as_ref()
+                            .is_some_and(|span| matches!(span, Span::End))
+                },
+            ))),
+            Span::End => panic!("we should always be at the start of an interaction"),
+            Span::StartEnd => Either::Right(first),
+        };
+
+        Some(property_interactions)
     }
 }
 

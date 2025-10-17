@@ -1,33 +1,21 @@
-use either::Either;
 use indexmap::IndexSet;
-use itertools::Itertools;
 
 use crate::{
     SandboxedResult, SimulatorEnv,
     model::{
         Query,
-        interactions::{InteractionPlan, InteractionType, Interactions, InteractionsType, Span},
-        property::{Property, PropertyDiscriminants},
+        interactions::{InteractionPlan, InteractionType},
+        property::PropertyDiscriminants,
     },
     run_simulation,
     runner::execution::Execution,
 };
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     ops::Range,
     sync::{Arc, Mutex},
 };
-
-fn retain_relevant_queries(
-    extensional_queries: &mut Vec<Query>,
-    depending_tables: &IndexSet<String>,
-) {
-    extensional_queries.retain(|query| {
-        query.is_transaction()
-            || (!matches!(query, Query::Select(..))
-                && query.uses().iter().any(|t| depending_tables.contains(t)))
-    });
-}
 
 impl InteractionPlan {
     /// Create a smaller interaction plan by deleting a property
@@ -111,66 +99,8 @@ impl InteractionPlan {
 
         plan.truncate(failing_execution.interaction_index + 1);
 
-        // phase 1: shrink extensions
-        for interaction in &mut plan {
-            if let InteractionsType::Property(property) = &mut interaction.interactions {
-                match property {
-                    Property::InsertValuesSelect { queries, .. }
-                    | Property::DoubleCreateFailure { queries, .. }
-                    | Property::DeleteSelect { queries, .. }
-                    | Property::DropSelect { queries, .. }
-                    | Property::Queries { queries } => {
-                        let mut temp_plan = InteractionPlan::new_with(
-                            queries
-                                .iter()
-                                .map(|q| {
-                                    Interactions::new(
-                                        interaction.connection_index,
-                                        InteractionsType::Query(q.clone()),
-                                    )
-                                })
-                                .collect(),
-                            self.mvcc,
-                        );
-
-                        temp_plan = InteractionPlan::iterative_shrink(
-                            temp_plan,
-                            failing_execution,
-                            result,
-                            env.clone(),
-                            secondary_interactions_index,
-                        );
-                        //temp_plan = Self::shrink_queries(temp_plan, failing_execution, result, env);
-
-                        *queries = temp_plan
-                            .into_iter()
-                            .filter_map(|i| match i.interactions {
-                                InteractionsType::Query(q) => Some(q),
-                                _ => None,
-                            })
-                            .collect();
-                    }
-                    Property::WhereTrueFalseNull { .. }
-                    | Property::UnionAllPreservesCardinality { .. }
-                    | Property::SelectLimit { .. }
-                    | Property::SelectSelectOptimizer { .. }
-                    | Property::FaultyQuery { .. }
-                    | Property::FsyncNoWait { .. }
-                    | Property::ReadYourUpdatesBack { .. }
-                    | Property::TableHasExpectedContent { .. }
-                    | Property::AllTableHaveExpectedContent { .. } => {}
-                }
-            }
-        }
-
         // phase 2: shrink the entire plan
-        plan = Self::iterative_shrink(
-            plan,
-            failing_execution,
-            result,
-            env,
-            secondary_interactions_index,
-        );
+        plan = Self::iterative_shrink(&plan, failing_execution, result, env, property_id);
 
         let after = plan.len_properties();
 
@@ -185,26 +115,31 @@ impl InteractionPlan {
 
     /// shrink a plan by removing one interaction at a time (and its deps) while preserving the error
     fn iterative_shrink(
-        mut plan: InteractionPlan,
+        plan: &InteractionPlan,
         failing_execution: &Execution,
         old_result: &SandboxedResult,
         env: Arc<Mutex<SimulatorEnv>>,
-        secondary_interaction_index: usize,
+        failing_property_id: NonZeroUsize,
     ) -> InteractionPlan {
-        for i in (0..plan.len_properties()).rev() {
-            if i == secondary_interaction_index {
-                continue;
-            }
-            let mut test_plan = plan.clone();
+        let mut iter_properties = plan.iter_properties();
 
-            // TODO: change
-            test_plan.remove_property(i);
+        let mut ret_plan = plan.clone();
 
-            if Self::test_shrunk_plan(&test_plan, failing_execution, old_result, env.clone()) {
-                plan = test_plan;
+        while let Some(mut property_interactions) = iter_properties.next_property() {
+            // get the overall property id and try to remove it
+            if let Some((_, interaction)) = property_interactions.next()
+                && interaction.id() != failing_property_id
+            {
+                // try to remove the property
+                let mut test_plan = ret_plan.clone();
+                test_plan.remove_property(interaction.id());
+                if Self::test_shrunk_plan(&test_plan, failing_execution, old_result, env.clone()) {
+                    ret_plan = test_plan;
+                }
             }
         }
-        plan
+
+        ret_plan
     }
 
     fn test_shrunk_plan(
@@ -243,31 +178,9 @@ impl InteractionPlan {
     ) {
         // First pass - mark indexes that should be retained
         let mut retain_map = Vec::with_capacity(self.len());
-        let mut iter = self.interactions_list().iter().enumerate().peekable();
-        while let Some((idx, interaction)) = iter.next() {
-            let id = interaction.id();
-            // get interactions from a particular property
-            let span = interaction
-                .span
-                .expect("we should loop on interactions that a span");
-
-            let first = std::iter::once((idx, interaction));
-
-            let property_interactions = match span {
-                Span::Start => {
-                    Either::Left(first.chain(iter.peeking_take_while(|(_idx, interaction)| {
-                        interaction.id() == id
-                            && interaction
-                                .span
-                                .as_ref()
-                                .is_some_and(|span| matches!(span, Span::End))
-                    })))
-                }
-                Span::End => panic!("we should always be at the start of an interaction"),
-                Span::StartEnd => Either::Right(first),
-            };
-
-            for (idx, interaction) in property_interactions.into_iter() {
+        let mut iter_properties = self.iter_properties();
+        while let Some(property_interactions) = iter_properties.next_property() {
+            for (idx, interaction) in property_interactions {
                 let retain = if failing_interaction_range.contains(&idx) {
                     true
                 } else {
