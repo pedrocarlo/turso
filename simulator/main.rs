@@ -285,7 +285,7 @@ fn run_simulator(
                         tracing::trace!(
                             "adding bug to bugbase, seed: {}, plan: {}, error: {}",
                             env.opts.seed,
-                            plan.len(),
+                            plan.len_properties(),
                             error
                         );
                         bugbase

@@ -52,13 +52,13 @@ impl InteractionPlan {
         }
     }
 
-    /// Count of interactions that are not transaction statements
+    /// Count of interactions
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    /// Count of properties in the plan
+    /// Count of properties
     #[inline]
     pub fn len_properties(&self) -> usize {
         self.len_properties
@@ -77,19 +77,15 @@ impl InteractionPlan {
         self.last_interactions.as_ref()
     }
 
-    pub fn last_interactions_mut(&mut self) -> Option<&mut Interactions> {
-        self.last_interactions.as_mut()
-    }
-
-    pub fn set_last_interactions(&mut self, interactions: Interactions) {
+    pub fn push_interactions(&mut self, interactions: Interactions) {
+        if !interactions.ignore() {
+            self.len_properties += 1;
+        }
         self.last_interactions = Some(interactions);
     }
 
-    pub fn push(&mut self, interactions: Interactions) {
-        if !interactions.ignore() {
-            self.len += 1;
-        }
-        self.set_last_interactions(interactions);
+    pub fn push(&mut self, interaction: Interaction) {
+        self.plan.push(interaction);
     }
 
     /// Finds the range of interactions that are contained between the start and end spans for a given ID.
@@ -177,10 +173,8 @@ impl InteractionPlan {
 
     pub fn iter_properties(
         &self,
-    ) -> IterProperty<
-        '_,
-        std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>,
-    > {
+    ) -> IterProperty<std::iter::Peekable<std::iter::Enumerate<std::slice::Iter<'_, Interaction>>>>
+    {
         IterProperty {
             iter: self.interactions_list().iter().enumerate().peekable(),
         }
@@ -201,16 +195,13 @@ impl InteractionPlan {
     }
 }
 
-pub struct IterProperty<'a, I>
-where
-    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext,
-{
+pub struct IterProperty<I> {
     iter: I,
 }
 
-impl<'a, I> IterProperty<'a, I>
+impl<'a, I> IterProperty<I>
 where
-    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext,
+    I: Iterator<Item = (usize, &'a Interaction)> + itertools::PeekingNext + std::fmt::Debug,
 {
     pub fn next_property(&mut self) -> Option<impl Iterator<Item = (usize, &'a Interaction)>> {
         let (idx, interaction) = self.iter.next()?;

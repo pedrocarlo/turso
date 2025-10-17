@@ -48,7 +48,7 @@ impl InteractionPlan {
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
         // First interaction
-        if self.len() == 0 {
+        if self.len_properties() == 0 {
             // First create at least one table
             let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
 
@@ -78,7 +78,7 @@ impl InteractionPlan {
             return Some(check_all_tables);
         }
 
-        if self.len() < num_interactions {
+        if self.len_properties() < num_interactions {
             let conn_index = env.choose_conn(rng);
             let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
                 let query = Query::Begin(Begin::Concurrent);
@@ -95,7 +95,11 @@ impl InteractionPlan {
                 Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index))
             };
 
-            tracing::debug!("Generating interaction {}/{}", self.len(), num_interactions);
+            tracing::debug!(
+                "Generating interaction {}/{}",
+                self.len_properties(),
+                num_interactions
+            );
 
             Some(interactions)
         } else {
@@ -134,7 +138,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
 
                 let mut iter = iter.into_iter();
 
-                self.plan.push(interactions);
+                self.plan.push_interactions(interactions);
 
                 let next = iter.next();
                 self.iter = iter;
@@ -157,10 +161,11 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         &conn_ctx,
                     );
 
-                    let Some(InteractionsType::Property(property)) = &mut self
+                    let Some(InteractionsType::Property(property)) = self
                         .plan
-                        .last_interactions_mut()
-                        .map(|interactions| &mut interactions.interactions)
+                        .last_interactions()
+                        .as_ref()
+                        .map(|interactions| &interactions.interactions)
                     else {
                         unreachable!("only properties have extensional queries");
                     };
@@ -178,12 +183,6 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
                         if let Some(new_query) =
                             (query_gen)(self.rng, &conn_ctx, &query_distr, property)
                         {
-                            let queries = property.get_extensional_queries().unwrap();
-                            let query = queries
-                                .iter_mut()
-                                .find(|query| matches!(query, Query::Placeholder))
-                                .expect("Placeholder should be present in extensional queries");
-                            *query = new_query.clone();
                             break new_query;
                         }
                         count += 1;
@@ -211,7 +210,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
-        let next_interaction = match self.peek(env) {
+        let mut next_interaction = || match self.peek(env) {
             Some(peek_interaction) => {
                 if mvcc && peek_interaction.is_ddl() {
                     // if any connection is in a transaction,
@@ -250,7 +249,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                         .build()
                         .unwrap();
 
-                        self.plan.push(interactions);
+                        self.plan.push_interactions(interactions);
 
                         interaction
                     });
@@ -263,6 +262,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                 commit
             }
         };
+        let next_interaction = next_interaction();
         // intercept interaction to update metrics
         if let Some(next_interaction) = next_interaction.as_ref() {
             // Skip counting queries that come from Properties that only exist to check tables
@@ -271,6 +271,7 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
             {
                 self.plan.stats_mut().update(next_interaction);
             }
+            self.plan.push(next_interaction.clone());
         }
 
         next_interaction
