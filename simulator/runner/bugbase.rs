@@ -15,6 +15,11 @@ use crate::{Paths, model::interactions::InteractionPlan};
 
 use super::cli::SimulatorCLI;
 
+const READABLE_PLAN_PATH: &str = "plan.sql";
+const SHRUNK_READABLE_PLAN_PATH: &str = "shrunk.sql";
+const SEED_PATH: &str = "seed.txt";
+const RUNS_PATH: &str = "runs.json";
+
 /// A bug is a run that has been identified as buggy.
 #[derive(Clone)]
 pub struct Bug {
@@ -49,34 +54,29 @@ pub struct BugRun {
 }
 
 impl Bug {
-    const READABLE_PLAN_PATH: &str = "plan.sql";
-    const SHRUNK_READABLE_PLAN_PATH: &str = "shrunk.sql";
-    const SEED_PATH: &str = "seed.txt";
-    const RUNS_PATH: &str = "runs.json";
-
     fn save_to_path(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
         let path = path.as_ref();
         let bug_path = path.join(self.seed.to_string());
         std::fs::create_dir_all(&bug_path)
             .with_context(|| "should be able to create bug directory")?;
 
-        let seed_path = bug_path.join(Self::SEED_PATH);
+        let seed_path = bug_path.join(SEED_PATH);
         std::fs::write(&seed_path, self.seed.to_string())
             .with_context(|| "should be able to write seed file")?;
 
         if let Some(plan) = &self.plan {
-            let readable_plan_path = bug_path.join(Self::READABLE_PLAN_PATH);
+            let readable_plan_path = bug_path.join(READABLE_PLAN_PATH);
             std::fs::write(&readable_plan_path, plan.to_string())
                 .with_context(|| "should be able to write readable plan file")?;
         }
 
         if let Some(shrunk_plan) = &self.shrunk_plan {
-            let readable_shrunk_plan_path = bug_path.join(Self::SHRUNK_READABLE_PLAN_PATH);
+            let readable_shrunk_plan_path = bug_path.join(SHRUNK_READABLE_PLAN_PATH);
             std::fs::write(&readable_shrunk_plan_path, shrunk_plan.to_string())
                 .with_context(|| "should be able to write readable shrunk plan file")?;
         }
 
-        let runs_path = bug_path.join(Self::RUNS_PATH);
+        let runs_path = bug_path.join(RUNS_PATH);
         std::fs::write(
             &runs_path,
             serde_json::to_string_pretty(&self.runs)
@@ -158,9 +158,15 @@ impl BugBase {
     }
 
     fn load_bug(&self, seed: u64) -> anyhow::Result<Bug> {
-        let runs = std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))
-            .with_context(|| "should be able to read runs file")
-            .and_then(|runs| serde_json::from_str(&runs).map_err(|e| anyhow!("{}", e)))?;
+        let path = self.path.join(seed.to_string()).join(RUNS_PATH);
+
+        let runs = if !path.exists() {
+            vec![]
+        } else {
+            std::fs::read_to_string(self.path.join(seed.to_string()).join(RUNS_PATH))
+                .with_context(|| "should be able to read runs file")
+                .and_then(|runs| serde_json::from_str(&runs).map_err(|e| anyhow!("{}", e)))?
+        };
 
         let bug = Bug {
             seed,
