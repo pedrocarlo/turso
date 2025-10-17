@@ -31,8 +31,7 @@ pub(crate) struct InteractionPlan {
     // so we can have nested properties
     last_interactions: Option<Interactions>,
     pub mvcc: bool,
-    /// Counts [Interaction]
-    len: usize,
+
     /// Counts [Interactions]. Should not count transactions statements, just so we can generate more meaningful interactions per run
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
     len_properties: usize,
@@ -46,7 +45,6 @@ impl InteractionPlan {
             stats: InteractionStats::default(),
             last_interactions: None,
             mvcc,
-            len: 0,
             len_properties: 0,
             next_interaction_id: NonZeroUsize::new(1).unwrap(),
         }
@@ -55,7 +53,7 @@ impl InteractionPlan {
     /// Count of interactions
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.plan.len()
     }
 
     /// Count of properties
@@ -214,15 +212,12 @@ where
         let first = std::iter::once((idx, interaction));
 
         let property_interactions = match span {
-            Span::Start => Either::Left(first.chain(self.iter.peeking_take_while(
-                move |(_idx, interaction)| {
-                    interaction.id() == id
-                        && interaction
-                            .span
-                            .as_ref()
-                            .is_some_and(|span| matches!(span, Span::End))
-                },
-            ))),
+            Span::Start => Either::Left(
+                first.chain(
+                    self.iter
+                        .peeking_take_while(move |(_idx, interaction)| interaction.id() == id),
+                ),
+            ),
             Span::End => panic!("we should always be at the start of an interaction"),
             Span::StartEnd => Either::Right(first),
         };

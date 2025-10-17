@@ -42,8 +42,8 @@ impl InteractionPlan {
                     InteractionType::Query(query) | InteractionType::FaultyQuery(query) => {
                         Some(query.dependencies())
                     }
-                    // Fault does not depend on
-                    InteractionType::Fault(..) => Some(IndexSet::new()),
+                    // Fault does not depend on tables
+                    InteractionType::Fault(..) => None,
                     _ => None,
                 }
             })
@@ -227,7 +227,7 @@ impl InteractionPlan {
             }
         }
 
-        debug_assert!(self.len() == retain_map.len());
+        debug_assert_eq!(self.len(), retain_map.len());
 
         let mut idx = 0;
         // Remove all properties that do not use the failing tables
