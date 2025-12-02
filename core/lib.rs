@@ -1331,7 +1331,7 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(program, mv_store, pager, mode))
+        Ok(Statement::new(program, pager, mode))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -1489,8 +1489,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
-                .run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1537,7 +1536,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self.db.mv_store.clone(), pager, mode);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some(stmt))
     }
 
@@ -1573,8 +1572,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
-                .run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1605,7 +1603,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode);
+        let stmt = Statement::new(program, pager.clone(), mode);
         Ok(Some((stmt, parser.offset())))
     }
 
@@ -2597,7 +2595,6 @@ impl BusyTimeout {
 pub struct Statement {
     program: vdbe::Program,
     state: vdbe::ProgramState,
-    mv_store: Option<Arc<MvStore>>,
     pager: Arc<Pager>,
     /// Whether the statement accesses the database.
     /// Used to determine whether we need to check for schema changes when
@@ -2625,12 +2622,7 @@ impl Drop for Statement {
 }
 
 impl Statement {
-    pub fn new(
-        program: vdbe::Program,
-        mv_store: Option<Arc<MvStore>>,
-        pager: Arc<Pager>,
-        query_mode: QueryMode,
-    ) -> Self {
+    pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
         let accesses_db = program.accesses_db;
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -2641,7 +2633,6 @@ impl Statement {
         Self {
             program,
             state,
-            mv_store,
             pager,
             accesses_db,
             query_mode,
@@ -2676,6 +2667,10 @@ impl Statement {
         self.state.execution_state
     }
 
+    pub fn mv_store(&self) -> Option<&Arc<MvStore>> {
+        self.program.connection.mv_store()
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if let Some(busy_timeout) = self.busy_timeout.as_ref() {
             if self.pager.io.now() < busy_timeout.timeout {
@@ -2690,7 +2685,7 @@ impl Statement {
         let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
-                self.mv_store.as_ref(),
+                self.program.connection.mv_store(),
                 self.pager.clone(),
                 self.query_mode,
                 waker,
@@ -2699,7 +2694,7 @@ impl Statement {
             const MAX_SCHEMA_RETRY: usize = 50;
             let mut res = self.program.step(
                 &mut self.state,
-                self.mv_store.as_ref(),
+                self.program.connection.mv_store(),
                 self.pager.clone(),
                 self.query_mode,
                 waker,
@@ -2713,7 +2708,7 @@ impl Statement {
                 self.reprepare()?;
                 res = self.program.step(
                     &mut self.state,
-                    self.mv_store.as_ref(),
+                    self.program.connection.mv_store(),
                     self.pager.clone(),
                     self.query_mode,
                     waker,
@@ -2972,8 +2967,12 @@ impl Statement {
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program
-            .abort(self.mv_store.as_ref(), &self.pager, None, &mut self.state);
+        self.program.abort(
+            self.program.connection.mv_store(),
+            &self.pager,
+            None,
+            &mut self.state,
+        );
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
