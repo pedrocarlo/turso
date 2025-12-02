@@ -1286,19 +1286,11 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        if self.is_mvcc_bootstrap_connection() {
-            // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
-            return self._prepare(sql, None);
-        }
-        self._prepare(sql, self.db.mv_store.clone())
+        self._prepare(sql)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn _prepare(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-        mv_store: Option<Arc<MvStore>>,
-    ) -> Result<Statement> {
+    pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1929,7 +1921,7 @@ impl Connection {
     }
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.mv_store.is_some()
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.mv_store().is_some()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -2128,7 +2120,12 @@ impl Connection {
     }
 
     pub fn mv_store(&self) -> Option<&Arc<MvStore>> {
-        self.db.mv_store.as_ref()
+        // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
+        if !self.is_mvcc_bootstrap_connection() {
+            self.db.mv_store.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Query the current value(s) of `pragma_name` associated to
@@ -2220,7 +2217,7 @@ impl Connection {
         }
 
         let use_indexes = self.db.schema.lock().indexes_enabled();
-        let use_mvcc = self.db.mv_store.is_some();
+        let use_mvcc = self.mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
@@ -2506,7 +2503,7 @@ impl Connection {
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
-        match self.db.mv_store.as_ref() {
+        match self.mv_store().as_ref() {
             Some(mv_store) => {
                 mv_store.set_checkpoint_threshold(threshold);
                 Ok(())
@@ -2516,7 +2513,7 @@ impl Connection {
     }
 
     pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<i64> {
-        match self.db.mv_store.as_ref() {
+        match self.mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
