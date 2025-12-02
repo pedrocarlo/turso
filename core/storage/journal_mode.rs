@@ -45,6 +45,16 @@ impl JournalMode {
             _ => None,
         }
     }
+
+    #[inline]
+    pub fn wal(&self) -> bool {
+        matches!(self, Self::Wal)
+    }
+
+    #[inline]
+    pub fn mvcc(&self) -> bool {
+        matches!(self, Self::ExperimentalMvcc)
+    }
 }
 
 impl TryFrom<Version> for JournalMode {

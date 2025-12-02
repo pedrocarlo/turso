@@ -437,32 +437,8 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
-        // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
-        if opts.enable_mvcc && journal_mode::wal_exists(wal_path) {
-            return Err(LimboError::InvalidArgument(format!(
-                    "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
-                )));
-        }
-
-        // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
-        // because the changes in the logical log would not be visible to the non-MVCC connections.
-        if !opts.enable_mvcc && journal_mode::logical_log_exists(path) {
-            return Err(LimboError::InvalidArgument(format!(
-                    "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
-                )));
-        }
-
-        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
-
-        let mv_store = if opts.enable_mvcc {
-            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
-            let storage = mvcc::persistent_storage::Storage::new(file);
-            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            Some(Arc::new(mv_store))
-        } else {
-            None
-        };
+        let shared_wal = WalFileShared::new_noop();
+        let mv_store = None;
 
         let db_size = db_file.size()?;
         let db_state = if db_size == 0 {
@@ -478,8 +454,8 @@ impl Database {
         } else {
             BufferPool::DEFAULT_ARENA_SIZE
         };
-        // opts is now passed as parameter
-        let db = Arc::new(Database {
+
+        let mut db = Database {
             mv_store,
             path: path.to_string(),
             wal_path: wal_path.to_string(),
@@ -495,7 +471,54 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(&io, arena_size),
             n_connections: AtomicUsize::new(0),
-        });
+        };
+
+        let pager = db._init()?;
+        // Check to see if mvcc is enabled or not in the DB header
+        let (read_version, write_version) =
+            io.block(|| pager.with_header(|header| (header.read_version, header.write_version)))?;
+        if read_version != write_version {
+            return Err(LimboError::Corrupt(format!("Database header read_version `{read_version:?}` is not equal to the write_version `{write_version:?}`")));
+        }
+        let journal_mode = journal_mode::JournalMode::try_from(read_version)?;
+        if journal_mode.mvcc() {
+            db.opts = db.opts.with_mvcc(true);
+        }
+
+        dbg!(journal_mode);
+
+        // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
+        // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+        if db.opts.enable_mvcc && journal_mode::wal_exists(wal_path) {
+            return Err(LimboError::InvalidArgument(format!(
+                    "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
+                )));
+        }
+
+        // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
+        // because the changes in the logical log would not be visible to the non-MVCC connections.
+        if !db.opts.enable_mvcc && journal_mode::logical_log_exists(path) {
+            return Err(LimboError::InvalidArgument(format!(
+                    "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                )));
+        }
+
+        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
+
+        let mv_store = if db.opts.enable_mvcc {
+            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
+            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+            Some(Arc::new(mv_store))
+        } else {
+            None
+        };
+
+        db.shared_wal = shared_wal;
+        db.mv_store = mv_store;
+
+        // opts is now passed as parameter
+        let db = Arc::new(db);
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
@@ -536,7 +559,7 @@ impl Database {
             })?;
         }
 
-        if opts.enable_mvcc {
+        if db.opts.enable_mvcc {
             let mv_store = db.mv_store.as_ref().unwrap();
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
@@ -554,14 +577,14 @@ impl Database {
         self._connect(true)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
-    fn _connect(
-        self: &Arc<Database>,
-        is_mvcc_bootstrap_connection: bool,
-    ) -> Result<Arc<Connection>> {
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1
+    fn _init(&self) -> Result<Arc<Pager>> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
+
+        // Allocate Database Header so that we may be able to read from it
+        self.io.block(|| pager.maybe_allocate_page1())?;
 
         if self.db_state.get().is_initialized() {
             let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
@@ -598,6 +621,16 @@ impl Database {
                 final_mode
             );
         }
+
+        Ok(pager)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn _connect(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+    ) -> Result<Arc<Connection>> {
+        let pager = self._init()?;
 
         let page_size = pager.get_page_size_unchecked();
 
