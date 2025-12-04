@@ -7,6 +7,7 @@ pub mod expr;
 pub mod opts;
 pub mod predicate;
 pub mod query;
+pub mod strategy;
 pub mod table;
 pub mod value;
 
