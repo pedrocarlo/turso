@@ -237,10 +237,10 @@ pub trait Wal: Debug {
     fn begin_write_tx(&mut self) -> Result<()>;
 
     /// End a read transaction.
-    fn end_read_tx(&self);
+    fn end_read_tx(&mut self);
 
     /// End a write transaction.
-    fn end_write_tx(&self);
+    fn end_write_tx(&mut self);
 
     /// Find the latest frame containing a page.
     ///
@@ -992,7 +992,7 @@ impl Wal for WalFile {
     /// End a read transaction.
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn end_read_tx(&self) {
+    fn end_read_tx(&mut self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
             self.with_shared_mut(|shared| shared.locks.read_locks[slot].unlock());
@@ -1034,7 +1034,7 @@ impl Wal for WalFile {
 
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn end_write_tx(&self) {
+    fn end_write_tx(&mut self) {
         tracing::debug!("end_write_txn");
         self.with_shared(|shared| shared.locks.write_lock.unlock());
     }
@@ -2815,7 +2815,7 @@ pub mod test {
         // Release reader
         {
             let pager = conn2.pager.load();
-            let wal2 = pager.wal.as_ref().unwrap().borrow_mut();
+            let mut wal2 = pager.wal.as_ref().unwrap().borrow_mut();
             wal2.end_read_tx();
         }
 
@@ -3471,7 +3471,7 @@ pub mod test {
         // End the read transaction
         {
             let pager = conn2.pager.load();
-            let wal = pager.wal.as_ref().unwrap().borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
         }
         {
@@ -3576,7 +3576,7 @@ pub mod test {
         // Release the reader, now full mode should succeed and backfill everything
         {
             let pager = reader.pager.load();
-            let wal = pager.wal.as_ref().unwrap().borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
         }
 
