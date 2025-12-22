@@ -2666,11 +2666,9 @@ impl IOCompletions {
         }
     }
 
-    pub fn set_waker(&self, waker: Option<&Waker>) {
-        if let Some(waker) = waker {
-            match self {
-                IOCompletions::Single(c) => c.set_waker(waker),
-            }
+    pub fn set_waker(&self, waker: &Waker) {
+        match self {
+            IOCompletions::Single(c) => c.set_waker(waker),
         }
     }
 }
