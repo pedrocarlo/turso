@@ -75,7 +75,7 @@ pub use io::{
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
-pub use statement::{AsyncStepResult, Statement};
+pub use statement::{AsyncStepResult, Statement, SyncStatement};
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{

@@ -3,6 +3,7 @@ use std::{
     future::Future,
     num::NonZero,
     ops::Deref,
+    pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll, Waker},
 };
@@ -538,5 +539,85 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+
+    /// Convert this statement into a SyncStatement for sync execution
+    #[inline]
+    pub fn into_sync(self) -> SyncStatement {
+        SyncStatement::from_statement(self)
+    }
+}
+
+/// A sync wrapper that owns the Statement via Option, allowing us to
+/// take ownership during polling and store the future without self-referential issues.
+/// Needed for synchronous code
+pub struct SyncStatement {
+    /// Statement stored in Option so we can take ownership during step operations
+    inner: Option<Statement>,
+    step_fut: Option<Pin<Box<dyn Future<Output = (Statement, Result<AsyncStepResult>)>>>>,
+}
+
+impl SyncStatement {
+    /// Create a SyncStatement directly from a Statement.
+    #[inline]
+    pub fn from_statement(statement: Statement) -> Self {
+        Self {
+            inner: Some(statement),
+            step_fut: None,
+        }
+    }
+
+    /// Steps the statement.
+    ///
+    /// Internally it takes the Statement out of the Option, creates the future, polls it,
+    /// and puts the Statement back when done.
+    pub fn step(&mut self) -> Result<StepResult> {
+        let step_fut = self.step_fut.take();
+        let stmt = self.inner.take();
+        let mut step_fut = match (stmt, step_fut) {
+            (None, None) => {
+                unreachable!("SyncStatement::step called on empty statement or step_future")
+            }
+            // No step future to poll grab a new one
+            (Some(stmt), None) => Box::pin(async move {
+                let mut stmt = stmt;
+                let res = stmt._step_poll().await;
+                (stmt, res)
+            }),
+            (None, Some(step_fut)) => step_fut,
+            (Some(_), Some(_)) => {
+                unreachable!("SyncStatement::step called on existing statement with step_future")
+            }
+        };
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        let Poll::Ready((stmt, result)) = step_fut.as_mut().poll(&mut cx) else {
+            self.step_fut = Some(step_fut);
+            return Ok(StepResult::IO);
+        };
+
+        // Put the statement back
+        self.inner = Some(stmt);
+        result.map(|r| r.into())
+    }
+
+    /// Get a reference to the underlying Statement.
+    #[inline]
+    pub fn statement(&self) -> &Statement {
+        self.inner.as_ref().expect("statement taken during step")
+    }
+
+    /// Get a mutable reference to the underlying Statement.
+    #[inline]
+    pub fn statement_mut(&mut self) -> &mut Statement {
+        self.inner.as_mut().expect("statement taken during step")
+    }
+
+    /// Consume self and return the underlying Statement.
+    #[inline]
+    pub fn into_statement(self) -> Statement {
+        self.inner.expect("statement taken during step")
     }
 }
