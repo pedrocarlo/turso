@@ -1,10 +1,11 @@
 use core::fmt::{self, Debug};
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    task::Waker,
+    task::{Poll, Waker},
 };
 
 use parking_lot::Mutex;
@@ -449,6 +450,26 @@ impl Completion {
         if self.get_inner().parent.set(group_inner.clone()).is_err() {
             panic!("completion can only be linked once");
         }
+    }
+}
+
+impl Future for Completion {
+    type Output = Result<(), CompletionError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if !self.finished() {
+            self.set_waker(cx.waker());
+            return Poll::Pending;
+        }
+        cx.waker().wake_by_ref();
+        self.wake();
+        Poll::Ready(match self.get_error() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        })
     }
 }
 
