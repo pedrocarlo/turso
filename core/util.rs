@@ -84,8 +84,10 @@ macro_rules! ends_with_ignore_ascii_case {
     }};
 }
 
-pub trait IOExt {
+pub trait IOExt: IO {
     fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
+
+    fn block_async<T>(&self, fut: impl std::future::Future<Output = Result<T>>) -> Result<T>;
 }
 
 impl<I: ?Sized + IO> IOExt for I {
@@ -96,6 +98,19 @@ impl<I: ?Sized + IO> IOExt for I {
                 IOResult::IO(io) => io.wait(self)?,
             }
         })
+    }
+
+    fn block_async<T>(&self, mut fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let res = loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(val) => break val?,
+                std::task::Poll::Pending => self.step()?,
+            };
+        };
+        Ok(res)
     }
 }
 

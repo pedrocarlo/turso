@@ -2,12 +2,13 @@ use std::{
     borrow::Cow,
     future::Future,
     num::NonZero,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll, Waker},
 };
 
+use parking_lot::RwLock;
 use tracing::{instrument, Level};
 use turso_parser::{
     ast::{fmt::ToTokens, Cmd},
@@ -24,7 +25,7 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    IOExt, LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -255,34 +256,19 @@ impl Statement {
         }
     }
 
+    #[inline]
     pub fn run_ignore_rows(&mut self) -> Result<()> {
-        loop {
-            match self.step()? {
-                vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Row => continue,
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
-            }
-        }
+        self.run_with_row_callback(|_| Ok(()))
     }
 
+    #[inline]
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
         let mut values = Vec::new();
-        loop {
-            match self.step()? {
-                vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Row => {
-                    values.push(self.row().unwrap().get_values().cloned().collect());
-                    continue;
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
-            }
-        }
+        self.run_with_row_callback(|row| {
+            values.push(row.get_values().cloned().collect());
+            Ok(())
+        })?;
+        Ok(values)
     }
 
     /// Blocks execution, advances IO, and runs to completion of the statement
@@ -290,15 +276,17 @@ impl Statement {
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
     ) -> Result<()> {
+        let io = self.pager.io.clone();
+
         loop {
-            match self.step()? {
-                vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO => self.pager.io.step()?,
-                vdbe::StepResult::Row => {
+            match io.block_async(self.step_async())? {
+                AsyncStepResult::Done => break,
+                AsyncStepResult::Row => {
                     func(self.row().expect("row should be present"))?;
+                    continue;
                 }
-                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
-                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+                AsyncStepResult::Interrupt => return Err(LimboError::Interrupt),
+                AsyncStepResult::Busy => return Err(LimboError::Busy),
             }
         }
         Ok(())
@@ -553,8 +541,8 @@ impl Statement {
 /// Needed for synchronous code
 pub struct SyncStatement {
     /// Statement stored in Option so we can take ownership during step operations
-    inner: Option<Statement>,
-    step_fut: Option<Pin<Box<dyn Future<Output = (Statement, Result<AsyncStepResult>)>>>>,
+    inner: Arc<RwLock<Statement>>,
+    step_fut: Option<Box<dyn Future<Output = Result<AsyncStepResult>> + Unpin>>,
 }
 
 impl SyncStatement {
@@ -562,7 +550,7 @@ impl SyncStatement {
     #[inline]
     pub fn from_statement(statement: Statement) -> Self {
         Self {
-            inner: Some(statement),
+            inner: Arc::new(RwLock::new(statement)),
             step_fut: None,
         }
     }
@@ -573,51 +561,59 @@ impl SyncStatement {
     /// and puts the Statement back when done.
     pub fn step(&mut self) -> Result<StepResult> {
         let step_fut = self.step_fut.take();
-        let stmt = self.inner.take();
-        let mut step_fut = match (stmt, step_fut) {
-            (None, None) => {
-                unreachable!("SyncStatement::step called on empty statement or step_future")
-            }
-            // No step future to poll grab a new one
-            (Some(stmt), None) => Box::pin(async move {
-                let mut stmt = stmt;
-                let res = stmt._step_poll().await;
-                (stmt, res)
-            }),
-            (None, Some(step_fut)) => step_fut,
-            (Some(_), Some(_)) => {
-                unreachable!("SyncStatement::step called on existing statement with step_future")
-            }
-        };
+        let mut step_fut = step_fut.unwrap_or_else(|| {
+            Box::new(StepFuture {
+                stmt: self.inner.clone(),
+            })
+        });
 
         let waker = Waker::noop();
         let mut cx = Context::from_waker(&waker);
 
-        let Poll::Ready((stmt, result)) = step_fut.as_mut().poll(&mut cx) else {
+        let mut fut = std::pin::pin!(&mut step_fut);
+        let Poll::Ready(result) = fut.as_mut().poll(&mut cx) else {
             self.step_fut = Some(step_fut);
             return Ok(StepResult::IO);
         };
 
-        // Put the statement back
-        self.inner = Some(stmt);
         result.map(|r| r.into())
     }
 
     /// Get a reference to the underlying Statement.
     #[inline]
-    pub fn statement(&self) -> &Statement {
-        self.inner.as_ref().expect("statement taken during step")
+    pub fn statement(&self) -> impl Deref<Target = Statement> + use<'_> {
+        self.inner.read()
     }
 
     /// Get a mutable reference to the underlying Statement.
     #[inline]
-    pub fn statement_mut(&mut self) -> &mut Statement {
-        self.inner.as_mut().expect("statement taken during step")
+    pub fn statement_mut(&mut self) -> impl DerefMut<Target = Statement> + use<'_> {
+        self.inner.write()
     }
 
     /// Consume self and return the underlying Statement.
     #[inline]
-    pub fn into_statement(self) -> Statement {
-        self.inner.expect("statement taken during step")
+    pub fn into_statement(mut self) -> Statement {
+        // First drop the step future which contains an Arc of the Statement
+        self.step_fut.take();
+        // Now we should be the sole owner of the Statement
+        Arc::into_inner(self.inner)
+            .expect("Should be sole owner")
+            .into_inner()
+    }
+}
+
+struct StepFuture {
+    stmt: Arc<RwLock<Statement>>,
+}
+
+impl Future for StepFuture {
+    type Output = Result<AsyncStepResult>;
+
+    // Drops the lock after any poll
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut stmt = self.stmt.write();
+        let fut = std::pin::pin!(stmt._step_poll());
+        fut.poll(cx)
     }
 }
