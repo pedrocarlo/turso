@@ -1,9 +1,10 @@
 use std::{
     borrow::Cow,
+    future::Future,
     num::NonZero,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
-    task::Waker,
+    task::{Context, Poll, Waker},
 };
 
 use tracing::{instrument, Level};
@@ -29,6 +30,28 @@ use crate::{
 type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
+
+/// Result type for async step operations.
+/// Unlike `StepResult`, this does not have an `IO` variant because
+/// in async contexts, IO pending is represented by `Poll::Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncStepResult {
+    Done,
+    Row,
+    Interrupt,
+    Busy,
+}
+
+impl From<AsyncStepResult> for StepResult {
+    fn from(result: AsyncStepResult) -> Self {
+        match result {
+            AsyncStepResult::Done => StepResult::Done,
+            AsyncStepResult::Row => StepResult::Row,
+            AsyncStepResult::Interrupt => StepResult::Interrupt,
+            AsyncStepResult::Busy => StepResult::Busy,
+        }
+    }
+}
 
 pub struct Statement {
     pub(crate) program: vdbe::Program,
@@ -108,83 +131,127 @@ impl Statement {
         self.program.connection.mv_store()
     }
 
-    fn _step(&mut self, waker: &Waker) -> Result<StepResult> {
-        // If we're waiting for a busy handler timeout, check if we can proceed
-        if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.now() < busy_state.timeout() {
-                // Yield the query as the timeout has not been reached yet
-                waker.wake_by_ref();
-                return Ok(StepResult::IO);
-            }
-        }
+    /// Async step - the core async logic.
+    /// Returns `Poll::Pending` when IO is in progress, and `Poll::Ready` with
+    /// an `AsyncStepResult` when the step completes.
+    async fn _step_poll(&mut self) -> Result<AsyncStepResult> {
+        std::future::poll_fn(|cx| {
+            let waker = cx.waker();
 
-        let mut res = if !self.accesses_db {
-            self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
-        } else {
-            const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res =
-                self.program
-                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
-            for attempt in 0..MAX_SCHEMA_RETRY {
-                // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
-                    break;
+            // If we're waiting for a busy handler timeout, check if we can proceed
+            if let Some(busy_state) = self.busy_handler_state.as_ref() {
+                if self.pager.io.now() < busy_state.timeout() {
+                    // Yield the query as the timeout has not been reached yet
+                    waker.wake_by_ref();
+                    return Poll::Pending;
                 }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
-                res =
+            }
+
+            let mut res = if !self.accesses_db {
+                self.program
+                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
+            } else {
+                const MAX_SCHEMA_RETRY: usize = 50;
+                let mut res =
                     self.program
                         .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+                for attempt in 0..MAX_SCHEMA_RETRY {
+                    // Only reprepare if we still need to update schema
+                    if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                        break;
+                    }
+                    tracing::debug!("reprepare: attempt={}", attempt);
+                    if let Err(e) = self.reprepare() {
+                        return Poll::Ready(Err(e));
+                    }
+                    res = self.program.step(
+                        &mut self.state,
+                        self.pager.clone(),
+                        self.query_mode,
+                        waker,
+                    );
+                }
+                res
+            };
+
+            // Aggregate metrics when statement completes
+            if matches!(res, Ok(StepResult::Done)) {
+                let mut conn_metrics = self.program.connection.metrics.write();
+                conn_metrics.record_statement(self.state.metrics.clone());
+                self.busy = false;
+                self.busy_handler_state = None; // Reset busy state on completion
+                drop(conn_metrics);
+
+                // After ANALYZE completes, refresh in-memory stats so planners can use them.
+                let sql = self.program.sql.trim_start();
+                if sql.to_ascii_uppercase().starts_with("ANALYZE") {
+                    refresh_analyze_stats(&self.program.connection);
+                }
+            } else {
+                self.busy = true;
             }
-            res
-        };
 
-        // Aggregate metrics when statement completes
-        if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.write();
-            conn_metrics.record_statement(self.state.metrics.clone());
-            self.busy = false;
-            self.busy_handler_state = None; // Reset busy state on completion
-            drop(conn_metrics);
+            // Handle busy result by invoking the busy handler
+            if matches!(res, Ok(StepResult::Busy)) {
+                let now = self.pager.io.now();
+                let handler = self.program.connection.get_busy_handler();
 
-            // After ANALYZE completes, refresh in-memory stats so planners can use them.
-            let sql = self.program.sql.trim_start();
-            if sql.to_ascii_uppercase().starts_with("ANALYZE") {
-                refresh_analyze_stats(&self.program.connection);
+                // Initialize or get existing busy handler state
+                let busy_state = self
+                    .busy_handler_state
+                    .get_or_insert_with(|| BusyHandlerState::new(now));
+
+                // Invoke the busy handler to determine if we should retry
+                if busy_state.invoke(&handler, now) {
+                    // Handler says retry, yield with IO to wait for timeout
+                    waker.wake_by_ref();
+                    res = Ok(StepResult::IO);
+                }
+                // else: Handler says stop, res stays as Busy
             }
-        } else {
-            self.busy = true;
-        }
 
-        // Handle busy result by invoking the busy handler
-        if matches!(res, Ok(StepResult::Busy)) {
-            let now = self.pager.io.now();
-            let handler = self.program.connection.get_busy_handler();
-
-            // Initialize or get existing busy handler state
-            let busy_state = self
-                .busy_handler_state
-                .get_or_insert_with(|| BusyHandlerState::new(now));
-
-            // Invoke the busy handler to determine if we should retry
-            if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
-                waker.wake_by_ref();
-                res = Ok(StepResult::IO);
+            match res {
+                Ok(StepResult::IO) => Poll::Pending,
+                Ok(StepResult::Done) => Poll::Ready(Ok(AsyncStepResult::Done)),
+                Ok(StepResult::Row) => Poll::Ready(Ok(AsyncStepResult::Row)),
+                Ok(StepResult::Interrupt) => Poll::Ready(Ok(AsyncStepResult::Interrupt)),
+                Ok(StepResult::Busy) => Poll::Ready(Ok(AsyncStepResult::Busy)),
+                Err(e) => Poll::Ready(Err(e)),
             }
-            // else: Handler says stop, res stays as Busy
-        }
-
-        res
+        })
+        .await
     }
 
+    /// Public async step API.
+    pub async fn step_async(&mut self) -> Result<AsyncStepResult> {
+        self._step_poll().await
+    }
+
+    /// Sync step - polls the async `_step_poll` once.
+    /// Returns `StepResult::IO` when the async step is pending.
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(Waker::noop())
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(self._step_poll());
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(result)) => Ok(result.into()),
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Ok(StepResult::IO),
+        }
     }
 
+    /// Sync step with custom waker - polls the async `_step_poll` once with the provided waker.
+    /// Returns `StepResult::IO` when the async step is pending.
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(waker)
+        let mut cx = Context::from_waker(waker);
+        let mut fut = std::pin::pin!(self._step_poll());
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(result)) => Ok(result.into()),
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Ok(StepResult::IO),
+        }
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
