@@ -5122,6 +5122,7 @@ name = "sql_gen_prop"
 version = "0.4.0"
 dependencies = [
  "proptest",
+ "strum",
 ]
 
 [[package]]
