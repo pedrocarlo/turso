@@ -8,9 +8,9 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emit_monad::{
-            alloc_label, alloc_reg, alloc_regs, column, copy, function_call, goto, insert, integer,
-            is_null, make_record, ne_jump, new_rowid, next, preassign_label, rewind, sequence,
-            string8, when, Emit,
+            alloc_label, alloc_labels, alloc_reg, alloc_regs, column, copy, function_call, goto,
+            insert, integer, is_null, make_record, ne_jump, new_rowid, next, preassign_label,
+            rewind, sequence, string8, when, Emit,
         },
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -420,6 +420,8 @@ fn emit_index_stats(
 ///
 /// This demonstrates the declarative, composable style where the bytecode
 /// structure is described rather than imperatively emitted.
+///
+/// Uses tuple-based allocation to avoid deep nesting.
 fn emit_index_stats_monadic(
     idx_cursor: usize,
     stat_cursor: usize,
@@ -428,96 +430,92 @@ fn emit_index_stats_monadic(
     index_name: String,
     column_collations: Vec<Option<CollationSeq>>,
 ) -> impl Emit<Output = ()> {
-    // Allocate all registers upfront
-    alloc_reg().then(move |reg_accum| {
-        alloc_reg().then(move |reg_chng| {
-            alloc_regs(n_cols).then(move |reg_prev_base| {
-                alloc_reg().then(move |reg_temp| {
-                    // Allocate all labels
-                    alloc_label().then(move |lbl_empty| {
-                        alloc_label().then(move |lbl_loop| {
-                            alloc_label().then(move |lbl_stat_push| {
-                                // Allocate per-column update labels
-                                sequence((0..n_cols).map(|_| alloc_label()).collect()).then(
-                                    move |lbl_update_prev: Vec<BranchOffset>| {
-                                        // Clone data for inner closures
-                                        let lbl_update_prev_clone = lbl_update_prev.clone();
-                                        let column_collations_clone = column_collations.clone();
+    // Allocate all registers and labels in one flat tuple
+    (
+        alloc_reg(),          // reg_accum
+        alloc_reg(),          // reg_chng
+        alloc_regs(n_cols),   // reg_prev_base
+        alloc_reg(),          // reg_temp
+        alloc_label(),        // lbl_empty
+        alloc_label(),        // lbl_loop
+        alloc_label(),        // lbl_stat_push
+        alloc_labels(n_cols), // lbl_update_prev
+    )
+        .then(
+            move |(
+                reg_accum,
+                reg_chng,
+                reg_prev_base,
+                reg_temp,
+                lbl_empty,
+                lbl_loop,
+                lbl_stat_push,
+                lbl_update_prev,
+            )| {
+                // Clone for inner closures that need ownership
+                let lbl_update_prev_clone = lbl_update_prev.clone();
 
-                                        // Initialize accumulator with stat_init(n_cols)
-                                        integer(n_cols as i64, reg_chng)
-                                            .and_then(function_call(
-                                                reg_chng,
-                                                reg_accum,
-                                                FuncCtx {
-                                                    func: Func::Scalar(ScalarFunc::StatInit),
-                                                    arg_count: 1,
-                                                },
-                                                0,
-                                            ))
-                                            // Rewind cursor; if empty, jump to end
-                                            .and_then(rewind(idx_cursor, lbl_empty))
-                                            // First row: chng=0, jump to update all prev columns
-                                            .and_then(integer(0, reg_chng))
-                                            .and_then(goto(lbl_update_prev[0]))
-                                            // Main loop label
-                                            .and_then(preassign_label(lbl_loop))
-                                            // Reset chng = 0
-                                            .and_then(integer(0, reg_chng))
-                                            // Compare each column
-                                            .and_then(emit_column_comparisons(
-                                                idx_cursor,
-                                                n_cols,
-                                                reg_temp,
-                                                reg_prev_base,
-                                                reg_chng,
-                                                lbl_update_prev_clone.clone(),
-                                                column_collations_clone,
-                                            ))
-                                            // All columns equal - duplicate row
-                                            .and_then(integer(n_cols as i64, reg_chng))
-                                            .and_then(goto(lbl_stat_push))
-                                            // Update prev section
-                                            .and_then(emit_update_prev_section(
-                                                idx_cursor,
-                                                n_cols,
-                                                reg_prev_base,
-                                                lbl_update_prev_clone,
-                                            ))
-                                            // stat_push
-                                            .and_then(preassign_label(lbl_stat_push))
-                                            .and_then(function_call(
-                                                reg_accum,
-                                                reg_accum,
-                                                FuncCtx {
-                                                    func: Func::Scalar(ScalarFunc::StatPush),
-                                                    arg_count: 2,
-                                                },
-                                                0,
-                                            ))
-                                            // Next iteration
-                                            .and_then(next(idx_cursor, lbl_loop))
-                                            // Get final stat string
-                                            .then(move |_| {
-                                                emit_stat_insert(
-                                                    stat_cursor,
-                                                    reg_accum,
-                                                    lbl_empty,
-                                                    table_name,
-                                                    index_name,
-                                                )
-                                            })
-                                            // Empty label at end
-                                            .and_then(preassign_label(lbl_empty))
-                                    },
-                                )
-                            })
-                        })
+                // Initialize accumulator with stat_init(n_cols)
+                integer(n_cols as i64, reg_chng)
+                    .and_then(function_call(
+                        reg_chng,
+                        reg_accum,
+                        FuncCtx {
+                            func: Func::Scalar(ScalarFunc::StatInit),
+                            arg_count: 1,
+                        },
+                        0,
+                    ))
+                    // Rewind cursor; if empty, jump to end
+                    .and_then(rewind(idx_cursor, lbl_empty))
+                    // First row: chng=0, jump to update all prev columns
+                    .and_then(integer(0, reg_chng))
+                    .and_then(goto(lbl_update_prev[0]))
+                    // Main loop label
+                    .and_then(preassign_label(lbl_loop))
+                    // Reset chng = 0
+                    .and_then(integer(0, reg_chng))
+                    // Compare each column
+                    .and_then(emit_column_comparisons(
+                        idx_cursor,
+                        n_cols,
+                        reg_temp,
+                        reg_prev_base,
+                        reg_chng,
+                        lbl_update_prev_clone.clone(),
+                        column_collations,
+                    ))
+                    // All columns equal - duplicate row
+                    .and_then(integer(n_cols as i64, reg_chng))
+                    .and_then(goto(lbl_stat_push))
+                    // Update prev section
+                    .and_then(emit_update_prev_section(
+                        idx_cursor,
+                        n_cols,
+                        reg_prev_base,
+                        lbl_update_prev_clone,
+                    ))
+                    // stat_push
+                    .and_then(preassign_label(lbl_stat_push))
+                    .and_then(function_call(
+                        reg_accum,
+                        reg_accum,
+                        FuncCtx {
+                            func: Func::Scalar(ScalarFunc::StatPush),
+                            arg_count: 2,
+                        },
+                        0,
+                    ))
+                    // Next iteration
+                    .and_then(next(idx_cursor, lbl_loop))
+                    // Get final stat string
+                    .then(move |_| {
+                        emit_stat_insert(stat_cursor, reg_accum, lbl_empty, table_name, index_name)
                     })
-                })
-            })
-        })
-    })
+                    // Empty label at end
+                    .and_then(preassign_label(lbl_empty))
+            },
+        )
 }
 
 /// Emit column comparisons for the main loop.
