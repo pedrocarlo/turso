@@ -766,6 +766,178 @@ pub fn divide(lhs: usize, rhs: usize, dest: usize) -> EmitInsn {
 }
 
 // =============================================================================
+// Cursor and Column Operations
+// =============================================================================
+
+/// Emit a Rewind instruction - position cursor at first row.
+/// Returns the "empty" label that should be jumped to when the cursor is empty.
+#[inline(always)]
+pub fn rewind(cursor_id: usize, pc_if_empty: BranchOffset) -> EmitInsn {
+    insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty,
+    })
+}
+
+/// Emit a Next instruction - advance cursor to next row.
+#[inline(always)]
+pub fn next(cursor_id: usize, pc_if_next: BranchOffset) -> EmitInsn {
+    insn(Insn::Next {
+        cursor_id,
+        pc_if_next,
+    })
+}
+
+/// Emit a Column instruction - read a column value into a register.
+#[inline(always)]
+pub fn column(cursor_id: usize, column_idx: usize, dest: usize) -> EmitInsn {
+    insn(Insn::Column {
+        cursor_id,
+        column: column_idx,
+        dest,
+        default: None,
+    })
+}
+
+/// Emit a RowId instruction - get the rowid of the current row.
+#[inline(always)]
+pub fn rowid(cursor_id: usize, dest: usize) -> EmitInsn {
+    insn(Insn::RowId { cursor_id, dest })
+}
+
+// =============================================================================
+// Comparison Operations
+// =============================================================================
+
+/// Emit a Ne (not equal) comparison that jumps if not equal.
+#[inline(always)]
+pub fn ne_jump(
+    lhs: usize,
+    rhs: usize,
+    target_pc: BranchOffset,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<crate::translate::collate::CollationSeq>,
+) -> EmitInsn {
+    insn(Insn::Ne {
+        lhs,
+        rhs,
+        target_pc,
+        flags,
+        collation,
+    })
+}
+
+/// Emit an IsNull instruction - jump if register is NULL.
+#[inline(always)]
+pub fn is_null(reg: usize, target_pc: BranchOffset) -> EmitInsn {
+    insn(Insn::IsNull { reg, target_pc })
+}
+
+// =============================================================================
+// Function Calls
+// =============================================================================
+
+/// Emit a Function call instruction.
+#[inline(always)]
+pub fn function_call(
+    start_reg: usize,
+    dest: usize,
+    func: crate::function::FuncCtx,
+    constant_mask: i32,
+) -> EmitInsn {
+    insn(Insn::Function {
+        constant_mask,
+        start_reg,
+        dest,
+        func,
+    })
+}
+
+// =============================================================================
+// Record and Insert Operations
+// =============================================================================
+
+/// Emit a MakeRecord instruction.
+#[inline(always)]
+pub fn make_record(start_reg: usize, count: usize, dest_reg: usize) -> EmitInsn {
+    insn(Insn::MakeRecord {
+        start_reg: crate::vdbe::insn::to_u16(start_reg),
+        count: crate::vdbe::insn::to_u16(count),
+        dest_reg: crate::vdbe::insn::to_u16(dest_reg),
+        index_name: None,
+        affinity_str: None,
+    })
+}
+
+/// Emit a NewRowid instruction.
+#[inline(always)]
+pub fn new_rowid(cursor: usize, rowid_reg: usize) -> EmitInsn {
+    insn(Insn::NewRowid {
+        cursor,
+        rowid_reg,
+        prev_largest_reg: 0,
+    })
+}
+
+/// Emit an Insert instruction.
+#[inline(always)]
+pub fn insert(cursor: usize, key_reg: usize, record_reg: usize, table_name: String) -> EmitInsn {
+    insn(Insn::Insert {
+        cursor,
+        key_reg,
+        record_reg,
+        flag: Default::default(),
+        table_name,
+    })
+}
+
+// =============================================================================
+// Label Operations with Preassignment
+// =============================================================================
+
+/// Allocate a label and preassign it to the next instruction.
+///
+/// This is useful when you need a label that points to the *current* position
+/// rather than a forward reference.
+#[inline(always)]
+pub fn preassigned_label() -> PreassignedLabel {
+    PreassignedLabel
+}
+
+pub struct PreassignedLabel;
+
+impl Emit for PreassignedLabel {
+    type Output = BranchOffset;
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let label = program.allocate_label();
+        program.preassign_label_to_next_insn(label);
+        Ok(label)
+    }
+}
+
+/// Preassign an existing label to the next instruction.
+#[inline(always)]
+pub fn preassign_label(label: BranchOffset) -> PreassignLabel {
+    PreassignLabel { label }
+}
+
+pub struct PreassignLabel {
+    label: BranchOffset,
+}
+
+impl Emit for PreassignLabel {
+    type Output = ();
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        program.preassign_label_to_next_insn(self.label);
+        Ok(())
+    }
+}
+
+// =============================================================================
 // Collection Combinators
 // =============================================================================
 
