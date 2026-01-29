@@ -6,6 +6,12 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
+        collate::CollationSeq,
+        emit_monad::{
+            alloc_label, alloc_reg, alloc_regs, column, copy, function_call, goto, insert, integer,
+            is_null, make_record, ne_jump, new_rowid, next, preassign_label, rewind, sequence,
+            string8, when, Emit,
+        },
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
@@ -14,6 +20,7 @@ use crate::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        BranchOffset,
     },
     Result,
 };
@@ -383,7 +390,7 @@ fn emit_index_stats(
         return;
     }
 
-    // Open the index cursor
+    // Open the index cursor (imperative - needs cursor allocation)
     let idx_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     program.emit_insn(Insn::OpenRead {
         cursor_id: idx_cursor,
@@ -391,184 +398,224 @@ fn emit_index_stats(
         db: 0,
     });
 
-    // Allocate registers contiguously for stat_push(accum, chng):
-    let reg_accum = program.alloc_register();
-    let reg_chng = program.alloc_register();
+    // Build the monadic computation for the rest
+    let table_name = table.name.clone();
+    let index_name = index.name.clone();
+    let column_collations: Vec<_> = index.columns.iter().map(|c| c.collation).collect();
 
-    // Registers for previous row values and comparison temp
-    let reg_prev_base = program.alloc_registers(n_cols);
-    let reg_temp = program.alloc_register();
+    let computation = emit_index_stats_monadic(
+        idx_cursor,
+        stat_cursor,
+        n_cols,
+        table_name,
+        index_name,
+        column_collations,
+    );
 
-    // Initialize the accumulator with stat_init(n_cols)
-    // Reuse reg_chng temporarily for the n_cols argument
-    program.emit_insn(Insn::Integer {
-        value: n_cols as i64,
-        dest: reg_chng,
-    });
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: reg_chng,
-        dest: reg_accum,
-        func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatInit),
-            arg_count: 1,
-        },
-    });
+    // Run the monadic computation
+    computation.run(program).expect("emit_index_stats failed");
+}
 
-    // Labels for control flow
-    let lbl_empty = program.allocate_label();
-    let lbl_loop = program.allocate_label();
-    let lbl_stat_push = program.allocate_label();
+/// Monadic implementation of index statistics emission.
+///
+/// This demonstrates the declarative, composable style where the bytecode
+/// structure is described rather than imperatively emitted.
+fn emit_index_stats_monadic(
+    idx_cursor: usize,
+    stat_cursor: usize,
+    n_cols: usize,
+    table_name: String,
+    index_name: String,
+    column_collations: Vec<Option<CollationSeq>>,
+) -> impl Emit<Output = ()> {
+    // Allocate all registers upfront
+    alloc_reg().then(move |reg_accum| {
+        alloc_reg().then(move |reg_chng| {
+            alloc_regs(n_cols).then(move |reg_prev_base| {
+                alloc_reg().then(move |reg_temp| {
+                    // Allocate all labels
+                    alloc_label().then(move |lbl_empty| {
+                        alloc_label().then(move |lbl_loop| {
+                            alloc_label().then(move |lbl_stat_push| {
+                                // Allocate per-column update labels
+                                sequence((0..n_cols).map(|_| alloc_label()).collect()).then(
+                                    move |lbl_update_prev: Vec<BranchOffset>| {
+                                        // Clone data for inner closures
+                                        let lbl_update_prev_clone = lbl_update_prev.clone();
+                                        let column_collations_clone = column_collations.clone();
 
-    // We need one label per column for the update_prev jump targets
-    let lbl_update_prev: Vec<_> = (0..n_cols).map(|_| program.allocate_label()).collect();
+                                        // Initialize accumulator with stat_init(n_cols)
+                                        integer(n_cols as i64, reg_chng)
+                                            .and_then(function_call(
+                                                reg_chng,
+                                                reg_accum,
+                                                FuncCtx {
+                                                    func: Func::Scalar(ScalarFunc::StatInit),
+                                                    arg_count: 1,
+                                                },
+                                                0,
+                                            ))
+                                            // Rewind cursor; if empty, jump to end
+                                            .and_then(rewind(idx_cursor, lbl_empty))
+                                            // First row: chng=0, jump to update all prev columns
+                                            .and_then(integer(0, reg_chng))
+                                            .and_then(goto(lbl_update_prev[0]))
+                                            // Main loop label
+                                            .and_then(preassign_label(lbl_loop))
+                                            // Reset chng = 0
+                                            .and_then(integer(0, reg_chng))
+                                            // Compare each column
+                                            .and_then(emit_column_comparisons(
+                                                idx_cursor,
+                                                n_cols,
+                                                reg_temp,
+                                                reg_prev_base,
+                                                reg_chng,
+                                                lbl_update_prev_clone.clone(),
+                                                column_collations_clone,
+                                            ))
+                                            // All columns equal - duplicate row
+                                            .and_then(integer(n_cols as i64, reg_chng))
+                                            .and_then(goto(lbl_stat_push))
+                                            // Update prev section
+                                            .and_then(emit_update_prev_section(
+                                                idx_cursor,
+                                                n_cols,
+                                                reg_prev_base,
+                                                lbl_update_prev_clone,
+                                            ))
+                                            // stat_push
+                                            .and_then(preassign_label(lbl_stat_push))
+                                            .and_then(function_call(
+                                                reg_accum,
+                                                reg_accum,
+                                                FuncCtx {
+                                                    func: Func::Scalar(ScalarFunc::StatPush),
+                                                    arg_count: 2,
+                                                },
+                                                0,
+                                            ))
+                                            // Next iteration
+                                            .and_then(next(idx_cursor, lbl_loop))
+                                            // Get final stat string
+                                            .then(move |_| {
+                                                emit_stat_insert(
+                                                    stat_cursor,
+                                                    reg_accum,
+                                                    lbl_empty,
+                                                    table_name,
+                                                    index_name,
+                                                )
+                                            })
+                                            // Empty label at end
+                                            .and_then(preassign_label(lbl_empty))
+                                    },
+                                )
+                            })
+                        })
+                    })
+                })
+            })
+        })
+    })
+}
 
-    // Rewind the index cursor; if empty, skip to end
-    program.emit_insn(Insn::Rewind {
-        cursor_id: idx_cursor,
-        pc_if_empty: lbl_empty,
-    });
+/// Emit column comparisons for the main loop.
+fn emit_column_comparisons(
+    idx_cursor: usize,
+    n_cols: usize,
+    reg_temp: usize,
+    reg_prev_base: usize,
+    reg_chng: usize,
+    lbl_update_prev: Vec<BranchOffset>,
+    column_collations: Vec<Option<CollationSeq>>,
+) -> impl Emit<Output = ()> {
+    sequence(
+        (0..n_cols)
+            .map(|i| {
+                let lbl = lbl_update_prev[i];
+                let collation = column_collations[i];
+                let is_last = i == n_cols - 1;
 
-    // First row: set chng=0 and jump to update all prev columns
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: reg_chng,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: lbl_update_prev[0],
-    });
+                // Read column into temp, compare with prev
+                column(idx_cursor, i, reg_temp)
+                    .and_then(ne_jump(
+                        reg_temp,
+                        reg_prev_base + i,
+                        lbl,
+                        CmpInsFlags::default().null_eq(),
+                        collation,
+                    ))
+                    // If not last and columns match, set chng to i+1
+                    .and_then(when(!is_last, move || integer((i + 1) as i64, reg_chng)))
+            })
+            .collect(),
+    )
+    .map(|_| ())
+}
 
-    // Main loop: compare columns to find change point
-    program.preassign_label_to_next_insn(lbl_loop);
+/// Emit the update_prev section where we update previous column values.
+fn emit_update_prev_section(
+    idx_cursor: usize,
+    n_cols: usize,
+    reg_prev_base: usize,
+    lbl_update_prev: Vec<BranchOffset>,
+) -> impl Emit<Output = ()> {
+    sequence(
+        (0..n_cols)
+            .map(|i| {
+                let lbl = lbl_update_prev[i];
+                preassign_label(lbl).and_then(column(idx_cursor, i, reg_prev_base + i))
+            })
+            .collect(),
+    )
+    .map(|_| ())
+}
 
-    // Set reg_chng = 0, then check each column
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: reg_chng,
-    });
-
-    for (i, lbl) in lbl_update_prev.iter().enumerate().take(n_cols) {
-        program.emit_insn(Insn::Column {
-            cursor_id: idx_cursor,
-            column: i,
-            dest: reg_temp,
-            default: None,
-        });
-        program.emit_insn(Insn::Ne {
-            lhs: reg_temp,
-            rhs: reg_prev_base + i,
-            target_pc: *lbl,
-            flags: CmpInsFlags::default().null_eq(),
-            collation: index.columns[i].collation,
-        });
-        // If columns match, increment chng and continue to next column
-        if i < n_cols - 1 {
-            program.emit_insn(Insn::Integer {
-                value: (i + 1) as i64,
-                dest: reg_chng,
-            });
-        }
-    }
-
-    // All columns equal - chng = n_cols (duplicate row), jump over update section to stat_push
-    program.emit_insn(Insn::Integer {
-        value: n_cols as i64,
-        dest: reg_chng,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: lbl_stat_push,
-    });
-
-    // Update prev section: emit n_cols consecutive Column instructions that cascade
-    // When col i differs from prev, jump here to update prev[i], prev[i+1], ..., prev[n_cols-1]
-    for (i, lbl) in lbl_update_prev.iter().enumerate().take(n_cols) {
-        program.preassign_label_to_next_insn(*lbl);
-        program.emit_insn(Insn::Column {
-            cursor_id: idx_cursor,
-            column: i,
-            dest: reg_prev_base + i,
-            default: None,
-        });
-        // Fall through to next column update, then to stat_push
-    }
-
-    program.preassign_label_to_next_insn(lbl_stat_push);
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: reg_accum,
-        dest: reg_accum,
-        func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatPush),
-            arg_count: 2,
-        },
-    });
-
-    // Next iteration
-    program.emit_insn(Insn::Next {
-        cursor_id: idx_cursor,
-        pc_if_next: lbl_loop,
-    });
-
-    // stat_get(accum) to get the final stat string
-    let reg_stat = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: reg_accum,
-        dest: reg_stat,
-        func: FuncCtx {
-            func: Func::Scalar(ScalarFunc::StatGet),
-            arg_count: 1,
-        },
-    });
-
-    // Skip insert if stat is NULL (empty index)
-    program.emit_insn(Insn::IsNull {
-        reg: reg_stat,
-        target_pc: lbl_empty,
-    });
-
-    // Insert record into sqlite_stat1
-    // Allocate contiguous registers for MakeRecord: tablename, indexname, stat
-    let record_start = program.alloc_registers(3);
-    program.emit_insn(Insn::String8 {
-        value: table.name.to_string(),
-        dest: record_start,
-    });
-    program.mark_last_insn_constant();
-    program.emit_insn(Insn::String8 {
-        value: index.name.to_string(),
-        dest: record_start + 1,
-    });
-    program.mark_last_insn_constant();
-    program.emit_insn(Insn::Copy {
-        src_reg: reg_stat,
-        dst_reg: record_start + 2,
-        extra_amount: 0,
-    });
-
-    let idx_record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(record_start),
-        count: to_u16(3),
-        dest_reg: to_u16(idx_record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-
-    let idx_rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: stat_cursor,
-        rowid_reg: idx_rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: stat_cursor,
-        key_reg: idx_rowid_reg,
-        record_reg: idx_record_reg,
-        flag: Default::default(),
-        table_name: "sqlite_stat1".to_string(),
-    });
-
-    // Label for empty index case, just skip the insert
-    program.preassign_label_to_next_insn(lbl_empty);
+/// Emit stat_get and insert into sqlite_stat1.
+fn emit_stat_insert(
+    stat_cursor: usize,
+    reg_accum: usize,
+    lbl_empty: BranchOffset,
+    table_name: String,
+    index_name: String,
+) -> impl Emit<Output = ()> {
+    // Allocate register for stat result
+    alloc_reg().then(move |reg_stat| {
+        // Call stat_get
+        function_call(
+            reg_accum,
+            reg_stat,
+            FuncCtx {
+                func: Func::Scalar(ScalarFunc::StatGet),
+                arg_count: 1,
+            },
+            0,
+        )
+        // Skip insert if NULL
+        .and_then(is_null(reg_stat, lbl_empty))
+        // Allocate record registers: tablename, indexname, stat
+        .then(move |_| {
+            alloc_regs(3).then(move |record_start| {
+                string8(table_name.clone(), record_start)
+                    .and_then(string8(index_name.clone(), record_start + 1))
+                    .and_then(copy(reg_stat, record_start + 2))
+                    // Make record and insert
+                    .then(move |_| {
+                        alloc_reg().then(move |idx_record_reg| {
+                            make_record(record_start, 3, idx_record_reg).then(move |_| {
+                                alloc_reg().then(move |idx_rowid_reg| {
+                                    new_rowid(stat_cursor, idx_rowid_reg).and_then(insert(
+                                        stat_cursor,
+                                        idx_rowid_reg,
+                                        idx_record_reg,
+                                        "sqlite_stat1".to_string(),
+                                    ))
+                                })
+                            })
+                        })
+                    })
+            })
+        })
+    })
 }
