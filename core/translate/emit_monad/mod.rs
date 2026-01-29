@@ -318,6 +318,193 @@ where
     }
 }
 
+// =============================================================================
+// Tuple Implementations (Chumsky-style)
+// =============================================================================
+//
+// These allow combining multiple Emit values without nesting:
+//
+// Instead of:
+//   alloc_reg().then(|r1| {
+//       alloc_reg().then(|r2| {
+//           alloc_label().then(|l1| { ... })
+//       })
+//   })
+//
+// Write:
+//   (alloc_reg(), alloc_reg(), alloc_label()).then(|(r1, r2, l1)| { ... })
+
+impl<E1, E2> Emit for (E1, E2)
+where
+    E1: Emit,
+    E2: Emit,
+{
+    type Output = (E1::Output, E2::Output);
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        Ok((a, b))
+    }
+}
+
+impl<E1, E2, E3> Emit for (E1, E2, E3)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+{
+    type Output = (E1::Output, E2::Output, E3::Output);
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        Ok((a, b, c))
+    }
+}
+
+impl<E1, E2, E3, E4> Emit for (E1, E2, E3, E4)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+    E4: Emit,
+{
+    type Output = (E1::Output, E2::Output, E3::Output, E4::Output);
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        let d = self.3.run(program)?;
+        Ok((a, b, c, d))
+    }
+}
+
+impl<E1, E2, E3, E4, E5> Emit for (E1, E2, E3, E4, E5)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+    E4: Emit,
+    E5: Emit,
+{
+    type Output = (E1::Output, E2::Output, E3::Output, E4::Output, E5::Output);
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        let d = self.3.run(program)?;
+        let e = self.4.run(program)?;
+        Ok((a, b, c, d, e))
+    }
+}
+
+impl<E1, E2, E3, E4, E5, E6> Emit for (E1, E2, E3, E4, E5, E6)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+    E4: Emit,
+    E5: Emit,
+    E6: Emit,
+{
+    type Output = (
+        E1::Output,
+        E2::Output,
+        E3::Output,
+        E4::Output,
+        E5::Output,
+        E6::Output,
+    );
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        let d = self.3.run(program)?;
+        let e = self.4.run(program)?;
+        let f = self.5.run(program)?;
+        Ok((a, b, c, d, e, f))
+    }
+}
+
+impl<E1, E2, E3, E4, E5, E6, E7> Emit for (E1, E2, E3, E4, E5, E6, E7)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+    E4: Emit,
+    E5: Emit,
+    E6: Emit,
+    E7: Emit,
+{
+    type Output = (
+        E1::Output,
+        E2::Output,
+        E3::Output,
+        E4::Output,
+        E5::Output,
+        E6::Output,
+        E7::Output,
+    );
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        let d = self.3.run(program)?;
+        let e = self.4.run(program)?;
+        let f = self.5.run(program)?;
+        let g = self.6.run(program)?;
+        Ok((a, b, c, d, e, f, g))
+    }
+}
+
+impl<E1, E2, E3, E4, E5, E6, E7, E8> Emit for (E1, E2, E3, E4, E5, E6, E7, E8)
+where
+    E1: Emit,
+    E2: Emit,
+    E3: Emit,
+    E4: Emit,
+    E5: Emit,
+    E6: Emit,
+    E7: Emit,
+    E8: Emit,
+{
+    type Output = (
+        E1::Output,
+        E2::Output,
+        E3::Output,
+        E4::Output,
+        E5::Output,
+        E6::Output,
+        E7::Output,
+        E8::Output,
+    );
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        let a = self.0.run(program)?;
+        let b = self.1.run(program)?;
+        let c = self.2.run(program)?;
+        let d = self.3.run(program)?;
+        let e = self.4.run(program)?;
+        let f = self.5.run(program)?;
+        let g = self.6.run(program)?;
+        let h = self.7.run(program)?;
+        Ok((a, b, c, d, e, f, g, h))
+    }
+}
+
 /// The result of `emit.inspect(f)`.
 pub struct Inspect<E, F> {
     emit: E,
@@ -577,6 +764,32 @@ impl Emit for AllocLabel {
     #[inline(always)]
     fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
         Ok(program.allocate_label())
+    }
+}
+
+/// Allocate multiple labels at once.
+///
+/// # Example
+/// ```ignore
+/// alloc_labels(3).then(|labels| {
+///     goto(labels[0]).and_then(preassign_label(labels[1]))
+/// })
+/// ```
+#[inline(always)]
+pub fn alloc_labels(count: usize) -> AllocLabels {
+    AllocLabels { count }
+}
+
+pub struct AllocLabels {
+    count: usize,
+}
+
+impl Emit for AllocLabels {
+    type Output = Vec<BranchOffset>;
+
+    #[inline(always)]
+    fn run(self, program: &mut ProgramBuilder) -> Result<Self::Output> {
+        Ok((0..self.count).map(|_| program.allocate_label()).collect())
     }
 }
 
