@@ -10,7 +10,7 @@ use crate::{
         emit_monad::{
             alloc_label, alloc_labels, alloc_reg, alloc_regs, column, copy, function_call, goto,
             insert, integer, is_null, make_record, ne_jump, new_rowid, next, preassign_label,
-            rewind, sequence, string8, when, Emit,
+            rewind, static_iter, string8, when, Emit, LoopEmit,
         },
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -519,6 +519,8 @@ fn emit_index_stats_monadic(
 }
 
 /// Emit column comparisons for the main loop.
+///
+/// Uses `static_iter` from LoopEmit to iterate over columns at compile time.
 fn emit_column_comparisons(
     idx_cursor: usize,
     n_cols: usize,
@@ -528,46 +530,42 @@ fn emit_column_comparisons(
     lbl_update_prev: Vec<BranchOffset>,
     column_collations: Vec<Option<CollationSeq>>,
 ) -> impl Emit<Output = ()> {
-    sequence(
-        (0..n_cols)
-            .map(|i| {
-                let lbl = lbl_update_prev[i];
-                let collation = column_collations[i];
-                let is_last = i == n_cols - 1;
+    // Use static_iter to emit comparison code for each column
+    static_iter(0..n_cols, move |i| {
+        let lbl = lbl_update_prev[i];
+        let collation = column_collations[i];
+        let is_last = i == n_cols - 1;
 
-                // Read column into temp, compare with prev
-                column(idx_cursor, i, reg_temp)
-                    .and_then(ne_jump(
-                        reg_temp,
-                        reg_prev_base + i,
-                        lbl,
-                        CmpInsFlags::default().null_eq(),
-                        collation,
-                    ))
-                    // If not last and columns match, set chng to i+1
-                    .and_then(when(!is_last, move || integer((i + 1) as i64, reg_chng)))
-            })
-            .collect(),
-    )
-    .map(|_| ())
+        // Read column into temp, compare with prev
+        column(idx_cursor, i, reg_temp)
+            .and_then(ne_jump(
+                reg_temp,
+                reg_prev_base + i,
+                lbl,
+                CmpInsFlags::default().null_eq(),
+                collation,
+            ))
+            // If not last and columns match, set chng to i+1
+            .and_then(when(!is_last, move || integer((i + 1) as i64, reg_chng)))
+    })
+    .emit_all()
 }
 
 /// Emit the update_prev section where we update previous column values.
+///
+/// Uses `static_iter` from LoopEmit to emit code for each column.
 fn emit_update_prev_section(
     idx_cursor: usize,
     n_cols: usize,
     reg_prev_base: usize,
     lbl_update_prev: Vec<BranchOffset>,
 ) -> impl Emit<Output = ()> {
-    sequence(
-        (0..n_cols)
-            .map(|i| {
-                let lbl = lbl_update_prev[i];
-                preassign_label(lbl).and_then(column(idx_cursor, i, reg_prev_base + i))
-            })
-            .collect(),
-    )
-    .map(|_| ())
+    // Use static_iter to emit update code for each column
+    static_iter(0..n_cols, move |i| {
+        let lbl = lbl_update_prev[i];
+        preassign_label(lbl).and_then(column(idx_cursor, i, reg_prev_base + i))
+    })
+    .emit_all()
 }
 
 /// Emit stat_get and insert into sqlite_stat1.

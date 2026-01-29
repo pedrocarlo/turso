@@ -61,9 +61,45 @@
 //! - Generic structs that encode the computation structure
 //! - `#[inline(always)]` to ensure everything gets inlined
 //! - The final `.run()` call collapses the entire structure into direct calls
+//!
+//! ## Loop Abstractions
+//!
+//! For loop patterns, see the [`loop_emit`] module which provides chumsky-inspired
+//! iteration combinators:
+//!
+//! ```ignore
+//! // Simple cursor loop
+//! cursor_loop(cursor_id, |ctx| {
+//!     column(ctx.cursor_id, 0, dest_reg)
+//! })
+//! .emit_all()
+//! .run(&mut program)?;
+//!
+//! // Collect results from each iteration
+//! cursor_loop(cursor_id, |ctx| column(ctx.cursor_id, 0, temp_reg).map(move |_| temp_reg))
+//!     .collect()
+//!     .run(&mut program)?;
+//!
+//! // Static iteration over known items
+//! static_iter(0..num_columns, |col_idx| {
+//!     column(cursor_id, col_idx, base_reg + col_idx)
+//! })
+//! .emit_all()
+//! .run(&mut program)?;
+//! ```
 
 #[cfg(test)]
 mod emit_monad_examples;
+
+pub mod loop_emit;
+
+// Re-export commonly used loop_emit types and functions
+#[allow(unused_imports)]
+pub use loop_emit::{
+    cursor_loop, generic_loop, nested_loop, reverse_cursor_loop, sorter_loop, static_iter,
+    CursorLoop, GenericLoop, LoopContext, LoopEmit, NestedLoop, ReverseCursorLoop, SorterLoop,
+    StaticIter,
+};
 
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
