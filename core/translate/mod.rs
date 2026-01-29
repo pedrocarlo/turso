@@ -45,6 +45,10 @@ mod values;
 pub(crate) mod view;
 mod window;
 
+/// Monadic zero-cost abstraction for declarative, lazy bytecode emission.
+/// See the module documentation for usage examples and design philosophy.
+pub mod emit_monad;
+
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
