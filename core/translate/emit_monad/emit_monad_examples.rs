@@ -257,6 +257,99 @@ where
 }
 
 // =============================================================================
+// Example 8: Using LoopEmit Trait (chumsky-inspired)
+// =============================================================================
+//
+// The LoopEmit trait provides iterator-like combinators for loop patterns.
+// Compare the cursor_loop above with the LoopEmit-based version below:
+
+use super::loop_emit::{cursor_loop as loop_emit_cursor, sorter_loop, static_iter, LoopEmit};
+
+/// Using LoopEmit: cleaner loop structure with combinators
+fn cursor_loop_with_loop_emit(cursor_id: usize, result_reg: usize) -> impl Emit<Output = ()> {
+    // Using the LoopEmit trait's cursor_loop
+    loop_emit_cursor(cursor_id, move |ctx| {
+        // Body: read column into result register
+        column(ctx.cursor_id, 0, result_reg)
+    })
+    .emit_all()
+}
+
+/// Using LoopEmit: collect results from each iteration
+fn cursor_loop_collect_example(cursor_id: usize) -> impl Emit<Output = Vec<usize>> {
+    alloc_regs(10).then(move |base_reg| {
+        loop_emit_cursor(cursor_id, move |ctx| {
+            let dest = base_reg; // In real code, you'd increment this
+            column(ctx.cursor_id, 0, dest).map(move |_| dest)
+        })
+        .collect()
+    })
+}
+
+/// Using LoopEmit: fold to count rows
+fn cursor_loop_count_example(cursor_id: usize) -> impl Emit<Output = usize> {
+    loop_emit_cursor(cursor_id, |_ctx| pure(()))
+        .map_item(|_| 1usize)
+        .fold_emit(0, |acc, n| pure(acc + n))
+}
+
+/// Using static_iter: emit code for each column at compile time
+fn emit_columns_static(cursor_id: usize, num_cols: usize, base_reg: usize) -> impl Emit<Output = ()> {
+    static_iter(0..num_cols, move |col_idx| {
+        column(cursor_id, col_idx, base_reg + col_idx)
+    })
+    .emit_all()
+}
+
+/// Using static_iter with enumerate: track index during emission
+fn emit_columns_with_index(cursor_id: usize, columns: Vec<usize>, base_reg: usize) -> impl Emit<Output = Vec<(usize, ())>> {
+    static_iter(columns.into_iter(), move |col_idx| {
+        column(cursor_id, col_idx, base_reg + col_idx)
+    })
+    .enumerate()
+    .collect()
+}
+
+/// Using static_iter with filter: conditionally emit
+fn emit_only_even_columns(_cursor_id: usize, num_cols: usize, _base_reg: usize) -> impl Emit<Output = ()> {
+    static_iter(0..num_cols, move |col_idx| {
+        pure(col_idx)
+    })
+    .filter_item(|col| col % 2 == 0)
+    .map_item(move |col_idx| {
+        // Note: This returns a value, not an Emit
+        // For more complex emission, you'd use fold_emit or collect + then
+        col_idx
+    })
+    .emit_all()
+}
+
+/// Example: chain two static iterations
+fn emit_chained_columns(cursor_id: usize) -> impl Emit<Output = Vec<()>> {
+    // First emit columns 0-2, then columns 5-7
+    static_iter(0..3, move |i| column(cursor_id, i, 10 + i))
+        .chain(static_iter(5..8, move |i| column(cursor_id, i, 20 + i)))
+        .collect()
+}
+
+/// Complex example: emit comparison logic for multiple columns (like in emit_index_stats)
+fn emit_column_comparisons_loop_emit(
+    cursor_id: usize,
+    n_cols: usize,
+    temp_reg: usize,
+    _prev_base: usize,
+) -> impl Emit<Output = Vec<()>> {
+    static_iter(0..n_cols, move |i| {
+        // Read column into temp
+        column(cursor_id, i, temp_reg)
+            // Compare with previous value
+            // (In real code, you'd emit Ne and jump to appropriate label)
+            .and_then(pure(()))
+    })
+    .collect()
+}
+
+// =============================================================================
 // Benefits Summary
 // =============================================================================
 //
