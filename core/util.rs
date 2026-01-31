@@ -15,6 +15,7 @@ use crate::{
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::future::Future;
 use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
@@ -81,6 +82,10 @@ macro_rules! ends_with_ignore_ascii_case {
 
 pub trait IOExt {
     fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
+    fn wait<T, F>(&self, f: F) -> impl Future<Output = Result<T>> + Send
+    where
+        F: FnMut() -> Result<IOResult<T>> + Send,
+        T: Send;
 }
 
 impl<I: ?Sized + IO> IOExt for I {
@@ -91,6 +96,21 @@ impl<I: ?Sized + IO> IOExt for I {
                 IOResult::IO(io) => io.wait(self)?,
             }
         })
+    }
+
+    fn wait<T, F>(&self, mut f: F) -> impl Future<Output = Result<T>> + Send
+    where
+        F: FnMut() -> Result<IOResult<T>> + Send,
+        T: Send,
+    {
+        async move {
+            Ok(loop {
+                match f()? {
+                    IOResult::Done(v) => break v,
+                    IOResult::IO(io) => io.wait_async(self).await?,
+                }
+            })
+        }
     }
 }
 
