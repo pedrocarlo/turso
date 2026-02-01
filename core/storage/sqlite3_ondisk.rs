@@ -1297,6 +1297,7 @@ pub fn build_shared_wal(
         checkpoint_lock: TursoRwLock::new(),
         initialized: AtomicBool::new(false),
         epoch: AtomicU32::new(0),
+        lock_released: event_listener::Event::new(),
     }));
 
     if size < WAL_HEADER_SIZE as u64 {

@@ -13,7 +13,7 @@ use turso_parser::{
 };
 
 use crate::{
-    busy::BusyHandlerState,
+    busy::{BusyHandlerState, BusyWait},
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
@@ -40,6 +40,10 @@ pub struct Statement {
     busy: bool,
     /// Busy handler state for tracking invocations and timeouts
     busy_handler_state: Option<BusyHandlerState>,
+    /// Pending busy wait for event-driven waiting.
+    /// When set, the caller should wait for either the timeout or lock release
+    /// instead of immediately retrying.
+    busy_wait: Option<BusyWait>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -71,6 +75,7 @@ impl Statement {
             query_mode,
             busy: false,
             busy_handler_state: None,
+            busy_wait: None,
         }
     }
 
@@ -119,6 +124,24 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    /// Take the pending busy wait from this statement.
+    /// Returns None if no busy wait is pending.
+    ///
+    /// When `step()` returns `StepResult::IO` due to a busy condition, the caller
+    /// should take the busy wait and use it to wait for either:
+    /// - The timeout to expire (backoff delay)
+    /// - The lock to be released (notified via the EventListener)
+    ///
+    /// This enables event-driven busy handling instead of busy-polling.
+    pub fn take_busy_wait(&mut self) -> Option<BusyWait> {
+        self.busy_wait.take()
+    }
+
+    /// Check if there's a pending busy wait.
+    pub fn has_busy_wait(&self) -> bool {
+        self.busy_wait.is_some()
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
@@ -128,16 +151,22 @@ impl Statement {
         {
             self.reprepare()?;
         }
+
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
-                // Yield the query as the timeout has not been reached yet
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+            let now = self.pager.io.current_time_monotonic();
+            if now < busy_state.timeout() {
+                // Timeout hasn't passed yet - create a BusyWait for event-driven waiting
+                // instead of immediately waking the waker (which causes busy-polling)
+                let lock_listener = self.get_lock_listener();
+                self.busy_wait = Some(BusyWait::new(busy_state.timeout(), lock_listener));
+                // Don't wake the waker - the caller should wait on the BusyWait
                 return Ok(StepResult::IO);
             }
         }
+
+        // Clear any previous busy_wait since we're proceeding with execution
+        self.busy_wait = None;
 
         const MAX_SCHEMA_RETRY: usize = 50;
         let mut res =
@@ -161,6 +190,7 @@ impl Statement {
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
+            self.busy_wait = None;
             drop(conn_metrics);
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -177,6 +207,9 @@ impl Statement {
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
+            // Get the lock listener BEFORE getting the mutable reference to busy_state
+            let lock_listener = self.get_lock_listener();
+
             // Initialize or get existing busy handler state
             let busy_state = self
                 .busy_handler_state
@@ -184,11 +217,12 @@ impl Statement {
 
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
-                // Handler says retry, yield with IO to wait for timeout
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                // Handler says retry - create a BusyWait for event-driven waiting
+                // instead of immediately waking the waker (which causes busy-polling)
+                let timeout = busy_state.timeout();
+                self.busy_wait = Some(BusyWait::new(timeout, lock_listener));
                 res = Ok(StepResult::IO);
+                // Don't wake the waker - the caller should wait on the BusyWait
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
             }
@@ -196,6 +230,21 @@ impl Statement {
         }
 
         res
+    }
+
+    /// Get a lock listener from the WAL if available.
+    /// This listener will be notified when locks are released.
+    fn get_lock_listener(&self) -> Option<event_listener::EventListener> {
+        // Get the WAL from the pager and create a lock listener
+        if self.pager.wal.is_some() {
+            // The WAL shared state contains the lock_released event
+            // We need to access it through the Database's shared_wal
+            let db = &self.program.connection.db;
+            let shared_wal = db.shared_wal.read();
+            Some(shared_wal.lock_listener())
+        } else {
+            None
+        }
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
@@ -524,6 +573,7 @@ impl Statement {
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
+        self.busy_wait = None;
     }
 
     pub fn row(&self) -> Option<&Row> {
