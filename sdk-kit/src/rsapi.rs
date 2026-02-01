@@ -31,6 +31,8 @@ assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
 pub use turso_core::types::FromValue;
+pub use turso_core::BusyWait;
+pub use turso_core::MonotonicInstant;
 pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
@@ -959,10 +961,28 @@ impl TursoStatement {
             name.as_ref()
         )))
     }
-    /// make one execution step of the statement
-    /// method returns [TursoStatusCode::Done] if execution is finished
-    /// method returns [TursoStatusCode::Row] if execution generated a row
-    /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
+    /// Make one execution step of the statement.
+    ///
+    /// # Returns
+    /// - `TursoStatusCode::Done` - execution is finished
+    /// - `TursoStatusCode::Row` - execution generated a row
+    /// - `TursoStatusCode::Io` - async_io was set and execution needs IO or busy waiting
+    ///
+    /// # Busy Handling with async_io
+    ///
+    /// When `async_io` is enabled and the database is busy (lock contention),
+    /// the busy handler may convert the busy condition to an IO yield with a
+    /// pending `BusyWait`. After receiving `TursoStatusCode::Io`, call
+    /// `take_busy_wait()` to check if this is a busy condition:
+    ///
+    /// - If `take_busy_wait()` returns `Some(BusyWait)`: This is a busy condition.
+    ///   Use the `BusyWait` for event-driven waiting instead of polling.
+    /// - If `take_busy_wait()` returns `None`: This is regular IO. Call `run_io()`
+    ///   to process the pending IO operation.
+    ///
+    /// # Errors
+    /// - `TursoError::Busy` - database is locked and busy handler gave up retrying
+    /// - `TursoError::Interrupt` - statement was interrupted
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
@@ -1025,6 +1045,87 @@ impl TursoStatement {
         self.statement._io().step()?;
         Ok(())
     }
+
+    /// Take the pending busy wait from this statement.
+    /// Returns None if no busy wait is pending.
+    ///
+    /// When `step()` returns `TursoStatusCode::Io` due to a busy condition
+    /// (database lock contention), the caller can use this method to get
+    /// a `BusyWait` that enables event-driven waiting instead of busy-polling.
+    ///
+    /// # BusyWait Contents
+    ///
+    /// - **Timeout**: The instant until which to wait before retrying. Use
+    ///   `remaining_delay(now)` to get a `Duration` suitable for async sleep.
+    /// - **Lock Listener**: An optional `EventListener` (from the `event_listener`
+    ///   crate) that will resolve when a database lock is released. The listener
+    ///   is awaitable with any async runtime (tokio, async-std, etc.).
+    ///
+    /// # Workflow
+    ///
+    /// After waiting (either by timeout or lock release), call `step()` again
+    /// to retry the operation. The busy handler manages exponential backoff
+    /// automatically.
+    ///
+    /// # Example (tokio async context)
+    ///
+    /// ```ignore
+    /// use turso_sdk_kit::MonotonicInstant;
+    ///
+    /// loop {
+    ///     match stmt.step(Some(&waker))? {
+    ///         TursoStatusCode::Io => {
+    ///             // Check if this is a busy wait or regular IO
+    ///             if let Some(mut busy_wait) = stmt.take_busy_wait() {
+    ///                 // Get the delay duration for sleeping
+    ///                 let delay = busy_wait.remaining_delay(MonotonicInstant::now());
+    ///
+    ///                 if let Some(listener) = busy_wait.take_lock_listener() {
+    ///                     // Wait for either timeout OR lock release (whichever first)
+    ///                     tokio::select! {
+    ///                         _ = tokio::time::sleep(delay) => {
+    ///                             // Timeout expired - retry with backoff
+    ///                         }
+    ///                         _ = listener => {
+    ///                             // Lock released early - can retry immediately
+    ///                         }
+    ///                     }
+    ///                 } else {
+    ///                     // No lock listener available, just wait for timeout
+    ///                     tokio::time::sleep(delay).await;
+    ///                 }
+    ///             } else {
+    ///                 // Regular IO - wait for IO completion
+    ///                 stmt.run_io()?;
+    ///             }
+    ///             continue;
+    ///         }
+    ///         TursoStatusCode::Done => break,
+    ///         TursoStatusCode::Row => { /* process row */ }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - Can only be called once per busy condition; subsequent calls return `None`
+    ///   until another busy condition occurs.
+    /// - The timeout always provides a fallback; even if no lock release is
+    ///   detected, execution will retry when the timeout expires.
+    /// - Safe to drop the `BusyWait` without waiting; the next `step()` call
+    ///   will handle retry logic.
+    pub fn take_busy_wait(&mut self) -> Option<turso_core::BusyWait> {
+        self.statement.take_busy_wait()
+    }
+
+    /// Check if there's a pending busy wait.
+    ///
+    /// This is useful for quickly checking if the previous `step()` call
+    /// yielded due to a busy condition without taking ownership of the wait.
+    pub fn has_busy_wait(&self) -> bool {
+        self.statement.has_busy_wait()
+    }
+
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
