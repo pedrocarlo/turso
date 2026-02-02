@@ -22,9 +22,11 @@ use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
-use std::task::Waker;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -2809,7 +2811,125 @@ impl<T> IOResult<T> {
             IOResult::IO(io) => IOResult::IO(io),
         }
     }
+
+    /// Converts this IOResult into a Future that waits for the I/O completion.
+    ///
+    /// If the result is `Done(T)`, the future immediately resolves with `Ok(T)`.
+    /// If the result is `IO`, the future waits for the completion and then
+    /// returns `Ok(T)` on success or propagates any error.
+    ///
+    /// # Important
+    ///
+    /// The returned future only waits for the I/O completion notification.
+    /// You must still call `io.step()` to drive the actual I/O operations.
+    /// This is designed to work with async runtimes that have their own I/O drivers.
+    ///
+    /// For a blocking version that handles I/O stepping internally, use `block_on`.
+    #[inline]
+    pub fn into_completion_future(self) -> IOCompletionFuture<T> {
+        IOCompletionFuture::new(self)
+    }
 }
+
+/// A Future that wraps an `IOResult<T>`, waiting for I/O completion if needed.
+///
+/// This future resolves to:
+/// - `Ok(Some(T))` when the `IOResult` was already `Done(T)`
+/// - `Ok(None)` when I/O completion succeeds (caller should re-invoke the operation)
+/// - `Err(CompletionError)` if the I/O fails
+///
+/// # Usage
+///
+/// This is useful in async contexts where you want to wait for I/O to complete
+/// and then re-invoke the operation. For `Done` results, you get the value directly.
+/// For `IO` results, after the future resolves with `Ok(None)`, call the operation again.
+///
+/// ```ignore
+/// use turso_core::{IOResult, IOCompletionFuture};
+///
+/// async fn example<F>(mut op: F) -> Result<i32, Error>
+/// where
+///     F: FnMut() -> Result<IOResult<i32>, Error>
+/// {
+///     loop {
+///         match op()?.into_completion_future().await? {
+///             Some(value) => return Ok(value),
+///             None => continue, // I/O completed, retry operation
+///         }
+///     }
+/// }
+/// ```
+pub struct IOCompletionFuture<T> {
+    state: IOCompletionFutureState<T>,
+}
+
+enum IOCompletionFutureState<T> {
+    Done(Option<T>),
+    Waiting { completions: IOCompletions },
+    Finished,
+}
+
+impl<T> IOCompletionFuture<T> {
+    /// Creates a new IOCompletionFuture from an IOResult.
+    pub fn new(result: IOResult<T>) -> Self {
+        match result {
+            IOResult::Done(value) => Self {
+                state: IOCompletionFutureState::Done(Some(value)),
+            },
+            IOResult::IO(completions) => Self {
+                state: IOCompletionFutureState::Waiting { completions },
+            },
+        }
+    }
+
+    /// Returns true if this future is already complete (no I/O needed).
+    pub fn is_ready(&self) -> bool {
+        matches!(self.state, IOCompletionFutureState::Done(_))
+    }
+}
+
+impl<T: Unpin> Future for IOCompletionFuture<T> {
+    type Output = std::result::Result<Option<T>, CompletionError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        match &mut this.state {
+            IOCompletionFutureState::Done(value) => {
+                // Value is ready, return it
+                let value = value.take();
+                this.state = IOCompletionFutureState::Finished;
+                Poll::Ready(Ok(value))
+            }
+            IOCompletionFutureState::Waiting { completions } => {
+                // Check if I/O has completed
+                if completions.finished() {
+                    // Check for errors
+                    if let Some(err) = completions.get_error() {
+                        this.state = IOCompletionFutureState::Finished;
+                        return Poll::Ready(Err(err));
+                    }
+                    // I/O completed successfully - return None to signal completion
+                    // Caller should re-invoke the operation to get the actual value
+                    this.state = IOCompletionFutureState::Finished;
+                    return Poll::Ready(Ok(None));
+                }
+
+                // Not finished yet - register waker and return Pending
+                completions.set_waker(Some(cx.waker()));
+                Poll::Pending
+            }
+            IOCompletionFutureState::Finished => {
+                panic!("IOCompletionFuture polled after completion");
+            }
+        }
+    }
+}
+
+// Safety: IOCompletionFuture is Send if T is Send, since IOCompletions is Send
+unsafe impl<T: Send> Send for IOCompletionFuture<T> {}
+// Safety: IOCompletionFuture is Sync if T is Sync, since IOCompletions is Sync
+unsafe impl<T: Sync> Sync for IOCompletionFuture<T> {}
 
 /// Evaluate a Result<IOResult<T>>, if IO return IO.
 #[macro_export]

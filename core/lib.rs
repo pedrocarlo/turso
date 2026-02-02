@@ -84,12 +84,12 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
-    SyscallIO, WriteCompletion, IO,
+    Buffer, Completion, CompletionFuture, CompletionType, File, GroupCompletion, MemoryIO,
+    OpenFlags, PlatformIO, SyscallIO, WriteCompletion, IO,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
-pub use statement::Statement;
+pub use statement::{RunFuture, Statement, StepFuture};
 use std::time::Duration;
 use std::{
     fmt::{self},
@@ -111,6 +111,7 @@ pub use storage::{
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
+pub use types::IOCompletionFuture;
 pub use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;
