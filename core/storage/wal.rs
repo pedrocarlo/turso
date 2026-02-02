@@ -828,6 +828,9 @@ pub struct WalFileShared {
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
     /// backfilling.
     pub epoch: AtomicU32,
+    /// Event that is notified when locks are released. This allows waiters to be woken up
+    /// when a lock becomes available instead of busy-polling.
+    pub lock_released: event_listener::Event,
 }
 
 impl fmt::Debug for WalFileShared {
@@ -924,11 +927,13 @@ impl Drop for CheckpointLocks {
                 guard.write_lock.unlock();
                 guard.read_locks[0].unlock();
                 guard.checkpoint_lock.unlock();
+                guard.notify_lock_released();
             }
             CheckpointLocks::Read0 { ptr: shared } => {
                 let guard = shared.write();
                 guard.read_locks[0].unlock();
                 guard.checkpoint_lock.unlock();
+                guard.notify_lock_released();
             }
         }
     }
@@ -1169,6 +1174,10 @@ impl Wal for WalFile {
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
+            // Note: We don't notify lock_released for read locks because:
+            // 1. Read locks don't block writers (they can proceed if no readers)
+            // 2. Busy conditions are caused by write lock contention, not read locks
+            // 3. Notifying on read unlock would cause unnecessary wakeups
             self.with_shared(|shared| shared.read_locks[slot].unlock());
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
@@ -1203,6 +1212,7 @@ impl Wal for WalFile {
                 // Retrying with busy_timeout will NEVER HELP.
                 tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
                 shared.write_lock.unlock();
+                shared.notify_lock_released();
                 return Err(LimboError::BusySnapshot);
             }
 
@@ -1218,6 +1228,7 @@ impl Wal for WalFile {
         // don't forget to release the write-lock if
         self.with_shared(|shared| {
             shared.write_lock.unlock();
+            shared.notify_lock_released();
         });
 
         Err(result.expect_err("Ok case handled above"))
@@ -1227,7 +1238,10 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
-        self.with_shared(|shared| shared.write_lock.unlock());
+        self.with_shared(|shared| {
+            shared.write_lock.unlock();
+            shared.notify_lock_released();
+        });
     }
 
     /// Find the latest frame containing a page.
@@ -2864,6 +2878,7 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            lock_released: event_listener::Event::new(),
         };
         Arc::new(RwLock::new(shared))
     }
@@ -2896,12 +2911,28 @@ impl WalFileShared {
             loaded: AtomicBool::new(true),
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
+            lock_released: event_listener::Event::new(),
         };
         Ok(Arc::new(RwLock::new(shared)))
     }
 
     pub fn page_size(&self) -> u32 {
         self.wal_header.lock().page_size
+    }
+
+    /// Notify all waiters that a lock has been released.
+    /// This should be called after releasing the write lock to wake up any
+    /// statements waiting for the lock to become available.
+    #[inline]
+    pub fn notify_lock_released(&self) {
+        self.lock_released.notify(usize::MAX);
+    }
+
+    /// Get a listener that will be notified when a lock is released.
+    /// Use this to implement event-driven busy waiting instead of polling.
+    #[inline]
+    pub fn lock_listener(&self) -> event_listener::EventListener {
+        self.lock_released.listen()
     }
 
     /// Called after a successful RESTART/TRUNCATE mode checkpoint

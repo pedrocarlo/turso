@@ -1,4 +1,7 @@
 use crate::MonotonicInstant;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 /// Type alias for busy handler callback function.
@@ -176,6 +179,162 @@ impl BusyHandlerState {
         } else {
             self.timeout.duration_since(now)
         }
+    }
+}
+
+/// Represents a pending busy wait that can be awaited or polled.
+///
+/// This type enables event-driven busy handling instead of busy-polling.
+/// When a statement encounters a busy condition, it can create a `BusyWait`
+/// that will be ready when either:
+/// - The timeout expires (backoff delay has passed)
+/// - The lock is released (notified via EventListener)
+///
+/// This eliminates the busy-loop where the async runtime constantly reschedules
+/// the task to check if the timeout has passed.
+pub struct BusyWait {
+    /// The timeout instant to wait until before retrying
+    timeout: MonotonicInstant,
+    /// Listener for lock release events. When notified, the lock may be available.
+    lock_listener: Option<event_listener::EventListener>,
+}
+
+impl std::fmt::Debug for BusyWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BusyWait")
+            .field("timeout", &self.timeout)
+            .field("has_lock_listener", &self.lock_listener.is_some())
+            .finish()
+    }
+}
+
+impl BusyWait {
+    /// Create a new BusyWait with the given timeout and optional lock listener.
+    ///
+    /// # Arguments
+    /// * `timeout` - The instant until which to wait before retrying
+    /// * `lock_listener` - Optional listener that will be notified when a lock is released
+    pub fn new(
+        timeout: MonotonicInstant,
+        lock_listener: Option<event_listener::EventListener>,
+    ) -> Self {
+        Self {
+            timeout,
+            lock_listener,
+        }
+    }
+
+    /// Check if this busy wait is ready (timeout passed or lock released).
+    ///
+    /// Returns `true` if either:
+    /// - The timeout has passed (backoff delay completed)
+    /// - The lock listener has been notified (lock was released)
+    ///
+    /// This allows callers to check if they should retry the operation without
+    /// needing to await the listener.
+    ///
+    /// Note: Once the lock listener is notified and this method returns `true`,
+    /// subsequent calls will continue to return `true` (the listener is consumed).
+    pub fn is_ready(&mut self, now: MonotonicInstant) -> bool {
+        // Check if timeout passed
+        if now >= self.timeout {
+            return true;
+        }
+
+        // Check if lock was released (listener was notified)
+        if let Some(listener) = self.lock_listener.as_mut() {
+            // Use a noop waker to poll without scheduling a wake-up
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(&waker);
+
+            // Poll the listener to check if it's been notified
+            // Safety: We only poll here, we don't move the listener
+            if Pin::new(listener).poll(&mut cx).is_ready() {
+                // Lock was released - consume the listener
+                self.lock_listener = None;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Get the timeout instant.
+    pub fn timeout(&self) -> MonotonicInstant {
+        self.timeout
+    }
+
+    /// Get the remaining delay until timeout.
+    /// Returns `Duration::ZERO` if the timeout has already passed.
+    pub fn remaining_delay(&self, now: MonotonicInstant) -> Duration {
+        if now >= self.timeout {
+            Duration::ZERO
+        } else {
+            self.timeout.duration_since(now)
+        }
+    }
+
+    /// Poll the busy wait with the given context, registering the waker for notification.
+    ///
+    /// Returns `Poll::Ready(())` if the wait is complete (timeout passed or listener notified).
+    /// Returns `Poll::Pending` if still waiting.
+    ///
+    /// This method properly registers the waker with the lock listener, so when the lock
+    /// is released, the waker will be notified. This is more efficient than polling
+    /// with `is_ready()` which uses a noop waker.
+    ///
+    /// Note: This only registers the waker with the lock listener. For timeout-based
+    /// waking, the caller should use a timer (e.g., `tokio::time::sleep`).
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+
+        let now = crate::MonotonicInstant::now();
+
+        // Check if timeout passed
+        if now >= self.timeout {
+            return Poll::Ready(());
+        }
+
+        // Poll the listener with the real context to register the waker
+        if let Some(listener) = self.lock_listener.as_mut() {
+            match Pin::new(listener).poll(cx) {
+                Poll::Ready(()) => {
+                    self.lock_listener = None;
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    // Waker is now registered with the listener
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+
+    /// Take the lock listener, consuming it.
+    /// This is useful when the caller wants to await the listener.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In an async context:
+    /// if let Some(busy_wait) = stmt.take_busy_wait() {
+    ///     let timeout = busy_wait.timeout();
+    ///     if let Some(listener) = busy_wait.take_lock_listener() {
+    ///         // Wait for either timeout or lock release
+    ///         tokio::select! {
+    ///             _ = tokio::time::sleep_until(timeout.into()) => {
+    ///                 // Timeout - retry the operation
+    ///             }
+    ///             _ = listener => {
+    ///                 // Lock released early - can retry immediately
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub fn take_lock_listener(&mut self) -> Option<event_listener::EventListener> {
+        self.lock_listener.take()
     }
 }
 
