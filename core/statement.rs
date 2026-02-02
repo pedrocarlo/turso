@@ -614,26 +614,11 @@ impl<'a> std::future::Future for StepFuture<'a> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // If there are pending IO completions, check if they're done
-        if let Some(ref completions) = self.stmt.state.io_completions {
-            if !completions.finished() {
-                // Set the waker and wait
-                completions.set_waker(Some(cx.waker()));
-                return std::task::Poll::Pending;
-            }
-            // IO completed - check for errors
-            if let Some(err) = completions.get_error() {
-                return std::task::Poll::Ready(Err(LimboError::CompletionError(err)));
-            }
-        }
-
-        // Try to step
+        // step_with_waker handles completion checking internally:
+        // - If pending completions aren't finished, it sets the waker and returns IO
+        // - If they are finished, it checks for errors and continues execution
         match self.stmt.step_with_waker(cx.waker()) {
-            Ok(StepResult::IO) => {
-                // IO was initiated - the step_with_waker already set up the waker
-                // via the io_completions, so we just return Pending
-                std::task::Poll::Pending
-            }
+            Ok(StepResult::IO) => std::task::Poll::Pending,
             Ok(result) => std::task::Poll::Ready(Ok(result)),
             Err(e) => std::task::Poll::Ready(Err(e)),
         }
@@ -659,29 +644,11 @@ impl<'a> std::future::Future for RunFuture<'a> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         loop {
-            // If there are pending IO completions, check if they're done
-            if let Some(ref completions) = self.stmt.state.io_completions {
-                if !completions.finished() {
-                    // Set the waker and wait
-                    completions.set_waker(Some(cx.waker()));
-                    return std::task::Poll::Pending;
-                }
-                // IO completed - check for errors
-                if let Some(err) = completions.get_error() {
-                    return std::task::Poll::Ready(Err(LimboError::CompletionError(err)));
-                }
-            }
-
+            // step_with_waker handles completion checking internally
             match self.stmt.step_with_waker(cx.waker()) {
                 Ok(StepResult::Done) => return std::task::Poll::Ready(Ok(())),
-                Ok(StepResult::IO) => {
-                    // IO was initiated - return Pending
-                    return std::task::Poll::Pending;
-                }
-                Ok(StepResult::Row) => {
-                    // Ignore rows, continue stepping
-                    continue;
-                }
+                Ok(StepResult::IO) => return std::task::Poll::Pending,
+                Ok(StepResult::Row) => continue, // Ignore rows, keep stepping
                 Ok(StepResult::Interrupt) => {
                     return std::task::Poll::Ready(Err(LimboError::Interrupt))
                 }

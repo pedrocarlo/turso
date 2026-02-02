@@ -52,6 +52,10 @@ pub struct Connection {
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
     pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
+    /// Whether this connection uses true async I/O.
+    /// When true, step() returns Pending without running I/O synchronously.
+    /// An IoDriver must be running to process I/O operations.
+    pub(crate) async_io: bool,
 }
 
 assert_send_sync!(Connection);
@@ -63,6 +67,7 @@ impl Clone for Connection {
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
             extra_io: self.extra_io.clone(),
+            async_io: self.async_io,
         }
     }
 }
@@ -72,14 +77,22 @@ impl Connection {
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
     ) -> Self {
+        Self::create_with_async(conn, extra_io, false)
+    }
+
+    pub fn create_with_async(
+        conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
+        extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
+        async_io: bool,
+    ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
-        let connection = Connection {
+        Connection {
             inner: Some(conn),
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
             extra_io,
-        };
-        connection
+            async_io,
+        }
     }
 
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
