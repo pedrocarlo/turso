@@ -1,4 +1,7 @@
 use crate::MonotonicInstant;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 /// Type alias for busy handler callback function.
@@ -223,11 +226,37 @@ impl BusyWait {
 
     /// Check if this busy wait is ready (timeout passed or lock released).
     ///
-    /// Returns `true` if the timeout has passed, meaning the caller should retry.
-    /// Note: Even if the lock was released, we still honor the minimum timeout
-    /// to avoid overwhelming the system with retries.
-    pub fn is_ready(&self, now: MonotonicInstant) -> bool {
-        now >= self.timeout
+    /// Returns `true` if either:
+    /// - The timeout has passed (backoff delay completed)
+    /// - The lock listener has been notified (lock was released)
+    ///
+    /// This allows callers to check if they should retry the operation without
+    /// needing to await the listener.
+    ///
+    /// Note: Once the lock listener is notified and this method returns `true`,
+    /// subsequent calls will continue to return `true` (the listener is consumed).
+    pub fn is_ready(&mut self, now: MonotonicInstant) -> bool {
+        // Check if timeout passed
+        if now >= self.timeout {
+            return true;
+        }
+
+        // Check if lock was released (listener was notified)
+        if let Some(listener) = self.lock_listener.as_mut() {
+            // Use a noop waker to poll without scheduling a wake-up
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(&waker);
+
+            // Poll the listener to check if it's been notified
+            // Safety: We only poll here, we don't move the listener
+            if Pin::new(listener).poll(&mut cx).is_ready() {
+                // Lock was released - consume the listener
+                self.lock_listener = None;
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Get the timeout instant.
@@ -243,6 +272,43 @@ impl BusyWait {
         } else {
             self.timeout.duration_since(now)
         }
+    }
+
+    /// Poll the busy wait with the given context, registering the waker for notification.
+    ///
+    /// Returns `Poll::Ready(())` if the wait is complete (timeout passed or listener notified).
+    /// Returns `Poll::Pending` if still waiting.
+    ///
+    /// This method properly registers the waker with the lock listener, so when the lock
+    /// is released, the waker will be notified. This is more efficient than polling
+    /// with `is_ready()` which uses a noop waker.
+    ///
+    /// Note: This only registers the waker with the lock listener. For timeout-based
+    /// waking, the caller should use a timer (e.g., `tokio::time::sleep`).
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> std::task::Poll<()> {
+        use std::task::Poll;
+
+        let now = crate::MonotonicInstant::now();
+
+        // Check if timeout passed
+        if now >= self.timeout {
+            return Poll::Ready(());
+        }
+
+        // Poll the listener with the real context to register the waker
+        if let Some(listener) = self.lock_listener.as_mut() {
+            match Pin::new(listener).poll(cx) {
+                Poll::Ready(()) => {
+                    self.lock_listener = None;
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    // Waker is now registered with the listener
+                }
+            }
+        }
+
+        Poll::Pending
     }
 
     /// Take the lock listener, consuming it.

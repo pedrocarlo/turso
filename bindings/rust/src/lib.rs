@@ -275,29 +275,49 @@ impl Statement {
         columns: Option<usize>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<Row>>> {
-        let mut stmt = self.inner.lock().unwrap();
-        match stmt.step(Some(cx.waker()))? {
-            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                if let Some(columns) = columns {
-                    let mut values = Vec::with_capacity(columns);
-                    for i in 0..columns {
-                        let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+        loop {
+            let mut stmt = self.inner.lock().unwrap();
+            match stmt.step(Some(cx.waker()))? {
+                turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                    if let Some(columns) = columns {
+                        let mut values = Vec::with_capacity(columns);
+                        for i in 0..columns {
+                            let value = stmt.row_value(i)?;
+                            values.push(value.to_owned());
+                        }
+                        return Poll::Ready(Ok(Some(Row { values })));
+                    } else {
+                        return Poll::Ready(Err(Error::Misuse(
+                            "unexpected row during execution".to_string(),
+                        )));
                     }
-                    Poll::Ready(Ok(Some(Row { values })))
-                } else {
-                    Poll::Ready(Err(Error::Misuse(
-                        "unexpected row during execution".to_string(),
-                    )))
                 }
-            }
-            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
-            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
-                stmt.run_io()?;
-                if let Some(extra_io) = &self.conn.extra_io {
-                    extra_io(cx.waker().clone())?;
+                turso_sdk_kit::rsapi::TursoStatusCode::Done => return Poll::Ready(Ok(None)),
+                turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                    // Check if this is a busy wait condition (lock contention)
+                    if let Some(mut busy_wait) = stmt.take_busy_wait() {
+                        // Poll the busy wait to check readiness and register waker
+                        // with the lock listener for efficient event-driven waiting
+                        match busy_wait.poll(cx) {
+                            Poll::Ready(()) => {
+                                // Lock released or timeout passed - retry immediately
+                                continue;
+                            }
+                            Poll::Pending => {
+                                // Put the busy_wait back to preserve the EventListener
+                                // registration. If dropped, waker would be unregistered.
+                                stmt.put_busy_wait(busy_wait);
+                                return Poll::Pending;
+                            }
+                        }
+                    }
+                    // No busy wait - this is regular IO, process it
+                    stmt.run_io()?;
+                    if let Some(extra_io) = &self.conn.extra_io {
+                        extra_io(cx.waker().clone())?;
+                    }
+                    return Poll::Pending;
                 }
-                Poll::Pending
             }
         }
     }

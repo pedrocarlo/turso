@@ -1126,6 +1126,34 @@ impl TursoStatement {
         self.statement.has_busy_wait()
     }
 
+    /// Put a busy wait back into the statement.
+    ///
+    /// This is used when the caller polls the busy wait and it returns `Pending`.
+    /// The busy wait must be stored back to preserve the `EventListener` registration
+    /// across poll boundaries. If the listener is dropped, the waker would be
+    /// unregistered and the task would not be woken when the lock is released.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // In a Future::poll implementation:
+    /// if let Some(mut busy_wait) = stmt.take_busy_wait() {
+    ///     match busy_wait.poll(cx) {
+    ///         Poll::Ready(()) => {
+    ///             // Ready to retry - proceed with step
+    ///         }
+    ///         Poll::Pending => {
+    ///             // Put it back to preserve the listener registration
+    ///             stmt.put_busy_wait(busy_wait);
+    ///             return Poll::Pending;
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub fn put_busy_wait(&mut self, busy_wait: turso_core::BusyWait) {
+        self.statement.put_busy_wait(busy_wait);
+    }
+
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {

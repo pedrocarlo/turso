@@ -142,6 +142,16 @@ impl Statement {
         self.busy_wait.is_some()
     }
 
+    /// Put a busy wait back into the statement.
+    ///
+    /// This is used when the caller polls the busy wait and it returns `Pending`.
+    /// The busy wait must be stored back to preserve the `EventListener` registration
+    /// across poll boundaries. If the listener is dropped, the waker would be
+    /// unregistered and the task would not be woken when the lock is released.
+    pub fn put_busy_wait(&mut self, busy_wait: BusyWait) {
+        self.busy_wait = Some(busy_wait);
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             && !self
