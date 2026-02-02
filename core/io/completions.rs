@@ -1,10 +1,12 @@
 use core::fmt::{self, Debug};
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    task::Waker,
+    task::{Context as TaskContext, Poll, Waker},
 };
 
 use crate::sync::Mutex;
@@ -537,6 +539,70 @@ impl TruncateCompletion {
 
     pub fn callback(&self, res: Result<i32, CompletionError>) {
         (self.complete)(res);
+    }
+}
+
+/// A Future that wraps a Completion, resolving when the I/O operation completes.
+///
+/// This provides native Rust async/await support for I/O completions,
+/// allowing seamless integration with async runtimes like tokio, async-std, etc.
+///
+/// # Example
+///
+/// ```ignore
+/// let completion = file.pread(offset, completion)?;
+/// let future = CompletionFuture::new(completion);
+/// future.await?; // Returns Ok(()) on success, Err(CompletionError) on failure
+/// ```
+pub struct CompletionFuture {
+    completion: Completion,
+}
+
+impl CompletionFuture {
+    /// Creates a new CompletionFuture wrapping the given Completion.
+    pub fn new(completion: Completion) -> Self {
+        Self { completion }
+    }
+
+    /// Returns a reference to the underlying Completion.
+    pub fn completion(&self) -> &Completion {
+        &self.completion
+    }
+
+    /// Checks if the underlying completion has finished.
+    pub fn is_finished(&self) -> bool {
+        self.completion.finished()
+    }
+}
+
+impl Future for CompletionFuture {
+    type Output = Result<(), CompletionError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let completion = &self.completion;
+
+        // Check if already finished
+        if completion.finished() {
+            // Check for errors
+            if let Some(err) = completion.get_error() {
+                return Poll::Ready(Err(err));
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        // Not finished yet - register waker and return Pending
+        completion.set_waker(cx.waker());
+        Poll::Pending
+    }
+}
+
+// Safety: CompletionFuture is Send + Sync because Completion is Send + Sync
+unsafe impl Send for CompletionFuture {}
+unsafe impl Sync for CompletionFuture {}
+
+impl From<Completion> for CompletionFuture {
+    fn from(completion: Completion) -> Self {
+        Self::new(completion)
     }
 }
 

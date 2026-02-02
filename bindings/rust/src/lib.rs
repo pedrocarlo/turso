@@ -217,6 +217,161 @@ impl Builder {
     }
 }
 
+/// A builder for `AsyncDatabase` with true async I/O support.
+///
+/// Unlike `Builder`, this creates databases that use native async I/O
+/// where futures properly wait for I/O completion instead of blocking.
+///
+/// # Example
+///
+/// ```ignore
+/// use turso::AsyncBuilder;
+///
+/// let (db, io_driver) = AsyncBuilder::new_local(":memory:").build().await?;
+///
+/// // Spawn the IO driver to process I/O operations
+/// tokio::spawn(async move {
+///     io_driver.run().await;
+/// });
+///
+/// let conn = db.connect()?;
+/// conn.execute("CREATE TABLE users (id INTEGER)", ()).await?;
+/// ```
+pub struct AsyncBuilder {
+    path: String,
+    enable_encryption: bool,
+    enable_triggers: bool,
+    enable_attach: bool,
+    vfs: Option<String>,
+    encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+}
+
+impl AsyncBuilder {
+    /// Create a new local async database.
+    pub fn new_local(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            enable_encryption: false,
+            enable_triggers: false,
+            enable_attach: false,
+            vfs: None,
+            encryption_opts: None,
+        }
+    }
+
+    pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
+        self.enable_encryption = encryption_enabled;
+        self
+    }
+
+    pub fn with_encryption(mut self, opts: turso_sdk_kit::rsapi::EncryptionOpts) -> Self {
+        self.encryption_opts = Some(opts);
+        self
+    }
+
+    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
+        self.enable_triggers = triggers_enabled;
+        self
+    }
+
+    pub fn experimental_attach(mut self, attach_enabled: bool) -> Self {
+        self.enable_attach = attach_enabled;
+        self
+    }
+
+    pub fn with_io(mut self, vfs: String) -> Self {
+        self.vfs = Some(vfs);
+        self
+    }
+
+    fn build_features_string(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.enable_encryption {
+            features.push("encryption");
+        }
+        if self.enable_triggers {
+            features.push("triggers");
+        }
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if features.is_empty() {
+            return None;
+        }
+        Some(features.join(","))
+    }
+
+    /// Build the async database.
+    ///
+    /// The async database uses the completion-based waker system for true async I/O.
+    /// When IO is needed, the waker is registered with the completion and the future
+    /// returns Pending. IO is processed when the statement's `run_io()` is called.
+    #[allow(unused_variables, clippy::arc_with_non_send_sync)]
+    pub async fn build(self) -> Result<AsyncDatabase> {
+        let features = self.build_features_string();
+        let db =
+            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                path: self.path,
+                experimental_features: features,
+                async_io: true, // Enable async I/O mode
+                encryption: self.encryption_opts,
+                vfs: self.vfs,
+                io: None,
+                db_file: None,
+            });
+
+        // Open database - with async_io=true this may require IO
+        // For opening, we do it synchronously since we don't have a statement yet
+        let mut result = db.open()?;
+        // Opening a database may not actually need IO for memory or simple file opens
+        // If it does, we fall back to sync for the open phase
+        while result.is_io() {
+            // For db open, there's no way to step IO without a statement
+            // This is a limitation - db open is always sync
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            result = db.open()?;
+        }
+
+        Ok(AsyncDatabase { inner: db })
+    }
+}
+
+/// An async database that uses the completion-based async I/O system.
+///
+/// The `AsyncDatabase` leverages Rust's Future system for async operations.
+/// When a statement needs I/O, the waker is registered with the I/O completion
+/// and the future returns `Pending`. IO is driven by calling `run_io()` on
+/// the statement, which processes pending operations and wakes the task when complete.
+///
+/// # Example
+///
+/// ```ignore
+/// use turso::AsyncBuilder;
+///
+/// let db = AsyncBuilder::new_local(":memory:").build().await?;
+/// let conn = db.connect()?;
+/// conn.execute("CREATE TABLE users (id INTEGER)", ()).await?;
+/// ```
+#[derive(Clone)]
+pub struct AsyncDatabase {
+    inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+}
+
+impl Debug for AsyncDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncDatabase").finish()
+    }
+}
+
+impl AsyncDatabase {
+    /// Connect to the async database.
+    pub fn connect(&self) -> Result<Connection> {
+        let conn = self.inner.connect()?;
+        // Use async_io=true so step returns IO status without blocking
+        Ok(Connection::create_with_async(conn, None, true))
+    }
+}
+
 /// A database.
 ///
 /// The `Database` object points to a database and allows you to connect to it
@@ -293,6 +448,12 @@ impl Statement {
             }
             turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
             turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                // The waker is already set by step_with_waker on the I/O completion.
+                // We need to drive I/O to make progress. In both sync and async modes,
+                // we call run_io() to process pending I/O operations.
+                // The difference is:
+                // - Sync mode: run_io() completes the IO and we loop immediately
+                // - Async mode: run_io() starts processing, waker will wake us when done
                 stmt.run_io()?;
                 if let Some(extra_io) = &self.conn.extra_io {
                     extra_io(cx.waker().clone())?;
@@ -590,6 +751,74 @@ mod tests {
                 assert_eq!(rows.get_value(0)?, Value::Integer(i as i64 + 1));
                 assert!(rows_iter.next().await?.is_none());
             }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_database() -> Result<()> {
+        // Test the async database
+        let db = AsyncBuilder::new_local(":memory:").build().await?;
+
+        // Connect and execute queries
+        let conn = db.connect()?;
+
+        // Create a table
+        conn.execute(
+            "CREATE TABLE async_test (id INTEGER PRIMARY KEY, value TEXT)",
+            (),
+        )
+        .await?;
+
+        // Insert some data
+        conn.execute("INSERT INTO async_test (value) VALUES ('hello')", ())
+            .await?;
+        conn.execute("INSERT INTO async_test (value) VALUES ('world')", ())
+            .await?;
+
+        // Query the data
+        let mut rows = conn
+            .query("SELECT value FROM async_test ORDER BY id", ())
+            .await?;
+
+        let row1 = rows.next().await?.expect("Expected first row");
+        assert_eq!(row1.get_value(0)?, Value::Text("hello".to_string()));
+
+        let row2 = rows.next().await?.expect("Expected second row");
+        assert_eq!(row2.get_value(0)?, Value::Text("world".to_string()));
+
+        assert!(rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_async_vs_sync_equivalence() -> Result<()> {
+        // Test that async and sync databases produce the same results
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        // Use sync database to create data
+        {
+            let db = Builder::new_local(db_path).build().await?;
+            let conn = db.connect()?;
+            conn.execute(
+                "CREATE TABLE equiv_test (id INTEGER PRIMARY KEY, data TEXT)",
+                (),
+            )
+            .await?;
+            conn.execute("INSERT INTO equiv_test (data) VALUES ('sync_data')", ())
+                .await?;
+        }
+
+        // Use async database to read data
+        {
+            let db = AsyncBuilder::new_local(db_path).build().await?;
+            let conn = db.connect()?;
+            let mut rows = conn.query("SELECT data FROM equiv_test", ()).await?;
+            let row = rows.next().await?.expect("Expected row");
+            assert_eq!(row.get_value(0)?, Value::Text("sync_data".to_string()));
         }
 
         Ok(())

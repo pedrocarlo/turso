@@ -1078,6 +1078,43 @@ impl TursoStatement {
         Ok(())
     }
 
+    /// Returns a Future that performs a single step of statement execution.
+    ///
+    /// This is the async version of `step()`. The future resolves to a
+    /// `TursoStatusCode` indicating the result of the step.
+    ///
+    /// # Note
+    ///
+    /// You must ensure I/O is driven by your async runtime (e.g., by calling
+    /// `run_io()` in a background task or using a custom I/O driver).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// loop {
+    ///     match stmt.step_future().await? {
+    ///         TursoStatusCode::Row => { /* process row */ }
+    ///         TursoStatusCode::Done => break,
+    ///         TursoStatusCode::Io => unreachable!("should not happen with async"),
+    ///     }
+    /// }
+    /// ```
+    pub fn step_future(&mut self) -> TursoStepFuture<'_> {
+        TursoStepFuture { stmt: self }
+    }
+
+    /// Returns a Future that executes the statement to completion.
+    ///
+    /// This is the async version of `execute()`. The future resolves when
+    /// the statement finishes executing.
+    ///
+    /// # Note
+    ///
+    /// You must ensure I/O is driven by your async runtime.
+    pub fn execute_future(&mut self) -> TursoExecuteFuture<'_> {
+        TursoExecuteFuture { stmt: self }
+    }
+
     /// helper method to get C raw container to the TursoStatement instance
     /// this method is used in the capi wrappers
     pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_statement_t {
@@ -1108,6 +1145,78 @@ impl TursoStatement {
         Box::from_raw(value as *mut Self)
     }
 }
+
+/// A Future that performs a single step of statement execution.
+///
+/// This future wraps the core's async stepping capability and provides
+/// native Rust async/await support. The core's `step_with_waker` method
+/// handles waker registration internally.
+pub struct TursoStepFuture<'a> {
+    stmt: &'a mut TursoStatement,
+}
+
+impl<'a> std::future::Future for TursoStepFuture<'a> {
+    type Output = Result<TursoStatusCode, TursoError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // The step method with waker handles IO completion tracking internally.
+        // When IO is needed, step_with_waker sets the waker on the completion.
+        match self.stmt.step(Some(cx.waker())) {
+            Ok(TursoStatusCode::Io) => {
+                // IO was initiated - the waker is already set by step_with_waker
+                std::task::Poll::Pending
+            }
+            Ok(status) => std::task::Poll::Ready(Ok(status)),
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
+// Safety: TursoStepFuture is Send because TursoStatement is Send
+unsafe impl<'a> Send for TursoStepFuture<'a> {}
+
+/// A Future that executes a statement to completion.
+///
+/// This future repeatedly steps the statement until it reaches completion,
+/// handling I/O waiting automatically via the async runtime.
+pub struct TursoExecuteFuture<'a> {
+    stmt: &'a mut TursoStatement,
+}
+
+impl<'a> std::future::Future for TursoExecuteFuture<'a> {
+    type Output = Result<TursoExecutionResult, TursoError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            match self.stmt.step(Some(cx.waker())) {
+                Ok(TursoStatusCode::Done) => {
+                    return std::task::Poll::Ready(Ok(TursoExecutionResult {
+                        status: TursoStatusCode::Done,
+                        rows_changed: self.stmt.statement.n_change() as u64,
+                    }));
+                }
+                Ok(TursoStatusCode::Io) => {
+                    // IO was initiated - waker is set by step_with_waker
+                    return std::task::Poll::Pending;
+                }
+                Ok(TursoStatusCode::Row) => {
+                    // Ignore rows, continue stepping
+                    continue;
+                }
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+// Safety: TursoExecuteFuture is Send because TursoStatement is Send
+unsafe impl<'a> Send for TursoExecuteFuture<'a> {}
 
 #[cfg(test)]
 mod tests {

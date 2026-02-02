@@ -206,6 +206,50 @@ impl Statement {
         self._step(Some(waker))
     }
 
+    /// Returns a Future that performs a single step of the statement execution.
+    ///
+    /// This async method automatically handles I/O waiting using the completion
+    /// notification system. The caller's async runtime will be notified when
+    /// I/O completes via the waker.
+    ///
+    /// # Important
+    ///
+    /// The future returned only waits for I/O completion notifications.
+    /// You must ensure `io.step()` is called by your async runtime or I/O driver
+    /// to actually perform the I/O operations.
+    ///
+    /// For most async runtimes (tokio, async-std), you'll want to spawn a task
+    /// that drives `io.step()` or integrate with the runtime's I/O system.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut stmt = conn.prepare("SELECT * FROM users")?;
+    /// loop {
+    ///     match stmt.step_async().await? {
+    ///         StepResult::Row => {
+    ///             // Process row
+    ///         }
+    ///         StepResult::Done => break,
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    pub fn step_async(&mut self) -> StepFuture<'_> {
+        StepFuture { stmt: self }
+    }
+
+    /// Returns a Future that runs the statement to completion, ignoring all rows.
+    ///
+    /// This is the async equivalent of `run_ignore_rows()`.
+    ///
+    /// # Important
+    ///
+    /// Like `step_async()`, you must ensure I/O is driven by your async runtime.
+    pub fn run_async(&mut self) -> RunFuture<'_> {
+        RunFuture { stmt: self }
+    }
+
     pub fn run_ignore_rows(&mut self) -> Result<()> {
         loop {
             match self.step()? {
@@ -547,3 +591,73 @@ impl Statement {
         self.pager.io.as_ref()
     }
 }
+
+/// A Future that performs a single step of statement execution.
+///
+/// This future resolves to `StepResult` when the step completes.
+/// If the step requires I/O, the future will wait for I/O completion
+/// notification before resolving.
+///
+/// # Note
+///
+/// The I/O completion notification is provided by the `Completion` system.
+/// You must ensure your async runtime drives the actual I/O operations
+/// (e.g., by calling `io.step()` in a background task).
+pub struct StepFuture<'a> {
+    stmt: &'a mut Statement,
+}
+
+impl<'a> std::future::Future for StepFuture<'a> {
+    type Output = Result<StepResult>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        // step_with_waker handles completion checking internally:
+        // - If pending completions aren't finished, it sets the waker and returns IO
+        // - If they are finished, it checks for errors and continues execution
+        match self.stmt.step_with_waker(cx.waker()) {
+            Ok(StepResult::IO) => std::task::Poll::Pending,
+            Ok(result) => std::task::Poll::Ready(Ok(result)),
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }
+}
+
+// Safety: StepFuture is Send because Statement is Send
+unsafe impl<'a> Send for StepFuture<'a> {}
+
+/// A Future that runs a statement to completion, ignoring rows.
+///
+/// This future repeatedly steps the statement until it reaches `Done`,
+/// handling I/O waiting automatically.
+pub struct RunFuture<'a> {
+    stmt: &'a mut Statement,
+}
+
+impl<'a> std::future::Future for RunFuture<'a> {
+    type Output = Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        loop {
+            // step_with_waker handles completion checking internally
+            match self.stmt.step_with_waker(cx.waker()) {
+                Ok(StepResult::Done) => return std::task::Poll::Ready(Ok(())),
+                Ok(StepResult::IO) => return std::task::Poll::Pending,
+                Ok(StepResult::Row) => continue, // Ignore rows, keep stepping
+                Ok(StepResult::Interrupt) => {
+                    return std::task::Poll::Ready(Err(LimboError::Interrupt))
+                }
+                Ok(StepResult::Busy) => return std::task::Poll::Ready(Err(LimboError::Busy)),
+                Err(e) => return std::task::Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+// Safety: RunFuture is Send because Statement is Send
+unsafe impl<'a> Send for RunFuture<'a> {}
