@@ -21,7 +21,7 @@ use crate::{
 use super::{
     emitter::TranslateCtx,
     expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
+    plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -372,24 +372,35 @@ pub fn order_by_sorter_insert(
         cur_reg += 1;
     }
 
-    for (i, rc) in result_columns.iter().enumerate() {
-        // If the result column is an exact duplicate of a sort key, we skip it.
-        if sort_metadata
-            .remappings
-            .get(i)
-            .expect("remapping must exist for all result columns")
-            .deduplicated
-        {
-            continue;
+    // For EXISTS subqueries, we only need to determine whether any row exists, not its
+    // column values. The result is simply writing `1` to the result register. Evaluating
+    // the actual result columns would be wasted CPU cycles (and may cause errors for
+    // expressions that would overflow if evaluated, like ABS(i64::MIN)).
+    let skip_column_eval = matches!(
+        plan.query_destination,
+        QueryDestination::ExistsSubqueryResult { .. }
+    );
+
+    if !skip_column_eval {
+        for (i, rc) in result_columns.iter().enumerate() {
+            // If the result column is an exact duplicate of a sort key, we skip it.
+            if sort_metadata
+                .remappings
+                .get(i)
+                .expect("remapping must exist for all result columns")
+                .deduplicated
+            {
+                continue;
+            }
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                cur_reg,
+                resolver,
+            )?;
+            cur_reg += 1;
         }
-        translate_expr(
-            program,
-            Some(&plan.table_references),
-            &rc.expr,
-            cur_reg,
-            resolver,
-        )?;
-        cur_reg += 1;
     }
 
     // Handle SELECT DISTINCT deduplication
