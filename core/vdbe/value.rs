@@ -944,19 +944,10 @@ impl Value {
     }
 
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
-        let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
-            || matches!(Numeric::from(rhs), Numeric::Float(_));
-
-        match NullableInteger::from(self) % NullableInteger::from(rhs) {
-            NullableInteger::Null => Value::Null,
-            NullableInteger::Integer(v) => {
-                if convert_to_float {
-                    Value::Float(v as f64)
-                } else {
-                    Value::Integer(v)
-                }
-            }
-        }
+        // The % operator in SQLite is fundamentally an integer operation.
+        // Both operands are converted to integers, the remainder is computed,
+        // and the result is always an integer.
+        (NullableInteger::from(self) % NullableInteger::from(rhs)).into()
     }
 
     pub fn exec_bit_not(&self) -> Value {

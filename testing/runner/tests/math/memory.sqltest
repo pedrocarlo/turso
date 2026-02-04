@@ -1628,9 +1628,6 @@ test remainder-int-float {
     SELECT 38 % 10.35
 }
 expect {
-    8.0
-}
-expect @js {
     8
 }
 
@@ -1638,9 +1635,6 @@ test remainder-float-int {
     SELECT 38.43 % 13
 }
 expect {
-    12.0
-}
-expect @js {
     12
 }
 
@@ -1648,9 +1642,6 @@ test remainder-0-float {
     SELECT 0 % 12.0
 }
 expect {
-    0.0
-}
-expect @js {
     0
 }
 
@@ -1664,9 +1655,6 @@ test remainder-float-float {
     SELECT 23.14 % 12.0
 }
 expect {
-    11.0
-}
-expect @js {
     11
 }
 
@@ -2924,9 +2912,6 @@ test remainder-text-4 {
     SELECT 'a' % 11.0
 }
 expect {
-    0.0
-}
-expect @js {
     0
 }
 
@@ -2947,9 +2932,6 @@ test remainder-text-8 {
     SELECT '10.0' % '3'
 }
 expect {
-    1.0
-}
-expect @js {
     1
 }
 
@@ -2957,9 +2939,6 @@ test remainder-text-9 {
     SELECT '10.0' % -3
 }
 expect {
-    1.0
-}
-expect @js {
     1
 }
 
@@ -2982,10 +2961,35 @@ test remainder-overflow-3 {
     SELECT -9223372036854775809 % -1
 }
 expect {
-    0.0
-}
-expect @js {
     0
+}
+
+# Regression test: overflow multiplication followed by modulo should return Integer
+# This tests the fix for the differential fuzzer bug where Turso rejected
+# INSERT with "datatype mismatch" because the overflow caused Float promotion
+# that propagated through the modulo operation.
+test remainder-overflow-mul-type {
+    SELECT typeof(9223372036854775807 * 2 % 10)
+}
+expect {
+    integer
+}
+
+test remainder-overflow-mul-value {
+    SELECT 9223372036854775807 * 2 % 10
+}
+expect {
+    7
+}
+
+# Test that INSERT with overflow multiplication + modulo succeeds
+test remainder-overflow-insert {
+    CREATE TABLE overflow_test (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO overflow_test VALUES (1, 9223372036854775807 * 2 % 100);
+    SELECT val FROM overflow_test
+}
+expect {
+    7
 }
 
 test is-nonnull-divide-by-zero {
