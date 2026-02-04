@@ -208,6 +208,8 @@ fn set_to_current(p: &mut DateTime) {
 }
 
 fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
+    // Trim leading whitespace to match SQLite behavior
+    let value = value.trim_start();
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
     }
@@ -2577,6 +2579,19 @@ mod tests {
     }
 
     #[test]
+    fn test_unixepoch_leading_whitespace() {
+        // Test that leading whitespace is trimmed (SQLite compatibility)
+        let result_with_space = exec_unixepoch(vec![Value::build_text(" 277".to_string())]);
+        let result_no_space = exec_unixepoch(vec![Value::build_text("277".to_string())]);
+        assert_eq!(result_with_space, result_no_space);
+        assert_eq!(result_with_space, Value::Integer(-210842827200));
+
+        // Test with date format and leading whitespace
+        let result_date = exec_unixepoch(vec![Value::build_text(" 2023-01-01".to_string())]);
+        assert_eq!(result_date, Value::Integer(1672531200));
+    }
+
+    #[test]
     fn test_unixepoch_numeric_modifiers_unixepoch() {
         let res1 = exec_unixepoch(vec![
             Value::Integer(1672531200),
@@ -2994,7 +3009,8 @@ mod tests {
         assert_eq!(run("abc"), Value::Null);
         assert_eq!(run("abcd"), Value::Null);
         assert_eq!(run_str("0000-01-01"), "0000-01-01 00:00:00");
-        assert_eq!(run(" 2024-01-01"), Value::Null);
+        // Leading whitespace is trimmed to match SQLite behavior
+        assert_eq!(run_str(" 2024-01-01"), "2024-01-01 00:00:00");
         assert_eq!(run_str("2024-01-01 "), "2024-01-01 00:00:00");
         assert_eq!(run_str("2024-01-15\t10:30:45"), "2024-01-15 10:30:45");
         assert_eq!(run("2024-1-01"), Value::Null);
