@@ -2017,7 +2017,11 @@ impl Optimizable for ast::Expr {
                         }));
                     }
 
-                    Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
+                    // Non-numeric strings that don't parse as i64 or f64 may
+                    // still have a leading numeric portion (e.g. '2abc' -> 2 in
+                    // SQLite). Don't optimize these at compile time; let the
+                    // runtime evaluate them.
+                    Ok(None)
                 }
                 _ => Ok(None),
             },
