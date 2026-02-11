@@ -869,6 +869,15 @@ pub fn format_float(v: f64) -> String {
 }
 
 pub fn format_float_for_quote(v: f64) -> String {
+    // SQLite's QUOTE() uses %!.15g which formats Inf as 9.0e999
+    // (a valid SQL literal that overflows to Inf when parsed).
+    if v.is_infinite() {
+        return if v.is_sign_negative() {
+            "-9.0e999".to_string()
+        } else {
+            "9.0e999".to_string()
+        };
+    }
     let default = format_float(v);
     if str_to_f64(&default).map(f64::from) == Some(v) {
         return default;
