@@ -1445,22 +1445,35 @@ fn analyze_binary_term_for_index(
         return None;
     }
 
-    // Check if this is an indexable constraint on our table
-    let (table_col_pos, constraining_expr, side) = match lhs {
+    // Check if this is an indexable constraint on our table.
+    // When the column is on the RHS (e.g. `24 > col`), we flip the operator
+    // to normalize it to `col < 24` form, matching what constraints_from_where_clause does.
+    let (table_col_pos, constraining_expr, side, effective_operator) = match lhs {
         ast::Expr::Column { table, column, .. } if *table == table_id => {
-            (Some(*column), rhs.clone(), BinaryExprSide::Rhs)
+            (Some(*column), rhs.clone(), BinaryExprSide::Rhs, operator)
         }
-        ast::Expr::RowId { table, .. } if *table == table_id && rowid_alias_column.is_some() => {
-            (rowid_alias_column, rhs.clone(), BinaryExprSide::Rhs)
-        }
+        ast::Expr::RowId { table, .. } if *table == table_id && rowid_alias_column.is_some() => (
+            rowid_alias_column,
+            rhs.clone(),
+            BinaryExprSide::Rhs,
+            operator,
+        ),
         _ => match rhs {
-            ast::Expr::Column { table, column, .. } if *table == table_id => {
-                (Some(*column), lhs.clone(), BinaryExprSide::Lhs)
-            }
+            ast::Expr::Column { table, column, .. } if *table == table_id => (
+                Some(*column),
+                lhs.clone(),
+                BinaryExprSide::Lhs,
+                opposite_cmp_op(operator),
+            ),
             ast::Expr::RowId { table, .. }
                 if *table == table_id && rowid_alias_column.is_some() =>
             {
-                (rowid_alias_column, lhs.clone(), BinaryExprSide::Lhs)
+                (
+                    rowid_alias_column,
+                    lhs.clone(),
+                    BinaryExprSide::Lhs,
+                    opposite_cmp_op(operator),
+                )
             }
             _ => return None, // Doesn't reference our table
         },
@@ -1475,8 +1488,12 @@ fn analyze_binary_term_for_index(
     };
 
     // Find the best index for this constraint
-    let (best_index, constraint_refs) =
-        find_best_index_for_constraint(table_col_pos, operator, indexes, rowid_alias_column);
+    let (best_index, constraint_refs) = find_best_index_for_constraint(
+        table_col_pos,
+        effective_operator,
+        indexes,
+        rowid_alias_column,
+    );
 
     // If no index can be used, this term is not indexable
     if constraint_refs.is_empty() {
@@ -1489,7 +1506,7 @@ fn analyze_binary_term_for_index(
         table_reference,
         table_column,
         table_col_pos,
-        operator,
+        effective_operator,
         &constraining_expr,
         available_indexes,
         table_references,
@@ -1515,7 +1532,7 @@ fn analyze_binary_term_for_index(
     }
 
     // Compute the affinity for the constraining expression
-    let affinity = if let Some(ast_op) = operator.as_ast_operator() {
+    let affinity = if let Some(ast_op) = effective_operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
             comparison_affinity(lhs, rhs, Some(table_references))
         } else {
@@ -1526,13 +1543,13 @@ fn analyze_binary_term_for_index(
     };
 
     // Store the pre-computed constraining expression for multi-index branches
-    let stored_constraining_expr = operator
+    let stored_constraining_expr = effective_operator
         .as_ast_operator()
         .map(|ast_op| (ast_op, constraining_expr.clone(), affinity));
 
     let constraint = Constraint {
         where_clause_pos: (where_term_idx, side),
-        operator,
+        operator: effective_operator,
         table_col_pos,
         expr: None,
         constraining_expr: stored_constraining_expr,

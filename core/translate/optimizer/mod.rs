@@ -1591,12 +1591,31 @@ fn optimize_table_access(
                 // Build the MultiIndexScanOp from the branch parameters
                 let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
                 for branch in branches.iter() {
+                    // Determine iteration direction based on constraint type.
+                    // Upper-bound-only constraints (e.g. `a < X` from NOT BETWEEN)
+                    // need backward iteration (SeekLT + Prev), while lower-bound-only
+                    // or equality constraints use forward iteration (SeekGT/SeekGE + Next).
+                    let has_lower = branch
+                        .constraint_refs
+                        .iter()
+                        .any(|r| r.lower_bound.is_some());
+                    let has_upper = branch
+                        .constraint_refs
+                        .iter()
+                        .any(|r| r.upper_bound.is_some());
+                    let has_eq = branch.constraint_refs.iter().any(|r| r.eq.is_some());
+                    let iter_dir = if !has_lower && !has_eq && has_upper {
+                        IterationDirection::Backwards
+                    } else {
+                        IterationDirection::Forwards
+                    };
+
                     // Build seek_def from constraint_refs using the branch's own constraint
                     // (not constraints_per_table, since the branch constraint was created separately)
                     let seek_def = build_seek_def_from_constraints(
                         &[branch.constraint.clone()],
                         &branch.constraint_refs,
-                        IterationDirection::Forwards, // Multi-index always scans forward
+                        iter_dir,
                         where_clause,
                         Some(table_references),
                     )?;

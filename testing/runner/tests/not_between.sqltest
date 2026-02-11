@@ -34,6 +34,53 @@ expect {
     4|40|400
 }
 
+test not-between-or-decomposition-upper-bound {
+    CREATE TABLE t_nb1 (a INTEGER PRIMARY KEY);
+    INSERT INTO t_nb1 VALUES (274333), (-69288);
+    SELECT a FROM t_nb1 WHERE a NOT BETWEEN LENGTH('S4Jr5MYjpTuxPjYuk6eUrpHg') AND X'1082D0FE' / X'76' ORDER BY a DESC;
+}
+expect {
+    -69288
+}
+
+test not-between-or-decomposition-no-order {
+    CREATE TABLE t_nb1b (a INTEGER PRIMARY KEY);
+    INSERT INTO t_nb1b VALUES (274333), (-69288);
+    SELECT a FROM t_nb1b WHERE a NOT BETWEEN 24 AND NULL;
+}
+expect {
+    -69288
+}
+
+test not-between-or-decomposition-order-asc {
+    CREATE TABLE t_nb1c (a INTEGER PRIMARY KEY);
+    INSERT INTO t_nb1c VALUES (274333), (-69288);
+    SELECT a FROM t_nb1c WHERE a NOT BETWEEN 24 AND NULL ORDER BY a ASC;
+}
+expect {
+    -69288
+}
+
+test not-between-or-decomposition-order-desc {
+    CREATE TABLE t_nb1d (a INTEGER PRIMARY KEY);
+    INSERT INTO t_nb1d VALUES (274333), (-69288);
+    SELECT a FROM t_nb1d WHERE a NOT BETWEEN 24 AND NULL ORDER BY a DESC;
+}
+expect {
+    -69288
+}
+
+test between-and-intersection {
+    CREATE TABLE t_nb2 (a INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t_nb2 VALUES (5, 'alice'), (10, 'bob'), (15, 'carol'), (20, 'dave'), (25, 'eve');
+    SELECT a, name FROM t_nb2 WHERE a BETWEEN 10 AND 20 ORDER BY a;
+}
+expect {
+    10|bob
+    15|carol
+    20|dave
+}
+
 test between-self-ref-group-by {
     CREATE TABLE t3 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
     INSERT INTO t3 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
