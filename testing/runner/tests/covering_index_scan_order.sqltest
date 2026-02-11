@@ -1,0 +1,44 @@
+@database :memory:
+
+# Regression test: covering index full scan must not change query results.
+# A covering index delivers rows in index-key order (NULLs first), whereas a
+# table scan delivers rows in rowid order. For ORDER BY with ties + LIMIT, the
+# stable sort preserves scan order, so picking the wrong access path changes
+# which row is returned. The optimizer must prefer the table scan when the
+# index does not satisfy the ORDER BY.
+
+test covering-index-does-not-change-order-by-limit-result {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b REAL NOT NULL, c INTEGER);
+    INSERT INTO t1 VALUES (1, 5.0, 100);
+    INSERT INTO t1 VALUES (2, 5.0, NULL);
+    INSERT INTO t1 VALUES (3, 5.0, 300);
+    CREATE INDEX idx ON t1 (c, b);
+    SELECT c FROM t1 ORDER BY b ASC LIMIT 1;
+}
+expect {
+    100
+}
+
+test covering-index-duplicate-columns {
+    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b REAL NOT NULL, c INTEGER);
+    INSERT INTO t2 VALUES (1, 5.0, 100);
+    INSERT INTO t2 VALUES (2, 5.0, NULL);
+    INSERT INTO t2 VALUES (3, 5.0, 300);
+    CREATE INDEX idx2 ON t2 (c, c, b);
+    SELECT c FROM t2 ORDER BY b ASC LIMIT 1;
+}
+expect {
+    100
+}
+
+test covering-index-scalar-subquery {
+    CREATE TABLE t3 (a INTEGER PRIMARY KEY, b REAL NOT NULL, c INTEGER);
+    INSERT INTO t3 VALUES (1, 5.0, 100);
+    INSERT INTO t3 VALUES (2, 5.0, NULL);
+    INSERT INTO t3 VALUES (3, 5.0, 300);
+    CREATE INDEX idx3 ON t3 (c, b);
+    SELECT (SELECT c FROM t3 ORDER BY b ASC LIMIT 1) AS sub;
+}
+expect {
+    100
+}

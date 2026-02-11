@@ -360,7 +360,7 @@ fn find_best_access_method_for_btree(
             (IterationDirection::Forwards, false, Cost(0.0))
         };
 
-        let cost = estimate_cost_for_scan_or_seek(
+        let mut cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
             &usable_constraint_refs,
@@ -369,6 +369,19 @@ fn find_best_access_method_for_btree(
             is_index_ordered,
             params,
         );
+        // Penalize covering index full scans that do not satisfy the ORDER BY.
+        // A covering index scan delivers rows in index-key order (e.g. NULLs first)
+        // instead of rowid order. When the query has ORDER BY with ties + LIMIT, the
+        // stable sort preserves scan order, so picking the wrong access path changes
+        // which row is returned. Only apply when there actually is an ORDER BY;
+        // queries without ORDER BY (e.g. MIN/MAX optimizations) are unaffected.
+        if index_info.covering
+            && usable_constraint_refs.is_empty()
+            && !is_index_ordered
+            && maybe_order_target.is_some()
+        {
+            cost = Cost(cost.0 * 2.0);
+        }
         if cost < best_cost + order_satisfiability_bonus {
             best_cost = cost;
             best_params = AccessMethodParams::BTreeTable {
