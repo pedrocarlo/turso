@@ -1429,6 +1429,35 @@ expect {
     text
 }
 
+# Regression from differential fuzzer seed 11892374816530398276:
+# QUOTE() of infinity must return '9.0e999' (not 'Inf') to match SQLite.
+test quote-float-positive-infinity {
+    SELECT quote(1e999);
+}
+expect {
+    9.0e999
+}
+
+test quote-float-negative-infinity {
+    SELECT quote(-1e999);
+}
+expect {
+    -9.0e999
+}
+
+# QUOTE(Inf) in WHERE clause should be truthy (9.0e999 parses as nonzero)
+test quote-float-infinity-where-clause {
+    CREATE TABLE t_quote_inf(a INTEGER, b TEXT);
+    INSERT INTO t_quote_inf VALUES(1, 'hello');
+    INSERT INTO t_quote_inf VALUES(2, 'world');
+    SELECT a FROM t_quote_inf WHERE QUOTE(1e999);
+    DROP TABLE t_quote_inf;
+}
+expect {
+    1
+    2
+}
+
 test sign-positive-integer {
     SELECT sign(42);
 }
