@@ -453,6 +453,8 @@ Thanks to all the partners of Turso!
 
 Thanks to all the contributors to Turso Database!
 
+- Pedro Carlo
+
 <a href="https://github.com/tursodatabase/turso/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=tursodatabase/turso" />
 </a>
