@@ -341,7 +341,7 @@ impl Limbo {
     fn display_in_memory(&mut self) -> io::Result<()> {
         if self.opts.db_file == ":memory:" {
             self.writeln("Connected to a transient in-memory database.")?;
-            self.writeln("Use \".open FILENAME\" to reopen on a persistent database")?;
+            self.writeln("Use \".open FILENAME\" to reopen on a persistent database.")?;
         }
         Ok(())
     }
