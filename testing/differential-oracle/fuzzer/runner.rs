@@ -420,22 +420,34 @@ impl Fuzzer {
         let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
             match result {
                 QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
-                    if let SqlValue::Text(ref text) = rows[0].0[0] {
-                        if text == "ok" {
-                            return Ok(());
+                    match &rows[0].0[0] {
+                        SqlValue::Text(text) if text == "ok" => Ok(()),
+                        SqlValue::Text(text) => {
+                            bail!("{db_name} integrity check returned unexpected text: '{}' (expected 'ok')", text)
+                        }
+                        other => {
+                            bail!("{db_name} integrity check returned non-text value: {:?} (expected Text('ok'))", other)
                         }
                     }
-                    bail!("{db_name} integrity check failed: {:?}", rows);
+                }
+                QueryResult::Rows(rows) if rows.is_empty() => {
+                    bail!("{db_name} integrity check returned empty row set");
                 }
                 QueryResult::Rows(rows) => {
-                    // Multiple rows means multiple integrity errors
-                    bail!("{db_name} integrity check failed: {:?}", rows);
+                    // Multiple rows or wrong column count - show detailed info
+                    let row_count = rows.len();
+                    let col_counts: Vec<_> = rows.iter().map(|r| r.0.len()).collect();
+                    let first_few: Vec<_> = rows.iter().take(3).map(|r| {
+                        r.0.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>().join(", ")
+                    }).collect();
+                    bail!("{db_name} integrity check failed: {row_count} rows with column counts {:?}. First rows: [{}]", 
+                          col_counts, first_few.join("]; ["));
                 }
                 QueryResult::Error(e) => {
                     bail!("{db_name} integrity check errored: {e}");
                 }
                 QueryResult::Ok => {
-                    bail!("{db_name} integrity check returned no results");
+                    bail!("{db_name} integrity check returned no results (QueryResult::Ok)");
                 }
             }
         };
