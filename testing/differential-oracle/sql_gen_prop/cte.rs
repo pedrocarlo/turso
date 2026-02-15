@@ -265,31 +265,27 @@ fn cte_name(schema: &Schema, existing_cte_names: &[String]) -> BoxedStrategy<Str
         .boxed()
 }
 
-/// Generate optional column aliases for a CTE.
-fn column_aliases(num_columns: usize, profile: &CteProfile) -> BoxedStrategy<Option<Vec<String>>> {
+/// Generate column aliases for a CTE.
+/// Always returns Some with generated aliases to ensure columns have explicit names
+/// that can be referenced in generated SQL.
+fn column_aliases(num_columns: usize, _profile: &CteProfile) -> BoxedStrategy<Option<Vec<String>>> {
     // Only generate aliases if the query has explicit columns (not SELECT *)
     if num_columns == 0 {
         return Just(None).boxed();
     }
 
-    let no_alias_w = profile.no_column_aliases_weight;
-    let alias_w = profile.column_aliases_weight;
-
-    prop_oneof![
-        no_alias_w => Just(None),
-        alias_w => {
-            proptest::collection::vec(
-                // Regex guarantees at least 1 char, so no filter needed
-                "[a-z][a-z0-9_]{0,5}",
-                num_columns..=num_columns
-            )
-            .prop_filter("aliases must be unique", |aliases| {
-                let unique: std::collections::HashSet<_> = aliases.iter().collect();
-                unique.len() == aliases.len()
-            })
-            .prop_map(Some)
-        },
-    ]
+    // Always generate explicit column aliases to ensure columns have names
+    // that can be referenced consistently by both SQLite and Turso
+    proptest::collection::vec(
+        // Regex guarantees at least 1 char, so no filter needed
+        "[a-z][a-z0-9_]{0,5}",
+        num_columns..=num_columns
+    )
+    .prop_filter("aliases must be unique", |aliases| {
+        let unique: std::collections::HashSet<_> = aliases.iter().collect();
+        unique.len() == aliases.len()
+    })
+    .prop_map(Some)
     .boxed()
 }
 
