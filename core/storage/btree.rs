@@ -900,6 +900,10 @@ impl BTreeCursor {
                 }
 
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
+                // Reset going_upwards before descending into the left child.
+                // If the left child is an interior page, we need to visit its
+                // rightmost pointer first (checked via !self.going_upwards above).
+                self.going_upwards = false;
                 self.stack.push_backwards(mem_page);
                 if let Some(c) = c {
                     io_yield_one!(c);

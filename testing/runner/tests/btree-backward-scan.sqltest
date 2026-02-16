@@ -1,0 +1,36 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/5277
+# Backward table scan (ORDER BY DESC) silently omits rows when the B-tree has
+# 3+ levels. The going_upwards flag was not reset when descending into a left
+# child's interior page, causing its rightmost subtree to be skipped.
+
+test backward-scan-count {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t SELECT value, printf('val_%06d', value) FROM generate_series(1, 1800);
+    SELECT count(*) FROM (SELECT * FROM t ORDER BY a DESC);
+}
+expect {
+    1800
+}
+
+test backward-scan-min-max {
+    PRAGMA page_size = 512;
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t2 SELECT value, printf('val_%06d', value) FROM generate_series(1, 1800);
+    SELECT min(a), max(a) FROM (SELECT a FROM t2 ORDER BY a DESC);
+}
+expect {
+    1|1800
+}
+
+test backward-scan-sum {
+    PRAGMA page_size = 512;
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t3 SELECT value, printf('val_%06d', value) FROM generate_series(1, 1800);
+    SELECT sum(a) FROM (SELECT a FROM t3 ORDER BY a DESC);
+}
+expect {
+    1620900
+}
