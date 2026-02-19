@@ -397,7 +397,16 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
-        let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
+        let varint_buf = buf
+            .get(cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..)
+            .ok_or_else(|| {
+                crate::LimboError::Corrupt(format!(
+                    "cell pointer {} out of bounds for page size {}",
+                    cell_pointer,
+                    buf.len()
+                ))
+            })?;
+        let (rowid, _) = read_varint(varint_buf)?;
         Ok(rowid as i64)
     }
 
@@ -435,9 +444,23 @@ impl PageInner {
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
         let mut pos = cell_pointer;
-        let (_, nr) = read_varint(&buf[pos..])?;
+        let varint_buf = buf.get(pos..).ok_or_else(|| {
+            crate::LimboError::Corrupt(format!(
+                "cell pointer {} out of bounds for page size {}",
+                pos,
+                buf.len()
+            ))
+        })?;
+        let (_, nr) = read_varint(varint_buf)?;
         pos += nr;
-        let (rowid, _) = read_varint(&buf[pos..])?;
+        let varint_buf = buf.get(pos..).ok_or_else(|| {
+            crate::LimboError::Corrupt(format!(
+                "cell offset {} out of bounds for page size {}",
+                pos,
+                buf.len()
+            ))
+        })?;
+        let (rowid, _) = read_varint(varint_buf)?;
         Ok(rowid as i64)
     }
 
@@ -461,11 +484,25 @@ impl PageInner {
         let page_type = self.page_type()?;
         let (payload_size, varint_len, header_skip) = match page_type {
             PageType::IndexInterior => {
-                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                let varint_buf = buf.get(cell_offset + 4..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        cell_offset + 4,
+                        buf.len()
+                    ))
+                })?;
+                let (size, len) = read_varint(varint_buf)?;
                 (size, len, 4usize)
             }
             PageType::IndexLeaf => {
-                let (size, len) = read_varint(&buf[cell_offset..])?;
+                let varint_buf = buf.get(cell_offset..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        cell_offset,
+                        buf.len()
+                    ))
+                })?;
+                let (size, len) = read_varint(varint_buf)?;
                 (size, len, 0usize)
             }
             _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
@@ -484,25 +521,46 @@ impl PageInner {
 
         let (payload_slice, first_overflow) = if overflows {
             let overflow_ptr_offset = payload_start + local_size - 4;
+            if overflow_ptr_offset + 4 > buf.len() {
+                crate::bail_corrupt_error!(
+                    "overflow pointer offset {} out of bounds for page size {}",
+                    overflow_ptr_offset,
+                    buf.len()
+                );
+            }
             let first_overflow_page = u32::from_be_bytes([
                 buf[overflow_ptr_offset],
                 buf[overflow_ptr_offset + 1],
                 buf[overflow_ptr_offset + 2],
                 buf[overflow_ptr_offset + 3],
             ]);
+            let payload_end = payload_start + local_size - 4;
+            let payload_range = payload_start..payload_end;
+            if payload_range.is_empty() || payload_end > buf.len() {
+                crate::bail_corrupt_error!(
+                    "payload range {:?} out of bounds for page size {}",
+                    payload_range,
+                    buf.len()
+                );
+            }
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + local_size - 4],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_range])
             };
             (slice, Some(first_overflow_page))
         } else {
+            let payload_end = payload_start + payload_size as usize;
+            let payload_range = payload_start..payload_end;
+            if payload_end > buf.len() {
+                crate::bail_corrupt_error!(
+                    "payload range {:?} out of bounds for page size {}",
+                    payload_range,
+                    buf.len()
+                );
+            }
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(
-                    &buf[payload_start..payload_start + payload_size as usize],
-                )
+                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_range])
             };
             (slice, None)
         };
@@ -540,14 +598,14 @@ impl PageInner {
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
         let cell_count = self.cell_count();
-        Ok(self._cell_get_raw_region_faster(
+        self._cell_get_raw_region_faster(
             idx,
             usable_size,
             cell_count,
             max_local,
             min_local,
             page_type,
-        ))
+        )
     }
 
     #[inline]
@@ -559,13 +617,20 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> (usize, usize) {
+    ) -> crate::Result<(usize, usize)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
-                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let varint_buf = buf.get(start + 4..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        start + 4,
+                        buf.len()
+                    ))
+                })?;
+                let (len_payload, n_payload) = read_varint(varint_buf)?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -579,11 +644,25 @@ impl PageInner {
                 }
             }
             PageType::TableInterior => {
-                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                let varint_buf = buf.get(start + 4..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        start + 4,
+                        buf.len()
+                    ))
+                })?;
+                let (_, n_rowid) = read_varint(varint_buf)?;
                 4 + n_rowid
             }
             PageType::IndexLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let varint_buf = buf.get(start..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        start,
+                        buf.len()
+                    ))
+                })?;
+                let (len_payload, n_payload) = read_varint(varint_buf)?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -601,8 +680,22 @@ impl PageInner {
                 }
             }
             PageType::TableLeaf => {
-                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
-                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let varint_buf = buf.get(start..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        start,
+                        buf.len()
+                    ))
+                })?;
+                let (len_payload, n_payload) = read_varint(varint_buf)?;
+                let varint_buf2 = buf.get(start + n_payload..).ok_or_else(|| {
+                    crate::LimboError::Corrupt(format!(
+                        "cell offset {} out of bounds for page size {}",
+                        start + n_payload,
+                        buf.len()
+                    ))
+                })?;
+                let (_, n_rowid) = read_varint(varint_buf2)?;
                 let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
                     len_payload as usize,
                     max_local,
@@ -620,7 +713,15 @@ impl PageInner {
                 }
             }
         };
-        (start, len)
+        if start + len > buf.len() {
+            return Err(crate::LimboError::Corrupt(format!(
+                "cell region {}..{} out of bounds for page size {}",
+                start,
+                start + len,
+                buf.len()
+            )));
+        }
+        Ok((start, len))
     }
 
     pub fn is_leaf(&self) -> bool {
