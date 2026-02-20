@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
+use super::ConnectionProvider;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
@@ -17,6 +18,7 @@ use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
 use crate::vdbe::insn::{to_u16, CmpInsFlags};
+use crate::CaptureDataChangesExt;
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -39,7 +41,6 @@ use crate::{
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
 };
-use crate::{CaptureDataChangesExt, Connection};
 
 // The following comment is copied directly from SQLite source and should be used as a guiding light
 // whenever we encounter compatibility bugs related to conflict clause handling:
@@ -366,7 +367,7 @@ pub fn emit_upsert(
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     table_references: &mut TableReferences,
 ) -> crate::Result<()> {
     // Seek & snapshot CURRENT

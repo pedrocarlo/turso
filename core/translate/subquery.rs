@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
+use super::ConnectionProvider;
 use crate::{
     emit_explain,
     schema::{BTreeTable, Index, IndexColumn, Table},
@@ -24,7 +25,7 @@ use crate::{
         insn::Insn,
         CursorID,
     },
-    Connection, QueryMode, Result,
+    QueryMode, Result,
 };
 
 use super::{
@@ -48,7 +49,7 @@ pub fn plan_subqueries_from_select_plan(
     program: &mut ProgramBuilder,
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     // WHERE
     plan_subqueries_with_outer_query_access(
@@ -158,7 +159,7 @@ pub fn plan_subqueries_from_where_clause(
     table_references: &mut TableReferences,
     where_clause: &mut [WhereTerm],
     resolver: &Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
@@ -184,7 +185,7 @@ pub fn plan_subqueries_from_values(
     table_references: &mut TableReferences,
     values: &mut [Vec<Box<ast::Expr>>],
     resolver: &Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
@@ -209,7 +210,7 @@ pub fn plan_subqueries_from_set_clauses(
     table_references: &mut TableReferences,
     set_clauses: &mut [(usize, Box<ast::Expr>)],
     resolver: &Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
@@ -234,7 +235,7 @@ pub fn plan_subqueries_from_returning(
     table_references: &mut TableReferences,
     returning: &mut [ast::ResultColumn],
     resolver: &Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     // Extract mutable references to expressions from ResultColumn::Expr variants
     let exprs = returning.iter_mut().filter_map(|rc| match rc {
@@ -263,7 +264,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
     referenced_tables: &mut TableReferences,
     resolver: &Resolver,
     exprs: impl Iterator<Item = &'a mut ast::Expr>,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     position: SubqueryPosition,
 ) -> Result<()> {
     // Most subqueries can reference columns from the outer query,
@@ -332,7 +333,7 @@ fn get_subquery_parser<'a>(
     out_subqueries: &'a mut Vec<NonFromClauseSubquery>,
     referenced_tables: &'a mut TableReferences,
     resolver: &'a Resolver,
-    connection: &'a Arc<Connection>,
+    connection: &'a impl ConnectionProvider,
     get_outer_query_refs: fn(&TableReferences) -> Vec<OuterQueryReference>,
     position: SubqueryPosition,
 ) -> impl FnMut(&mut ast::Expr) -> Result<WalkControl> + 'a {

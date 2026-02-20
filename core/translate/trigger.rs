@@ -1,4 +1,4 @@
-use crate::sync::Arc;
+use super::ConnectionProvider;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -6,7 +6,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, Connection, Result};
+use crate::{bail_parse_error, Result};
 use turso_parser::ast::{self, QualifiedName};
 
 /// Reconstruct SQL string from CREATE TRIGGER AST
@@ -91,7 +91,7 @@ pub fn translate_create_trigger(
     tbl_name: QualifiedName,
     program: &mut ProgramBuilder,
     sql: String,
-    connection: Arc<Connection>,
+    connection: impl ConnectionProvider,
 ) -> Result<()> {
     // Check if experimental triggers are enabled
     if !connection.experimental_triggers_enabled() {
@@ -194,7 +194,7 @@ pub fn translate_create_trigger(
 
 /// Translate DROP TRIGGER statement
 pub fn translate_drop_trigger(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
     trigger_name: &ast::QualifiedName,
     if_exists: bool,

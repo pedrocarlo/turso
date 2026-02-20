@@ -1,10 +1,13 @@
 use crate::connection::AttachedDatabasesFingerprint;
 use crate::io::FileSyncType;
-use crate::schema::Schema;
+use crate::schema::{Schema, Trigger};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
-use crate::storage::pager::Pager;
+use crate::storage::page_cache::CacheResizeResult;
+use crate::storage::pager::AutoVacuumMode;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::sqlite3_ondisk::PageSize;
 use crate::sync::Arc;
+use crate::util::IOExt as _;
 use crate::{
     CaptureDataChangesInfo, Connection, DatabaseCatalog, Result, RwLock, SyncMode, TempStore,
 };
@@ -22,7 +25,6 @@ pub(crate) trait ConnectionProvider {
     // Getters
     fn get_busy_timeout(&self) -> Duration;
     fn get_cache_size(&self) -> i32;
-    fn get_pager(&self) -> Arc<Pager>;
     fn get_page_size(&self) -> PageSize;
     fn get_query_only(&self) -> bool;
     fn get_encryption_cipher_mode(&self) -> Option<CipherMode>;
@@ -43,6 +45,7 @@ pub(crate) trait ConnectionProvider {
     fn database_ptr(&self) -> usize;
     fn syms_generation(&self) -> u64;
     fn attached_databases_fingerprint(&self) -> AttachedDatabasesFingerprint;
+    fn get_spill_enabled(&self) -> bool;
 
     // Setters
     fn set_busy_timeout(&self, duration: Duration);
@@ -58,6 +61,26 @@ pub(crate) trait ConnectionProvider {
     fn set_sync_type(&self, value: FileSyncType);
     fn set_temp_store(&self, value: TempStore);
     fn reset_page_size(&self, size: u32) -> Result<()>;
+    fn experimental_attach_enabled(&self) -> bool;
+    fn experimental_index_method_enabled(&self) -> bool;
+    fn experimental_triggers_enabled(&self) -> bool;
+    fn experimental_views_enabled(&self) -> bool;
+    fn is_nested_stmt(&self) -> bool;
+    fn is_mvcc_bootstrap_connection(&self) -> bool;
+    fn experimental_strict_enabled(&self) -> bool;
+    fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool;
+    fn start_trigger_compilation(&self, trigger: Arc<Trigger>);
+    fn end_trigger_compilation(&self);
+    /// Set whether cache spilling is enabled.
+    fn set_spill_enabled(&self, enabled: bool);
+
+    // Pager-wrapping methods
+    fn get_auto_vacuum_mode(&self) -> AutoVacuumMode;
+    fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode);
+    fn freepage_list(&self) -> u32;
+    fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<T>;
+    fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<T>;
+    fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult>;
 }
 
 impl ConnectionProvider for Connection {
@@ -81,10 +104,6 @@ impl ConnectionProvider for Connection {
 
     fn get_cache_size(&self) -> i32 {
         self.get_cache_size()
-    }
-
-    fn get_pager(&self) -> Arc<Pager> {
-        self.get_pager()
     }
 
     fn get_page_size(&self) -> PageSize {
@@ -218,6 +237,80 @@ impl ConnectionProvider for Connection {
     fn reset_page_size(&self, size: u32) -> Result<()> {
         self.reset_page_size(size)
     }
+
+    fn experimental_attach_enabled(&self) -> bool {
+        self.experimental_attach_enabled()
+    }
+
+    fn experimental_index_method_enabled(&self) -> bool {
+        self.experimental_index_method_enabled()
+    }
+
+    fn experimental_triggers_enabled(&self) -> bool {
+        self.experimental_triggers_enabled()
+    }
+
+    fn experimental_views_enabled(&self) -> bool {
+        self.experimental_views_enabled()
+    }
+
+    fn is_nested_stmt(&self) -> bool {
+        self.is_nested_stmt()
+    }
+
+    fn is_mvcc_bootstrap_connection(&self) -> bool {
+        self.is_mvcc_bootstrap_connection()
+    }
+
+    fn experimental_strict_enabled(&self) -> bool {
+        self.experimental_strict_enabled()
+    }
+
+    fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+        Connection::trigger_is_compiling(self, trigger)
+    }
+
+    fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
+        Connection::start_trigger_compilation(self, trigger)
+    }
+
+    fn end_trigger_compilation(&self) {
+        Connection::end_trigger_compilation(self)
+    }
+
+    fn get_spill_enabled(&self) -> bool {
+        self.get_pager().get_spill_enabled()
+    }
+
+    fn set_spill_enabled(&self, enabled: bool) {
+        self.get_pager().set_spill_enabled(enabled);
+    }
+
+    fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
+        self.get_pager().get_auto_vacuum_mode()
+    }
+
+    fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
+        self.get_pager().set_auto_vacuum_mode(mode)
+    }
+
+    fn freepage_list(&self) -> u32 {
+        self.get_pager().freepage_list()
+    }
+
+    fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<T> {
+        let pager = self.get_pager();
+        pager.io.block(|| pager.with_header(&f))
+    }
+
+    fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<T> {
+        let pager = self.get_pager();
+        pager.io.block(|| pager.with_header_mut(&f))
+    }
+
+    fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
+        self.get_pager().change_page_cache_size(capacity)
+    }
 }
 
 impl ConnectionProvider for Arc<Connection> {
@@ -241,10 +334,6 @@ impl ConnectionProvider for Arc<Connection> {
 
     fn get_cache_size(&self) -> i32 {
         self.as_ref().get_cache_size()
-    }
-
-    fn get_pager(&self) -> Arc<Pager> {
-        self.as_ref().get_pager()
     }
 
     fn get_page_size(&self) -> PageSize {
@@ -378,6 +467,78 @@ impl ConnectionProvider for Arc<Connection> {
     fn reset_page_size(&self, size: u32) -> Result<()> {
         self.as_ref().reset_page_size(size)
     }
+
+    fn experimental_attach_enabled(&self) -> bool {
+        self.as_ref().experimental_attach_enabled()
+    }
+
+    fn experimental_index_method_enabled(&self) -> bool {
+        self.as_ref().experimental_index_method_enabled()
+    }
+
+    fn experimental_triggers_enabled(&self) -> bool {
+        self.as_ref().experimental_triggers_enabled()
+    }
+
+    fn experimental_views_enabled(&self) -> bool {
+        self.as_ref().experimental_views_enabled()
+    }
+
+    fn is_nested_stmt(&self) -> bool {
+        self.as_ref().is_nested_stmt()
+    }
+
+    fn is_mvcc_bootstrap_connection(&self) -> bool {
+        self.as_ref().is_mvcc_bootstrap_connection()
+    }
+
+    fn experimental_strict_enabled(&self) -> bool {
+        self.as_ref().experimental_strict_enabled()
+    }
+
+    fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+        self.as_ref().trigger_is_compiling(trigger)
+    }
+
+    fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
+        self.as_ref().start_trigger_compilation(trigger)
+    }
+
+    fn end_trigger_compilation(&self) {
+        self.as_ref().end_trigger_compilation()
+    }
+
+    fn get_spill_enabled(&self) -> bool {
+        self.as_ref().get_spill_enabled()
+    }
+
+    fn set_spill_enabled(&self, enabled: bool) {
+        self.as_ref().set_spill_enabled(enabled);
+    }
+
+    fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
+        self.as_ref().get_auto_vacuum_mode()
+    }
+
+    fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
+        self.as_ref().set_auto_vacuum_mode(mode)
+    }
+
+    fn freepage_list(&self) -> u32 {
+        self.as_ref().freepage_list()
+    }
+
+    fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<T> {
+        self.as_ref().with_header(f)
+    }
+
+    fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<T> {
+        self.as_ref().with_header_mut(f)
+    }
+
+    fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
+        self.as_ref().change_page_cache_size(capacity)
+    }
 }
 
 impl<C: ConnectionProvider> ConnectionProvider for &C {
@@ -401,10 +562,6 @@ impl<C: ConnectionProvider> ConnectionProvider for &C {
 
     fn get_cache_size(&self) -> i32 {
         (*self).get_cache_size()
-    }
-
-    fn get_pager(&self) -> Arc<Pager> {
-        (*self).get_pager()
     }
 
     fn get_page_size(&self) -> PageSize {
@@ -537,5 +694,77 @@ impl<C: ConnectionProvider> ConnectionProvider for &C {
 
     fn reset_page_size(&self, size: u32) -> Result<()> {
         (*self).reset_page_size(size)
+    }
+
+    fn experimental_attach_enabled(&self) -> bool {
+        (*self).experimental_attach_enabled()
+    }
+
+    fn experimental_index_method_enabled(&self) -> bool {
+        (*self).experimental_index_method_enabled()
+    }
+
+    fn experimental_triggers_enabled(&self) -> bool {
+        (*self).experimental_triggers_enabled()
+    }
+
+    fn experimental_views_enabled(&self) -> bool {
+        (*self).experimental_views_enabled()
+    }
+
+    fn is_nested_stmt(&self) -> bool {
+        (*self).is_nested_stmt()
+    }
+
+    fn is_mvcc_bootstrap_connection(&self) -> bool {
+        (*self).is_mvcc_bootstrap_connection()
+    }
+
+    fn experimental_strict_enabled(&self) -> bool {
+        (*self).experimental_strict_enabled()
+    }
+
+    fn trigger_is_compiling(&self, trigger: impl AsRef<Trigger>) -> bool {
+        (*self).trigger_is_compiling(trigger)
+    }
+
+    fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
+        (*self).start_trigger_compilation(trigger)
+    }
+
+    fn end_trigger_compilation(&self) {
+        (*self).end_trigger_compilation()
+    }
+
+    fn get_spill_enabled(&self) -> bool {
+        (*self).get_spill_enabled()
+    }
+
+    fn set_spill_enabled(&self, enabled: bool) {
+        (*self).set_spill_enabled(enabled)
+    }
+
+    fn get_auto_vacuum_mode(&self) -> AutoVacuumMode {
+        (*self).get_auto_vacuum_mode()
+    }
+
+    fn set_auto_vacuum_mode(&self, mode: AutoVacuumMode) {
+        (*self).set_auto_vacuum_mode(mode)
+    }
+
+    fn freepage_list(&self) -> u32 {
+        (*self).freepage_list()
+    }
+
+    fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> Result<T> {
+        (*self).with_header(f)
+    }
+
+    fn with_header_mut<T>(&self, f: impl Fn(&mut DatabaseHeader) -> T) -> Result<T> {
+        (*self).with_header_mut(f)
+    }
+
+    fn change_page_cache_size(&self, capacity: usize) -> Result<CacheResizeResult> {
+        (*self).change_page_cache_size(capacity)
     }
 }

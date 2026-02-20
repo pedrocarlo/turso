@@ -1,4 +1,4 @@
-use crate::turso_assert_eq;
+use crate::{turso_assert_eq, Program};
 use std::{
     borrow::Cow,
     num::NonZero,
@@ -296,15 +296,9 @@ impl Statement {
             turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = conn.schema.read().clone();
-            translate::translate(
-                &schema,
-                stmt,
-                self.pager.clone(),
-                conn.clone(),
-                &syms,
-                mode,
-                &self.program.sql,
-            )?
+            let prepared =
+                translate::translate(&schema, stmt, conn.clone(), &syms, mode, &self.program.sql)?;
+            Program::from_prepared(prepared, conn.clone())
         };
 
         // Save parameters before they are reset

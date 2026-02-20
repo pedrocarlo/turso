@@ -23,8 +23,9 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
 };
-use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
+
+use super::ConnectionProvider;
 
 use turso_ext::VTabKind;
 
@@ -112,7 +113,7 @@ pub(crate) fn validate_check_expr(
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
-    connection: &Connection,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
 ) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
@@ -179,7 +180,7 @@ pub fn translate_create_table(
     if_not_exists: bool,
     body: ast::CreateTableBody,
     program: &mut ProgramBuilder,
-    connection: &Connection,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     if database_id >= 2 {
@@ -639,7 +640,7 @@ pub fn translate_create_virtual_table(
     vtab: ast::CreateVirtualTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
         bail_parse_error!("Virtual tables are not supported in MVCC mode");
@@ -743,7 +744,7 @@ pub fn translate_create_virtual_table(
 fn validate_drop_table(
     resolver: &Resolver,
     tbl_name: &str,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     if !connection.is_nested_stmt()
         && crate::schema::is_system_table(tbl_name)
@@ -766,7 +767,7 @@ pub fn translate_drop_table(
     resolver: &mut Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(&tbl_name)?;
     let name = tbl_name.name.as_str();

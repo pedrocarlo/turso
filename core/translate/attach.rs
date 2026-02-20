@@ -1,12 +1,11 @@
+use super::ConnectionProvider;
 use crate::function::{Func, ScalarFunc};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{sanitize_string, translate_expr};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::Connection;
 use crate::Result;
-use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
@@ -17,7 +16,7 @@ pub fn translate_attach(
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
-    connection: Arc<Connection>,
+    connection: impl ConnectionProvider,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -132,7 +131,7 @@ pub fn translate_detach(
     expr: &Expr,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: Arc<Connection>,
+    connection: impl ConnectionProvider,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(

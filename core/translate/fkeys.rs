@@ -11,8 +11,10 @@ use crate::{
         insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
-    Connection, LimboError, Result, Value,
+    LimboError, PrepareContext, Result, Value,
 };
+
+use super::ConnectionProvider;
 use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
 #[inline]
@@ -1263,7 +1265,7 @@ const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
 fn emit_fk_action_subprogram(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     stmt: ast::Stmt,
     ctx: &FkActionContext,
     description: &'static str,
@@ -1282,7 +1284,11 @@ fn emit_fk_action_subprogram(
         description,
     )?;
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
+    let built_subprogram = Arc::new(subprogram_builder.build_prepared_program(
+        PrepareContext::from_connection(connection),
+        true,
+        description,
+    )?);
 
     // Build params: OLD key register indices, then optionally NEW key register indices
     let mut params: Vec<Value> = ctx
@@ -1303,7 +1309,7 @@ fn emit_fk_action_subprogram(
 
     program.emit_insn(Insn::Program {
         params,
-        program: built_subprogram.prepared().clone(),
+        program: built_subprogram,
     });
 
     Ok(())
@@ -1475,7 +1481,7 @@ fn fire_fk_cascade_delete(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     fk_ref: &ResolvedFkRef,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
@@ -1508,7 +1514,7 @@ fn fire_fk_set_null(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     fk_ref: &ResolvedFkRef,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
@@ -1534,7 +1540,7 @@ fn fire_fk_set_default(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     fk_ref: &ResolvedFkRef,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
@@ -1560,7 +1566,7 @@ fn fire_fk_cascade_update(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     fk_ref: &ResolvedFkRef,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
@@ -1596,7 +1602,7 @@ pub fn fire_fk_delete_actions(
     parent_table_name: &str,
     parent_cursor_id: usize,
     parent_rowid_reg: usize,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<()> {
     let parent_bt = resolver
@@ -1662,7 +1668,7 @@ pub fn fire_fk_update_actions(
     old_values_start: usize,
     new_values_start: usize,
     new_rowid_reg: usize,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<()> {
     let parent_bt = resolver
@@ -1753,7 +1759,7 @@ pub fn emit_fk_drop_table_check(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     parent_table_name: &str,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<()> {
     let parent_tbl = resolver

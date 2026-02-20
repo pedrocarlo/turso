@@ -1,3 +1,4 @@
+use super::ConnectionProvider;
 use crate::schema::{SchemaObjectType, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
@@ -6,14 +7,14 @@ use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEI
 use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
-use crate::{Connection, Result};
+use crate::Result;
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
-    connection: Arc<Connection>,
+    connection: impl ConnectionProvider,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Check if experimental views are enabled
@@ -256,7 +257,7 @@ pub fn translate_create_view(
     select_stmt: &ast::Select,
     _columns: &[ast::IndexedColumn],
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
         return Err(crate::LimboError::ParseError(

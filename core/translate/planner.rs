@@ -2,6 +2,7 @@ use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal, turso_assert_less_than};
 use std::cmp::PartialEq;
 
+use super::ConnectionProvider;
 use super::{
     expr::walk_expr,
     plan::{
@@ -440,7 +441,7 @@ fn plan_cte(
     base_outer_query_refs: &[OuterQueryReference],
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     count_reference: bool,
 ) -> Result<JoinedTable> {
     let cte_def = &cte_definitions[cte_idx];
@@ -541,7 +542,7 @@ pub fn plan_ctes_as_outer_refs(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let Some(with) = with else {
         return Ok(());
@@ -640,7 +641,7 @@ fn parse_from_clause_table(
     table_references: &mut TableReferences,
     vtab_predicates: &mut Vec<Expr>,
     cte_definitions: &[CteDefinition],
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
@@ -767,7 +768,7 @@ fn parse_table(
     qualified_name: &QualifiedName,
     maybe_alias: Option<&As>,
     args: &[Box<Expr>],
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
     let database_id = resolver.resolve_database_id(qualified_name)?;
@@ -1153,7 +1154,7 @@ pub fn parse_from(
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     // Collect CTE definitions instead of planning them immediately.
     // Each CTE reference will be planned fresh when encountered, ensuring unique internal_ids.
@@ -1627,7 +1628,7 @@ fn parse_join(
     out_where_clause: &mut Vec<WhereTerm>,
     vtab_predicates: &mut Vec<Expr>,
     table_references: &mut TableReferences,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,

@@ -40,8 +40,10 @@ use crate::{
         insn::{to_u16, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset,
     },
-    CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
+    CaptureDataChangesExt, LimboError, Result, VirtualTable,
 };
+
+use super::ConnectionProvider;
 use std::num::NonZeroUsize;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
@@ -53,7 +55,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     table: &Table,
-    conn: &Arc<Connection>,
+    conn: &impl ConnectionProvider,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
     if !conn.is_nested_stmt()
@@ -164,7 +166,7 @@ impl<'a> InsertEmitCtx<'a> {
         num_values: usize,
         temp_table_ctx: Option<TempTableCtx>,
         database_id: usize,
-        _connection: &Arc<crate::Connection>,
+        _connection: &impl ConnectionProvider,
     ) -> Result<Self> {
         // allocate cursor id's for each btree index cursor we'll need to populate the indexes
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -217,7 +219,7 @@ pub fn translate_insert(
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
@@ -1134,7 +1136,7 @@ fn resolve_upserts(
     insertion: &Insertion,
     table: &Table,
     result_columns: &mut [ResultSetColumn],
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     table_references: &mut TableReferences,
 ) -> Result<()> {
     for (_, label, upsert) in upsert_actions {
@@ -1503,7 +1505,7 @@ fn bind_insert(
 fn init_source_emission<'a>(
     program: &mut ProgramBuilder,
     table: &Table,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &mut InsertEmitCtx<'a>,
     resolver: &Resolver,
     values: &mut Vec<Box<Expr>>,
@@ -2125,14 +2127,14 @@ fn translate_column(
 
 /// Emit bytecode to check PRIMARY KEY uniqueness constraint.
 /// Handles ON REPLACE (delete conflicting row) and UPSERT routing.
-fn emit_pk_uniqueness_check(
+fn emit_pk_uniqueness_check<C: ConnectionProvider>(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &mut Resolver,
     insertion: &Insertion,
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
-    preflight: &mut PreflightCtx,
+    preflight: &mut PreflightCtx<'_, '_, C>,
 ) -> Result<()> {
     let make_record_label = program.allocate_label();
     program.emit_insn(Insn::NotExists {
@@ -2193,7 +2195,7 @@ fn emit_pk_uniqueness_check(
 /// Emit bytecode to check index uniqueness constraint.
 /// Handles partial index predicates, ON REPLACE, UPSERT routing, and non-unique indexes.
 #[allow(clippy::too_many_arguments)]
-fn emit_index_uniqueness_check(
+fn emit_index_uniqueness_check<C: ConnectionProvider>(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &mut Resolver,
@@ -2201,7 +2203,7 @@ fn emit_index_uniqueness_check(
     index: &Index,
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
-    preflight: &mut PreflightCtx,
+    preflight: &mut PreflightCtx<'_, '_, C>,
 ) -> Result<()> {
     // find which cursor we opened earlier for this index
     let idx_cursor_id = ctx
@@ -2280,7 +2282,7 @@ fn emit_index_uniqueness_check(
 
 /// Emit bytecode for unique index conflict detection and handling.
 #[allow(clippy::too_many_arguments)]
-fn emit_unique_index_check(
+fn emit_unique_index_check<C: ConnectionProvider>(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &mut Resolver,
@@ -2290,7 +2292,7 @@ fn emit_unique_index_check(
     num_cols: usize,
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
-    preflight: &mut PreflightCtx,
+    preflight: &mut PreflightCtx<'_, '_, C>,
 ) -> Result<()> {
     let aff = index
         .columns
@@ -2414,13 +2416,13 @@ fn emit_unique_index_check(
 // DO UPDATE (matching target) -> fetch conflicting rowid and jump to `upsert_entry`.
 //
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
-fn emit_preflight_constraint_checks(
+fn emit_preflight_constraint_checks<C: ConnectionProvider>(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &mut Resolver,
     insertion: &Insertion,
     constraints: &ConstraintsToCheck,
-    preflight: &mut PreflightCtx,
+    preflight: &mut PreflightCtx<'_, '_, C>,
 ) -> Result<()> {
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
@@ -2790,13 +2792,13 @@ struct ConstraintsToCheck {
 }
 
 /// Context for preflight constraint checks
-struct PreflightCtx<'a, 'b> {
+struct PreflightCtx<'a, 'b, C: ConnectionProvider> {
     /// UPSERT action handlers (target, label, upsert clause)
     upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     /// Whether ON CONFLICT REPLACE is active (without UPSERT)
     on_replace: bool,
     /// Database connection for FK checks
-    connection: &'a Arc<Connection>,
+    connection: &'a C,
     /// Table references for expression evaluation
     table_references: &'b mut TableReferences,
 }
@@ -2806,7 +2808,7 @@ fn build_constraints_to_check(
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     has_user_provided_rowid: bool,
     resolver: &Resolver,
-    _connection: &Arc<crate::Connection>,
+    _connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> ConstraintsToCheck {
     let mut constraints_to_check = Vec::new();
@@ -2925,7 +2927,7 @@ fn emit_update_sqlite_sequence(
 fn emit_replace_delete_conflicting_row(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     ctx: &mut InsertEmitCtx,
     table_references: &mut TableReferences,
 ) -> Result<()> {

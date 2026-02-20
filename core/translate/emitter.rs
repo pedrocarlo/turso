@@ -72,7 +72,9 @@ use crate::{
     bail_parse_error, emit_explain, Database, DatabaseCatalog, LimboError, Result, RwLock,
     SymbolTable,
 };
-use crate::{CaptureDataChangesExt, Connection, QueryMode};
+use crate::{CaptureDataChangesExt, QueryMode};
+
+use super::ConnectionProvider;
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
@@ -490,7 +492,7 @@ pub enum TransactionMode {
 /// Takes a query plan and generates the corresponding bytecode program
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
@@ -1457,7 +1459,7 @@ pub fn emit_query<'a>(
 
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_delete(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
@@ -1803,7 +1805,7 @@ pub fn emit_fk_child_decrement_on_delete(
 }
 
 fn emit_delete_insns<'a>(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx<'a>,
     table_references: &mut TableReferences,
@@ -1958,7 +1960,7 @@ fn emit_delete_insns<'a>(
 /// - `virtual_table_cursor_id`: If Some, use this cursor for virtual table deletion
 #[allow(clippy::too_many_arguments)]
 fn emit_delete_row_common(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
@@ -2153,7 +2155,7 @@ fn emit_delete_row_common(
 /// Helper function to delete a row when we've already seeked to it (e.g., from a RowSet).
 /// This is similar to emit_delete_insns but assumes the cursor is already positioned at the row.
 fn emit_delete_insns_when_triggers_present(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &mut TableReferences,
@@ -2329,7 +2331,7 @@ fn emit_delete_insns_when_triggers_present(
 
 #[instrument(skip_all, level = Level::DEBUG)]
 fn emit_program_for_update(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
@@ -2829,7 +2831,7 @@ fn emit_update_column_values<'a>(
 /// `all_index_cursors` contains cursors for ALL indexes on the table (used for REPLACE to delete
 /// conflicting rows from all indexes, not just those being updated).
 fn emit_update_insns<'a>(
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     table_references: &mut TableReferences,
     set_clauses: &[(usize, Box<ast::Expr>)],
     cdc_update_alter_statement: Option<&str>,
@@ -5061,7 +5063,7 @@ pub(crate) fn emit_check_constraints<'a>(
     table_name: &str,
     rowid_reg: usize,
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,

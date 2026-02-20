@@ -8,6 +8,8 @@
 //! will read rows from the database and filter them according to a WHERE clause.
 
 pub(crate) mod aggregation;
+mod connection_provider;
+pub(crate) use connection_provider::ConnectionProvider;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
@@ -46,13 +48,11 @@ pub(crate) mod view;
 mod window;
 
 use crate::schema::Schema;
-use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
-use crate::vdbe::Program;
-use crate::{bail_parse_error, Connection, Result, SymbolTable};
+use crate::{bail_parse_error, PrepareContext, PreparedProgram, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize};
@@ -70,12 +70,11 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
-    pager: Arc<Pager>,
-    connection: Arc<Connection>,
+    connection: impl ConnectionProvider,
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
-) -> Result<Program> {
+) -> Result<Arc<PreparedProgram>> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
         stmt,
@@ -107,21 +106,19 @@ pub fn translate(
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(
-                &resolver,
-                &name,
-                body,
-                pager,
-                connection.clone(),
-                &mut program,
-            )?;
+            pragma::translate_pragma(&resolver, &name, body, &connection, &mut program)?;
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
-
-    program.build(connection, change_cnt_on, input)
+    program
+        .build_prepared_program(
+            PrepareContext::from_connection(connection),
+            change_cnt_on,
+            input,
+        )
+        .map(Arc::new)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -131,7 +128,7 @@ pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
+    connection: &impl ConnectionProvider,
     input: &str,
 ) -> Result<()> {
     let is_write = matches!(
@@ -166,7 +163,7 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection)?;
         }
         ast::Stmt::Begin { typ, name } => {
             translate_tx_begin(typ, name, resolver.schema(), program)?
@@ -223,7 +220,7 @@ pub fn translate_inner(
                 tbl_name,
                 program,
                 sql,
-                connection.clone(),
+                connection,
             )?
         }
         ast::Stmt::CreateView {
@@ -237,11 +234,7 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name, select, ..
         } => view::translate_create_materialized_view(
-            &view_name,
-            resolver,
-            &select,
-            connection.clone(),
-            program,
+            &view_name, resolver, &select, connection, program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
@@ -273,7 +266,7 @@ pub fn translate_inner(
             )?
         }
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
+            attach::translate_detach(&name, resolver, program, connection)?
         }
         ast::Stmt::DropIndex {
             if_exists,
@@ -369,7 +362,6 @@ mod tests {
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         let schema = db.schema.lock().clone();
-        let pager = conn.pager.load().clone();
 
         // Use an empty SymbolTable so regexp() is not available.
         let empty_syms = SymbolTable::new();
@@ -380,15 +372,7 @@ mod tests {
             _ => panic!("expected statement"),
         };
 
-        let result = translate(
-            &schema,
-            stmt,
-            pager,
-            conn,
-            &empty_syms,
-            QueryMode::Normal,
-            "",
-        );
+        let result = translate(&schema, stmt, conn, &empty_syms, QueryMode::Normal, "");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("no such function: regexp"),

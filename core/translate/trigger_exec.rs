@@ -1,3 +1,4 @@
+use super::ConnectionProvider;
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -5,7 +6,7 @@ use crate::translate::expr::translate_expr;
 use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::{bail_parse_error, QueryMode, Result};
+use crate::{bail_parse_error, PrepareContext, QueryMode, Result};
 use rustc_hash::FxHashSet as HashSet;
 use std::num::NonZero;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
@@ -548,7 +549,7 @@ fn execute_trigger_commands(
     resolver: &mut Resolver,
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<bool> {
     if connection.trigger_is_compiling(trigger) {
@@ -624,8 +625,11 @@ fn execute_trigger_commands(
         )?;
     }
     subprogram_builder.epilogue(resolver.schema());
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
+    let built_subprogram = subprogram_builder.build_prepared_program(
+        PrepareContext::from_connection(connection),
+        true,
+        "trigger subprogram",
+    )?;
 
     let mut params = Vec::with_capacity(
         ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0)
@@ -650,7 +654,7 @@ fn execute_trigger_commands(
 
     program.emit_insn(Insn::Program {
         params,
-        program: built_subprogram.prepared().clone(),
+        program: Arc::new(built_subprogram),
     });
     connection.end_trigger_compilation();
 
@@ -753,7 +757,7 @@ pub fn fire_trigger(
     resolver: &mut Resolver,
     trigger: Arc<Trigger>,
     ctx: &TriggerContext,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<()> {
     // Evaluate WHEN clause if present

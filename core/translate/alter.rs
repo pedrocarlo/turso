@@ -28,6 +28,7 @@ use either::Either;
 use super::{
     schema::{validate_check_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
+    ConnectionProvider,
 };
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
@@ -350,7 +351,7 @@ pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     input: &str,
 ) -> Result<()> {
     let ast::AlterTable {
@@ -1368,7 +1369,7 @@ fn translate_rename_virtual_table(
     old_name: &str,
     new_name_norm: String,
     resolver: &Resolver,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<()> {
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

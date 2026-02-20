@@ -1,7 +1,7 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
-use crate::sync::Arc;
+use crate::translate::ConnectionProvider;
 use crate::turso_soft_unreachable;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
@@ -16,11 +16,10 @@ use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
-use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{normalize_ident, parse_signed_number, parse_string};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value};
@@ -50,8 +49,7 @@ pub fn translate_pragma(
     resolver: &Resolver,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
-    pager: Arc<Pager>,
-    connection: Arc<crate::Connection>,
+    connection: impl ConnectionProvider,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let opts = ProgramBuilderOpts {
@@ -74,15 +72,7 @@ pub fn translate_pragma(
     let database_id = resolver.resolve_database_id(name)?;
 
     let mode = match body {
-        None => query_pragma(
-            pragma,
-            resolver,
-            None,
-            pager,
-            connection,
-            database_id,
-            program,
-        )?,
+        None => query_pragma(pragma, resolver, None, &connection, database_id, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
             PragmaName::IndexInfo
@@ -97,20 +87,11 @@ pub fn translate_pragma(
                 pragma,
                 resolver,
                 Some(*value),
-                pager,
-                connection,
+                &connection,
                 database_id,
                 program,
             )?,
-            _ => update_pragma(
-                pragma,
-                resolver,
-                *value,
-                pager,
-                connection,
-                database_id,
-                program,
-            )?,
+            _ => update_pragma(pragma, resolver, *value, &connection, database_id, program)?,
         },
     };
     match mode {
@@ -133,8 +114,7 @@ fn update_pragma(
     pragma: PragmaName,
     resolver: &Resolver,
     value: ast::Expr,
-    pager: Arc<Pager>,
-    connection: Arc<crate::Connection>,
+    connection: impl ConnectionProvider,
     database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
@@ -186,12 +166,12 @@ fn update_pragma(
                 Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
-            update_cache_size(cache_size, pager, connection)?;
+            update_cache_size(cache_size, &connection)?;
             Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
             let enabled = parse_pragma_enabled(&value);
-            connection.get_pager().set_spill_enabled(enabled);
+            connection.set_spill_enabled(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
@@ -221,8 +201,7 @@ fn update_pragma(
             PragmaName::WalCheckpoint,
             resolver,
             Some(value),
-            pager,
-            connection,
+            &connection,
             database_id,
             program,
         ),
@@ -231,8 +210,7 @@ fn update_pragma(
             PragmaName::PageCount,
             resolver,
             None,
-            pager,
-            connection,
+            &connection,
             database_id,
             program,
         ),
@@ -299,14 +277,14 @@ fn update_pragma(
         }
         PragmaName::AutoVacuum => {
             // Check if autovacuum is enabled in database opts
-            if !connection.db.opts.enable_autovacuum {
+            if !connection.enable_autovacuum() {
                 return Err(LimboError::InvalidArgument(
                     "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
                         .to_string(),
                 ));
             }
 
-            let is_empty = is_database_empty(resolver.schema(), &pager)?;
+            let is_empty = is_database_empty(resolver.schema(), &connection)?;
             tracing::debug!(
                 "Checking if database is empty for auto_vacuum pragma: {}",
                 is_empty
@@ -341,9 +319,9 @@ fn update_pragma(
                 }
             };
             match auto_vacuum_mode {
-                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, pager)?,
-                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, pager)?,
-                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, pager)?,
+                0 => update_auto_vacuum_mode(AutoVacuumMode::None, 0, &connection)?,
+                1 => update_auto_vacuum_mode(AutoVacuumMode::Full, 1, &connection)?,
+                2 => update_auto_vacuum_mode(AutoVacuumMode::Incremental, 1, &connection)?,
                 _ => {
                     return Err(LimboError::InvalidArgument(
                         "invalid auto vacuum mode".to_string(),
@@ -407,8 +385,7 @@ fn update_pragma(
             PragmaName::QueryOnly,
             resolver,
             Some(value),
-            pager,
-            connection,
+            &connection,
             database_id,
             program,
         ),
@@ -416,8 +393,7 @@ fn update_pragma(
             PragmaName::FreelistCount,
             resolver,
             Some(value),
-            pager,
-            connection,
+            &connection,
             database_id,
             program,
         ),
@@ -526,8 +502,7 @@ fn update_pragma(
             PragmaName::FunctionList,
             resolver,
             Some(value),
-            pager,
-            connection,
+            &connection,
             database_id,
             program,
         ),
@@ -538,8 +513,7 @@ fn query_pragma(
     pragma: PragmaName,
     resolver: &Resolver,
     value: Option<ast::Expr>,
-    pager: Arc<Pager>,
-    connection: Arc<crate::Connection>,
+    connection: impl ConnectionProvider,
     database_id: usize,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
@@ -569,7 +543,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
-            let spill_enabled = connection.get_pager().get_spill_enabled();
+            let spill_enabled = connection.get_spill_enabled();
             program.emit_int(spill_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
@@ -601,9 +575,8 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Encoding => {
-            let encoding = pager
-                .io
-                .block(|| pager.with_header(|header| header.text_encoding))
+            let encoding = connection
+                .with_header(|header| header.text_encoding)
                 .unwrap_or_default()
                 .to_string();
             program.emit_string8(encoding, register);
@@ -1034,9 +1007,8 @@ fn query_pragma(
         }
         PragmaName::PageSize => {
             program.emit_int(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.page_size.get()))
+                connection
+                    .with_header(|header| header.page_size.get())
                     .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
                 register,
             );
@@ -1045,7 +1017,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
-            let auto_vacuum_mode = pager.get_auto_vacuum_mode();
+            let auto_vacuum_mode = connection.get_auto_vacuum_mode();
             let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
                 AutoVacuumMode::None => 0,
                 AutoVacuumMode::Full => 1,
@@ -1131,7 +1103,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::FreelistCount => {
-            let value = pager.freepage_list();
+            let value = connection.freepage_list();
             let register = program.alloc_register();
             program.emit_int(value as i64, register);
             program.emit_result_row(register, 1);
@@ -1140,7 +1112,7 @@ fn query_pragma(
         }
         PragmaName::EncryptionKey => {
             let msg = {
-                if connection.encryption_key.read().is_some() {
+                if connection.encryption_key_is_set() {
                     "encryption key is set for this session"
                 } else {
                     "encryption key is not set for this session"
@@ -1292,22 +1264,16 @@ fn emit_columns_for_table_info(
 fn update_auto_vacuum_mode(
     auto_vacuum_mode: AutoVacuumMode,
     largest_root_page_number: u32,
-    pager: Arc<Pager>,
+    connection: impl ConnectionProvider,
 ) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
+    connection.with_header_mut(|header| {
+        header.vacuum_mode_largest_root_page = largest_root_page_number.into()
     })?;
-    pager.set_auto_vacuum_mode(auto_vacuum_mode);
+    connection.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
 
-fn update_cache_size(
-    value: i64,
-    pager: Arc<Pager>,
-    connection: Arc<crate::Connection>,
-) -> crate::Result<()> {
+fn update_cache_size(value: i64, connection: impl ConnectionProvider) -> crate::Result<()> {
     let mut cache_size_unformatted: i64 = value;
 
     let mut cache_size = if cache_size_unformatted < 0 {
@@ -1315,9 +1281,8 @@ fn update_cache_size(
             .checked_abs()
             .unwrap_or(i64::MAX)
             .saturating_mul(1024);
-        let page_size = pager
-            .io
-            .block(|| pager.with_header(|header| header.page_size))
+        let page_size = connection
+            .with_header(|header| header.page_size)
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
@@ -1350,7 +1315,7 @@ fn update_cache_size(
 
     connection.set_cache_size(cache_size_unformatted as i32);
 
-    pager
+    connection
         .change_page_cache_size(final_cache_size as usize)
         .map_err(|e| LimboError::InternalError(format!("Failed to update page cache size: {e}")))?;
 
@@ -1362,12 +1327,12 @@ pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
 pub use crate::CDC_VERSION_CURRENT;
 
-fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
+fn update_page_size(connection: impl ConnectionProvider, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
 }
 
-fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
+fn is_database_empty(schema: &Schema, connection: &impl ConnectionProvider) -> crate::Result<bool> {
     if schema.tables.len() > 1 {
         return Ok(false);
     }
@@ -1383,9 +1348,7 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
         }
     }
 
-    let db_size_result = pager
-        .io
-        .block(|| pager.with_header(|header| header.database_size.get()));
+    let db_size_result = connection.with_header(|header| header.database_size.get());
 
     match db_size_result {
         Err(_) => Ok(true),

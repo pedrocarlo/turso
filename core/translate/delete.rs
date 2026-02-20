@@ -1,6 +1,7 @@
 use crate::schema::Table;
-use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
+
+use super::ConnectionProvider;
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
@@ -29,7 +30,7 @@ pub fn translate_delete(
     returning: Vec<ResultColumn>,
     with: Option<With>,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<()> {
     let database_id = resolver.resolve_database_id(tbl_name)?;
     let tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -125,7 +126,7 @@ pub fn prepare_delete_plan(
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
     with: Option<With>,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     database_id: usize,
 ) -> Result<Plan> {
     let schema = resolver.schema();

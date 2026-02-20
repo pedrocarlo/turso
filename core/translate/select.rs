@@ -3,8 +3,8 @@ use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
     Search, TableReferences, WhereTerm, Window,
 };
+use super::ConnectionProvider;
 use crate::schema::Table;
-use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
 use crate::translate::group_by::compute_group_by_sort_order;
@@ -32,7 +32,7 @@ pub fn translate_select(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<usize> {
     let mut select_plan = prepare_select_plan(
         select,
@@ -131,7 +131,7 @@ pub fn prepare_select_plan(
     program: &mut ProgramBuilder,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<Plan> {
     let compounds = select.body.compounds;
     match compounds.is_empty() {
@@ -223,7 +223,7 @@ fn prepare_one_select_plan(
     with: Option<ast::With>,
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> Result<SelectPlan> {
     if order_by
         .iter()

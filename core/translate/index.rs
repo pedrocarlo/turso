@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
+use super::ConnectionProvider;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func};
 use crate::index_method::IndexMethodConfiguration;
@@ -37,7 +38,7 @@ use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
 pub fn translate_create_index(
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
@@ -975,7 +976,7 @@ pub fn translate_optimize(
     idx_name: Option<ast::QualifiedName>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> crate::Result<()> {
     if !connection.experimental_index_method_enabled() {
         crate::bail_parse_error!(

@@ -1,6 +1,6 @@
-use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+use super::ConnectionProvider;
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
@@ -12,7 +12,7 @@ use crate::{
     schema::{Schema, Table},
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
-    CaptureDataChangesExt, Connection,
+    CaptureDataChangesExt,
 };
 use turso_parser::ast::{self, Expr, Indexed, SortOrder};
 
@@ -60,7 +60,7 @@ pub fn translate_update(
     body: ast::Update,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
 ) -> crate::Result<()> {
     let mut plan = prepare_update_plan(program, resolver, body, connection, false)?;
 
@@ -106,7 +106,7 @@ pub fn translate_update_for_schema_change(
     body: ast::Update,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
@@ -157,7 +157,7 @@ fn validate_update(
     body: &ast::Update,
     table_name: &str,
     is_internal_schema_change: bool,
-    conn: &Arc<Connection>,
+    conn: &impl ConnectionProvider,
 ) -> crate::Result<()> {
     // Check if this is a system table that should be protected from direct writes
     if !is_internal_schema_change
@@ -206,7 +206,7 @@ pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut body: ast::Update,
-    connection: &Arc<crate::Connection>,
+    connection: &impl ConnectionProvider,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
     let database_id = resolver.resolve_database_id(&body.tbl_name)?;

@@ -1,9 +1,5 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
-use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
-    Arc, RwLock,
-};
 use crate::turso_assert;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -22,6 +18,13 @@ use crate::{
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
     Value, VirtualTable,
+};
+use crate::{
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+        Arc, RwLock,
+    },
+    Program,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -274,15 +277,8 @@ impl Connection {
         // where we try to read the schema again there
         let schema = self.schema.read().clone();
 
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let program = translate::translate(&schema, stmt, self.clone(), &syms, mode, input)?;
+        let program = Program::from_prepared(program, self.clone());
         Ok(Statement::new(program, pager, mode))
     }
 
@@ -300,12 +296,12 @@ impl Connection {
         let program = translate::translate(
             &schema,
             stmt,
-            pager.clone(),
             self.clone(),
             &syms,
             mode,
             "<ast>", // No SQL input string available
         )?;
+        let program = Program::from_prepared(program, self.clone());
         Ok(Statement::new(program, pager, mode))
     }
 
@@ -478,15 +474,8 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let program = translate::translate(&schema, stmt, self.clone(), &syms, mode, input)?;
+            let program = Program::from_prepared(program, self.clone());
             Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
@@ -526,15 +515,8 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let program = translate::translate(&schema, stmt, self.clone(), &syms, mode, input)?;
+        let program = Program::from_prepared(program, self.clone());
         let stmt = Statement::new(program, pager, mode);
         Ok(Some(stmt))
     }
@@ -563,15 +545,8 @@ impl Connection {
             let mode = QueryMode::new(&cmd);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             let schema = self.schema.read().clone();
-            let program = translate::translate(
-                &schema,
-                stmt,
-                pager.clone(),
-                self.clone(),
-                &syms,
-                mode,
-                input,
-            )?;
+            let program = translate::translate(&schema, stmt, self.clone(), &syms, mode, input)?;
+            let program = Program::from_prepared(program, self.clone());
             Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
@@ -595,15 +570,8 @@ impl Connection {
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
         let schema = self.schema.read().clone();
-        let program = translate::translate(
-            &schema,
-            stmt,
-            pager.clone(),
-            self.clone(),
-            &syms,
-            mode,
-            input,
-        )?;
+        let program = translate::translate(&schema, stmt, self.clone(), &syms, mode, input)?;
+        let program = Program::from_prepared(program, self.clone());
         let stmt = Statement::new(program, pager, mode);
         Ok(Some((stmt, parser.offset())))
     }

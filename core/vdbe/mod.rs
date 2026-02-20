@@ -857,8 +857,7 @@ pub struct PrepareContext {
 }
 
 impl PrepareContext {
-    pub fn from_connection(connection: &Connection) -> Self {
-        let pager = connection.get_pager();
+    pub(crate) fn from_connection(connection: impl crate::translate::ConnectionProvider) -> Self {
         Self {
             database_ptr: connection.database_ptr(),
             foreign_keys: connection.foreign_keys_enabled(),
@@ -868,14 +867,13 @@ impl PrepareContext {
             attached_databases_fingerprint: connection.attached_databases_fingerprint(),
             busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
             cache_size: connection.get_cache_size(),
-            spill_enabled: pager.get_spill_enabled(),
+            spill_enabled: connection.get_spill_enabled(),
             page_size: connection.get_page_size().get(),
             sync_mode: connection.get_sync_mode(),
             data_sync_retry: connection.get_data_sync_retry(),
-            encryption_key_set: connection.encryption_key.read().is_some(),
-            encryption_cipher: connection.encryption_cipher_mode.get(),
+            encryption_key_set: connection.encryption_key_is_set(),
+            encryption_cipher: connection.encryption_cipher(),
             mvcc_checkpoint_threshold: connection
-                .db
                 .mvcc_enabled()
                 .then(|| connection.mvcc_checkpoint_threshold())
                 .and_then(|res| res.ok()),
