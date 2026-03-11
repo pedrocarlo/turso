@@ -36,6 +36,20 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
+    // Phase 1: Bind the SELECT statement before planning (validation only).
+    // Clone the entire select, bind the clone, then discard it.
+    // This runs only at the top level; recursive calls (CTEs, subqueries)
+    // go directly through prepare_select_plan without re-binding.
+    {
+        let mut select_clone = select.clone();
+        let mut bind_counter = crate::vdbe::builder::TableRefIdCounter::new();
+        let _bound = crate::translate::bind::bind_select_statement(
+            &mut select_clone,
+            resolver,
+            &mut bind_counter,
+        );
+    }
+
     let mut select_plan = prepare_select_plan(
         select,
         resolver,
@@ -1356,3 +1370,5 @@ fn find_aliased_aggregate_ref(expr: &ast::Expr, result_columns: &[ResultSetColum
     })?;
     Ok(())
 }
+
+// ── Save/restore unbound FROM subqueries ──────────────────────────────

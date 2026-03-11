@@ -39,6 +39,12 @@ impl TableRefIdCounter {
     }
 }
 
+impl crate::translate::bind::IdGenerator for TableRefIdCounter {
+    fn next_id(&mut self) -> ast::TableInternalId {
+        self.next()
+    }
+}
+
 use super::{
     BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
     Program,
