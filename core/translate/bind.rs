@@ -85,6 +85,7 @@ impl BindTable for Table {
 }
 
 /// Lightweight table for CTEs — just column names, no schema object.
+#[allow(dead_code)]
 pub struct CteTable {
     pub name: String,
     pub columns: Vec<String>,
@@ -149,6 +150,7 @@ pub enum BindPhase {
 ///
 /// Cheap to clone (table metadata is Arc-wrapped).
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ScopeTable {
     /// The name used to refer to this table in the query (original name or alias).
     pub identifier: String,
@@ -163,13 +165,14 @@ pub struct ScopeTable {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum ScopeTableSource {
     Table(Arc<Table>),
     Cte {
         name: String,
         columns: Vec<String>,
         cte_id: Option<usize>,
-        select: ast::Select,
+        select: Box<ast::Select>,
     },
     Derived {
         name: String,
@@ -180,6 +183,7 @@ pub enum ScopeTableSource {
 // ── BindScope ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
+#[allow(dead_code)]
 /// Snapshot of all tables visible at one query level.
 ///
 /// Analogous to DataFusion's `DFSchema`. Owned, Arc-wrapped for cheap
@@ -287,6 +291,7 @@ pub struct BoundColumn {
     pub expr: ast::Expr,
 }
 
+#[allow(dead_code)]
 pub struct BoundSelect {
     pub result_columns: Vec<BoundColumn>,
     pub main_scope: BindScope,
@@ -299,6 +304,7 @@ struct OuterQueryFrame {
     aliases: Vec<BoundColumn>,
 }
 
+#[allow(dead_code)]
 impl BoundSelect {
     pub fn into_table_references(self) -> Result<TableReferences> {
         let joined_tables = self
@@ -346,6 +352,7 @@ pub struct BindTracking {
     pub outer_refs_used: Vec<(TableInternalId, usize)>,
 }
 
+#[allow(dead_code)]
 impl BindTracking {
     pub fn record_column(&mut self, table_id: TableInternalId, col_idx: usize) {
         self.columns_used.push((table_id, col_idx));
@@ -467,17 +474,20 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     }
 
     /// The immediately enclosing query's scope (if any).
+    #[allow(dead_code)]
     fn latest_outer_scope(&self) -> Option<&BindScopeRef> {
         self.outer_query_frames.last().map(|frame| &frame.scope)
     }
 
     // ── Outer FROM (LATERAL support) ─────────────────────────────────
 
+    #[allow(dead_code)]
     fn outer_from_scope(&self) -> Option<&BindScopeRef> {
         self.outer_from_scope.as_ref()
     }
 
     /// Set the outer FROM scope, returning the previous value.
+    #[allow(dead_code)]
     fn set_outer_from_scope(&mut self, scope: Option<BindScopeRef>) -> Option<BindScopeRef> {
         std::mem::replace(&mut self.outer_from_scope, scope)
     }
@@ -485,6 +495,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
     /// Extend the outer FROM scope by merging tables from another scope.
     /// Used during LATERAL join planning: each left-side table's scope
     /// is accumulated so the right side can reference it.
+    #[allow(dead_code)]
     fn extend_outer_from_scope(&mut self, scope: &BindScopeRef) {
         match self.outer_from_scope.as_mut() {
             Some(existing) => {
@@ -501,12 +512,14 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         self.ctes.insert(name, entry);
     }
 
+    #[allow(dead_code)]
     fn get_cte(&self, name: &str) -> Option<&CteEntry> {
         self.ctes.get(name)
     }
 
     // ── Phase and aliases ────────────────────────────────────────────
 
+    #[allow(dead_code)]
     fn set_phase(&mut self, phase: BindPhase) {
         self.phase = phase;
     }
@@ -851,7 +864,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                             name: table_name,
                             columns: cte.resolved_columns.clone(),
                             cte_id: cte.cte_id,
-                            select: cte.select.clone(),
+                            select: Box::new(cte.select.clone()),
                         },
                         table: cte_table,
                         join_info: None,
@@ -865,7 +878,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .schema()
                         .get_table(&table_name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                            crate::LimboError::ParseError(format!("no such table: {table_name}"))
                         })?;
 
                 // 4. Generate internal_id via self.id_gen.next_id()
@@ -924,7 +937,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
                         .schema()
                         .get_table(&table_name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such table: {}", table_name))
+                            crate::LimboError::ParseError(format!("no such table: {table_name}"))
                         })?;
 
                 let identifier = alias
@@ -1188,6 +1201,7 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
         Ok(())
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
     fn bind_subquery_expr(&mut self, select: &mut ast::Select, scope: &BindScope) -> Result<()> {
         self.append_outer_query_scope(Arc::new(scope.clone()), self.aliases.clone());
         let result = self.bind_select(select);
@@ -1273,6 +1287,22 @@ impl<'a, G: IdGenerator> BindContext<'a, G> {
 
         Ok(scope)
     }
+}
+
+/// Public entry point: bind a SELECT statement, resolving all name references in-place.
+///
+/// This should be called **before** `prepare_select_plan` so that the AST has
+/// all `Expr::Id` / `Expr::Qualified` nodes already rewritten to `Expr::Column`,
+/// and BETWEEN rewritten to AND/OR.
+///
+/// Returns a [`BoundSelect`] containing the resolved scope and column tracking info.
+pub fn bind_select_statement<G: IdGenerator>(
+    select: &mut ast::Select,
+    resolver: &Resolver<'_>,
+    id_gen: &mut G,
+) -> Result<BoundSelect> {
+    let mut ctx = BindContext::new(resolver, id_gen);
+    ctx.bind_select(select)
 }
 
 #[cfg(test)]
@@ -1891,7 +1921,10 @@ mod tests {
                 parse_select("SELECT -a AS b, a, t.b FROM t ORDER BY (SELECT b)");
             ctx.bind_select(&mut source_preferred).unwrap();
             let order_subquery = subquery_expr(order_by_expr(&source_preferred, 0));
-            assert_eq!(select_expr(order_subquery, 0), select_expr(&source_preferred, 2));
+            assert_eq!(
+                select_expr(order_subquery, 0),
+                select_expr(&source_preferred, 2)
+            );
         });
     }
 
