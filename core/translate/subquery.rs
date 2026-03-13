@@ -16,8 +16,8 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated, ColumnUsedMask, JoinOrderMember,
-            NonFromClauseSubquery, OuterQueryReference, Plan, SetOperation, SubqueryPosition,
-            SubqueryState, TableReferences, WhereTerm,
+            NonFromClauseSubquery, OuterQueryReference, Plan, ResultSetColumn, SetOperation,
+            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::bind_prepare_select_plan,
     },
@@ -261,6 +261,26 @@ pub fn plan_subqueries_from_where_clause(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    plan_subqueries_from_where_clause_with_bound(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        where_clause,
+        resolver,
+        connection,
+        &mut Default::default(),
+    )
+}
+
+pub fn plan_subqueries_from_where_clause_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -269,7 +289,7 @@ pub fn plan_subqueries_from_where_clause(
         where_clause.iter_mut().map(|t| &mut t.expr),
         connection,
         SubqueryPosition::Where,
-        &mut Default::default(),
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -314,6 +334,26 @@ pub fn plan_subqueries_from_set_clauses(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    plan_subqueries_from_set_clauses_with_bound(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        set_clauses,
+        resolver,
+        connection,
+        &mut Default::default(),
+    )
+}
+
+pub fn plan_subqueries_from_set_clauses_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    set_clauses: &mut [(usize, Box<ast::Expr>)],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -321,8 +361,8 @@ pub fn plan_subqueries_from_set_clauses(
         resolver,
         set_clauses.iter_mut().map(|(_, expr)| expr.as_mut()),
         connection,
-        SubqueryPosition::ResultColumn, // SET clause subqueries are similar to result columns
-        &mut Default::default(),
+        SubqueryPosition::ResultColumn,
+        bound_subqueries,
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries);
@@ -369,6 +409,38 @@ pub fn plan_subqueries_from_returning(
     Ok(())
 }
 
+pub fn plan_subqueries_from_returning_with_bound(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    returning: &mut [ResultSetColumn],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    bound_subqueries: &mut HashMap<ast::TableInternalId, super::bind::BoundSubquery>,
+) -> Result<()> {
+    let count_before = non_from_clause_subqueries.len();
+
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        returning.iter_mut().map(|rc| &mut rc.expr),
+        connection,
+        SubqueryPosition::ResultColumn,
+        bound_subqueries,
+    )?;
+
+    // Mark newly added subqueries as RETURNING so the UPDATE emitter can
+    // defer their evaluation until after the Insert instruction.
+    for subquery in &mut non_from_clause_subqueries[count_before..] {
+        subquery.is_returning = true;
+    }
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
 /// Plan subqueries in a trigger WHEN clause expression.
 /// The WHEN clause has no FROM clause, so there are no outer query references.
 /// NEW/OLD references should already be rewritten to Expr::Register before calling this.
@@ -380,6 +452,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     let mut table_references = TableReferences::new(vec![], vec![]);
+    let mut bound_subqueries = HashMap::default();
     plan_subqueries_with_outer_query_access(
         program,
         non_from_clause_subqueries,
@@ -388,6 +461,7 @@ pub fn plan_subqueries_from_trigger_when_clause(
         std::iter::once(expr),
         connection,
         SubqueryPosition::Where,
+        &mut bound_subqueries,
     )
 }
 
@@ -689,6 +763,7 @@ fn get_subquery_parser<'a>(
                             unique: false,
                             where_clause: None,
                             index_method: None,
+                            on_conflict: None,
                         });
                         let cursor_id = program
                             .alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index.clone()));
