@@ -28,6 +28,7 @@ pub(crate) mod btree_dump;
 pub(crate) mod sync;
 pub(crate) mod thread;
 
+pub mod alloc;
 mod assert;
 mod connection;
 mod error;
@@ -372,6 +373,7 @@ static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<DatabaseKey, We
 /// Do that `Database` object is cached and can be long lived. DO NOT store anything sensitive like
 /// encryption key here.
 pub struct Database {
+    alloc: alloc::SharedAllocator,
     mv_store: ArcSwapOption<MvStore>,
     schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -462,6 +464,11 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    /// Returns the allocator associated with this database.
+    pub fn allocator(&self) -> &alloc::SharedAllocator {
+        &self.alloc
+    }
+
     fn new(
         opts: DatabaseOpts,
         flags: OpenFlags,
@@ -470,6 +477,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
+        alloc: alloc::SharedAllocator,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -501,6 +509,7 @@ impl Database {
         };
 
         let db = Database {
+            alloc,
             mv_store,
             path,
             wal_path,
@@ -640,6 +649,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            None,
         )
     }
 
@@ -656,6 +666,7 @@ impl Database {
             DatabaseOpts::new(),
             None,
             None,
+            None,
         )
     }
 
@@ -668,6 +679,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        alloc: Option<alloc::SharedAllocator>,
     ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
@@ -680,6 +692,7 @@ impl Database {
                 opts,
                 encryption_opts.clone(),
                 durable_storage.clone(),
+                alloc.clone(),
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -706,6 +719,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        alloc: Option<alloc::SharedAllocator>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_async_internal(
             state,
@@ -716,6 +730,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            alloc,
         );
         if result.is_err() {
             // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
@@ -734,6 +749,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        alloc: Option<alloc::SharedAllocator>,
     ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
@@ -777,6 +793,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            alloc.map(alloc::SharedAllocator::new),
         )?;
 
         if let IOResult::Done(ref db) = result {
@@ -814,6 +831,7 @@ impl Database {
                 opts,
                 encryption_opts.clone(),
                 None,
+                None,
             )? {
                 IOResult::Done(db) => return Ok(db),
                 IOResult::IO(io_completion) => {
@@ -837,6 +855,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        alloc: Option<alloc::SharedAllocator>,
     ) -> Result<IOResult<Arc<Database>>> {
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
@@ -848,6 +867,7 @@ impl Database {
             opts,
             encryption_opts,
             durable_storage,
+            alloc,
         );
         if result.is_err() {
             // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
@@ -868,6 +888,7 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
+        alloc: Option<alloc::SharedAllocator>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
             tracing::debug!(
@@ -896,6 +917,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
+                        alloc.clone().unwrap_or_else(alloc::SharedAllocator::global),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
@@ -1351,6 +1373,7 @@ impl Database {
         let encryption_cipher = self.encryption_cipher_mode.get();
 
         let conn = Arc::new(Connection {
+            alloc: self.alloc.clone(),
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),

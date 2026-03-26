@@ -27,6 +27,7 @@ use crate::{
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
     Value, VirtualTable,
 };
+use crate::alloc::SharedAllocator;
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -56,6 +57,7 @@ pub(crate) enum TransactionState {
 /// `bump_prepare_context_generation()` in its setter so cached prepared
 /// statements know they need to be reprepared.
 pub struct Connection {
+    pub(crate) alloc: SharedAllocator,
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
@@ -212,6 +214,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// Returns the allocator associated with this connection.
+    pub fn allocator(&self) -> &SharedAllocator {
+        &self.alloc
+    }
+
     /// Bump the prepare context generation counter. Must be called whenever any
     /// connection setting that is tracked in `PrepareContext` changes, so that
     /// prepared statements know they need to be reprepared.

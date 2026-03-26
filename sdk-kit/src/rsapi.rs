@@ -700,6 +700,7 @@ impl TursoDatabase {
                         opts,
                         self.config.encryption.clone(),
                         None,
+                        None,
                     )? {
                         IOResult::Done(db) => {
                             let mut inner_db = self.db.lock().unwrap();
