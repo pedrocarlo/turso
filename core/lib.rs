@@ -1,3 +1,6 @@
+#![cfg_attr(feature = "nightly", feature(allocator_api))]
+
+pub mod alloc;
 pub mod busy;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;

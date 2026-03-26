@@ -18,6 +18,8 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "series", "encryption"]
+nightly = []
+allocator-api2 = ["dep:allocator-api2"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
@@ -105,6 +107,7 @@ tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
+allocator-api2 = { workspace = true, optional = true }
 smallvec = "1.15.1"
 fastbloom = "0.14.1"
 crc32c = "0.6.8"
