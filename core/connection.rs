@@ -1,3 +1,4 @@
+use crate::alloc::SharedAllocator;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
@@ -27,7 +28,6 @@ use crate::{
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode, Trigger,
     Value, VirtualTable,
 };
-use crate::alloc::SharedAllocator;
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;

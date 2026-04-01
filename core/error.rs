@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::alloc::AllocError;
 use crate::storage::page_cache::CacheError;
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -21,6 +22,8 @@ pub enum LimboError {
     LexerError(#[from] turso_parser::error::Error),
     #[error("Conversion error: {0}")]
     ConversionError(String),
+    #[error("Allocation error")]
+    AllocError(AllocError),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
     #[error("Transaction error: {0}")]
@@ -218,6 +221,12 @@ macro_rules! bail_constraint_error {
 impl From<turso_ext::ResultCode> for LimboError {
     fn from(err: turso_ext::ResultCode) -> Self {
         cold_return(LimboError::ExtensionError(err.to_string()))
+    }
+}
+
+impl From<AllocError> for LimboError {
+    fn from(err: AllocError) -> Self {
+        cold_return(LimboError::AllocError(err))
     }
 }
 
