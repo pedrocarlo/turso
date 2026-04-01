@@ -4,7 +4,7 @@ use std::sync::Arc;
 pub(crate) use self::inner::*;
 
 // Nightly case: use the unstable `allocator_api` feature from std directly.
-#[cfg(feature = "nightly")]
+#[cfg(nightly)]
 mod inner {
     use std::alloc::Layout;
     use std::ptr::NonNull;
@@ -49,7 +49,7 @@ mod inner {
 }
 
 // Non-nightly with allocator-api2: use the polyfill crate.
-#[cfg(all(not(feature = "nightly"), feature = "allocator-api2"))]
+#[cfg(all(not(nightly), feature = "allocator-api2"))]
 mod inner {
     use std::alloc::Layout;
     use std::ptr::NonNull;
@@ -94,7 +94,7 @@ mod inner {
 }
 
 // No-defaults case: define a minimal Allocator trait and AllocError ourselves.
-#[cfg(not(any(feature = "nightly", feature = "allocator-api2")))]
+#[cfg(not(any(nightly, feature = "allocator-api2")))]
 mod inner {
     use core::fmt;
     use std::alloc::Layout;

@@ -2,15 +2,15 @@
 
 use crate::alloc::{AllocError, SharedAllocator};
 
-#[cfg(all(not(feature = "nightly"), feature = "allocator-api2"))]
+#[cfg(all(not(nightly), feature = "allocator-api2"))]
 use allocator_api2::collections::TryReserveError;
-#[cfg(not(all(not(feature = "nightly"), feature = "allocator-api2")))]
+#[cfg(not(all(not(nightly), feature = "allocator-api2")))]
 use std::collections::TryReserveError;
 
 #[expect(unused_imports)]
 pub(crate) use self::inner::*;
 
-#[cfg(feature = "nightly")]
+#[cfg(nightly)]
 mod inner {
     use super::TryReserveError;
     use crate::alloc::{AllocError, SharedAllocator};
@@ -143,7 +143,7 @@ mod inner {
     }
 }
 
-#[cfg(all(not(feature = "nightly"), feature = "allocator-api2"))]
+#[cfg(all(not(nightly), feature = "allocator-api2"))]
 mod inner {
     use super::TryReserveError;
     use crate::alloc::{AllocError, SharedAllocator};
@@ -280,7 +280,7 @@ mod inner {
     }
 }
 
-#[cfg(not(any(feature = "nightly", feature = "allocator-api2")))]
+#[cfg(not(any(nightly, feature = "allocator-api2")))]
 mod inner {
     use super::TryReserveError;
     use crate::alloc::{AllocError, SharedAllocator};

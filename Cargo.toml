@@ -204,7 +204,7 @@ codegen-units = 16        # Less cross-unit inlining
 inherits = "release-official"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
 
 [workspace.lints.clippy]
 or_fun_call = "deny"

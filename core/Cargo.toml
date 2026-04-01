@@ -18,7 +18,6 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "series", "encryption"]
-nightly = []
 allocator-api2 = ["dep:allocator-api2"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
