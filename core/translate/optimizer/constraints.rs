@@ -384,38 +384,50 @@ pub fn constraints_from_where_clause(
     schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Vec<TableConstraints>> {
-    let mut constraints = Vec::new();
+    let mut constraints = Vec::with_capacity(table_references.joined_tables().len());
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
     for table_reference in table_references.joined_tables() {
+        let table_name = table_reference.table.get_name();
+        let table_indexes = available_indexes.get(table_name);
         let rowid_alias_column = table_reference
             .columns()
             .iter()
             .position(|c| c.is_rowid_alias());
+        let usable_btree_index_count = table_indexes.map_or(0, |indexes| {
+            indexes
+                .iter()
+                // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
+                // pattern matching rather than btree index scans
+                .filter(|index| {
+                    index.index_method.is_none()
+                        && (index.where_clause.is_none()
+                            || can_use_partial_index(index, where_clause))
+                })
+                .count()
+        });
 
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
-            constraints: Vec::new(),
-            candidates: available_indexes
-                .get(table_reference.table.get_name())
-                .map_or(Vec::new(), |indexes| {
-                    indexes
-                        .iter()
-                        // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
-                        // pattern matching rather than btree index scans
-                        .filter(|index| index.index_method.is_none())
-                        .map(|index| ConstraintUseCandidate {
-                            index: Some(index.clone()),
-                            refs: Vec::new(),
-                        })
-                        .collect()
-                }),
+            constraints: Vec::with_capacity(where_clause.len()),
+            candidates: Vec::with_capacity(usable_btree_index_count + 1),
         };
         // Add a candidate for the rowid index, which is always available when the table has a rowid alias.
         cs.candidates.push(ConstraintUseCandidate {
             index: None,
-            refs: Vec::new(),
+            refs: Vec::with_capacity(1),
         });
+        if let Some(indexes) = table_indexes {
+            for index in indexes.iter().filter(|index| {
+                index.index_method.is_none()
+                    && (index.where_clause.is_none() || can_use_partial_index(index, where_clause))
+            }) {
+                cs.candidates.push(ConstraintUseCandidate {
+                    index: Some(index.clone()),
+                    refs: Vec::with_capacity(1),
+                });
+            }
+        }
 
         for (i, term) in where_clause.iter().enumerate() {
             // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
@@ -785,28 +797,23 @@ pub fn constraints_from_where_clause(
             if constraint.is_rowid
                 || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
             {
-                let rowid_candidate = cs
-                    .candidates
-                    .iter_mut()
-                    .find_map(|candidate| {
-                        if candidate.index.is_none() {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap();
-                rowid_candidate.refs.push(ConstraintRef {
+                cs.candidates[0].refs.push(ConstraintRef {
                     constraint_vec_pos: i,
                     index_col_pos: 0,
                     sort_order: SortOrder::Asc,
                 });
             }
-            for index in available_indexes
-                .get(table_reference.table.get_name())
-                .unwrap_or(&VecDeque::new())
+            let Some(indexes) = table_indexes else {
+                continue;
+            };
+            for (index, index_candidate) in indexes
                 .iter()
-                .filter(|idx| idx.index_method.is_none())
+                .filter(|index| {
+                    index.index_method.is_none()
+                        && (index.where_clause.is_none()
+                            || can_use_partial_index(index, where_clause))
+                })
+                .zip(cs.candidates.iter_mut().skip(1))
             {
                 if let Some(position_in_index) = match constraint.table_col_pos {
                     Some(pos) => index.column_table_pos_to_index_pos(pos),
@@ -844,21 +851,11 @@ pub fn constraints_from_where_clause(
                             continue;
                         }
                     }
-                    if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
-                        if candidate.index.as_ref().is_some_and(|i| {
-                            Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
-                        }) {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
-                    }) {
-                        index_candidate.refs.push(ConstraintRef {
-                            constraint_vec_pos: i,
-                            index_col_pos: position_in_index,
-                            sort_order: index.columns[position_in_index].order,
-                        });
-                    }
+                    index_candidate.refs.push(ConstraintRef {
+                        constraint_vec_pos: i,
+                        index_col_pos: position_in_index,
+                        sort_order: index.columns[position_in_index].order,
+                    });
                 }
             }
         }
@@ -997,7 +994,7 @@ pub fn usable_constraints_for_lhs_mask(
 ) -> Vec<RangeConstraintRef> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let mut usable: Vec<RangeConstraintRef> = Vec::new();
+    let mut usable: Vec<RangeConstraintRef> = Vec::with_capacity(refs.len());
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
