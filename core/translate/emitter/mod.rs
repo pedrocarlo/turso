@@ -287,7 +287,7 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> &'a Schema {
         self.schema
     }
 
