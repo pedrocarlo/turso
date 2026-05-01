@@ -9567,7 +9567,7 @@ pub fn op_idx_delete(
             state.active_op_state.idx_delete()
         );
         match state.active_op_state.idx_delete() {
-            Some(OpIdxDeleteState::Seeking) => {
+            OpIdxDeleteState::Seeking => {
                 let found = match seek_internal(
                     program,
                     state,
@@ -9601,9 +9601,9 @@ pub fn op_idx_delete(
                     state.active_op_state.clear();
                     return Ok(InsnFunctionStepResult::Step);
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Verifying);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
             }
-            Some(OpIdxDeleteState::Verifying) => {
+            OpIdxDeleteState::Verifying => {
                 let rowid = {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9618,9 +9618,9 @@ pub fn op_idx_delete(
                         "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
                     )));
                 }
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Deleting);
+                *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
             }
-            Some(OpIdxDeleteState::Deleting) => {
+            OpIdxDeleteState::Deleting => {
                 {
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
@@ -9631,9 +9631,6 @@ pub fn op_idx_delete(
                 state.pc += 1;
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
-            }
-            None => {
-                *state.active_op_state.idx_delete() = Some(OpIdxDeleteState::Seeking);
             }
         }
     }

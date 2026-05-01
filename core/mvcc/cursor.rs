@@ -143,6 +143,29 @@ impl<Clock: LogicalClock + 'static> ProvidesYieldContext for MvccLazyCursor<Cloc
     }
 }
 
+fn current_pos_matches_seek_key(
+    current_row_id: &RowKey,
+    seek_key: &SeekKey<'_>,
+    mv_cursor_type: &MvccCursorType,
+) -> Result<bool> {
+    Ok(match (current_row_id, seek_key) {
+        (RowKey::Int(current), SeekKey::TableRowId(target)) => *current == *target,
+        (RowKey::Record(current), SeekKey::IndexKey(target)) => {
+            let MvccCursorType::Index(index_info) = mv_cursor_type else {
+                return Ok(false);
+            };
+            let key_info: Vec<_> = index_info
+                .key_info
+                .iter()
+                .take(target.column_count())
+                .cloned()
+                .collect();
+            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+        }
+        _ => false,
+    })
+}
+
 #[cfg(any(test, injected_yields))]
 fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
@@ -400,12 +423,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(None));
                     };
                     {
-                        let mut record = self.get_immutable_record_or_create();
-                        let record = record.as_mut().ok_or_else(|| {
-                            LimboError::InternalError(
-                                "immutable record not initialized".to_string(),
-                            )
-                        })?;
+                        let record = self.get_immutable_record_or_create();
                         record.invalidate();
                         record.start_serialization(row.payload());
                     }
@@ -497,13 +515,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
     }
 
-    fn get_immutable_record_or_create(&mut self) -> Option<&mut ImmutableRecord> {
-        let reusable_immutable_record = &mut self.reusable_immutable_record;
-        if reusable_immutable_record.is_none() {
-            let record = ImmutableRecord::new(1024);
-            reusable_immutable_record.replace(record);
-        }
-        reusable_immutable_record.as_mut()
+    fn get_immutable_record_or_create(&mut self) -> &mut ImmutableRecord {
+        self.reusable_immutable_record
+            .get_or_insert_with(|| ImmutableRecord::new(1024))
     }
 
     fn get_current_pos(&self) -> CursorPosition {
@@ -1159,6 +1173,55 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // lt -> upper_bound bound excluded, we want last row before row_id
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
 
+        // Skip the seek and short-circuit to SeekResult::Found if the following are true:
+        //
+        // - the seek is eq_only
+        // - the cursor is already correctly positioned on a visible version
+        //
+        // This is because in the situation where the following are true:
+        //
+        // - the loop's seek is a range seek (not eq_only, ex: `DELETE ... WHERE a > 1000`)
+        // - the seek_key for the current iteration is in MvStore, but not in the b-tree
+        // - some matching rows are b-tree-resident. This can happen if there are inserts, then a
+        //   checkpoint (moving all previous rows to the b-tree), and then more inserts (only in MvStore).
+        //
+        // then the following problem could happen:
+        //
+        // 1. we seek to the first matching key using `SeekOp::GT { eq_only: false }`, so far so good.
+        // 2. op_idx_delete forces a eq_only seek on the cursor.
+        //    In the case of a delete using an index, this is redundant,
+        //    because the delete loop works by seeking the index and then Insn::DeferredSeek'ing the
+        //    table, so the index cursor is already correctly positioned.
+        // 3. we seek the mvcc cursor (self) and find the row
+        // 4. we seek btree_cursor, don't find the row, and set it to Exhausted immediately because
+        //    it's an eq_only seek, EVEN THOUGH the seek from step 1 would still have matched rows
+        //    in the b-tree.
+        // 5. eventually, the mvcc cursor runs out. When this happens, since btree_cursor is already
+        //    exhausted, current_pos becomes CursorPosition::End, and the next Insn::Next
+        //    INCORRECTLY finds the index cursor exhausted and breaks out of the delete loop, even
+        //    though there are still b-tree-resident rows to delete.
+        if self.state.is_none() && op.eq_only() {
+            if let CursorPosition::Loaded { row_id, .. } = &self.current_pos {
+                if current_pos_matches_seek_key(&row_id.row_id, &seek_key, &self.mv_cursor_type)? {
+                    let maybe_index_id = match &self.mv_cursor_type {
+                        MvccCursorType::Index(_) => Some(self.table_id),
+                        MvccCursorType::Table => None,
+                    };
+                    if self
+                        .db
+                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                        .is_some()
+                    {
+                        // We need to clear the null flag for the table cursor before seeking,
+                        // because it might have been set to false by an unmatched left-join row
+                        // during the previous iteration on the outer loop.
+                        self.set_null_flag(false);
+                        return Ok(IOResult::Done(SeekResult::Found));
+                    }
+                }
+            }
+        }
+
         loop {
             let state = self.state.clone();
             match state {
@@ -1169,8 +1232,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     self.reset_dual_peek();
                     self.invalidate_record();
                     // We need to clear the null flag for the table cursor before seeking,
-                    // because it might have been set to false by an unmatched left-join row during the previous iteration
-                    // on the outer loop.
+                    // because it might have been set to false by an unmatched left-join row
+                    // during the previous iteration on the outer loop.
                     self.set_null_flag(false);
 
                     let direction = op.iteration_direction();
@@ -1735,10 +1798,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn invalidate_record(&mut self) {
-        self.get_immutable_record_or_create()
-            .as_mut()
-            .expect("immutable record should be initialized")
-            .invalidate();
+        self.get_immutable_record_or_create().invalidate();
     }
 
     fn has_rowid(&self) -> bool {

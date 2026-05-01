@@ -683,6 +683,8 @@ impl<T> Sealed for Option<T> {}
 mod sealed {
     pub trait Sealed {}
 }
+#[allow(unused_imports)] //used in doc comments
+use crate::vdbe::insn::Insn;
 use sealed::Sealed;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2762,6 +2764,7 @@ impl Cursor {
         }
     }
 
+    /// Move the cursor to a synthetic null row. See [Insn::NullRow]
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
             Self::BTree(cursor) => cursor.set_null_flag(flag),
