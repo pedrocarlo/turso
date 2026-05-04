@@ -155,6 +155,36 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
 }
 
 #[test]
+fn mvcc_pragma_page_size_propagates_to_global_header() {
+    // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
+    // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
+    // pager but leaves global_header at the default 4 KiB. Ephemeral paths that derive the
+    // working page size from MvStore would then disagree with the pager's actual buffer size.
+    let db = MvccTestDb::new();
+
+    let initial = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        initial,
+        crate::storage::buffer_pool::BufferPool::DEFAULT_PAGE_SIZE as u32,
+        "global_header should start at the default page size"
+    );
+
+    db.conn.execute("PRAGMA page_size = 512").unwrap();
+
+    let after = db
+        .mvcc_store
+        .with_header(|h| h.page_size.get(), None)
+        .unwrap();
+    assert_eq!(
+        after, 512,
+        "PRAGMA page_size must propagate to MvStore.global_header"
+    );
+}
+
+#[test]
 fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     let db = MvccTestDb::new();
     db.conn

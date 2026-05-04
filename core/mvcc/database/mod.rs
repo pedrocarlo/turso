@@ -28,6 +28,7 @@ use crate::types::SeekResult;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
+use crate::PageSize;
 use crate::Result;
 use crate::ValueRef;
 use crate::{
@@ -3589,6 +3590,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let header = header.header.read();
         tracing::debug!("get_transaction_database_header read: header={:?}", header);
         *header
+    }
+
+    /// Update the cached global header's page size to match a fresh `PRAGMA page_size`.
+    ///
+    /// `global_header` is captured from the pager during MVCC bootstrap, before any PRAGMA
+    /// can run, so it always starts at the default 4 KiB. Subsequent transactions copy from
+    /// it, which means a `PRAGMA page_size = N` issued on the connection would otherwise be
+    /// invisible to MVCC header lookups even though the pager itself honors `N` for on-disk
+    /// page allocation. Only valid before any data has been written; matches the same
+    /// precondition `Connection::reset_page_size` enforces via `db.initialized()`.
+    pub fn set_global_page_size(&self, size: PageSize) {
+        let mut header = self.global_header.write();
+        if let Some(header) = header.as_mut() {
+            header.page_size = size;
+        }
     }
 
     pub fn with_header<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
