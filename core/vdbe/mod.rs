@@ -386,7 +386,7 @@ enum ActiveOpState {
     None,
     Delete(OpDeleteState),
     Destroy(OpDestroyState),
-    IdxDelete(Option<OpIdxDeleteState>),
+    IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
     Program(OpProgramState),
@@ -480,7 +480,12 @@ impl ActiveOpStateSlot {
         OpDestroyState,
         OpDestroyState::CreateCursor
     );
-    active_state_accessor!(idx_delete, IdxDelete, Option<OpIdxDeleteState>, None);
+    active_state_accessor!(
+        idx_delete,
+        IdxDelete,
+        OpIdxDeleteState,
+        OpIdxDeleteState::Seeking
+    );
     active_state_accessor!(
         integrity_check,
         IntegrityCheck,
