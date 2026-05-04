@@ -1,0 +1,41 @@
+@database :temp:
+@skip-file-if sqlite "run heavy test only on tursodb"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/5665:
+# large transactions used to drive a single pwrite/pwritev call past INT_MAX,
+# which Darwin rejects with EINVAL. UnixIO::pwrite/pwritev now cap each syscall
+# at INT_MAX bytes, so both the WAL and MVCC big-write paths complete.
+
+@backend cli
+test big-db {
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM t;
+}
+expect {
+   0|0|0
+   0|0|0
+   4194304
+}
+
+@backend cli
+test big-db-mvcc {
+    PRAGMA journal_mode='MVCC';
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 2 * 1024 * 1024);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM t;
+}
+expect {
+   mvcc
+   0|0|0
+   0|0|0
+   4194304
+}
