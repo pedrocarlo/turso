@@ -33,20 +33,6 @@ impl<T: Ord> TursoBinaryHeapExt<T> for BinaryHeap<T> {
         self.push(value);
         Ok(())
     }
-
-    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
-        for value in iter {
-            self.try_push(value)?;
-        }
-        Ok(())
-    }
 }
 
 impl<T: Ord> TursoTryWithCapacityExt for BinaryHeap<T> {
@@ -72,6 +58,20 @@ impl<T: Ord> TursoFromIterator<T> for BinaryHeap<T> {
             values.try_push(value)?;
         }
         Ok(values)
+    }
+
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        self.try_reserve(upper.unwrap_or(lower))
+            .map_err(TryReserveError::from)?;
+        for value in iter {
+            self.try_push(value)?;
+        }
+        Ok(())
     }
 }
 

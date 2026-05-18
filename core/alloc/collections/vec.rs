@@ -25,20 +25,6 @@ impl<T> TursoVecExt<T> for Vec<T> {
         self.push(value);
         Ok(())
     }
-
-    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
-    where
-        I: IntoIterator<Item = T>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
-        for value in iter {
-            self.try_push(value)?;
-        }
-        Ok(())
-    }
 }
 
 impl<T> TursoTryWithCapacityExt for Vec<T> {
@@ -72,6 +58,20 @@ impl<T> TursoFromIterator<T> for Vec<T> {
             values.try_push(value)?;
         }
         Ok(values)
+    }
+
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        self.try_reserve(upper.unwrap_or(lower))
+            .map_err(TryReserveError::from)?;
+        for value in iter {
+            self.try_push(value)?;
+        }
+        Ok(())
     }
 }
 

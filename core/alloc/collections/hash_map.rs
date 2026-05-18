@@ -25,20 +25,6 @@ where
         self.try_reserve(1).map_err(TryReserveError::from)?;
         Ok(self.insert(key, value))
     }
-
-    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
-    where
-        I: IntoIterator<Item = (K, V)>,
-    {
-        let iter = iter.into_iter();
-        let (lower, upper) = iter.size_hint();
-        self.try_reserve(upper.unwrap_or(lower))
-            .map_err(TryReserveError::from)?;
-        for (key, value) in iter {
-            TursoHashMapExt::try_insert(self, key, value)?;
-        }
-        Ok(())
-    }
 }
 
 impl<K, V, S> TursoTryWithCapacityExt for HashMap<K, V, S>
@@ -72,6 +58,20 @@ where
             TursoHashMapExt::try_insert(&mut values, key, value)?;
         }
         Ok(values)
+    }
+
+    fn try_extend<I>(&mut self, iter: I) -> Result<(), TryReserveError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        self.try_reserve(upper.unwrap_or(lower))
+            .map_err(TryReserveError::from)?;
+        for (key, value) in iter {
+            TursoHashMapExt::try_insert(self, key, value)?;
+        }
+        Ok(())
     }
 }
 
