@@ -15,7 +15,6 @@ use crate::mvcc::persistent_storage::logical_log::{
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
-use crate::state_machine::{StateTransition, TransitionResult};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
@@ -23,7 +22,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
-use crate::types::ImmutableRecordRef;
+use crate::types::{IOResult, ImmutableRecordRef};
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
     Buffer, Completion, DatabaseOpts, EncryptionKey, LimboError, OpenFlags, StatementStatusCounter,
@@ -600,6 +599,19 @@ pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
     ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap()
 }
 
+fn step_checkpoint_for_test(
+    checkpoint_sm: &mut CheckpointStateMachine<MvccClock>,
+    pager: &Pager,
+) -> bool {
+    match crate::sans_io::StateMachine::step(checkpoint_sm, ()).unwrap() {
+        crate::sans_io::Step::Wait(request) => {
+            request.submit().unwrap().wait(pager.io.as_ref()).unwrap();
+            false
+        }
+        crate::sans_io::Step::Emit(_) | crate::sans_io::Step::Done(_) => true,
+    }
+}
+
 fn advance_checkpoint_until_wal_has_commit_frame(
     mvcc_store: Arc<MvStore<MvccClock>>,
     conn: &Arc<Connection>,
@@ -629,12 +641,8 @@ fn advance_checkpoint_until_wal_has_commit_frame(
             return;
         }
 
-        match checkpoint_sm.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                panic!("checkpoint finalized before WAL had committed frames")
-            }
+        if step_checkpoint_for_test(&mut checkpoint_sm, pager.as_ref()) {
+            panic!("checkpoint finalized before WAL had committed frames");
         }
     }
 
@@ -1593,13 +1601,9 @@ fn test_checkpoint_truncates_wal_last() {
             );
         }
 
-        match checkpoint_sm.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                finished = true;
-                break;
-            }
+        if step_checkpoint_for_test(&mut checkpoint_sm, pager.as_ref()) {
+            finished = true;
+            break;
         }
     }
 
@@ -2304,12 +2308,8 @@ fn test_meta_checkpoint_case_10_metadata_upsert_is_atomic_with_pager_commit() {
             if checkpoint_sm.state_for_test() == CheckpointState::CheckpointWal {
                 break;
             }
-            match checkpoint_sm.step(&()).unwrap() {
-                TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-                TransitionResult::Continue => {}
-                TransitionResult::Done(_) => {
-                    panic!("checkpoint finished before expected stop window")
-                }
+            if step_checkpoint_for_test(&mut checkpoint_sm, pager.as_ref()) {
+                panic!("checkpoint finished before expected stop window");
             }
         }
     }
@@ -2677,12 +2677,8 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
             reached_truncate = true;
             break; // Simulate checkpoint aborting before log truncation
         }
-        match checkpoint_sm.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                panic!("checkpoint finished before reaching truncate state")
-            }
+        if step_checkpoint_for_test(&mut checkpoint_sm, pager.as_ref()) {
+            panic!("checkpoint finished before reaching truncate state");
         }
     }
     assert!(
@@ -2786,12 +2782,8 @@ fn test_checkpoint_resamples_boundary_before_starting() {
             reached_wal_checkpoint = true;
             break;
         }
-        match interrupted_checkpoint.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(interrupted_pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                panic!("checkpoint finished before reaching WAL checkpoint")
-            }
+        if step_checkpoint_for_test(&mut interrupted_checkpoint, interrupted_pager.as_ref()) {
+            panic!("checkpoint finished before reaching WAL checkpoint");
         }
     }
     assert!(
@@ -2806,13 +2798,9 @@ fn test_checkpoint_resamples_boundary_before_starting() {
 
     let mut finished = false;
     for _ in 0..50_000 {
-        match delayed_checkpoint.step(&()).unwrap() {
-            TransitionResult::Io(io) => io.wait(delayed_pager.io.as_ref()).unwrap(),
-            TransitionResult::Continue => {}
-            TransitionResult::Done(_) => {
-                finished = true;
-                break;
-            }
+        if step_checkpoint_for_test(&mut delayed_checkpoint, delayed_pager.as_ref()) {
+            finished = true;
+            break;
         }
     }
     assert!(finished, "delayed checkpoint did not finish");
@@ -6622,9 +6610,11 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         .write_row_to_pager(&row, cursor.clone(), true)
         .unwrap();
     loop {
-        match write_row_sm.step(&()).unwrap() {
-            IOResult::Done(()) => break,
-            IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
+        match crate::sans_io::StateMachine::step(&mut write_row_sm, ()).unwrap() {
+            crate::sans_io::Step::Emit(()) | crate::sans_io::Step::Done(()) => break,
+            crate::sans_io::Step::Wait(request) => {
+                request.submit().unwrap().wait(pager.io.as_ref()).unwrap();
+            }
         }
     }
     run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();

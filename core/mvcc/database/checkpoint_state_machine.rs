@@ -1,3 +1,4 @@
+use crate::io_ops::IoRequest;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -6,9 +7,9 @@ use crate::mvcc::database::{
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
+use crate::mvcc::yield_points::inject_transition_failure;
+use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::schema::Index;
-use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
@@ -75,6 +76,12 @@ pub enum CheckpointState {
         lwm: u64,
     },
     Finalize,
+}
+
+enum CheckpointTransition {
+    Continue,
+    Wait(IoRequest),
+    Done(CheckpointResult),
 }
 
 #[cfg(any(test, injected_yields))]
@@ -144,9 +151,9 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
     write_set: Vec<(RowVersion, Option<SpecialWrite>)>,
     /// State machine for writing rows to the B-tree
-    write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
+    write_row_state_machine: Option<WriteRowStateMachine>,
     /// State machine for deleting rows from the B-tree
-    delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
+    delete_row_state_machine: Option<DeleteRowStateMachine>,
     /// Cursors for the B-trees
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     /// Tables or indexes that were created in this checkpoint
@@ -300,6 +307,23 @@ fn is_schema_metadata_only_rewrite(current: &RowVersion, next: Option<&RowVersio
 }
 
 impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
+    #[cfg(any(test, injected_yields))]
+    fn maybe_inject_yield(&self, point: CheckpointYieldPoint) -> Option<CheckpointTransition> {
+        let yield_context = self.yield_context();
+        let should_yield = yield_context.injector.as_ref().is_some_and(|injector| {
+            injector.should_yield(
+                yield_context.instance_id,
+                yield_context.selection_key,
+                point.point(),
+            )
+        });
+        if should_yield {
+            tracing::debug!(?point, "injecting MVCC yield");
+            return Some(CheckpointTransition::Wait(IoRequest::yield_now()));
+        }
+        None
+    }
+
     fn refresh_checkpoint_bounds(&mut self) {
         let durable_tx_max = self.mvstore.durable_txid_max.load(Ordering::SeqCst);
         self.durable_txid_max_old = NonZeroU64::new(durable_tx_max);
@@ -1125,10 +1149,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         Ok(())
     }
 
-    fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
+    fn step_inner(&mut self, _context: &()) -> Result<CheckpointTransition> {
         match &self.state {
             CheckpointState::AcquireLock => {
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+                #[cfg(any(test, injected_yields))]
+                if let Some(transition) =
+                    self.maybe_inject_yield(CheckpointYieldPoint::BeforeAcquireLock)
+                {
+                    return Ok(transition);
+                }
 
                 tracing::debug!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
@@ -1142,19 +1171,19 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // index deletes are not replayed.
                 self.refresh_checkpoint_bounds();
                 self.state = CheckpointState::CollectTableRows;
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
             CheckpointState::CollectTableRows => {
                 if let Some(io) = self.collect_table_rows() {
-                    return Ok(TransitionResult::Io(io));
+                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
                 }
                 tracing::debug!("Collected {} committed versions", self.write_set.len());
                 self.state = CheckpointState::CollectIndexRows;
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
             CheckpointState::CollectIndexRows => {
                 if let Some(io) = self.collect_index_rows() {
-                    return Ok(TransitionResult::Io(io));
+                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
@@ -1184,7 +1213,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 } else {
                     self.state = CheckpointState::BeginPagerTxn;
                 }
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
             CheckpointState::BeginPagerTxn => {
                 tracing::debug!("Beginning pager transaction");
@@ -1212,7 +1241,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     write_set_index: 0,
                     requires_seek: true,
                 };
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
 
             CheckpointState::WriteRow {
@@ -1234,7 +1263,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             requires_seek: true,
                         };
                     }
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 let (num_columns, table_id, special_write) = {
@@ -1373,7 +1402,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         write_set_index: write_set_index + 1,
                         requires_seek: true,
                     };
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 let root_page = {
@@ -1501,7 +1530,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
-                        return Ok(TransitionResult::Continue);
+                        return Ok(CheckpointTransition::Continue);
                     }
                     let state_machine = self
                         .mvstore
@@ -1517,7 +1546,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     self.state = CheckpointState::WriteRowStateMachine { write_set_index };
                 }
 
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
 
             CheckpointState::WriteRowStateMachine { write_set_index } => {
@@ -1529,15 +1558,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match write_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
+                match SansIoStateMachine::step(write_row_state_machine, ())? {
+                    SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
+                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
                         let requires_seek = self.next_requires_seek_after_insert(write_set_index);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek,
                         };
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
                 }
             }
@@ -1551,14 +1580,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match delete_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
+                match SansIoStateMachine::step(delete_row_state_machine, ())? {
+                    SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
+                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
                 }
             }
@@ -1573,7 +1602,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if index_write_set_index >= self.index_write_set.len() {
                     // Done writing all index rows
                     self.state = CheckpointState::CommitPagerTxn;
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 let (index_id, row_version, is_delete) =
@@ -1585,7 +1614,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         index_write_set_index: index_write_set_index + 1,
                         requires_seek: true,
                     };
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 // Get Index struct - it should exist for all indexes we're checkpointing
@@ -1633,7 +1662,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
-                        return Ok(TransitionResult::Continue);
+                        return Ok(CheckpointTransition::Continue);
                     }
                     let state_machine = self
                         .mvstore
@@ -1653,7 +1682,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     };
                 }
 
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
 
             CheckpointState::WriteIndexRowStateMachine {
@@ -1667,14 +1696,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match write_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
+                match SansIoStateMachine::step(write_row_state_machine, ())? {
+                    SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
+                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
                 }
             }
@@ -1690,14 +1719,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match delete_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
+                match SansIoStateMachine::step(delete_row_state_machine, ())? {
+                    SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
+                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
                 }
             }
@@ -1762,13 +1791,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             self,
                             CheckpointYieldPoint::AfterDurableBoundaryAdvanced
                         );
-                        inject_transition_yield!(
-                            self,
-                            CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                        );
-                        Ok(TransitionResult::Continue)
+                        #[cfg(any(test, injected_yields))]
+                        if let Some(transition) = self
+                            .maybe_inject_yield(CheckpointYieldPoint::AfterDurableBoundaryAdvanced)
+                        {
+                            return Ok(transition);
+                        }
+                        Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
                 }
             }
 
@@ -1778,9 +1809,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+                    Ok(CheckpointTransition::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(CheckpointTransition::Wait(IoRequest::submitted(
+                        IOCompletions::Single(c),
+                    )))
                 }
             }
 
@@ -1789,16 +1822,18 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
                     self.state = CheckpointState::TruncateWal;
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::TruncateWal;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+                    Ok(CheckpointTransition::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(CheckpointTransition::Wait(IoRequest::submitted(
+                        IOCompletions::Single(c),
+                    )))
                 }
             }
 
@@ -1808,9 +1843,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
                 }
             }
 
@@ -1821,7 +1856,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of database file (synchronous=off)");
                     self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 let checkpoint_result = self
@@ -1832,13 +1867,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Only sync if we actually backfilled any frames
                 if checkpoint_result.wal_checkpoint_backfilled == 0 {
                     self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 // Check if we already sent the sync
                 if checkpoint_result.db_sync_sent {
                     self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CheckpointTransition::Continue);
                 }
 
                 tracing::debug!("Fsyncing database file before WAL truncation");
@@ -1847,7 +1882,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .db_file
                     .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
-                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                Ok(CheckpointTransition::Wait(IoRequest::submitted(
+                    IOCompletions::Single(c),
+                )))
             }
 
             CheckpointState::TruncateWal => {
@@ -1872,37 +1909,36 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .store(self.durable_txid_max_new, Ordering::SeqCst);
                         let lwm = self.mvstore.compute_lwm();
                         self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
-                        Ok(TransitionResult::Continue)
+                        Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
                 }
             }
 
             CheckpointState::GcTableRows { .. } => {
                 if let Some(io) = self.gc_checkpointed_table_versions() {
-                    return Ok(TransitionResult::Io(io));
+                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
                 }
                 let CheckpointState::GcTableRows { lwm, .. } = self.state else {
                     unreachable!("state is GcTableRows here");
                 };
                 self.state = CheckpointState::GcIndexRows { next_index: 0, lwm };
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
 
             CheckpointState::GcIndexRows { .. } => {
                 if let Some(io) = self.gc_checkpointed_index_versions() {
-                    return Ok(TransitionResult::Io(io));
+                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
                 }
                 self.state = CheckpointState::Finalize;
-                Ok(TransitionResult::Continue)
+                Ok(CheckpointTransition::Continue)
             }
 
             CheckpointState::Finalize => {
                 tracing::debug!("Releasing blocking checkpoint lock");
                 self.mvstore.drop_unused_row_versions();
                 self.checkpoint_lock.unlock();
-                self.finalize(&())?;
-                Ok(TransitionResult::Done(
+                Ok(CheckpointTransition::Done(
                     self.checkpoint_result.take().ok_or_else(|| {
                         LimboError::InternalError("checkpoint_result not set".to_string())
                     })?,
@@ -1912,37 +1948,35 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
-    type Context = ();
-    type SMResult = CheckpointResult;
+impl<Clock: LogicalClock> SansIoStateMachine<()> for CheckpointStateMachine<Clock> {
+    type Event = ();
+    type Signal = IoRequest;
+    type Output = CheckpointResult;
+    type Error = LimboError;
 
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        let res = self.step_inner(&());
-        match res {
-            Err(ref err) => {
-                self.mvstore
-                    .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
-                tracing::debug!("Error in checkpoint state machine: {err}");
-                self.cleanup_after_external_io_error();
-                res
+    fn step(&mut self, _input: ()) -> Result<SansIoStep<Self::Event, Self::Signal, Self::Output>> {
+        loop {
+            match self.step_inner(&()) {
+                Err(err) => {
+                    self.mvstore
+                        .storage
+                        .on_checkpoint_end(self.durable_txid_max_new, Err(err.clone()))?;
+                    tracing::debug!("Error in checkpoint state machine: {err}");
+                    self.cleanup_after_external_io_error();
+                    return Err(err);
+                }
+                Ok(CheckpointTransition::Done(result)) => {
+                    self.mvstore
+                        .storage
+                        .on_checkpoint_end(self.durable_txid_max_new, Ok(&result))?;
+                    return Ok(SansIoStep::Done(result));
+                }
+                Ok(CheckpointTransition::Wait(request)) => {
+                    return Ok(SansIoStep::Wait(request));
+                }
+                Ok(CheckpointTransition::Continue) => {}
             }
-            Ok(TransitionResult::Done(ref result)) => {
-                self.mvstore
-                    .storage
-                    .on_checkpoint_end(self.durable_txid_max_new, Ok(result))?;
-                res
-            }
-            Ok(result) => Ok(result),
         }
-    }
-
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_finalized(&self) -> bool {
-        matches!(self.state, CheckpointState::Finalize)
     }
 }
 

@@ -6,11 +6,11 @@ use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
+use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
-use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
@@ -601,7 +601,6 @@ pub fn op_checkpoint(
                 "Only TRUNCATE checkpoint mode is supported for MVCC".to_string(),
             ));
         }
-        use crate::state_machine::{StateTransition, TransitionResult};
         let mut ckpt_sm = CheckpointStateMachine::new(
             pager.clone(),
             mv_store.clone(),
@@ -614,11 +613,14 @@ pub fn op_checkpoint(
             wal_total_backfilled,
             ..
         } = loop {
-            match ckpt_sm.step(&()) {
-                Ok(TransitionResult::Continue) => {}
-                Ok(TransitionResult::Done(result)) => break result,
-                Ok(TransitionResult::Io(iocompletions)) => {
-                    if let Err(err) = iocompletions.wait(pager.io.as_ref()) {
+            match SansIoStateMachine::step(&mut ckpt_sm, ()) {
+                Ok(SansIoStep::Done(result)) => break result,
+                Ok(SansIoStep::Emit(())) => {
+                    unreachable!("checkpoint state machine must not emit non-terminal events")
+                }
+                Ok(SansIoStep::Wait(request)) => {
+                    let wait_result = request.submit().and_then(|io| io.wait(pager.io.as_ref()));
+                    if let Err(err) = wait_result {
                         ckpt_sm.cleanup_after_external_io_error();
                         return Err(err);
                     }
@@ -14814,7 +14816,7 @@ pub struct OpJournalModeState {
     /// The new journal mode we're changing to
     pub new_mode: Option<journal_mode::JournalMode>,
     /// Checkpoint state machine for MVCC mode
-    pub checkpoint_sm: Option<StateMachine<Box<CheckpointStateMachine<MvccClock>>>>,
+    pub checkpoint_sm: Option<CheckpointStateMachine<MvccClock>>,
     /// Page reference for writing header
     pub page_ref: Option<PageRef>,
 }
@@ -14922,13 +14924,13 @@ fn op_journal_mode_inner(
                     // MVCC checkpoint using state machine
                     if state.active_op_state.journal_mode().checkpoint_sm.is_none() {
                         state.active_op_state.journal_mode().checkpoint_sm =
-                            Some(StateMachine::new(Box::new(CheckpointStateMachine::new(
+                            Some(CheckpointStateMachine::new(
                                 pager.clone(),
                                 mv_store.clone(),
                                 program.connection.clone(),
                                 true,
                                 program.connection.get_sync_mode(),
-                            ))));
+                            ));
                     }
 
                     let ckpt_sm = state
@@ -14937,10 +14939,21 @@ fn op_journal_mode_inner(
                         .checkpoint_sm
                         .as_mut()
                         .unwrap();
-                    return_if_io!(ckpt_sm.step(&()));
-                    state.active_op_state.journal_mode().checkpoint_sm = None;
-                    state.active_op_state.journal_mode().sub_state =
-                        OpJournalModeSubState::UpdateHeader;
+                    match SansIoStateMachine::step(ckpt_sm, ())? {
+                        SansIoStep::Wait(request) => {
+                            return Ok(InsnFunctionStepResult::IO(request))
+                        }
+                        SansIoStep::Done(_) => {
+                            state.active_op_state.journal_mode().checkpoint_sm = None;
+                            state.active_op_state.journal_mode().sub_state =
+                                OpJournalModeSubState::UpdateHeader;
+                        }
+                        SansIoStep::Emit(()) => {
+                            unreachable!(
+                                "checkpoint state machine must not emit non-terminal events"
+                            )
+                        }
+                    }
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(

@@ -1,8 +1,10 @@
+use crate::io_ops::IoRequest;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
+use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::schema::{Schema, Table};
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
@@ -21,7 +23,6 @@ use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
-use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
@@ -1179,7 +1180,7 @@ pub enum CommitState<Clock: LogicalClock> {
     Checkpoint {
         // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
         // the mutex
-        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock>>>,
+        state_machine: Mutex<CheckpointStateMachine<Clock>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -1387,10 +1388,7 @@ pub struct DeleteRowStateMachine {
 impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     pub(crate) fn cleanup_mvcc_checkpoint_state(&mut self) {
         if let CommitState::Checkpoint { state_machine } = &mut self.state {
-            state_machine
-                .lock()
-                .inner_mut()
-                .cleanup_after_external_io_error();
+            state_machine.lock().cleanup_after_external_io_error();
         }
     }
 
@@ -3037,13 +3035,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if mvcc_store.storage.should_checkpoint() {
-                    let state_machine = StateMachine::new(CheckpointStateMachine::new(
+                    let state_machine = CheckpointStateMachine::new(
                         self.pager.clone(),
                         mvcc_store.clone(),
                         self.connection.clone(),
                         false,
                         self.connection.get_sync_mode(),
-                    ));
+                    );
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
@@ -3055,12 +3053,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
                     let mut sm = state_machine.lock();
-                    sm.step(&())
+                    SansIoStateMachine::step(&mut *sm, ())
                 };
                 match step_result {
-                    Ok(IOResult::Done(_)) => {}
-                    Ok(IOResult::IO(iocompletions)) => {
-                        return Ok(TransitionResult::Io(iocompletions));
+                    Ok(SansIoStep::Emit(_)) | Ok(SansIoStep::Done(_)) => {}
+                    Ok(SansIoStep::Wait(request)) => {
+                        return Ok(TransitionResult::Io(request.submit()?));
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
@@ -3085,161 +3083,149 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
     }
 }
 
-impl StateTransition for WriteRowStateMachine {
-    type Context = ();
-    type SMResult = ();
+impl SansIoStateMachine<()> for WriteRowStateMachine {
+    type Event = ();
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::DEBUG)]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    #[tracing::instrument(fields(state = ?self.state), skip(self, _input), level = Level::DEBUG)]
+    fn step(&mut self, _input: ()) -> Result<SansIoStep<Self::Event, Self::Signal, Self::Output>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
-        match self.state {
-            WriteRowState::Initial => {
-                // Create the record and key
-                self.record = if self.row.is_index_row() {
-                    None
-                } else {
-                    let row_data = self.row.data.as_ref().expect("table rows should have data");
-                    let mut record = ImmutableRecord::new(row_data.len())?;
-                    record.start_serialization(row_data)?;
-                    Some(record)
-                };
-                if self.requires_seek {
-                    self.state = WriteRowState::Seek;
-                } else {
-                    self.state = WriteRowState::Insert;
+        loop {
+            match self.state {
+                WriteRowState::Initial => {
+                    self.record = if self.row.is_index_row() {
+                        None
+                    } else {
+                        let row_data = self.row.data.as_ref().expect("table rows should have data");
+                        let mut record = ImmutableRecord::new(row_data.len())?;
+                        record.start_serialization(row_data)?;
+                        Some(record)
+                    };
+                    if self.requires_seek {
+                        self.state = WriteRowState::Seek;
+                    } else {
+                        self.state = WriteRowState::Insert;
+                    }
                 }
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Seek => {
-                // Position the cursor by seeking to the row position
-                let seek_key = match &self.row.id.row_id {
-                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
-                };
+                WriteRowState::Seek => {
+                    let seek_key = match &self.row.id.row_id {
+                        RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+                        RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                    };
 
-                match self
-                    .cursor
-                    .write()
-                    .seek(seek_key, SeekOp::GE { eq_only: true })?
-                {
-                    IOResult::Done(seek_result) => {
-                        if self.row.is_index_row() && matches!(seek_result, SeekResult::TryAdvance)
-                        {
-                            self.state = WriteRowState::Advance;
-                            return Ok(TransitionResult::Continue);
+                    match self
+                        .cursor
+                        .write()
+                        .seek(seek_key, SeekOp::GE { eq_only: true })?
+                    {
+                        IOResult::Done(seek_result) => {
+                            if self.row.is_index_row()
+                                && matches!(seek_result, SeekResult::TryAdvance)
+                            {
+                                self.state = WriteRowState::Advance;
+                                continue;
+                            }
+                        }
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
                         }
                     }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
+                    turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
+                    self.state = WriteRowState::Insert;
                 }
-                turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
-                self.state = WriteRowState::Insert;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Advance => {
-                match self
-                    .cursor
-                    .write()
-                    .next()
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                WriteRowState::Advance => {
+                    match self
+                        .cursor
+                        .write()
+                        .next()
+                        .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                    {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                        }
                     }
+                    turso_assert!(
+                        self.cursor.read().has_record(),
+                        "MVCC checkpoint index insert did not land on the matched interior record"
+                    );
+                    self.state = WriteRowState::Insert;
                 }
-                turso_assert!(
-                    self.cursor.read().has_record(),
-                    "MVCC checkpoint index insert did not land on the matched interior record"
-                );
-                self.state = WriteRowState::Insert;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Insert => {
-                // Insert the record into the B-tree
-                let key = match &self.row.id.row_id {
-                    RowKey::Int(row_id) => BTreeKey::new_table_rowid(*row_id, self.record.as_ref()),
-                    RowKey::Record(record) => BTreeKey::new_index_key(&record.key),
-                };
+                WriteRowState::Insert => {
+                    let key = match &self.row.id.row_id {
+                        RowKey::Int(row_id) => {
+                            BTreeKey::new_table_rowid(*row_id, self.record.as_ref())
+                        }
+                        RowKey::Record(record) => BTreeKey::new_index_key(&record.key),
+                    };
 
-                match self
-                    .cursor
-                    .write()
-                    .insert(&key)
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(()) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                    match self
+                        .cursor
+                        .write()
+                        .insert(&key)
+                        .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                    {
+                        IOResult::Done(()) => {}
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                        }
                     }
+                    self.state = WriteRowState::Next;
                 }
-                self.state = WriteRowState::Next;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Next => {
-                match self
-                    .cursor
-                    .write()
-                    .next()
-                    .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                WriteRowState::Next => {
+                    match self
+                        .cursor
+                        .write()
+                        .next()
+                        .map_err(|e: LimboError| LimboError::InternalError(e.to_string()))?
+                    {
+                        IOResult::Done(_) => {}
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                        }
                     }
+                    self.is_finalized = true;
+                    return Ok(SansIoStep::Done(()));
                 }
-                self.finalize(&())?;
-                Ok(TransitionResult::Done(()))
             }
         }
     }
-
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
-        self.is_finalized = true;
-        Ok(())
-    }
-
-    fn is_finalized(&self) -> bool {
-        self.is_finalized
-    }
 }
 
-impl StateTransition for DeleteRowStateMachine {
-    type Context = ();
-    type SMResult = ();
+impl SansIoStateMachine<()> for DeleteRowStateMachine {
+    type Event = ();
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context))]
-    fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    #[tracing::instrument(fields(state = ?self.state), skip(self, _input))]
+    fn step(&mut self, _input: ()) -> Result<SansIoStep<Self::Event, Self::Signal, Self::Output>> {
         use crate::types::{IOResult, SeekKey, SeekOp};
 
-        match self.state {
-            DeleteRowState::Initial => {
-                self.state = DeleteRowState::Seek;
-                Ok(TransitionResult::Continue)
-            }
-            DeleteRowState::Seek => {
-                let seek_key = match &self.rowid.row_id {
-                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(&record.key),
-                };
+        loop {
+            match self.state {
+                DeleteRowState::Initial => {
+                    self.state = DeleteRowState::Seek;
+                }
+                DeleteRowState::Seek => {
+                    let seek_key = match &self.rowid.row_id {
+                        RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+                        RowKey::Record(record) => SeekKey::IndexKey(&record.key),
+                    };
 
-                match self
-                    .cursor
-                    .write()
-                    .seek(seek_key, SeekOp::GE { eq_only: true })?
-                {
-                    IOResult::Done(seek_res) => {
-                        match seek_res {
+                    match self
+                        .cursor
+                        .write()
+                        .seek(seek_key, SeekOp::GE { eq_only: true })?
+                    {
+                        IOResult::Done(seek_res) => match seek_res {
                             SeekResult::Found => {
                                 self.state = DeleteRowState::Delete;
                             }
                             SeekResult::TryAdvance => {
-                                // In index B-trees, the key can reside in an interior node
-                                // rather than a leaf. The seek descends to the leaf but
-                                // doesn't find it there, returning TryAdvance. Advancing
-                                // the cursor will move up to the interior cell.
                                 self.state = DeleteRowState::Advance;
                             }
                             SeekResult::NotFound => {
@@ -3248,64 +3234,51 @@ impl StateTransition for DeleteRowStateMachine {
                                     self.rowid.row_id
                                 );
                             }
+                        },
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
                         }
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
                     }
                 }
-            }
-            DeleteRowState::Advance => {
-                let next_result = self.cursor.write().next()?;
-                match next_result {
-                    IOResult::Done(()) => {
-                        if !self.cursor.read().has_record() {
-                            crate::bail_corrupt_error!(
-                                "MVCC delete: rowid {} not found after advance",
-                                self.rowid.row_id
-                            );
+                DeleteRowState::Advance => {
+                    let next_result = self.cursor.write().next()?;
+                    match next_result {
+                        IOResult::Done(()) => {
+                            if !self.cursor.read().has_record() {
+                                crate::bail_corrupt_error!(
+                                    "MVCC delete: rowid {} not found after advance",
+                                    self.rowid.row_id
+                                );
+                            }
+                            self.state = DeleteRowState::Delete;
                         }
-                        self.state = DeleteRowState::Delete;
-                        Ok(TransitionResult::Continue)
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                        }
                     }
                 }
-            }
-            DeleteRowState::Delete => {
-                // Insert the record into the B-tree
-
-                match self
-                    .cursor
-                    .write()
-                    .delete()
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
-                {
-                    IOResult::Done(()) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
+                DeleteRowState::Delete => {
+                    match self
+                        .cursor
+                        .write()
+                        .delete()
+                        .map_err(|e| LimboError::InternalError(e.to_string()))?
+                    {
+                        IOResult::Done(()) => {}
+                        IOResult::IO(io) => {
+                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                        }
                     }
+                    tracing::trace!(
+                        "delete_row_from_pager(table_id={}, row_id={})",
+                        self.rowid.table_id,
+                        self.rowid.row_id
+                    );
+                    self.is_finalized = true;
+                    return Ok(SansIoStep::Done(()));
                 }
-                tracing::trace!(
-                    "delete_row_from_pager(table_id={}, row_id={})",
-                    self.rowid.table_id,
-                    self.rowid.row_id
-                );
-                self.finalize(&())?;
-                Ok(TransitionResult::Done(()))
             }
         }
-    }
-
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
-        self.is_finalized = true;
-        Ok(())
-    }
-
-    fn is_finalized(&self) -> bool {
-        self.is_finalized
     }
 }
 
@@ -5645,26 +5618,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row: &Row,
         cursor: Arc<RwLock<BTreeCursor>>,
         requires_seek: bool,
-    ) -> Result<StateMachine<WriteRowStateMachine>> {
-        let state_machine: StateMachine<WriteRowStateMachine> =
-            StateMachine::<WriteRowStateMachine>::new(WriteRowStateMachine::new(
-                row.clone(),
-                cursor,
-                requires_seek,
-            ));
-
-        Ok(state_machine)
+    ) -> Result<WriteRowStateMachine> {
+        Ok(WriteRowStateMachine::new(
+            row.clone(),
+            cursor,
+            requires_seek,
+        ))
     }
 
     pub fn delete_row_from_pager(
         &self,
         rowid: RowID,
         cursor: Arc<RwLock<BTreeCursor>>,
-    ) -> Result<StateMachine<DeleteRowStateMachine>> {
-        let state_machine: StateMachine<DeleteRowStateMachine> =
-            StateMachine::<DeleteRowStateMachine>::new(DeleteRowStateMachine::new(rowid, cursor));
-
-        Ok(state_machine)
+    ) -> Result<DeleteRowStateMachine> {
+        Ok(DeleteRowStateMachine::new(rowid, cursor))
     }
 
     pub fn get_last_table_rowid(

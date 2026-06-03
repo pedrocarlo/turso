@@ -10,9 +10,13 @@ use crate::Result;
 pub trait StateMachine<Input> {
     type Event;
     type Signal;
+    type Output;
     type Error: Error + Send + Sync + 'static;
 
-    fn step(&mut self, input: Input) -> Result<Step<Self::Event, Self::Signal>, Self::Error>;
+    fn step(
+        &mut self,
+        input: Input,
+    ) -> Result<Step<Self::Event, Self::Signal, Self::Output>, Self::Error>;
 
     fn close(&mut self) -> Result<(), Self::Error> {
         Ok(())
@@ -21,13 +25,13 @@ pub trait StateMachine<Input> {
 
 /// One finite step produced by a [`StateMachine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Step<Event, Signal> {
+pub enum Step<Event, Signal, Output> {
     /// The core has an event for the adapter or application to process.
     Emit(Event),
     /// The core cannot make progress until this signal is satisfied.
     Wait(Signal),
-    /// The machine has reached a terminal state.
-    Done,
+    /// The machine has reached a terminal state and produced its result.
+    Done(Output),
 }
 
 /// Async adapter hook for state-machine wait signals.

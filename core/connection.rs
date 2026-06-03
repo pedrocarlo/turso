@@ -1625,7 +1625,7 @@ impl Connection {
 
     pub fn checkpoint(self: &Arc<Self>, mode: CheckpointMode) -> Result<CheckpointResult> {
         use crate::mvcc::database::CheckpointStateMachine;
-        use crate::state_machine::{StateTransition, TransitionResult};
+        use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1640,11 +1640,18 @@ impl Connection {
                 self.get_sync_mode(),
             );
             loop {
-                match ckpt_sm.step(&()) {
-                    Ok(TransitionResult::Continue) => {}
-                    Ok(TransitionResult::Done(result)) => return Ok(result),
-                    Ok(TransitionResult::Io(iocompletions)) => {
-                        if let Err(err) = iocompletions.wait(io.as_ref()) {
+                match SansIoStateMachine::step(&mut ckpt_sm, ()) {
+                    Ok(SansIoStep::Done(result)) => {
+                        return Ok(result);
+                    }
+                    Ok(SansIoStep::Emit(())) => {
+                        unreachable!("checkpoint state machine must not emit non-terminal events")
+                    }
+                    Ok(SansIoStep::Wait(request)) => {
+                        let wait_result = request
+                            .submit()
+                            .and_then(|io_completions| io_completions.wait(io.as_ref()));
+                        if let Err(err) = wait_result {
                             ckpt_sm.cleanup_after_external_io_error();
                             return Err(err);
                         }
