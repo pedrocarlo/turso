@@ -59,6 +59,7 @@ use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSh
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
+use crate::io_ops::IoRequest;
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
@@ -615,8 +616,16 @@ pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
+    prepare_write_btree_page(pager, page)?
+        .submit()
+        .map(|io| match io {
+            IOCompletions::Single(completion) => completion,
+        })
+}
+
+pub fn prepare_write_btree_page(pager: &Pager, page: &PageRef) -> Result<IoRequest> {
     tracing::trace!("begin_write_btree_page(page={})", page.get().id);
-    let page_source = &pager.db_file;
+    let page_source = pager.db_file.clone();
     let page_finish = page.clone();
 
     let page_id = page.get().id;
@@ -640,8 +649,14 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         })
     };
     let c = Completion::new_write(write_complete);
-    let io_ctx = pager.io_ctx.read();
-    page_source.write_page(page_id, buffer, &io_ctx, c)
+    let io_ctx = pager.io_ctx.read().clone();
+    Ok(IoRequest::database_write_page(
+        page_source,
+        page_id,
+        buffer,
+        io_ctx,
+        c,
+    ))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]

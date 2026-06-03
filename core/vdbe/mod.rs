@@ -1689,7 +1689,8 @@ impl Program {
                     state.auto_txn_cleanup = TxnCleanup::None;
                     return Ok(StepResult::Done);
                 }
-                Ok(InsnFunctionStepResult::IO(io)) => {
+                Ok(InsnFunctionStepResult::IO(request)) => {
+                    let io = request.submit()?;
                     // Instruction not complete - waiting for I/O, will resume at same PC
                     io.set_waker(waker);
                     let is_yield = io.is_explicit_yield();

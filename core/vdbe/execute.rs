@@ -1,6 +1,7 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::io::TempFile;
+use crate::io_ops::IoRequest;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::MvccClock;
@@ -158,7 +159,9 @@ macro_rules! return_if_io {
     ($expr:expr) => {
         match $expr {
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Ok(IOResult::IO(io)) => {
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
+            }
             Err(err) => {
                 mark_unlikely();
                 return Err(err);
@@ -363,7 +366,7 @@ fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool
 
 pub enum InsnFunctionStepResult {
     Done,
-    IO(IOCompletions),
+    IO(IoRequest),
     Row,
     Step,
 }
@@ -372,7 +375,7 @@ impl<T> From<IOResult<T>> for InsnFunctionStepResult {
     fn from(value: IOResult<T>) -> Self {
         match value {
             IOResult::Done(_) => InsnFunctionStepResult::Done,
-            IOResult::IO(io) => InsnFunctionStepResult::IO(io),
+            IOResult::IO(io) => InsnFunctionStepResult::IO(IoRequest::submitted(io)),
         }
     }
 }
@@ -652,7 +655,7 @@ pub fn op_checkpoint(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
@@ -2928,7 +2931,7 @@ pub fn halt(
             IOResult::Done(_) => return Err(pending_error),
             IOResult::IO(io) => {
                 state.pending_fail_error = Some(pending_error); // put it back and wait
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
             }
         }
     }
@@ -3015,7 +3018,7 @@ pub fn halt(
                 IOResult::IO(io) => {
                     // store the error for reentrancy
                     state.pending_fail_error = Some(error);
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                 }
             }
         }
@@ -3485,7 +3488,7 @@ pub fn op_transaction_inner(
                             TransactionYieldPoint::BeforeStart,
                         )
                     {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                 }
 
@@ -3793,7 +3796,7 @@ pub fn op_transaction_inner(
                             conn.set_tx_state(TransactionState::PendingUpgrade {
                                 has_read_txn: matches!(current_state, TransactionState::Read),
                             });
-                            return Ok(InsnFunctionStepResult::IO(io));
+                            return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                         }
                     }
                 }
@@ -3818,7 +3821,7 @@ pub fn op_transaction_inner(
                 let conn = program.connection.clone();
                 let res = pager.begin_write_tx(conn.wal_auto_actions())?;
                 if let IOResult::IO(io) = res {
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                 }
                 *state.active_op_state.transaction() = OpTransactionState::CheckSchemaCookie;
                 continue;
@@ -3839,7 +3842,9 @@ pub fn op_transaction_inner(
                         }
                         continue;
                     }
-                    IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                    IOResult::IO(io) => {
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+                    }
                 }
             }
             // 4. Check whether schema has changed if we are actually going to access the database.
@@ -3858,7 +3863,9 @@ pub fn op_transaction_inner(
                             return Err(LimboError::SchemaUpdated);
                         }
                     }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Ok(IOResult::IO(io)) => {
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+                    }
                     // This means we are starting a read_tx and we do not have a page 1 yet, so we just continue execution
                     Err(LimboError::Page1NotAlloc) => {}
                     Err(err) => {
@@ -3875,7 +3882,7 @@ pub fn op_transaction_inner(
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                 } else if *db != crate::MAIN_DB_ID
                     && matches!(tx_mode, TransactionMode::Write)
@@ -4593,7 +4600,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_changes_value: saved_last_changes_value,
                                 };
-                                return Ok(InsnFunctionStepResult::IO(io));
+                                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                             }
                             StepResult::Row => continue,
                             StepResult::Interrupt | StepResult::Busy => {
@@ -5147,7 +5154,7 @@ pub fn op_seek(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(SeekInternalResult::IO(io)) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
         Err(e) => Err(e),
     }
 }
@@ -6693,7 +6700,7 @@ pub fn op_sorter_open(
     let page_size = match pager.with_header(|header| header.page_size) {
         Ok(IOResult::Done(page_size)) => page_size,
         Err(_) => PageSize::default(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     };
     let page_size = page_size.get() as usize;
 
@@ -9518,7 +9525,7 @@ pub fn op_insert(
                     is_without_rowid,
                     SeekOp::GE { eq_only: true },
                 )? {
-                    return Ok(InsnFunctionStepResult::IO(io));
+                    return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                 }
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
@@ -9981,7 +9988,9 @@ pub fn op_idx_delete(
                 ) {
                     Ok(SeekInternalResult::Found) => true,
                     Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+                    Ok(SeekInternalResult::IO(io)) => {
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+                    }
                     Err(e) => return Err(e),
                 };
 
@@ -10132,7 +10141,9 @@ pub fn op_idx_insert(
                     *state.active_op_state.idx_insert() = OpIdxInsertState::Insert;
                     Ok(InsnFunctionStepResult::Step)
                 }
-                SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+                SeekInternalResult::IO(io) => {
+                    Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+                }
             }
         }
         OpIdxInsertState::UniqueConstraintCheck => {
@@ -10612,7 +10623,9 @@ pub fn op_no_conflict(
                         state.active_op_state.clear();
                         Ok(InsnFunctionStepResult::Step)
                     }
-                    SeekInternalResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+                    SeekInternalResult::IO(io) => {
+                        Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+                    }
                 };
             }
         }
@@ -11338,7 +11351,7 @@ pub fn op_page_count(
     }) {
         Err(_) => 0.into(),
         Ok(IOResult::Done(v)) => v.into(),
-        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     };
     state.registers[*dest].set_int(count);
     state.pc += 1;
@@ -11476,7 +11489,7 @@ fn op_parse_schema_step(
                     .stmt
                     .take_io_completions()
                     .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
             }
             StepResult::Row => {
                 let inner = state
@@ -11735,7 +11748,7 @@ fn drive_init_cdc_version(
                     .stmt
                     .take_io_completions()
                     .unwrap_or_else(|| IOCompletions::Single(Completion::new_yield()));
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
             }
             StepResult::Row => match &inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
@@ -11939,7 +11952,9 @@ pub fn op_read_cookie(
         ) {
             Err(_) => 0.into(),
             Ok(IOResult::Done(v)) => v,
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+            Ok(IOResult::IO(io)) => {
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+            }
         };
 
     state.registers[*dest].set_int(cookie_value);
@@ -12039,7 +12054,7 @@ pub fn op_set_cookie(
         Ok(())
     })? {
         IOResult::Done(result) => result?,
-        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     }
 
     state.pc += 1;
@@ -12642,7 +12657,9 @@ pub fn op_found(
     ) {
         Ok(SeekInternalResult::Found) => SeekResult::Found,
         Ok(SeekInternalResult::NotFound) => SeekResult::NotFound,
-        Ok(SeekInternalResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
+        Ok(SeekInternalResult::IO(io)) => {
+            return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)))
+        }
         Err(e) => return Err(e),
     };
 
@@ -13896,7 +13913,7 @@ pub fn op_hash_build(
                     Ok(IOResult::Done(v)) => v,
                     Ok(IOResult::IO(io)) => {
                         *state.active_op_state.hash_build() = Some(op_state);
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                     Err(e) => {
                         *state.active_op_state.hash_build() = Some(op_state);
@@ -13930,7 +13947,7 @@ pub fn op_hash_build(
                 op_state.key_values = pending.key_values;
                 op_state.payload_values = pending.payload_values;
                 *state.active_op_state.hash_build() = Some(op_state);
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
             }
         }
     }
@@ -13993,7 +14010,7 @@ pub fn op_hash_distinct(
             };
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     }
 }
 
@@ -14009,7 +14026,7 @@ pub fn op_hash_build_finalize(
         match ht.finalize_build(Some(&mut state.metrics.hash_join))? {
             crate::types::IOResult::Done(()) => {}
             crate::types::IOResult::IO(io) => {
-                return Ok(InsnFunctionStepResult::IO(io));
+                return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
             }
         }
     }
@@ -14126,7 +14143,7 @@ pub fn op_hash_probe(
                             partition_idx,
                             probe_buffered: true,
                         });
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                 }
                 // Jump to target_pc: this row is deferred to grace processing.
@@ -14377,7 +14394,7 @@ fn advance_unmatched_scan(
                 match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                     crate::types::IOResult::Done(()) => {}
                     crate::types::IOResult::IO(io) => {
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                 }
             }
@@ -14399,7 +14416,9 @@ fn advance_unmatched_scan(
                             match hash_table.load_spilled_partition(partition_idx, Some(metrics))? {
                                 crate::types::IOResult::Done(()) => continue,
                                 crate::types::IOResult::IO(io) => {
-                                    return Ok(InsnFunctionStepResult::IO(io));
+                                    return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(
+                                        io,
+                                    )));
                                 }
                             }
                         }
@@ -14442,7 +14461,7 @@ pub fn op_hash_grace_init(
     match hash_table.finalize_probe_spill(Some(&mut state.metrics.hash_join))? {
         IOResult::Done(()) => {}
         IOResult::IO(io) => {
-            return Ok(InsnFunctionStepResult::IO(io));
+            return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
         }
     }
 
@@ -14484,7 +14503,7 @@ pub fn op_hash_grace_load_partition(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     }
 }
 
@@ -14531,7 +14550,7 @@ pub fn op_hash_grace_next_probe(
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
-        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
     }
 }
 
@@ -14828,7 +14847,7 @@ fn op_journal_mode_inner(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    use crate::storage::sqlite3_ondisk::begin_write_btree_page;
+    use crate::storage::sqlite3_ondisk::prepare_write_btree_page;
 
     load_insn!(JournalMode { db, dest, new_mode }, insn);
     let pager = program.get_pager_from_database_index(db)?;
@@ -14974,11 +14993,9 @@ fn op_journal_mode_inner(
                     .page_ref
                     .as_ref()
                     .expect("page_ref should be set");
-                let completion = begin_write_btree_page(pager, page)?;
+                let request = prepare_write_btree_page(pager, page)?;
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
-                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
-                    completion,
-                )));
+                return Ok(InsnFunctionStepResult::IO(request));
             }
 
             OpJournalModeSubState::Finalize => {
@@ -15419,7 +15436,7 @@ fn op_vacuum_into_inner(
                     }
                     crate::IOResult::IO(io) => {
                         vacuum_state.phase = VacuumIntoOpPhase::Build;
-                        return Ok(InsnFunctionStepResult::IO(io));
+                        return Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io)));
                     }
                 }
             }
@@ -15472,7 +15489,7 @@ pub fn op_vacuum(
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
-        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(IoRequest::submitted(io))),
         Err(err) => {
             let VacuumOpState::InPlace(vacuum_state) = std::mem::take(&mut state.op_vacuum_state)
             else {

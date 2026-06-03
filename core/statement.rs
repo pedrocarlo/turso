@@ -918,8 +918,11 @@ impl Statement {
                             halt_completed = true;
                             break;
                         }
-                        Ok(vdbe::execute::InsnFunctionStepResult::IO(_)) => {
-                            if let Err(e) = self.pager.io.step() {
+                        Ok(vdbe::execute::InsnFunctionStepResult::IO(request)) => {
+                            let result = request
+                                .submit()
+                                .and_then(|io| io.wait(self.pager.io.as_ref()));
+                            if let Err(e) = result {
                                 capture_reset_error(
                                     &mut reset_error,
                                     e,
