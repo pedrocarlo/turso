@@ -12,6 +12,7 @@ pub mod dbpage;
 pub mod functions;
 pub mod index_method;
 pub mod io;
+pub mod io_ops;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
 #[cfg(all(
@@ -24,6 +25,7 @@ mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+pub mod sans_io;
 pub mod schema;
 pub mod state_machine;
 pub mod storage;
