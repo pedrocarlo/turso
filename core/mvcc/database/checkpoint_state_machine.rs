@@ -1,4 +1,4 @@
-use crate::io_ops::IoRequest;
+use crate::io_ops::{IoRequest, IoResult};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -17,7 +17,7 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
+use crate::types::{ImmutableRecord, ImmutableRecordRef};
 use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
@@ -558,7 +558,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
-    fn collect_table_rows(&mut self) -> Option<IOCompletions> {
+    fn collect_table_rows(&mut self) -> Option<IoRequest> {
         // Invariant: RowID ordering is (table_id, row_id) with table_id ascending.
         // Since MV table IDs are negative and sqlite_schema is table_id=-1, iterating
         // in reverse visits sqlite_schema first so CREATE/DROP metadata is applied
@@ -705,7 +705,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             processed += 1;
             if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Some(IOCompletions::Single(Completion::new_yield()));
+                return Some(IoRequest::yield_now());
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -728,7 +728,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// 2. Either:
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
-    fn collect_index_rows(&mut self) -> Option<IOCompletions> {
+    fn collect_index_rows(&mut self) -> Option<IoRequest> {
         let outer_bounds: (Bound<MVTableId>, Bound<MVTableId>) =
             match self.collect_index_tableid_cursor {
                 None => (Bound::Unbounded, Bound::Unbounded),
@@ -768,7 +768,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Some(IOCompletions::Single(Completion::new_yield()));
+                    return Some(IoRequest::yield_now());
                 }
             }
             self.collect_index_tableid_cursor = Some(index_id);
@@ -853,30 +853,29 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         false
     }
 
-    /// Fsync the logical log file
-    fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync(self.pager.get_sync_type())
+    /// Fsync the logical log file.
+    fn fsync_logical_log(&self) -> IoRequest {
+        IoRequest::durable_sync(self.mvstore.storage.clone(), self.pager.get_sync_type())
     }
 
-    /// Truncate the logical log file
-    fn truncate_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.truncate()
+    /// Truncate the logical log file.
+    fn truncate_logical_log(&self) -> IoRequest {
+        IoRequest::durable_truncate(self.mvstore.storage.clone())
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
-    fn checkpoint_wal(&self) -> Result<IOResult<CheckpointResult>> {
+    fn checkpoint_wal(&self) -> Result<IoResult<CheckpointResult>> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        match wal.checkpoint(
-            &self.pager,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        )? {
-            IOResult::Done(result) => Ok(IOResult::Done(result)),
-            IOResult::IO(io) => Ok(IOResult::IO(io)),
-        }
+        Ok(wal
+            .checkpoint(
+                &self.pager,
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+            )?
+            .into())
     }
 
     fn has_unpublished_schema_changes(&self) -> bool {
@@ -986,7 +985,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         self.connection.bump_prepare_context_generation();
     }
 
-    fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
+    fn gc_checkpointed_table_versions(&mut self) -> Option<IoRequest> {
         // Safety: entry removal after dropping the version-chain write lock has a
         // TOCTOU gap — a concurrent writer could insert between the two. This is
         // only safe because the blocking checkpoint lock prevents concurrent writers.
@@ -1041,13 +1040,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             };
             *next_index = index;
 
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IoRequest::yield_now())
         } else {
             None
         }
     }
 
-    fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
+    fn gc_checkpointed_index_versions(&mut self) -> Option<IoRequest> {
         assert!(
             self.lock_states.blocking_checkpoint_lock_held,
             "gc_checkpointed_versions requires the blocking checkpoint lock"
@@ -1095,7 +1094,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
             };
             *next_index = index;
-            Some(IOCompletions::Single(Completion::new_yield()))
+            Some(IoRequest::yield_now())
         } else {
             None
         }
@@ -1175,7 +1174,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             CheckpointState::CollectTableRows => {
                 if let Some(io) = self.collect_table_rows() {
-                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
+                    return Ok(CheckpointTransition::Wait(io));
                 }
                 tracing::debug!("Collected {} committed versions", self.write_set.len());
                 self.state = CheckpointState::CollectIndexRows;
@@ -1183,7 +1182,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
             CheckpointState::CollectIndexRows => {
                 if let Some(io) = self.collect_index_rows() {
-                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
+                    return Ok(CheckpointTransition::Wait(io));
                 }
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
                 // Checkpoint boundary is derived from a stable snapshot under the blocking lock:
@@ -1764,11 +1763,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // on success below), so a retry will re-stage from the previous boundary.
                 // The logical log is also unaffected — its offset is not advanced here.
                 tracing::debug!("Committing pager transaction");
-                let result = self
+                let result: IoResult<_> = self
                     .pager
-                    .commit_tx(&self.connection, self.update_transaction_state)?;
+                    .commit_tx(&self.connection, self.update_transaction_state)?
+                    .into();
                 match result {
-                    IOResult::Done(_) => {
+                    IoResult::Done(_) => {
                         // Pager commit atomically staged data + metadata into WAL.
                         // Advance the in-memory durable boundary immediately so that if
                         // later checkpoint phases fail, a same-process retry starts from
@@ -1799,22 +1799,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         }
                         Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
+                    IoResult::IO(request) => Ok(CheckpointTransition::Wait(request)),
                 }
             }
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
-                let c = self.truncate_logical_log()?;
+                let request = self.truncate_logical_log();
                 self.state = CheckpointState::FsyncLogicalLog;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(CheckpointTransition::Continue)
-                } else {
-                    Ok(CheckpointTransition::Wait(IoRequest::submitted(
-                        IOCompletions::Single(c),
-                    )))
-                }
+                Ok(CheckpointTransition::Wait(request))
             }
 
             CheckpointState::FsyncLogicalLog => {
@@ -1825,27 +1818,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(CheckpointTransition::Continue);
                 }
                 tracing::debug!("Fsyncing logical log file");
-                let c = self.fsync_logical_log()?;
+                let request = self.fsync_logical_log();
                 self.state = CheckpointState::TruncateWal;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(CheckpointTransition::Continue)
-                } else {
-                    Ok(CheckpointTransition::Wait(IoRequest::submitted(
-                        IOCompletions::Single(c),
-                    )))
-                }
+                Ok(CheckpointTransition::Wait(request))
             }
 
             CheckpointState::CheckpointWal => {
                 tracing::debug!("Performing TRUNCATE checkpoint on WAL");
                 match self.checkpoint_wal()? {
-                    IOResult::Done(result) => {
+                    IoResult::Done(result) => {
                         self.checkpoint_result = Some(result);
                         self.state = CheckpointState::SyncDbFile;
                         Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
+                    IoResult::IO(request) => Ok(CheckpointTransition::Wait(request)),
                 }
             }
 
@@ -1861,7 +1847,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 let checkpoint_result = self
                     .checkpoint_result
-                    .as_mut()
+                    .as_ref()
                     .expect("checkpoint_result should be set");
 
                 // Only sync if we actually backfilled any frames
@@ -1870,20 +1856,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     return Ok(CheckpointTransition::Continue);
                 }
 
-                // Check if we already sent the sync
-                if checkpoint_result.db_sync_sent {
-                    self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(CheckpointTransition::Continue);
-                }
-
                 tracing::debug!("Fsyncing database file before WAL truncation");
-                let c = self
-                    .pager
-                    .db_file
-                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
-                checkpoint_result.db_sync_sent = true;
-                Ok(CheckpointTransition::Wait(IoRequest::submitted(
-                    IOCompletions::Single(c),
+                self.state = CheckpointState::TruncateLogicalLog;
+                Ok(CheckpointTransition::Wait(IoRequest::database_sync(
+                    self.pager.db_file.clone(),
+                    Completion::new_sync(|_| {}),
+                    self.pager.get_sync_type(),
                 )))
             }
 
@@ -1898,8 +1876,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .checkpoint_result
                     .as_mut()
                     .expect("checkpoint_result should be set");
-                match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
-                    IOResult::Done(()) => {
+                let result: IoResult<_> = wal
+                    .truncate_wal(checkpoint_result, self.pager.get_sync_type())?
+                    .into();
+                match result {
+                    IoResult::Done(()) => {
                         turso_assert!(
                             !self.has_pending_root_publication(),
                             "checkpoint finalized after pager writes without publishing schema changes"
@@ -1911,13 +1892,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
                         Ok(CheckpointTransition::Continue)
                     }
-                    IOResult::IO(io) => Ok(CheckpointTransition::Wait(IoRequest::submitted(io))),
+                    IoResult::IO(request) => Ok(CheckpointTransition::Wait(request)),
                 }
             }
 
             CheckpointState::GcTableRows { .. } => {
                 if let Some(io) = self.gc_checkpointed_table_versions() {
-                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
+                    return Ok(CheckpointTransition::Wait(io));
                 }
                 let CheckpointState::GcTableRows { lwm, .. } = self.state else {
                     unreachable!("state is GcTableRows here");
@@ -1928,7 +1909,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::GcIndexRows { .. } => {
                 if let Some(io) = self.gc_checkpointed_index_versions() {
-                    return Ok(CheckpointTransition::Wait(IoRequest::submitted(io)));
+                    return Ok(CheckpointTransition::Wait(io));
                 }
                 self.state = CheckpointState::Finalize;
                 Ok(CheckpointTransition::Continue)

@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::{
     io::{File, FileSyncType},
+    mvcc::persistent_storage::DurableStorage,
     storage::database::{DatabaseStorage, IOContext},
     sync::Arc,
     types::{IOCompletions, IOResult},
@@ -22,6 +23,8 @@ pub enum IoRequest {
     File(FileOp),
     /// Completion-based operation on database page storage.
     Database(DatabaseOp),
+    /// Completion-based operation on MVCC durable storage.
+    DurableStorage(DurableStorageOp),
 }
 
 impl IoRequest {
@@ -101,12 +104,46 @@ impl IoRequest {
         }))
     }
 
+    pub fn database_sync(
+        storage: Arc<dyn DatabaseStorage>,
+        completion: Completion,
+        sync_type: FileSyncType,
+    ) -> Self {
+        Self::Database(DatabaseOp::Sync(DatabaseSync {
+            storage,
+            completion,
+            sync_type,
+        }))
+    }
+
+    pub fn durable_sync(storage: Arc<dyn DurableStorage>, sync_type: FileSyncType) -> Self {
+        Self::DurableStorage(DurableStorageOp::Sync(DurableStorageSync {
+            storage,
+            sync_type,
+        }))
+    }
+
+    pub fn durable_truncate(storage: Arc<dyn DurableStorage>) -> Self {
+        Self::DurableStorage(DurableStorageOp::Truncate(DurableStorageTruncate {
+            storage,
+        }))
+    }
+
     pub fn submit(self) -> Result<IOCompletions> {
         match self {
             Self::Yield => Ok(IOCompletions::Single(Completion::new_yield())),
             Self::Submitted(completions) => Ok(completions),
             Self::File(op) => op.submit(),
             Self::Database(op) => op.submit(),
+            Self::DurableStorage(op) => op.submit(),
+        }
+    }
+
+    pub fn is_explicit_yield(&self) -> bool {
+        match self {
+            Self::Yield => true,
+            Self::Submitted(completions) => completions.is_explicit_yield(),
+            Self::File(_) | Self::Database(_) | Self::DurableStorage(_) => false,
         }
     }
 }
@@ -133,6 +170,7 @@ impl fmt::Debug for IoRequest {
             Self::Submitted(completions) => f.debug_tuple("Submitted").field(completions).finish(),
             Self::File(op) => f.debug_tuple("File").field(op).finish(),
             Self::Database(op) => f.debug_tuple("Database").field(op).finish(),
+            Self::DurableStorage(op) => f.debug_tuple("DurableStorage").field(op).finish(),
         }
     }
 }
@@ -261,6 +299,7 @@ impl fmt::Debug for FileTruncate {
 
 pub enum DatabaseOp {
     WritePage(DatabaseWritePage),
+    Sync(DatabaseSync),
 }
 
 impl DatabaseOp {
@@ -270,6 +309,7 @@ impl DatabaseOp {
                 op.storage
                     .write_page(op.page_idx, op.buffer, &op.io_ctx, op.completion)?
             }
+            Self::Sync(op) => op.storage.sync(op.completion, op.sync_type)?,
         };
         Ok(IOCompletions::Single(completion))
     }
@@ -279,6 +319,7 @@ impl fmt::Debug for DatabaseOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WritePage(op) => op.fmt(f),
+            Self::Sync(op) => op.fmt(f),
         }
     }
 }
@@ -297,6 +338,68 @@ impl fmt::Debug for DatabaseWritePage {
             .field("page_idx", &self.page_idx)
             .field("buffer_len", &self.buffer.len())
             .field("io_ctx", &self.io_ctx)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct DatabaseSync {
+    pub storage: Arc<dyn DatabaseStorage>,
+    pub completion: Completion,
+    pub sync_type: FileSyncType,
+}
+
+impl fmt::Debug for DatabaseSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DatabaseSync")
+            .field("sync_type", &self.sync_type)
+            .finish_non_exhaustive()
+    }
+}
+
+pub enum DurableStorageOp {
+    Sync(DurableStorageSync),
+    Truncate(DurableStorageTruncate),
+}
+
+impl DurableStorageOp {
+    pub fn submit(self) -> Result<IOCompletions> {
+        let completion = match self {
+            Self::Sync(op) => op.storage.sync(op.sync_type)?,
+            Self::Truncate(op) => op.storage.truncate()?,
+        };
+        Ok(IOCompletions::Single(completion))
+    }
+}
+
+impl fmt::Debug for DurableStorageOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sync(op) => op.fmt(f),
+            Self::Truncate(op) => op.fmt(f),
+        }
+    }
+}
+
+pub struct DurableStorageSync {
+    pub storage: Arc<dyn DurableStorage>,
+    pub sync_type: FileSyncType,
+}
+
+impl fmt::Debug for DurableStorageSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableStorageSync")
+            .field("sync_type", &self.sync_type)
+            .finish_non_exhaustive()
+    }
+}
+
+pub struct DurableStorageTruncate {
+    pub storage: Arc<dyn DurableStorage>,
+}
+
+impl fmt::Debug for DurableStorageTruncate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DurableStorageTruncate")
             .finish_non_exhaustive()
     }
 }
