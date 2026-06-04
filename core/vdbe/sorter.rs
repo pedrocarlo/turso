@@ -13,7 +13,7 @@ use crate::alloc::*;
 use crate::io::TempFile;
 use crate::io_ops::IoRequest;
 use crate::return_if_sans_io;
-use crate::sans_io::{NoEvent, Step as SansIoStep};
+use crate::sans_io::{NoEvent, StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::types::ValueIterator;
 use crate::CompletionError;
 use crate::{
@@ -52,6 +52,24 @@ enum InitChunkHeapState {
 
 type SorterStep<T> = SansIoStep<NoEvent, IoRequest, T>;
 
+pub struct SorterSortStateMachine<'a> {
+    sorter: &'a mut Sorter,
+}
+
+pub struct SorterNextStateMachine<'a> {
+    sorter: &'a mut Sorter,
+}
+
+pub struct SorterInsertStateMachine<'a> {
+    sorter: &'a mut Sorter,
+    record: &'a ImmutableRecord,
+    payload_size: usize,
+}
+
+struct SorterInitChunkHeapStateMachine<'a> {
+    sorter: &'a mut Sorter,
+}
+
 pub struct Sorter {
     /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
     /// All record data (payload bytes, key_values) is stored here for in-memory sorting.
@@ -88,11 +106,11 @@ pub struct Sorter {
     temp_file: Option<TempFile>,
     /// Offset where the next chunk will be placed in the `temp_file`
     next_chunk_offset: usize,
-    /// State machine for [Sorter::sort]
+    /// Current state for [SorterSortStateMachine].
     sort_state: SortState,
-    /// State machine for [Sorter::insert]
+    /// Current state for [SorterInsertStateMachine].
     insert_state: InsertState,
-    /// State machine for [Sorter::init_chunk_heap]
+    /// Current state for the chunk-heap initialization step.
     init_chunk_heap_state: InitChunkHeapState,
     /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
     pending_completion: Option<(Completion, usize)>,
@@ -156,203 +174,29 @@ impl Sorter {
         self.current.is_some()
     }
 
-    // We do the sorting here since this is what is called by the SorterSort instruction
-    pub fn sort(&mut self) -> Result<SorterStep<()>> {
-        loop {
-            match self.sort_state {
-                SortState::Start => {
-                    if self.chunks.is_empty() {
-                        // Sort ascending then reverse - we pop from end so this gives ascending output.
-                        // NOTE: We can't just sort descending because stable sort preserves insertion
-                        // order for equal elements, and descending sort doesn't reverse equal elements.
-                        // SAFETY: All pointers in records are valid (arena hasn't been reset).
-                        self.records
-                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
-                        self.records.reverse();
-                        self.sort_state = SortState::Next;
-                    } else {
-                        self.sort_state = SortState::Flush;
-                    }
-                }
-                SortState::Flush => {
-                    self.sort_state = SortState::InitHeap;
-                    if let Some(c) = self.flush()? {
-                        sans_io_yield_one!(IoRequest::completion(c));
-                    }
-                }
-                SortState::InitHeap => {
-                    // Check for write errors before proceeding
-                    if self.chunks.iter().any(|chunk| {
-                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
-                    }) {
-                        return Err(CompletionError::IOError(
-                            std::io::ErrorKind::WriteZero,
-                            "sorter write",
-                        )
-                        .into());
-                    }
-                    turso_assert!(
-                        !self.chunks.iter().any(|chunk| {
-                            matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
-                        }),
-                        "chunks should been written"
-                    );
-                    return_if_sans_io!(self.init_chunk_heap()?);
-                    self.sort_state = SortState::Next;
-                }
-                SortState::Next => {
-                    return_if_sans_io!(self.next()?);
-                    self.sort_state = SortState::Start;
-                    return Ok(SansIoStep::Done(()));
-                }
-            }
-        }
+    pub fn sort(&mut self) -> SorterSortStateMachine<'_> {
+        SorterSortStateMachine { sorter: self }
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<SorterStep<()>> {
-        if self.chunks.is_empty() {
-            match self.records.pop() {
-                Some(ptr) => {
-                    // SAFETY: ptr is valid - arena hasn't been reset yet.
-                    let arena_record = unsafe { ptr.as_ref() };
-                    let payload = arena_record.payload();
+    pub fn next(&mut self) -> SorterNextStateMachine<'_> {
+        SorterNextStateMachine { sorter: self }
+    }
 
-                    match &mut self.current {
-                        Some(record) => {
-                            record.invalidate();
-                            record.start_serialization(payload)?;
-                        }
-                        None => {
-                            self.current = Some(arena_record.to_immutable_record()?);
-                        }
-                    }
-
-                    if self.records.is_empty() {
-                        self.arena.reset();
-                    }
-                }
-                None => self.current = None,
-            }
-        } else {
-            // Serve from sorted chunk files
-            match return_if_sans_io!(self.next_from_chunk_heap()?) {
-                Some(boxed_record) => {
-                    if let Some(ref error) = boxed_record.deserialization_error {
-                        return Err(error.clone());
-                    }
-                    let payload = boxed_record.record.get_payload();
-                    match &mut self.current {
-                        Some(record) => {
-                            record.invalidate();
-                            record.start_serialization(payload)?;
-                        }
-                        None => {
-                            self.current = Some(boxed_record.record);
-                        }
-                    }
-                }
-                None => self.current = None,
-            }
+    pub fn insert<'a>(&'a mut self, record: &'a ImmutableRecord) -> SorterInsertStateMachine<'a> {
+        SorterInsertStateMachine {
+            sorter: self,
+            record,
+            payload_size: record.get_payload().len(),
         }
-        Ok(SansIoStep::Done(()))
     }
 
     pub const fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }
 
-    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<SorterStep<()>> {
-        let payload_size = record.get_payload().len();
-        loop {
-            match self.insert_state {
-                InsertState::Start => {
-                    self.insert_state = InsertState::Insert;
-                    if self.current_buffer_size + payload_size > self.max_buffer_size {
-                        if let Some(c) = self.flush()? {
-                            if !c.succeeded() {
-                                sans_io_yield_one!(IoRequest::completion(c));
-                            }
-                        }
-                        // Check for write errors immediately after flush completes
-                        if self.chunks.iter().any(|chunk| {
-                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
-                        }) {
-                            return Err(CompletionError::IOError(
-                                std::io::ErrorKind::WriteZero,
-                                "sorter write",
-                            )
-                            .into());
-                        }
-                    }
-                }
-                InsertState::Insert => {
-                    let sortable_record = ArenaSortableRecord::new(
-                        &self.arena,
-                        record,
-                        self.key_len,
-                        &self.index_key_info,
-                        &self.comparators,
-                    )?;
-                    let record_ref = self.arena.try_alloc(sortable_record)?;
-                    // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
-                    self.records.try_push(NonNull::from(record_ref))?;
-                    self.current_buffer_size += payload_size;
-                    self.max_payload_size_in_buffer =
-                        self.max_payload_size_in_buffer.max(payload_size);
-                    self.insert_state = InsertState::Start;
-                    return Ok(SansIoStep::Done(()));
-                }
-            }
-        }
-    }
-
-    fn init_chunk_heap(&mut self) -> Result<SorterStep<()>> {
-        match self.init_chunk_heap_state {
-            InitChunkHeapState::Start => {
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk in self.chunks.iter_mut() {
-                    match chunk.read() {
-                        Err(e) => {
-                            tracing::error!("Failed to read chunk: {e}");
-                            group.cancel();
-                            self.io.drain_completions(group.completions())?;
-                            return Err(e);
-                        }
-                        Ok(Some(c)) => group.add(&c),
-                        Ok(None) => {}
-                    };
-                }
-                self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                let completion = group.build();
-                sans_io_yield_one!(IoRequest::completion(completion));
-            }
-            InitChunkHeapState::PushChunk => {
-                // Make sure all chunks read at least one record into their buffer.
-                turso_assert!(
-                    !self.chunks.iter().any(|chunk| matches!(
-                        *chunk.io_state.read(),
-                        SortedChunkIOState::WaitingForRead
-                    )),
-                    "chunks should have been read"
-                );
-                self.chunk_heap.try_reserve(self.chunks.len())?;
-                // TODO: blocking will be unnecessary here with IO completions
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk_idx in 0..self.chunks.len() {
-                    if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
-                        group.add(&c);
-                    };
-                }
-                self.init_chunk_heap_state = InitChunkHeapState::Start;
-                let completion = group.build();
-                if completion.finished() {
-                    Ok(SansIoStep::Done(()))
-                } else {
-                    sans_io_yield_one!(IoRequest::completion(completion));
-                }
-            }
-        }
+    fn init_chunk_heap(&mut self) -> SorterInitChunkHeapStateMachine<'_> {
+        SorterInitChunkHeapStateMachine { sorter: self }
     }
 
     /// Returns the next record from the chunk heap in sorted order.
@@ -460,6 +304,233 @@ impl Sorter {
         self.next_chunk_offset += chunk_size;
 
         Ok(Some(c))
+    }
+}
+
+impl SansIoStateMachine<()> for SorterSortStateMachine<'_> {
+    type Event = NoEvent;
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
+
+    fn step(&mut self, _input: ()) -> Result<SorterStep<()>> {
+        loop {
+            match self.sorter.sort_state {
+                SortState::Start => {
+                    if self.sorter.chunks.is_empty() {
+                        // Sort ascending then reverse - we pop from end so this gives ascending output.
+                        // NOTE: We can't just sort descending because stable sort preserves insertion
+                        // order for equal elements, and descending sort doesn't reverse equal elements.
+                        // SAFETY: All pointers in records are valid (arena hasn't been reset).
+                        self.sorter
+                            .records
+                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+                        self.sorter.records.reverse();
+                        self.sorter.sort_state = SortState::Next;
+                    } else {
+                        self.sorter.sort_state = SortState::Flush;
+                    }
+                }
+                SortState::Flush => {
+                    self.sorter.sort_state = SortState::InitHeap;
+                    if let Some(c) = self.sorter.flush()? {
+                        sans_io_yield_one!(IoRequest::completion(c));
+                    }
+                }
+                SortState::InitHeap => {
+                    // Check for write errors before proceeding
+                    if self.sorter.chunks.iter().any(|chunk| {
+                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                    }) {
+                        return Err(CompletionError::IOError(
+                            std::io::ErrorKind::WriteZero,
+                            "sorter write",
+                        )
+                        .into());
+                    }
+                    turso_assert!(
+                        !self.sorter.chunks.iter().any(|chunk| {
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
+                        }),
+                        "chunks should been written"
+                    );
+                    return_if_sans_io!(self.sorter.init_chunk_heap().step(())?);
+                    self.sorter.sort_state = SortState::Next;
+                }
+                SortState::Next => {
+                    return_if_sans_io!(self.sorter.next().step(())?);
+                    self.sorter.sort_state = SortState::Start;
+                    return Ok(SansIoStep::Done(()));
+                }
+            }
+        }
+    }
+}
+
+impl SansIoStateMachine<()> for SorterNextStateMachine<'_> {
+    type Event = NoEvent;
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
+
+    fn step(&mut self, _input: ()) -> Result<SorterStep<()>> {
+        if self.sorter.chunks.is_empty() {
+            match self.sorter.records.pop() {
+                Some(ptr) => {
+                    // SAFETY: ptr is valid - arena hasn't been reset yet.
+                    let arena_record = unsafe { ptr.as_ref() };
+                    let payload = arena_record.payload();
+
+                    match &mut self.sorter.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload)?;
+                        }
+                        None => {
+                            self.sorter.current = Some(arena_record.to_immutable_record()?);
+                        }
+                    }
+
+                    if self.sorter.records.is_empty() {
+                        self.sorter.arena.reset();
+                    }
+                }
+                None => self.sorter.current = None,
+            }
+        } else {
+            // Serve from sorted chunk files
+            match return_if_sans_io!(self.sorter.next_from_chunk_heap()?) {
+                Some(boxed_record) => {
+                    if let Some(ref error) = boxed_record.deserialization_error {
+                        return Err(error.clone());
+                    }
+                    let payload = boxed_record.record.get_payload();
+                    match &mut self.sorter.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload)?;
+                        }
+                        None => {
+                            self.sorter.current = Some(boxed_record.record);
+                        }
+                    }
+                }
+                None => self.sorter.current = None,
+            }
+        }
+        Ok(SansIoStep::Done(()))
+    }
+}
+
+impl SansIoStateMachine<()> for SorterInitChunkHeapStateMachine<'_> {
+    type Event = NoEvent;
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
+
+    fn step(&mut self, _input: ()) -> Result<SorterStep<()>> {
+        match self.sorter.init_chunk_heap_state {
+            InitChunkHeapState::Start => {
+                let mut group = CompletionGroup::new(|_| {});
+                for chunk in self.sorter.chunks.iter_mut() {
+                    match chunk.read() {
+                        Err(e) => {
+                            tracing::error!("Failed to read chunk: {e}");
+                            group.cancel();
+                            self.sorter.io.drain_completions(group.completions())?;
+                            return Err(e);
+                        }
+                        Ok(Some(c)) => group.add(&c),
+                        Ok(None) => {}
+                    };
+                }
+                self.sorter.init_chunk_heap_state = InitChunkHeapState::PushChunk;
+                let completion = group.build();
+                sans_io_yield_one!(IoRequest::completion(completion));
+            }
+            InitChunkHeapState::PushChunk => {
+                // Make sure all chunks read at least one record into their buffer.
+                turso_assert!(
+                    !self.sorter.chunks.iter().any(|chunk| matches!(
+                        *chunk.io_state.read(),
+                        SortedChunkIOState::WaitingForRead
+                    )),
+                    "chunks should have been read"
+                );
+                self.sorter
+                    .chunk_heap
+                    .try_reserve(self.sorter.chunks.len())?;
+                // TODO: blocking will be unnecessary here with IO completions
+                let mut group = CompletionGroup::new(|_| {});
+                for chunk_idx in 0..self.sorter.chunks.len() {
+                    if let Some(c) = self.sorter.push_to_chunk_heap(chunk_idx)? {
+                        group.add(&c);
+                    };
+                }
+                self.sorter.init_chunk_heap_state = InitChunkHeapState::Start;
+                let completion = group.build();
+                if completion.finished() {
+                    Ok(SansIoStep::Done(()))
+                } else {
+                    sans_io_yield_one!(IoRequest::completion(completion));
+                }
+            }
+        }
+    }
+}
+
+impl SansIoStateMachine<()> for SorterInsertStateMachine<'_> {
+    type Event = NoEvent;
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
+
+    fn step(&mut self, _input: ()) -> Result<SorterStep<()>> {
+        loop {
+            match self.sorter.insert_state {
+                InsertState::Start => {
+                    self.sorter.insert_state = InsertState::Insert;
+                    if self.sorter.current_buffer_size + self.payload_size
+                        > self.sorter.max_buffer_size
+                    {
+                        if let Some(c) = self.sorter.flush()? {
+                            if !c.succeeded() {
+                                sans_io_yield_one!(IoRequest::completion(c));
+                            }
+                        }
+                        // Check for write errors immediately after flush completes
+                        if self.sorter.chunks.iter().any(|chunk| {
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                        }) {
+                            return Err(CompletionError::IOError(
+                                std::io::ErrorKind::WriteZero,
+                                "sorter write",
+                            )
+                            .into());
+                        }
+                    }
+                }
+                InsertState::Insert => {
+                    let sortable_record = ArenaSortableRecord::new(
+                        &self.sorter.arena,
+                        self.record,
+                        self.sorter.key_len,
+                        &self.sorter.index_key_info,
+                        &self.sorter.comparators,
+                    )?;
+                    let record_ref = self.sorter.arena.try_alloc(sortable_record)?;
+                    // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
+                    self.sorter.records.try_push(NonNull::from(record_ref))?;
+                    self.sorter.current_buffer_size += self.payload_size;
+                    self.sorter.max_payload_size_in_buffer = self
+                        .sorter
+                        .max_payload_size_in_buffer
+                        .max(self.payload_size);
+                    self.sorter.insert_state = InsertState::Start;
+                    return Ok(SansIoStep::Done(()));
+                }
+            }
+        }
     }
 }
 
@@ -1077,12 +1148,13 @@ mod tests {
                 values.append(&mut generate_values(&mut rng, &value_types));
                 let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
 
-                block_sorter_step(io.as_ref(), || sorter.insert(&record))
+                block_sorter_step(io.as_ref(), || sorter.insert(&record).step(()))
                     .expect("Failed to insert the record");
                 initial_records.push(record);
             }
 
-            block_sorter_step(io.as_ref(), || sorter.sort()).expect("Failed to sort the records");
+            block_sorter_step(io.as_ref(), || sorter.sort().step(()))
+                .expect("Failed to sort the records");
 
             assert!(!sorter.is_empty());
             assert!(!sorter.chunks.is_empty());
@@ -1094,7 +1166,7 @@ mod tests {
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
-                block_sorter_step(io.as_ref(), || sorter.next())
+                block_sorter_step(io.as_ref(), || sorter.next().step(()))
                     .expect("Failed to get the next record");
             }
             assert!(!sorter.has_more());

@@ -6820,7 +6820,7 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        return_if_insn_sans_io!(cursor.insert(record)?);
+        return_if_insn_sans_io!(cursor.insert(record).step(())?);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6844,7 +6844,7 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            return_if_insn_sans_io!(cursor.sort()?);
+            return_if_insn_sans_io!(cursor.sort().step(())?);
         }
         (is_empty, !is_empty)
     };
@@ -6878,7 +6878,7 @@ pub fn op_sorter_next(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        return_if_insn_sans_io!(cursor.next()?);
+        return_if_insn_sans_io!(cursor.next().step(())?);
         cursor.has_more()
     };
     if has_more {
