@@ -42,8 +42,8 @@ use crate::{
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
+    sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep},
     schema::Trigger,
-    state_machine::StateMachine,
     translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
     vdbe::{
@@ -182,11 +182,11 @@ enum CommitState {
     /// Committing attached database pagers after main pager commit is done.
     CommittingAttached,
     CommittingMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: Box<CommitStateMachine<MvccClock>>,
     },
     /// Committing MVCC transactions on attached databases after main MVCC commit is done.
     CommittingAttachedMvcc {
-        state_machine: StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        state_machine: Box<CommitStateMachine<MvccClock>>,
         db_id: usize,
         mv_store: Arc<MvStore>,
     },
@@ -196,10 +196,10 @@ impl CommitState {
     fn cleanup_mvcc_checkpoint_state(&mut self) {
         match self {
             CommitState::CommittingMvcc { state_machine } => {
-                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+                state_machine.cleanup_mvcc_checkpoint_state()
             }
             CommitState::CommittingAttachedMvcc { state_machine, .. } => {
-                state_machine.inner_mut().cleanup_mvcc_checkpoint_state()
+                state_machine.cleanup_mvcc_checkpoint_state()
             }
             CommitState::Ready | CommitState::Committing | CommitState::CommittingAttached => {}
         }
@@ -2055,7 +2055,10 @@ impl Program {
                 else {
                     unreachable!()
                 };
-                (state_machine.step(attached_mv)?, *db_id)
+                (
+                    self.step_end_mvcc_txn(state_machine.as_mut(), attached_mv)?,
+                    *db_id,
+                )
             };
             match step_result {
                 IOResult::Done(_) => {
@@ -2094,7 +2097,7 @@ impl Program {
                     return Err(e);
                 }
             };
-            match state_machine.step(&attached_mv_store)? {
+            match self.step_end_mvcc_txn(state_machine.as_mut(), &attached_mv_store)? {
                 IOResult::Done(_) => {
                     let attached_pager = conn
                         .get_pager_from_database_index(&db_id)
@@ -2275,10 +2278,14 @@ impl Program {
     #[instrument(skip(self, commit_state, mv_store), level = Level::DEBUG)]
     fn step_end_mvcc_txn(
         &self,
-        commit_state: &mut StateMachine<Box<CommitStateMachine<MvccClock>>>,
+        commit_state: &mut CommitStateMachine<MvccClock>,
         mv_store: &Arc<MvStore>,
     ) -> Result<IOResult<()>> {
-        commit_state.step(mv_store)
+        match commit_state.step(mv_store)? {
+            SansIoStep::Done(()) => Ok(IOResult::Done(())),
+            SansIoStep::Wait(request) => Ok(IOResult::IO(request.submit()?)),
+            SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
+        }
     }
 
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction

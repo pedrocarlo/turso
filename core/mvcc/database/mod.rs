@@ -4,11 +4,8 @@ use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
-use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
+use crate::sans_io::{NoEvent, StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::schema::{Schema, Table};
-use crate::state_machine::StateMachine;
-use crate::state_machine::StateTransition;
-use crate::state_machine::TransitionResult;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
@@ -22,7 +19,6 @@ use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
 use crate::types::compare_immutable;
-use crate::types::IOCompletions;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
@@ -1199,6 +1195,19 @@ pub enum CommitState<Clock: LogicalClock> {
     },
 }
 
+enum CommitTransition {
+    Continue,
+    Wait(IoRequest),
+    Done(()),
+}
+
+#[cfg(any(test, injected_yields))]
+impl crate::mvcc::yield_hooks::InjectedTransitionYield for CommitTransition {
+    fn injected_transition_yield() -> Self {
+        Self::Wait(IoRequest::yield_now())
+    }
+}
+
 /// Iteration state for the chunked `BuildLogRecord` step.
 #[derive(Debug)]
 pub struct BuildLogRecordCtx {
@@ -1741,7 +1750,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn step_build_log_record(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock>>,
-    ) -> Result<TransitionResult<()>> {
+    ) -> Result<CommitTransition> {
         // First entry into BuildLogRecord (no chunk processed yet): a yield-
         // point to bracket the chunked yields so tests can count them exactly.
         // Must run before the `&mut self.state` re-bind below — the macro
@@ -2106,16 +2115,14 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
         if ctx.cursor < write_set_len {
             // More work remains in the current pass: yield and resume.
-            return Ok(TransitionResult::Io(IOCompletions::Single(
-                Completion::new_yield(),
-            )));
+            return Ok(CommitTransition::Wait(IoRequest::yield_now()));
         }
 
         if ctx.schema_process {
             // Schema pass done; start the data pass from the top.
             ctx.schema_process = false;
             ctx.cursor = 0;
-            return Ok(TransitionResult::Continue);
+            return Ok(CommitTransition::Continue);
         }
 
         if let Some(header) = ctx.pending_header.take() {
@@ -2145,7 +2152,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
         }
         inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
-        Ok(TransitionResult::Continue)
+        Ok(CommitTransition::Continue)
     }
 
     fn populate_portable_changes(
@@ -2398,7 +2405,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     fn step_rewrite_live_versions(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock>>,
-    ) -> Result<TransitionResult<()>> {
+    ) -> Result<CommitTransition> {
         let tx_id = self.tx_id;
         let tx_entry = mvcc_store.txs.get(&tx_id);
         let tx = tx_entry
@@ -2445,12 +2452,10 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             iterations += 1;
         }
         if ctx.cursor < write_set_len {
-            return Ok(TransitionResult::Io(IOCompletions::Single(
-                Completion::new_yield(),
-            )));
+            return Ok(CommitTransition::Wait(IoRequest::yield_now()));
         }
         self.state = CommitState::FinalizeCommit { end_ts };
-        Ok(TransitionResult::Continue)
+        Ok(CommitTransition::Continue)
     }
 }
 
@@ -2467,12 +2472,9 @@ impl WriteRowStateMachine {
     }
 }
 
-impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
-    type Context = Arc<MvStore<Clock>>;
-    type SMResult = ();
-
+impl<Clock: LogicalClock> CommitStateMachine<Clock> {
     #[tracing::instrument(fields(state = ?self.state), skip(self, mvcc_store), level = Level::DEBUG)]
-    fn step(&mut self, mvcc_store: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
+    fn step_inner(&mut self, mvcc_store: &Arc<MvStore<Clock>>) -> Result<CommitTransition> {
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
@@ -2682,7 +2684,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         // Unresolved dependencies — skip validation (no writes)
                         // and go straight to WaitForDependencies.
                         self.state = CommitState::WaitForDependencies { end_ts };
-                        return Ok(TransitionResult::Continue);
+                        return Ok(CommitTransition::Continue);
                     }
                     // Check abort_now AFTER counter: rollback_tx stores abort_now
                     // (Release) before fetch_sub (AcqRel). Once counter == 0, all
@@ -2698,11 +2700,11 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
-                    return Ok(TransitionResult::Done(()));
+                    return Ok(CommitTransition::Done(()));
                 }
                 self.state = CommitState::Commit { end_ts };
                 inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
-                Ok(TransitionResult::Continue)
+                Ok(CommitTransition::Continue)
             }
             CommitState::Commit { end_ts } => {
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
@@ -2727,7 +2729,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // still be rolled back by matching on TxID(self.tx_id).
                 self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
                 inject_transition_yield!(self, CommitYieldPoint::WaitForDependencies);
-                return Ok(TransitionResult::Continue);
+                return Ok(CommitTransition::Continue);
             }
             CommitState::WaitForDependencies { end_ts } => {
                 let end_ts = *end_ts;
@@ -2745,9 +2747,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 // counter is zero." Deadlock impossible: edges always go from higher
                 // end_ts to lower end_ts, so the wait graph is acyclic.
                 if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
-                    return Ok(TransitionResult::Io(IOCompletions::Single(
-                        Completion::new_yield(),
-                    )));
+                    return Ok(CommitTransition::Wait(IoRequest::yield_now()));
                 }
 
                 // Check abort_now AFTER counter reaches 0. Memory ordering:
@@ -2778,7 +2778,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
-                    return Ok(TransitionResult::Done(()));
+                    return Ok(CommitTransition::Done(()));
                 }
 
                 // All dependencies resolved. Initialize an empty log record
@@ -2798,7 +2798,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     schema_process: true,
                     pending_header,
                 });
-                return Ok(TransitionResult::Continue);
+                return Ok(CommitTransition::Continue);
             }
             // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Pulled out
             // to a helper because the arm body needs `&mut self` to mutate
@@ -2814,9 +2814,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(
-                            Completion::new_yield(),
-                        )));
+                        return Ok(CommitTransition::Wait(IoRequest::yield_now()));
                     }
                     tx.value()
                         .pager_commit_lock_held
@@ -2834,12 +2832,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     _ => unreachable!(),
                 };
                 self.state = CommitState::UpgradeLogicalLogHeader { end_ts, log_record };
-                Ok(TransitionResult::Continue)
+                Ok(CommitTransition::Continue)
             }
             CommitState::UpgradeLogicalLogHeader { end_ts, log_record } => {
                 if let Some(c) = mvcc_store.storage.upgrade_header_for_log_tx(log_record)? {
                     if !c.succeeded() {
-                        return Ok(TransitionResult::Io(IOCompletions::Single(c)));
+                        return Ok(CommitTransition::Wait(IoRequest::completion(c)));
                     }
                 }
                 let end_ts = *end_ts;
@@ -2854,7 +2852,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     _ => unreachable!(),
                 };
                 self.state = CommitState::WriteLogicalLog { end_ts, log_record };
-                Ok(TransitionResult::Continue)
+                Ok(CommitTransition::Continue)
             }
             CommitState::WriteLogicalLog { end_ts, .. } => {
                 let end_ts = *end_ts;
@@ -2869,9 +2867,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.pending_log_append_bytes = Some(append_bytes);
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+                    Ok(CommitTransition::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(CommitTransition::Wait(IoRequest::completion(c)))
                 }
             }
 
@@ -2882,15 +2880,15 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 if self.sync_mode != SyncMode::Full {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CommitTransition::Continue);
                 }
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    Ok(TransitionResult::Continue)
+                    Ok(CommitTransition::Continue)
                 } else {
-                    Ok(TransitionResult::Io(IOCompletions::Single(c)))
+                    Ok(CommitTransition::Wait(IoRequest::completion(c)))
                 }
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
@@ -2915,7 +2913,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 self.header.write().replace(tx_header);
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
-                return Ok(TransitionResult::Continue);
+                return Ok(CommitTransition::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
                 // Order of operations matters here:
@@ -2965,7 +2963,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     end_ts: *end_ts,
                     cursor: 0,
                 });
-                Ok(TransitionResult::Continue)
+                Ok(CommitTransition::Continue)
             }
             // Chunked: yields every MVCC_COMMIT_BATCH_SIZE rowids. Same
             // helper-dispatch reason as BuildLogRecord above.
@@ -3044,47 +3042,76 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     );
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
-                    return Ok(TransitionResult::Continue);
+                    return Ok(CommitTransition::Continue);
                 }
                 tracing::trace!("logged(tx_id={}, end_ts={})", self.tx_id, *end_ts);
                 self.finalize(mvcc_store)?;
-                Ok(TransitionResult::Done(()))
+                Ok(CommitTransition::Done(()))
             }
             CommitState::Checkpoint { state_machine } => {
                 let step_result = {
                     let mut sm = state_machine.lock();
-                    SansIoStateMachine::step(&mut *sm, ())
+                    sm.step(())
                 };
                 match step_result {
-                    Ok(SansIoStep::Emit(_)) | Ok(SansIoStep::Done(_)) => {}
+                    Ok(SansIoStep::Done(_)) => {}
                     Ok(SansIoStep::Wait(request)) => {
-                        return Ok(TransitionResult::Io(request.submit()?));
+                        return Ok(CommitTransition::Wait(request));
                     }
+                    Ok(SansIoStep::Emit(event)) => crate::no_event_unreachable!(event),
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
                         tracing::info!("MVCC auto-checkpoint failed: {err}");
                         self.finalize(mvcc_store)?;
-                        return Ok(TransitionResult::Done(()));
+                        return Ok(CommitTransition::Done(()));
                     }
                 }
                 self.finalize(mvcc_store)?;
-                return Ok(TransitionResult::Done(()));
+                return Ok(CommitTransition::Done(()));
             }
         }
     }
 
-    fn finalize(&mut self, _context: &Self::Context) -> Result<()> {
+    fn finalize(&mut self, _context: &Arc<MvStore<Clock>>) -> Result<()> {
         self.is_finalized = true;
         Ok(())
     }
 
-    fn is_finalized(&self) -> bool {
+    pub fn is_finalized(&self) -> bool {
         self.is_finalized
     }
 }
 
+impl<'a, Clock: LogicalClock> SansIoStateMachine<&'a Arc<MvStore<Clock>>>
+    for CommitStateMachine<Clock>
+{
+    type Event = NoEvent;
+    type Signal = IoRequest;
+    type Output = ();
+    type Error = LimboError;
+
+    fn step(
+        &mut self,
+        mvcc_store: &'a Arc<MvStore<Clock>>,
+    ) -> Result<SansIoStep<Self::Event, Self::Signal, Self::Output>> {
+        loop {
+            if self.is_finalized {
+                unreachable!("CommitStateMachine::step: state machine is finalized");
+            }
+            match self.step_inner(mvcc_store)? {
+                CommitTransition::Continue => continue,
+                CommitTransition::Wait(request) => crate::sans_io_yield_one!(request),
+                CommitTransition::Done(result) => {
+                    assert!(self.is_finalized());
+                    return Ok(SansIoStep::Done(result));
+                }
+            }
+        }
+    }
+}
+
 impl SansIoStateMachine<()> for WriteRowStateMachine {
-    type Event = ();
+    type Event = NoEvent;
     type Signal = IoRequest;
     type Output = ();
     type Error = LimboError;
@@ -3130,7 +3157,7 @@ impl SansIoStateMachine<()> for WriteRowStateMachine {
                             }
                         }
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                     turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
@@ -3145,7 +3172,7 @@ impl SansIoStateMachine<()> for WriteRowStateMachine {
                     {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                     turso_assert!(
@@ -3170,7 +3197,7 @@ impl SansIoStateMachine<()> for WriteRowStateMachine {
                     {
                         IOResult::Done(()) => {}
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                     self.state = WriteRowState::Next;
@@ -3184,7 +3211,7 @@ impl SansIoStateMachine<()> for WriteRowStateMachine {
                     {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                     self.is_finalized = true;
@@ -3196,7 +3223,7 @@ impl SansIoStateMachine<()> for WriteRowStateMachine {
 }
 
 impl SansIoStateMachine<()> for DeleteRowStateMachine {
-    type Event = ();
+    type Event = NoEvent;
     type Signal = IoRequest;
     type Output = ();
     type Error = LimboError;
@@ -3236,7 +3263,7 @@ impl SansIoStateMachine<()> for DeleteRowStateMachine {
                             }
                         },
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                 }
@@ -3253,7 +3280,7 @@ impl SansIoStateMachine<()> for DeleteRowStateMachine {
                             self.state = DeleteRowState::Delete;
                         }
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                 }
@@ -3266,7 +3293,7 @@ impl SansIoStateMachine<()> for DeleteRowStateMachine {
                     {
                         IOResult::Done(()) => {}
                         IOResult::IO(io) => {
-                            return Ok(SansIoStep::Wait(IoRequest::submitted(io)));
+                            crate::sans_io_yield_one!(IoRequest::submitted(io));
                         }
                     }
                     tracing::trace!(
@@ -4820,8 +4847,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx_id: TxID,
         connection: &Arc<Connection>,
         db_id: usize,
-    ) -> Result<StateMachine<Box<CommitStateMachine<Clock>>>> {
-        let state = Box::new(CommitStateMachine::new(
+    ) -> Result<Box<CommitStateMachine<Clock>>> {
+        Ok(Box::new(CommitStateMachine::new(
             CommitState::Initial,
             tx_id,
             self.clone(),
@@ -4830,9 +4857,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.commit_coordinator.clone(),
             self.global_header.clone(),
             connection.get_sync_mode(),
-        ));
-        let state_machine = StateMachine::new(state);
-        Ok(state_machine)
+        )))
     }
 
     /// Returns true if the transaction can be rolled back (Active or Preparing).

@@ -34,7 +34,7 @@ pub trait FailureInjector: Debug + Send + Sync {
 }
 
 // At a safe resumable boundary, ask the active yield injector whether this
-// state machine should return a synthetic TransitionResult::Io yield here.
+// state machine should return a synthetic transition yield here.
 macro_rules! inject_transition_yield {
     ($state_machine:expr, $point:expr) => {{
         #[cfg(any(test, injected_yields))]
@@ -76,6 +76,33 @@ macro_rules! inject_io_yield {
 }
 
 pub(crate) use inject_io_yield;
+
+// At a safe resumable boundary, ask the active yield injector whether this
+// sans-I/O state machine should return a synthetic wait signal here.
+#[cfg(any(test, injected_yields))]
+macro_rules! inject_sans_io_yield {
+    ($state_machine:expr, $point:expr) => {{
+        #[cfg(any(test, injected_yields))]
+        {
+            use $crate::mvcc::yield_hooks::ProvidesYieldContext;
+            let yield_context = $state_machine.yield_context();
+            let point = $crate::mvcc::yield_hooks::YieldPointMarker::point($point);
+            if yield_context.injector.as_ref().is_some_and(|injector| {
+                injector.should_yield(
+                    yield_context.instance_id,
+                    yield_context.selection_key,
+                    point,
+                )
+            }) {
+                tracing::debug!(?point, "injecting MVCC yield");
+                $crate::sans_io_yield_one!($crate::io_ops::IoRequest::yield_now());
+            }
+        }
+    }};
+}
+
+#[cfg(any(test, injected_yields))]
+pub(crate) use inject_sans_io_yield;
 
 // At a safe resumable boundary, ask the active failure injector whether this
 // state machine should return Err here. Used to reproduce mid-commit failures

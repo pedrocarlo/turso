@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
-use crate::state_machine::TransitionResult;
 use crate::sync::Arc;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -54,19 +53,26 @@ pub(crate) trait ProvidesYieldContext {
     fn yield_context(&self) -> YieldContext;
 }
 
+#[cfg(any(test, injected_yields))]
+pub(crate) trait InjectedTransitionYield {
+    fn injected_transition_yield() -> Self;
+}
+
+#[cfg(any(test, injected_yields))]
 pub(crate) fn maybe_inject_transition_yield<T, P: YieldPointMarker>(
     injector: Option<&Arc<dyn YieldInjector>>,
     instance_id: u64,
     selection_key: u64,
     point: P,
-) -> Option<TransitionResult<T>> {
+) -> Option<T>
+where
+    T: InjectedTransitionYield,
+{
     let should_yield = injector
         .is_some_and(|injector| injector.should_yield(instance_id, selection_key, point.point()));
     if should_yield {
         tracing::debug!(?point, "injecting MVCC yield");
-        return Some(TransitionResult::Io(IOCompletions::Single(
-            Completion::new_yield(),
-        )));
+        return Some(T::injected_transition_yield());
     }
     None
 }

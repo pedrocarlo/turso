@@ -380,6 +380,18 @@ impl<T> From<IOResult<T>> for InsnFunctionStepResult {
     }
 }
 
+macro_rules! return_if_insn_sans_io {
+    ($expr:expr) => {
+        match $expr {
+            crate::sans_io::Step::Done(value) => value,
+            crate::sans_io::Step::Wait(request) => {
+                return Ok(InsnFunctionStepResult::IO(request));
+            }
+            crate::sans_io::Step::Emit(event) => crate::no_event_unreachable!(event),
+        }
+    };
+}
+
 pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
@@ -613,11 +625,8 @@ pub fn op_checkpoint(
             wal_total_backfilled,
             ..
         } = loop {
-            match SansIoStateMachine::step(&mut ckpt_sm, ()) {
+            match ckpt_sm.step(()) {
                 Ok(SansIoStep::Done(result)) => break result,
-                Ok(SansIoStep::Emit(())) => {
-                    unreachable!("checkpoint state machine must not emit non-terminal events")
-                }
                 Ok(SansIoStep::Wait(request)) => {
                     let wait_result = request.submit().and_then(|io| io.wait(pager.io.as_ref()));
                     if let Err(err) = wait_result {
@@ -625,6 +634,7 @@ pub fn op_checkpoint(
                         return Err(err);
                     }
                 }
+                Ok(SansIoStep::Emit(event)) => crate::no_event_unreachable!(event),
                 Err(err) => return Err(err),
             }
         };
@@ -6810,7 +6820,7 @@ pub fn op_sorter_insert(
             Register::Record(record) => record,
             _ => unreachable!("SorterInsert on non-record register"),
         };
-        return_if_io!(cursor.insert(record));
+        return_if_insn_sans_io!(cursor.insert(record)?);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -6834,7 +6844,7 @@ pub fn op_sorter_sort(
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
-            return_if_io!(cursor.sort());
+            return_if_insn_sans_io!(cursor.sort()?);
         }
         (is_empty, !is_empty)
     };
@@ -6868,7 +6878,7 @@ pub fn op_sorter_next(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
-        return_if_io!(cursor.next());
+        return_if_insn_sans_io!(cursor.next()?);
         cursor.has_more()
     };
     if has_more {
@@ -14939,21 +14949,10 @@ fn op_journal_mode_inner(
                         .checkpoint_sm
                         .as_mut()
                         .unwrap();
-                    match SansIoStateMachine::step(ckpt_sm, ())? {
-                        SansIoStep::Wait(request) => {
-                            return Ok(InsnFunctionStepResult::IO(request))
-                        }
-                        SansIoStep::Done(_) => {
-                            state.active_op_state.journal_mode().checkpoint_sm = None;
-                            state.active_op_state.journal_mode().sub_state =
-                                OpJournalModeSubState::UpdateHeader;
-                        }
-                        SansIoStep::Emit(()) => {
-                            unreachable!(
-                                "checkpoint state machine must not emit non-terminal events"
-                            )
-                        }
-                    }
+                    return_if_insn_sans_io!(ckpt_sm.step(())?);
+                    state.active_op_state.journal_mode().checkpoint_sm = None;
+                    state.active_op_state.journal_mode().sub_state =
+                        OpJournalModeSubState::UpdateHeader;
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(

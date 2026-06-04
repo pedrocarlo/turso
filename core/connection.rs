@@ -1640,12 +1640,9 @@ impl Connection {
                 self.get_sync_mode(),
             );
             loop {
-                match SansIoStateMachine::step(&mut ckpt_sm, ()) {
+                match ckpt_sm.step(()) {
                     Ok(SansIoStep::Done(result)) => {
                         return Ok(result);
-                    }
-                    Ok(SansIoStep::Emit(())) => {
-                        unreachable!("checkpoint state machine must not emit non-terminal events")
                     }
                     Ok(SansIoStep::Wait(request)) => {
                         let wait_result = request
@@ -1656,6 +1653,7 @@ impl Connection {
                             return Err(err);
                         }
                     }
+                    Ok(SansIoStep::Emit(event)) => crate::no_event_unreachable!(event),
                     Err(err) => return Err(err),
                 }
             }

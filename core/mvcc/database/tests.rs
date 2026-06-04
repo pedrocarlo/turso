@@ -15,6 +15,7 @@ use crate::mvcc::persistent_storage::logical_log::{
 use crate::mvcc::portable_logical::{PortableLogicalBuilder, PortableObjectMapEntry};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector, YieldPoint};
+use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::storage::sqlite3_ondisk::{
     checksum_wal, read_varint, write_varint, DatabaseHeader, WalHeader, WAL_FRAME_HEADER_SIZE,
     WAL_HEADER_SIZE,
@@ -603,12 +604,13 @@ fn step_checkpoint_for_test(
     checkpoint_sm: &mut CheckpointStateMachine<MvccClock>,
     pager: &Pager,
 ) -> bool {
-    match crate::sans_io::StateMachine::step(checkpoint_sm, ()).unwrap() {
+    match checkpoint_sm.step(()).unwrap() {
         crate::sans_io::Step::Wait(request) => {
             request.submit().unwrap().wait(pager.io.as_ref()).unwrap();
             false
         }
-        crate::sans_io::Step::Emit(_) | crate::sans_io::Step::Done(_) => true,
+        crate::sans_io::Step::Done(_) => true,
+        crate::sans_io::Step::Emit(event) => crate::no_event_unreachable!(event),
     }
 }
 
@@ -3975,10 +3977,11 @@ pub(crate) fn commit_tx(
     loop {
         let res = sm.step(&mv_store)?;
         match res {
-            IOResult::IO(io) => {
-                io.wait(conn.db.io.as_ref())?;
+            SansIoStep::Wait(request) => {
+                request.submit()?.wait(conn.db.io.as_ref())?;
             }
-            IOResult::Done(_) => break,
+            SansIoStep::Done(_) => break,
+            SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
         }
     }
     assert!(sm.is_finalized());
@@ -3996,10 +3999,11 @@ pub(crate) fn commit_tx_no_conn(
     loop {
         let res = sm.step(&mv_store)?;
         match res {
-            IOResult::IO(io) => {
-                io.wait(conn.db.io.as_ref())?;
+            SansIoStep::Wait(request) => {
+                request.submit()?.wait(conn.db.io.as_ref())?;
             }
-            IOResult::Done(_) => break,
+            SansIoStep::Done(_) => break,
+            SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
         }
     }
     assert!(sm.is_finalized());
@@ -6610,11 +6614,12 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         .write_row_to_pager(&row, cursor.clone(), true)
         .unwrap();
     loop {
-        match crate::sans_io::StateMachine::step(&mut write_row_sm, ()).unwrap() {
-            crate::sans_io::Step::Emit(()) | crate::sans_io::Step::Done(()) => break,
+        match write_row_sm.step(()).unwrap() {
+            crate::sans_io::Step::Done(()) => break,
             crate::sans_io::Step::Wait(request) => {
                 request.submit().unwrap().wait(pager.io.as_ref()).unwrap();
             }
+            crate::sans_io::Step::Emit(event) => crate::no_event_unreachable!(event),
         }
     }
     run_pager_until_done(|| pager.commit_tx(&db.conn, true), pager.as_ref()).unwrap();

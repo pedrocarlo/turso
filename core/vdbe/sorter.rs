@@ -1,4 +1,4 @@
-use crate::{turso_assert, turso_assert_eq};
+use crate::{sans_io_yield_one, turso_assert, turso_assert_eq};
 use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
@@ -11,16 +11,19 @@ use std::rc::Rc;
 
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{IOCompletions, ValueIterator};
+use crate::io_ops::IoRequest;
+use crate::return_if_sans_io;
+use crate::sans_io::{NoEvent, Step as SansIoStep};
+use crate::types::ValueIterator;
+use crate::CompletionError;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
-    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
+    types::{ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
-use crate::{io_yield_one, return_if_io, CompletionError};
 
 /// A custom comparison function for sorting custom type columns.
 /// Takes two value references and returns an Ordering.
@@ -46,6 +49,8 @@ enum InitChunkHeapState {
     Start,
     PushChunk,
 }
+
+type SorterStep<T> = SansIoStep<NoEvent, IoRequest, T>;
 
 pub struct Sorter {
     /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
@@ -152,7 +157,7 @@ impl Sorter {
     }
 
     // We do the sorting here since this is what is called by the SorterSort instruction
-    pub fn sort(&mut self) -> Result<IOResult<()>> {
+    pub fn sort(&mut self) -> Result<SorterStep<()>> {
         loop {
             match self.sort_state {
                 SortState::Start => {
@@ -172,7 +177,7 @@ impl Sorter {
                 SortState::Flush => {
                     self.sort_state = SortState::InitHeap;
                     if let Some(c) = self.flush()? {
-                        io_yield_one!(c);
+                        sans_io_yield_one!(IoRequest::completion(c));
                     }
                 }
                 SortState::InitHeap => {
@@ -192,20 +197,20 @@ impl Sorter {
                         }),
                         "chunks should been written"
                     );
-                    return_if_io!(self.init_chunk_heap());
+                    return_if_sans_io!(self.init_chunk_heap()?);
                     self.sort_state = SortState::Next;
                 }
                 SortState::Next => {
-                    return_if_io!(self.next());
+                    return_if_sans_io!(self.next()?);
                     self.sort_state = SortState::Start;
-                    return Ok(IOResult::Done(()));
+                    return Ok(SansIoStep::Done(()));
                 }
             }
         }
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Result<IOResult<()>> {
+    pub fn next(&mut self) -> Result<SorterStep<()>> {
         if self.chunks.is_empty() {
             match self.records.pop() {
                 Some(ptr) => {
@@ -231,7 +236,7 @@ impl Sorter {
             }
         } else {
             // Serve from sorted chunk files
-            match return_if_io!(self.next_from_chunk_heap()) {
+            match return_if_sans_io!(self.next_from_chunk_heap()?) {
                 Some(boxed_record) => {
                     if let Some(ref error) = boxed_record.deserialization_error {
                         return Err(error.clone());
@@ -250,14 +255,14 @@ impl Sorter {
                 None => self.current = None,
             }
         }
-        Ok(IOResult::Done(()))
+        Ok(SansIoStep::Done(()))
     }
 
     pub const fn record(&self) -> Option<&ImmutableRecord> {
         self.current.as_ref()
     }
 
-    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<IOResult<()>> {
+    pub fn insert(&mut self, record: &ImmutableRecord) -> Result<SorterStep<()>> {
         let payload_size = record.get_payload().len();
         loop {
             match self.insert_state {
@@ -266,7 +271,7 @@ impl Sorter {
                     if self.current_buffer_size + payload_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
                             if !c.succeeded() {
-                                io_yield_one!(c);
+                                sans_io_yield_one!(IoRequest::completion(c));
                             }
                         }
                         // Check for write errors immediately after flush completes
@@ -296,13 +301,13 @@ impl Sorter {
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
                     self.insert_state = InsertState::Start;
-                    return Ok(IOResult::Done(()));
+                    return Ok(SansIoStep::Done(()));
                 }
             }
         }
     }
 
-    fn init_chunk_heap(&mut self) -> Result<IOResult<()>> {
+    fn init_chunk_heap(&mut self) -> Result<SorterStep<()>> {
         match self.init_chunk_heap_state {
             InitChunkHeapState::Start => {
                 let mut group = CompletionGroup::new(|_| {});
@@ -320,7 +325,7 @@ impl Sorter {
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
                 let completion = group.build();
-                io_yield_one!(completion);
+                sans_io_yield_one!(IoRequest::completion(completion));
             }
             InitChunkHeapState::PushChunk => {
                 // Make sure all chunks read at least one record into their buffer.
@@ -342,9 +347,9 @@ impl Sorter {
                 self.init_chunk_heap_state = InitChunkHeapState::Start;
                 let completion = group.build();
                 if completion.finished() {
-                    Ok(IOResult::Done(()))
+                    Ok(SansIoStep::Done(()))
                 } else {
-                    io_yield_one!(completion);
+                    sans_io_yield_one!(IoRequest::completion(completion));
                 }
             }
         }
@@ -356,14 +361,14 @@ impl Sorter {
     /// from that chunk. If IO is needed, we store it in `pending_completion` and wait for it
     /// on the next call before popping again - this ensures all non-exhausted chunks have
     /// a record in the heap before we decide which is smallest.
-    fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<Box<BoxedSortableRecord>>>> {
+    fn next_from_chunk_heap(&mut self) -> Result<SorterStep<Option<Box<BoxedSortableRecord>>>> {
         // If there is a pending IO, we must wait for it before popping from the heap,
         // otherwise we might return records out of order.
         while let Some((completion, chunk_idx)) = self.pending_completion.take() {
             if !completion.succeeded() {
                 // IO not complete - put it back and yield
                 self.pending_completion = Some((completion.clone(), chunk_idx));
-                return Ok(IOResult::IO(IOCompletions::Single(completion)));
+                sans_io_yield_one!(IoRequest::completion(completion));
             }
             // IO completed - push result to heap and retry
             if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
@@ -376,11 +381,11 @@ impl Sorter {
             if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
-            return Ok(IOResult::Done(Some(next_record.0)));
+            return Ok(SansIoStep::Done(Some(next_record.0)));
         }
 
         // Heap empty and no pending IO - sorter exhausted
-        Ok(IOResult::Done(None))
+        Ok(SansIoStep::Done(None))
     }
 
     fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
@@ -1007,7 +1012,6 @@ mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
     use crate::types::{ImmutableRecord, Value, ValueRef, ValueType};
-    use crate::util::IOExt;
     use crate::PlatformIO;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -1025,6 +1029,19 @@ mod tests {
                     .expect("Failed to parse SEED environment variable as u64")
             },
         ) as u64
+    }
+
+    fn block_sorter_step<T>(
+        io: &dyn IO,
+        mut step: impl FnMut() -> Result<SorterStep<T>>,
+    ) -> Result<T> {
+        loop {
+            match step()? {
+                SansIoStep::Done(value) => return Ok(value),
+                SansIoStep::Wait(request) => request.submit()?.wait(io)?,
+                SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
+            }
+        }
     }
 
     #[test]
@@ -1060,13 +1077,12 @@ mod tests {
                 values.append(&mut generate_values(&mut rng, &value_types));
                 let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
 
-                io.block(|| sorter.insert(&record))
+                block_sorter_step(io.as_ref(), || sorter.insert(&record))
                     .expect("Failed to insert the record");
                 initial_records.push(record);
             }
 
-            io.block(|| sorter.sort())
-                .expect("Failed to sort the records");
+            block_sorter_step(io.as_ref(), || sorter.sort()).expect("Failed to sort the records");
 
             assert!(!sorter.is_empty());
             assert!(!sorter.chunks.is_empty());
@@ -1078,7 +1094,7 @@ mod tests {
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
-                io.block(|| sorter.next())
+                block_sorter_step(io.as_ref(), || sorter.next())
                     .expect("Failed to get the next record");
             }
             assert!(!sorter.has_more());

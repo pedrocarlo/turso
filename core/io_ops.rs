@@ -36,6 +36,10 @@ impl IoRequest {
         Self::Submitted(completions)
     }
 
+    pub fn completion(completion: Completion) -> Self {
+        Self::Submitted(IOCompletions::Single(completion))
+    }
+
     pub fn read(file: Arc<dyn File>, pos: u64, completion: Completion) -> Self {
         Self::File(FileOp::Read(FileRead {
             file,

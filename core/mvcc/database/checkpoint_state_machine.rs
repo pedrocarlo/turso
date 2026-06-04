@@ -7,8 +7,10 @@ use crate::mvcc::database::{
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
+#[cfg(any(test, injected_yields))]
+use crate::mvcc::yield_points::inject_sans_io_yield;
 use crate::mvcc::yield_points::inject_transition_failure;
-use crate::sans_io::{StateMachine as SansIoStateMachine, Step as SansIoStep};
+use crate::sans_io::{NoEvent, StateMachine as SansIoStateMachine, Step as SansIoStep};
 use crate::schema::Index;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -1151,13 +1153,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     fn step_inner(&mut self, _context: &()) -> Result<CheckpointTransition> {
         match &self.state {
             CheckpointState::AcquireLock => {
-                #[cfg(any(test, injected_yields))]
-                if let Some(transition) =
-                    self.maybe_inject_yield(CheckpointYieldPoint::BeforeAcquireLock)
-                {
-                    return Ok(transition);
-                }
-
                 tracing::debug!("Acquiring blocking checkpoint lock");
                 let locked = self.checkpoint_lock.write();
                 if !locked {
@@ -1557,9 +1552,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match SansIoStateMachine::step(write_row_state_machine, ())? {
+                match write_row_state_machine.step(())? {
                     SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
-                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
+                    SansIoStep::Done(()) => {
                         let requires_seek = self.next_requires_seek_after_insert(write_set_index);
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
@@ -1567,6 +1562,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         };
                         Ok(CheckpointTransition::Continue)
                     }
+                    SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
                 }
             }
 
@@ -1579,15 +1575,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match SansIoStateMachine::step(delete_row_state_machine, ())? {
+                match delete_row_state_machine.step(())? {
                     SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
-                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
+                    SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteRow {
                             write_set_index: write_set_index + 1,
                             requires_seek: true,
                         };
                         Ok(CheckpointTransition::Continue)
                     }
+                    SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
                 }
             }
 
@@ -1695,15 +1692,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match SansIoStateMachine::step(write_row_state_machine, ())? {
+                match write_row_state_machine.step(())? {
                     SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
-                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
+                    SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
                         Ok(CheckpointTransition::Continue)
                     }
+                    SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
                 }
             }
 
@@ -1718,15 +1716,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         )
                     })?;
 
-                match SansIoStateMachine::step(delete_row_state_machine, ())? {
+                match delete_row_state_machine.step(())? {
                     SansIoStep::Wait(request) => Ok(CheckpointTransition::Wait(request)),
-                    SansIoStep::Emit(()) | SansIoStep::Done(()) => {
+                    SansIoStep::Done(()) => {
                         self.state = CheckpointState::WriteIndexRow {
                             index_write_set_index: index_write_set_index + 1,
                             requires_seek: true,
                         };
                         Ok(CheckpointTransition::Continue)
                     }
+                    SansIoStep::Emit(event) => crate::no_event_unreachable!(event),
                 }
             }
 
@@ -1930,12 +1929,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 }
 
 impl<Clock: LogicalClock> SansIoStateMachine<()> for CheckpointStateMachine<Clock> {
-    type Event = ();
+    type Event = NoEvent;
     type Signal = IoRequest;
     type Output = CheckpointResult;
     type Error = LimboError;
 
     fn step(&mut self, _input: ()) -> Result<SansIoStep<Self::Event, Self::Signal, Self::Output>> {
+        #[cfg(any(test, injected_yields))]
+        if matches!(self.state, CheckpointState::AcquireLock) {
+            inject_sans_io_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+        }
+
         loop {
             match self.step_inner(&()) {
                 Err(err) => {
@@ -1953,7 +1957,7 @@ impl<Clock: LogicalClock> SansIoStateMachine<()> for CheckpointStateMachine<Cloc
                     return Ok(SansIoStep::Done(result));
                 }
                 Ok(CheckpointTransition::Wait(request)) => {
-                    return Ok(SansIoStep::Wait(request));
+                    crate::sans_io_yield_one!(request);
                 }
                 Ok(CheckpointTransition::Continue) => {}
             }
