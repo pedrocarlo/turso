@@ -159,7 +159,6 @@ use crate::{
 use bitflags::bitflags;
 use core::fmt;
 use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::OnceLock;
 use tracing::trace;
@@ -440,12 +439,21 @@ impl TypeDef {
                 sql,
                 domain_checks: Vec::new(),
                 kind: TypeDefKind::Custom {
-                    params: params.clone(),
+                    params: params.try_to_vec_ext()?,
                     base: base.clone(),
-                    encode: encode.clone(),
-                    decode: decode.clone(),
-                    operators: operators.clone(),
-                    default: default.clone(),
+                    encode: encode
+                        .as_deref()
+                        .map(|e| TursoTryNewExt::try_new(e.clone()))
+                        .transpose()?,
+                    decode: decode
+                        .as_deref()
+                        .map(|e| TursoTryNewExt::try_new(e.clone()))
+                        .transpose()?,
+                    operators: operators.try_to_vec_ext()?,
+                    default: default
+                        .as_deref()
+                        .map(|e| TursoTryNewExt::try_new(e.clone()))
+                        .transpose()?,
                 },
             },
             ast::CreateTypeBody::Struct(fields) => {
@@ -494,10 +502,12 @@ impl TypeDef {
                     sql,
                     domain_checks: Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
+                        // Arc is not allocator-aware yet, so build the slice
+                        // through a std Vec at this boundary.
                         tag_names: variants
                             .iter()
                             .map(|v| v.tag_name.clone())
-                            .try_collect::<Vec<_>>()?
+                            .collect::<std::vec::Vec<_>>()
                             .into(),
                         variants,
                     }),
@@ -522,7 +532,7 @@ impl TypeDef {
             not_null,
             is_domain: true,
             sql,
-            domain_checks: constraints.to_vec(),
+            domain_checks: constraints.to_vec_ext(),
             kind: TypeDefKind::Custom {
                 params: Vec::new(),
                 base: base_type.to_string(),
@@ -1043,7 +1053,7 @@ impl Schema {
                     &base_type,
                     not_null,
                     &constraints,
-                    default,
+                    default.map(|e| TursoTryNewExt::try_new(*e)).transpose()?,
                     sql.to_string(),
                 );
                 self.type_registry
@@ -1192,9 +1202,11 @@ impl Schema {
         let table_name = normalize_ident(table_name);
         let view_name = normalize_ident(view_name);
 
+        // or_default() needs Default, which the alias collections lack on nightly
+        #[allow(clippy::unwrap_or_default)]
         self.table_to_materialized_views
             .entry(table_name)
-            .or_default()
+            .or_insert_with(Vec::new)
             .push(view_name);
     }
 
@@ -1207,7 +1219,7 @@ impl Schema {
         self.table_to_materialized_views
             .get(&table_name)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(Vec::new)
     }
 
     /// Add a regular (non-materialized) view
@@ -1230,9 +1242,11 @@ impl Schema {
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
+        // or_default() needs Default, which the alias collections lack on nightly
+        #[allow(clippy::unwrap_or_default)]
         self.triggers
             .entry(table_name)
-            .or_default()
+            .or_insert_with(VecDeque::new)
             .push_front(Arc::new(trigger));
 
         Ok(())
@@ -1408,7 +1422,9 @@ impl Schema {
         // non-mutating conflict resolutions all happen before mutating ones, ensuring that
         // no half-committed state is left behind.
         let is_replace = index.on_conflict == Some(ResolveType::Replace);
-        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        // or_default() needs Default, which the alias collections lack on nightly
+        #[allow(clippy::unwrap_or_default)]
+        let indexes_for_table = self.indexes.entry(table_name).or_insert_with(VecDeque::new);
         if is_replace {
             // REPLACE indexes sort newest-first among themselves.
             let first_replace = indexes_for_table
@@ -1917,7 +1933,11 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
+            let cols: Vec<Column> = incremental_view
+                .column_schema
+                .flat_columns()
+                .into_iter()
+                .try_collect()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
@@ -1954,28 +1974,26 @@ impl Schema {
     /// currently in the schema. Shared shape for the SQL-based descriptor
     /// loader in `Connection` so the prefix-strip lives in one place.
     pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
-        self.tables
-            .keys()
-            .filter_map(|name| {
-                let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
-                Some((name.clone(), seq_name.to_string()))
-            })
-            .collect()
+        let mut names = Vec::new();
+        names.extend(self.tables.keys().filter_map(|name| {
+            let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
+            Some((name.clone(), seq_name.to_string()))
+        }));
+        names
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
-        self.tables
-            .iter()
-            .filter_map(|(name, table)| {
-                let bt = table.btree()?;
-                let sequence_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?.to_string();
-                Some(SequenceBackingTableSource {
-                    sequence_name,
-                    root_page: bt.root_page,
-                    num_columns: bt.columns().len(),
-                })
+        let mut sources = Vec::new();
+        sources.extend(self.tables.iter().filter_map(|(name, table)| {
+            let bt = table.btree()?;
+            let sequence_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?.to_string();
+            Some(SequenceBackingTableSource {
+                sequence_name,
+                root_page: bt.root_page,
+                num_columns: bt.columns().len(),
             })
-            .collect()
+        }));
+        sources
     }
 
     fn read_sequence_metadata(record: &ImmutableRecord) -> Option<SequenceMetadata> {
@@ -2231,7 +2249,10 @@ impl Schema {
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
+                            let mut final_columns: Vec<Column> = view_column_schema
+                                .flat_columns()
+                                .into_iter()
+                                .try_collect()?;
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     col.name = Some(indexed_col.col_name.to_string());
@@ -2300,7 +2321,7 @@ impl Schema {
                         event,
                         for_each_row,
                         when_clause.map(|e| *e),
-                        commands,
+                        commands.into_iter().try_collect()?,
                         temporary,
                         target_database_id,
                     ),
@@ -2823,7 +2844,7 @@ impl Table {
         }
     }
 
-    pub fn columns(&self) -> &Vec<Column> {
+    pub fn columns(&self) -> &[Column] {
         match self {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
@@ -3629,7 +3650,7 @@ impl BTreeTable {
     /// columns in this order guarantees that all dependencies of generated columns are computed
     /// before the columns that reference them.
     pub(crate) fn columns_topo_sort(&self) -> Result<ColumnsTopologicalSort<'_>> {
-        let topo = self.column_graph()?.topological_sort.to_vec();
+        let topo = self.column_graph()?.topological_sort.try_to_vec_ext()?;
         Ok(ColumnsTopologicalSort {
             columns: &self.columns,
             topological_sort: topo,
@@ -4233,11 +4254,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(ast::Type {
                         size: Some(ast::TypeSize::MaxSize(ref expr)),
                         ..
-                    }) => vec![expr.clone()],
+                    }) => vec![TursoTryNewExt::try_new((**expr).clone())?],
                     Some(ast::Type {
                         size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                         ..
-                    }) => vec![e1.clone(), e2.clone()],
+                    }) => vec![
+                        TursoTryNewExt::try_new((**e1).clone())?,
+                        TursoTryNewExt::try_new((**e2).clone())?,
+                    ],
                     _ => Vec::new(),
                 };
 
@@ -4277,7 +4301,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 bail_parse_error!("Stored generated columns are not supported");
                             }
                             validate_generated_expr(expr)?;
-                            generated = Some(expr.clone());
+                            generated = Some(TursoTryNewExt::try_new((**expr).clone())?);
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -4314,10 +4338,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
-                            default = Some(
-                                translate_ident_to_string_literal(expr)
-                                    .unwrap_or_else(|| expr.clone()),
-                            );
+                            default = Some(match translate_ident_to_string_literal(expr) {
+                                Some(e) => e,
+                                None => TursoTryNewExt::try_new((**expr).clone())?,
+                            });
                         }
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
@@ -4376,7 +4400,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                         }
                                     })
                                     .unwrap_or(RefAct::NoAction),
-                                child_columns: Box::from([name.clone()]),
+                                child_columns: [name.clone()].into_iter().try_collect()?,
                                 deferred: match defer_clause {
                                     Some(d) => {
                                         d.deferrable
@@ -5118,9 +5142,10 @@ impl TryFrom<&ColumnDefinition> for Column {
                 }
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default.replace(
-                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
-                    );
+                    default.replace(match translate_ident_to_string_literal(expr) {
+                        Some(e) => e,
+                        None => TursoTryNewExt::try_new((**expr).clone())?,
+                    });
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     let collation_seq = CollationSeq::new(collation_name.as_str())?;
@@ -5132,7 +5157,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                     collation.replace(collation_seq);
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
-                    generated = Some(expr.clone());
+                    generated = Some(TursoTryNewExt::try_new((**expr).clone())?);
                 }
                 _ => {}
             };
@@ -5153,11 +5178,14 @@ impl TryFrom<&ColumnDefinition> for Column {
             Some(ast::Type {
                 size: Some(ast::TypeSize::MaxSize(ref expr)),
                 ..
-            }) => vec![expr.clone()],
+            }) => vec![TursoTryNewExt::try_new((**expr).clone())?],
             Some(ast::Type {
                 size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
                 ..
-            }) => vec![e1.clone(), e2.clone()],
+            }) => vec![
+                TursoTryNewExt::try_new((**e1).clone())?,
+                TursoTryNewExt::try_new((**e2).clone())?,
+            ],
             _ => Vec::new(),
         };
 
@@ -5339,7 +5367,7 @@ impl Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
-                        columns: index_columns,
+                        columns: index_columns.into_iter().try_collect()?,
                         unique: false,
                         ephemeral: false,
                         has_rowid: table.has_rowid,
@@ -5352,11 +5380,13 @@ impl Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
                         root_page,
-                        columns: index_columns,
+                        columns: index_columns.into_iter().try_collect()?,
                         unique,
                         ephemeral: false,
                         has_rowid: table.has_rowid,
-                        where_clause,
+                        where_clause: where_clause
+                            .map(|e| TursoTryNewExt::try_new(*e))
+                            .transpose()?,
                         index_method: None,
                         on_conflict: None,
                     })

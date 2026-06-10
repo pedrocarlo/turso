@@ -1,3 +1,7 @@
+// On nightly the allocator-aware `crate::alloc::Vec` constructor resolves
+// through this trait; on stable the inherent `Vec::with_capacity` is used.
+#[cfg(nightly)]
+use crate::alloc::TursoVecExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -167,8 +171,8 @@ pub struct ParseSchemaRowsState {
 
 struct ParseSchemaRowsInner {
     rows: Statement,
-    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
     materialized_view_info: HashMap<String, (String, i64)>,
@@ -182,7 +186,7 @@ impl ParseSchemaRowsState {
         Self {
             inner: Some(ParseSchemaRowsInner {
                 rows,
-                from_sql_indexes: Vec::with_capacity(10),
+                from_sql_indexes: crate::alloc::Vec::with_capacity(10),
                 automatic_indices: HashMap::with_capacity_and_hasher(10, Default::default()),
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
