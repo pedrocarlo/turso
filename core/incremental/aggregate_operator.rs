@@ -1001,7 +1001,11 @@ impl AggregateState {
         Ok(state)
     }
 
-    fn to_blob(&self, aggregates: &[AggregateFunction], group_key: &[Value]) -> Result<Vec<u8>> {
+    fn to_blob(
+        &self,
+        aggregates: &[AggregateFunction],
+        group_key: &[Value],
+    ) -> Result<crate::alloc::Vec<u8>> {
         let mut all_values = Vec::new();
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
@@ -1014,7 +1018,7 @@ impl AggregateState {
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecordRef::from_bin_record(blob);
-        let mut all_values: Vec<Value> = record.get_values_owned()?;
+        let mut all_values: crate::alloc::Vec<Value> = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(

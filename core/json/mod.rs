@@ -5,6 +5,7 @@ mod ops;
 pub(crate) mod path;
 pub(crate) mod vtab;
 
+use crate::alloc::TursoSliceExt;
 use crate::json::error::Error as JsonError;
 pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
@@ -71,7 +72,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
 
     let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
     match jsonbin {
-        Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
+        Ok(jsonbin) => Ok(Value::Blob(jsonbin.data().try_to_vec_ext()?)),
         Err(_) => {
             bail_parse_error!("malformed JSON")
         }
@@ -595,7 +596,7 @@ pub fn json_string_to_db_type(
         return Ok(Value::Null);
     }
     if matches!(flag, OutputVariant::Binary) {
-        return Ok(Value::Blob(json.data()));
+        return Ok(Value::Blob(json.data().try_to_vec_ext()?));
     }
     let mut json_string = json.to_string()?;
     if matches!(flag, OutputVariant::String) {

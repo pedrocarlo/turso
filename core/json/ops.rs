@@ -5,6 +5,7 @@ use super::{
     Conv, JsonCacheCell, OutputVariant,
 };
 use crate::{
+    alloc::TursoSliceExt,
     types::{AsValueRef, Text, Value},
     ValueRef,
 };
@@ -146,7 +147,7 @@ where
         }
     }
 
-    Ok(Value::Blob(json.data()))
+    Ok(Value::Blob(json.data().try_to_vec_ext()?))
 }
 
 pub fn json_replace<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>

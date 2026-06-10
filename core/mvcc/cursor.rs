@@ -1586,9 +1586,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             let record = record.clone();
             let column_count = record.column_count();
             let row = match &self.mv_cursor_type {
-                MvccCursorType::Table => {
-                    Row::new_table_row(rowid.clone(), record.into_payload(), column_count)
-                }
+                MvccCursorType::Table => Row::new_table_row(
+                    rowid.clone(),
+                    record.into_payload().into_iter().collect(),
+                    column_count,
+                ),
                 MvccCursorType::Index(_) => Row::new_index_row(rowid.clone(), column_count),
             };
             self.db

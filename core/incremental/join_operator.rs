@@ -546,7 +546,7 @@ impl JoinOperator {
 
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     let record = ImmutableRecordRef::from_bin_record(blob);
-    let all_values: Vec<Value> = record.get_values_owned()?;
+    let all_values: crate::alloc::Vec<Value> = record.get_values_owned()?;
 
     if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
@@ -570,7 +570,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     Ok(HashableRow::new(rowid, values))
 }
 
-fn serialize_hashable_row(row: &HashableRow) -> Result<Vec<u8>> {
+fn serialize_hashable_row(row: &HashableRow) -> Result<crate::alloc::Vec<u8>> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);

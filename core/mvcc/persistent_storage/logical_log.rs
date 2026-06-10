@@ -231,6 +231,7 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
+use crate::alloc::TursoIteratorExt;
 use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -3510,7 +3511,9 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecord::from_bin_record(
+                    payload.into_iter().try_collect()?,
+                );
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
@@ -3529,7 +3532,9 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                let key_record = crate::types::ImmutableRecord::from_bin_record(payload);
+                let key_record = crate::types::ImmutableRecord::from_bin_record(
+                    payload.into_iter().try_collect()?,
+                );
                 let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = SortableIndexKey::new_from_record(key_record, index_info);
@@ -6172,7 +6177,7 @@ mod tests {
     fn make_test_raw_index_row_version(
         table_id: MVTableId,
         rowid: i64,
-        payload_bytes: Vec<u8>,
+        payload_bytes: crate::alloc::Vec<u8>,
         commit_ts: u64,
         is_delete: bool,
     ) -> crate::mvcc::database::RowVersion {

@@ -158,7 +158,7 @@ impl MaterializedViewCursor {
         }
 
         Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values),
+            HashableRow::new(rowid, btree_values.into_iter().collect()),
             weight,
         )]))
     }

@@ -1,6 +1,7 @@
 // Simplified DBSP integration for incremental view maintenance
 // For now, we'll use a basic approach and can expand to full DBSP later
 
+use crate::alloc::TursoSliceExt;
 use crate::numeric::Numeric;
 use crate::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -81,8 +82,8 @@ impl Hash128 {
     }
 
     /// Convert to a big-endian byte array for storage
-    pub fn to_blob(self) -> Vec<u8> {
-        self.uuid.as_bytes().to_vec()
+    pub fn to_blob(self) -> crate::alloc::Vec<u8> {
+        self.uuid.as_bytes().to_vec_ext()
     }
 
     /// Create from a big-endian byte array

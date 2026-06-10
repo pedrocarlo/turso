@@ -1,3 +1,4 @@
+use crate::alloc::{TursoSliceExt, TursoTryWithCapacityExt};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -131,7 +132,7 @@ pub struct SortableIndexKey {
 }
 
 impl SortableIndexKey {
-    pub fn new_from_bytes(key_bytes: Vec<u8>, metadata: Arc<IndexInfo>) -> Self {
+    pub fn new_from_bytes(key_bytes: crate::alloc::Vec<u8>, metadata: Arc<IndexInfo>) -> Self {
         Self {
             key: ImmutableRecord::from_bin_record(key_bytes),
             metadata,
@@ -6934,7 +6935,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                         let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                         if is_schema_row {
-                            let row_data = row.payload().to_vec();
+                            let row_data = row.payload().try_to_vec_ext()?;
                             let record = ImmutableRecord::from_bin_record(row_data);
                             if record.column_count() < 5 {
                                 return Err(LimboError::Corrupt(format!(
@@ -7048,7 +7049,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 // tombstones so checkpoint can still recover B-tree identity.
                                 Row::new_table_row(
                                     rowid.clone(),
-                                    record.as_blob().clone(),
+                                    record.as_blob().to_vec(),
                                     record.column_count(),
                                 )
                             } else {
@@ -7258,8 +7259,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let mut fresh = Schema::new();
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
-        let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+        let mut from_sql_indexes = crate::alloc::Vec::try_with_capacity_ext(10)?;
+        let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
+            HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
