@@ -527,10 +527,7 @@ impl HashEntry {
                 // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
                 // Skipping validation here for performance in the spill/reload path.
                 // Doing checked utf8 construction here is a massive performance hit.
-                let bytes: Vec<_> = buf[offset..offset + str_len as usize]
-                    .iter()
-                    .copied()
-                    .try_collect()?;
+                let bytes: std::vec::Vec<_> = buf[offset..offset + str_len as usize].to_vec();
                 let s = unsafe { String::from_utf8_unchecked(bytes) };
                 offset += str_len as usize;
                 Value::Text(s.into())
@@ -1774,7 +1771,7 @@ impl HashTable {
             return Ok(());
         }
 
-        let entries = std::mem::take(&mut partition_buffer.entries);
+        let entries = std::mem::replace(&mut partition_buffer.entries, TursoAllocExt::new());
         // we don't change self.mem_used here, as these entries
         // were always in memory. we’re just changing their layout
         partition_buffer.mem_used = 0;

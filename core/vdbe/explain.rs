@@ -1,3 +1,4 @@
+use crate::alloc::TursoSliceExt;
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
@@ -1018,7 +1019,7 @@ pub fn insn_to_row(
                 0,
                 *dest as i64,
                 0,
-                Value::Blob(value.clone()),
+                Value::Blob(value.to_vec_ext()),
                 0,
                 format!(
                     "r[{}]={} (len={})",

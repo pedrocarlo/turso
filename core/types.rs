@@ -565,7 +565,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::Blob(blob.try_to_vec_ext()?))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -1899,7 +1899,7 @@ impl<'a> ValueRef<'a> {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            ValueRef::Blob(b) => Value::Blob(b.to_vec_ext()),
         }
     }
 
@@ -2838,7 +2838,9 @@ impl Record {
 
 pub enum Cursor {
     BTree(Box<dyn CursorTrait>),
-    IndexMethod(Box<dyn IndexMethodCursor>),
+    // TODO: index_method modules still hand out std boxes; switch to the alias Box
+    // once core/index_method is allocator-aware.
+    IndexMethod(std::boxed::Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),

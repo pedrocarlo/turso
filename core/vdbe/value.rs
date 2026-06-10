@@ -1,3 +1,6 @@
+use crate::alloc::TursoSliceExt;
+#[cfg(nightly)]
+use crate::alloc::TursoVecExt;
 use crate::turso_assert;
 use crate::{
     function::MathFunc,
@@ -344,7 +347,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        let mut blob: Vec<u8> = vec![0; length as usize];
+        let mut blob: crate::alloc::Vec<u8> = crate::alloc::try_vec![0; length as usize]?;
         fill_bytes(&mut blob);
         Ok(Value::Blob(blob))
     }
@@ -549,7 +552,7 @@ impl Value {
         match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
-                Value::from_blob(b[start..end].to_vec())
+                Value::from_blob(b[start..end].to_vec_ext())
             }
             (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
@@ -654,7 +657,7 @@ impl Value {
                     .cast_text()
                     .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
                 {
-                    Some(Ok(bytes)) => Value::Blob(bytes),
+                    Some(Ok(bytes)) => Value::Blob(bytes.to_vec_ext()),
                     _ => Value::Null,
                 },
                 Some(ignore) => match ignore {
@@ -662,7 +665,7 @@ impl Value {
                         let input = self.to_string();
                         let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
-                        let mut out = Vec::with_capacity(input.len() / 2);
+                        let mut out = crate::alloc::Vec::with_capacity(input.len() / 2);
 
                         let is_sep = |c: char| ignore.contains(c) && !c.is_ascii_hexdigit();
 
@@ -862,7 +865,7 @@ impl Value {
             return Err(LimboError::TooBig);
         }
 
-        Ok(Value::Blob(vec![0; length as usize]))
+        Ok(Value::Blob(crate::alloc::try_vec![0; length as usize]?))
     }
 
     // exec_if returns whether you should jump
@@ -887,7 +890,7 @@ impl Value {
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::Blob(text.into_bytes())
+                Value::Blob(text.as_bytes().to_vec_ext())
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -1146,7 +1149,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec_ext());
         }
 
         let Some(lhs) = self.cast_text() else {

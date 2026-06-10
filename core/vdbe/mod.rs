@@ -17,6 +17,7 @@
 //!
 //! https://www.sqlite.org/opcode.html
 
+use crate::alloc::TursoSliceExt;
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
@@ -315,7 +316,7 @@ impl Register {
     /// Set the value of the register to a blob,
     /// reusing Register::Value(Value::Blob(_)) buffer if possible.
     #[inline]
-    pub fn set_blob(&mut self, val: Vec<u8>) -> Result<()> {
+    pub fn set_blob(&mut self, val: crate::alloc::Vec<u8>) -> Result<()> {
         match self {
             Register::Value(Value::Blob(existing)) => {
                 existing.do_extend(&val)?;
@@ -410,11 +411,11 @@ impl ProgramExecutionState {
 
 /// Re-entrant state for [Insn::HashBuild].
 /// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashBuildState {
-    pub key_values: Vec<Value>,
+    pub key_values: crate::alloc::Vec<Value>,
     pub key_idx: usize,
-    pub payload_values: Vec<Value>,
+    pub payload_values: crate::alloc::Vec<Value>,
     pub payload_idx: usize,
     pub rowid: Option<i64>,
     pub cursor_id: CursorID,
@@ -425,10 +426,10 @@ pub struct OpHashBuildState {
 
 /// Re-entrant state for [Insn::HashProbe].
 /// Allows HashProbe to resume cleanly after async probe-row buffering I/O.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OpHashProbeState {
     /// Cached probe key values to avoid re-reading from registers
-    pub probe_keys: Vec<Value>,
+    pub probe_keys: crate::alloc::Vec<Value>,
     /// Hash table register being probed
     pub hash_table_id: usize,
     /// Partition index being loaded (if any)
@@ -2966,7 +2967,7 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                         }
                     }
                     _ => {
-                        if let Err(err) = dest.set_blob(blob_data.to_vec()) {
+                        if let Err(err) = dest.set_blob(blob_data.to_vec_ext()) {
                             return Some(Err(err));
                         }
                     }

@@ -1,3 +1,9 @@
+#[cfg(nightly)]
+use crate::alloc::TursoNewExt;
+use crate::alloc::{
+    TursoAllocExt, TursoFromIterator, TursoIteratorExt, TursoSliceExt, TursoTryWithCapacityExt,
+    TursoVecExt,
+};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
@@ -1177,24 +1183,24 @@ pub fn op_open_read(
         _ => unreachable!("This should not have happened"),
     };
 
-    let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+    let maybe_promote_to_mvcc_cursor = |btree_cursor: BTreeCursor,
                                         mv_cursor_type: MvccCursorType|
-     -> Result<Box<dyn CursorTrait>> {
+     -> Result<crate::alloc::Box<dyn CursorTrait>> {
         if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
             let mv_store = mv_store
                 .as_ref()
                 .expect("mv_store should be Some when MVCC transaction is active")
                 .clone();
-            Ok(Box::new(MvCursor::new(
+            Ok(crate::alloc::Box::new(MvCursor::new(
                 mv_store,
                 &program.connection,
                 tx_id,
                 *root_page,
                 mv_cursor_type,
-                btree_cursor,
+                Box::new(btree_cursor),
             )?))
         } else {
-            Ok(btree_cursor)
+            Ok(crate::alloc::Box::new(btree_cursor))
         }
     };
 
@@ -1208,7 +1214,25 @@ pub fn op_open_read(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             ));
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
+            // MaterializedViewCursor still takes a std box, so the MVCC promotion is
+            // inlined here with std boxes instead of going through the closure above.
+            let cursor: Box<dyn CursorTrait> =
+                if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+                    let mv_store = mv_store
+                        .as_ref()
+                        .expect("mv_store should be Some when MVCC transaction is active")
+                        .clone();
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        &program.connection,
+                        tx_id,
+                        *root_page,
+                        MvccCursorType::Table,
+                        btree_cursor,
+                    )?)
+                } else {
+                    btree_cursor
+                };
 
             // Get the view name and look up or create its transaction state
             let view_name = view_mutex.lock().name().to_string();
@@ -1237,19 +1261,19 @@ pub fn op_open_read(
                     "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
                 ));
             }
-            let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                Box::new(BTreeCursor::new_table(
+            let btree_cursor = if table.has_rowid {
+                BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
-                ))
+                )
             } else {
-                Box::new(BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
-                ))
+                )
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1258,12 +1282,12 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = Box::new(BTreeCursor::new_index(
+            let btree_cursor = BTreeCursor::new_index(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
-            )?);
+            )?;
             let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -2266,7 +2290,7 @@ pub fn op_array_element(
                         if t.value.as_bytes().iter().any(|&b| b > 0x7F)
                             && std::str::from_utf8(t.value.as_bytes()).is_err()
                         {
-                            return Value::Blob(t.value.as_bytes().to_vec());
+                            return Value::Blob(t.value.as_bytes().to_vec_ext());
                         }
                     }
                     vref.to_owned()
@@ -2439,7 +2463,7 @@ pub fn op_union_pack(
     let record_bytes = record.into_payload();
 
     // Format: [tag_index: 1 byte][record bytes]
-    let mut blob = Vec::with_capacity(1 + record_bytes.len());
+    let mut blob = crate::alloc::Vec::try_with_capacity_ext(1 + record_bytes.len())?;
     blob.push(*tag_index);
     blob.extend_from_slice(&record_bytes);
     state.registers[*dest].set_value(Value::Blob(blob));
@@ -4713,7 +4737,7 @@ pub fn op_blob(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest].set_blob(value.clone())?;
+    state.registers[*dest].set_blob(value.try_to_vec_ext()?)?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -5799,7 +5823,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
-fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
+fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
@@ -5848,11 +5872,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::Vec::new()));
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            payload.push(Value::Blob(vec![]));
+            payload.push(Value::Blob(crate::alloc::Vec::new()));
         }
     };
     Ok(())
@@ -6109,8 +6133,8 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
-            let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
+            let key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
+            let val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -6121,8 +6145,8 @@ fn update_agg_payload(
                 // bits for obj header
                 vec.push(12);
             }
-            vec.append(&mut key_vec);
-            vec.append(&mut val_vec);
+            vec.try_extend(key_vec)?;
+            vec.try_extend(val_vec)?;
         }
         AggFunc::ArrayAgg => {
             // ArrayAgg accumulation is handled directly in the AggStep caller
@@ -6141,7 +6165,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
-            let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
+            let data = convert_dbtype_to_raw_jsonb(&arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 mark_unlikely();
                 return Err(LimboError::InternalError(
@@ -6151,7 +6175,7 @@ fn update_agg_payload(
             if vec.is_empty() {
                 vec.push(11); // bits for array header
             }
-            vec.append(&mut data);
+            vec.try_extend(data)?;
         }
     }
     Ok(())
@@ -6396,7 +6420,9 @@ fn op_window_step(
         WindowFunc::RowNumber => {
             if let Register::Value(Value::Null) = state.registers[acc_reg] {
                 state.registers[acc_reg] =
-                    Register::Aggregate(AggContext::Builtin(vec![Value::from_i64(0)]));
+                    Register::Aggregate(AggContext::Builtin(crate::alloc::try_vec![
+                        Value::from_i64(0)
+                    ]?));
             }
             let Register::Aggregate(AggContext::Builtin(payload)) = &mut state.registers[acc_reg]
             else {
@@ -6492,7 +6518,7 @@ pub fn op_agg_step(
             },
             _ => {
                 // Built-in aggregates use flat payload
-                let mut payload = Vec::new();
+                let mut payload = crate::alloc::Vec::new();
                 init_agg_payload(func, &mut payload)?;
                 Register::Aggregate(AggContext::Builtin(payload))
             }
@@ -6694,8 +6720,11 @@ pub fn op_agg_final(
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupArray => {
-                    state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_array(1).data())?;
+                    state.registers[dest_reg].set_blob(
+                        json::jsonb::Jsonb::make_empty_array(1)
+                            .data()
+                            .try_to_vec_ext()?,
+                    )?;
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonGroupObject => {
@@ -6703,8 +6732,11 @@ pub fn op_agg_final(
                 }
                 #[cfg(feature = "json")]
                 AggFunc::JsonbGroupObject => {
-                    state.registers[dest_reg]
-                        .set_blob(json::jsonb::Jsonb::make_empty_obj(1).data())?;
+                    state.registers[dest_reg].set_blob(
+                        json::jsonb::Jsonb::make_empty_obj(1)
+                            .data()
+                            .try_to_vec_ext()?,
+                    )?;
                 }
                 AggFunc::External(ext_func) => {
                     let value = match ext_func.as_ref() {
@@ -6779,14 +6811,15 @@ pub fn op_sorter_open(
         (cache_size as usize) * page_size
     };
     let mut order = Vec::with_capacity(order_collations_nulls.len());
-    let mut collations = Vec::with_capacity(order_collations_nulls.len());
-    let mut nulls_orders = Vec::with_capacity(order_collations_nulls.len());
+    let mut collations = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
+    let mut nulls_orders = crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         order.push(*ord);
         collations.push(coll.unwrap_or_default());
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators = Vec::with_capacity(order_collations_nulls.len());
+    let mut sort_comparators =
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
@@ -8124,7 +8157,7 @@ pub fn op_function(
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
-                state.registers[*dest].set_blob(accum.to_bytes())?;
+                state.registers[*dest].set_blob(accum.to_bytes().try_to_vec_ext()?)?;
             }
             ScalarFunc::StatPush => {
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
@@ -8140,7 +8173,7 @@ pub fn op_function(
                     Value::Blob(bytes) => {
                         if let Some(mut accum) = StatAccum::from_bytes(bytes) {
                             accum.push(i_chng);
-                            Value::Blob(accum.to_bytes())
+                            Value::Blob(accum.to_bytes().try_to_vec_ext()?)
                         } else {
                             Value::Null
                         }
@@ -8419,7 +8452,7 @@ pub fn op_function(
                             ))
                         })?;
                         let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        Value::from_blob(bigdecimal_to_blob(&validated).try_to_vec_ext()?)
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -9597,7 +9630,7 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    pub old_record: Option<(i64, Vec<Value>)>,
+    pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
@@ -9947,7 +9980,7 @@ pub fn op_insert(
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -9956,7 +9989,7 @@ pub fn op_insert(
                         .view_transaction_states
                         .get_or_create(view_name);
 
-                    tx_state.insert(table_name, key, values.clone());
+                    tx_state.insert(table_name, key, values.to_vec());
                 }
 
                 break;
@@ -9991,7 +10024,7 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
-    pub deleted_record: Option<(i64, Vec<Value>)>,
+    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
 }
 
 #[derive(Clone, Copy)]
@@ -10086,7 +10119,7 @@ pub fn op_delete(
                             .connection
                             .view_transaction_states
                             .get_or_create(&view_name);
-                        tx_state.delete(table_name, key, values.clone());
+                        tx_state.delete(table_name, key, values.to_vec());
                     }
                 }
                 break;
@@ -10952,34 +10985,34 @@ pub fn op_open_write(
     };
 
     if !can_reuse_cursor {
-        let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
+        let maybe_promote_to_mvcc_cursor = |btree_cursor: BTreeCursor,
                                             mv_cursor_type: MvccCursorType|
-         -> Result<Box<dyn CursorTrait>> {
+         -> Result<crate::alloc::Box<dyn CursorTrait>> {
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
                 let mv_store = mv_store
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(Box::new(MvCursor::new(
+                Ok(crate::alloc::Box::new(MvCursor::new(
                     mv_store,
                     &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
-                    btree_cursor,
+                    Box::new(btree_cursor),
                 )?))
             } else {
-                Ok(btree_cursor)
+                Ok(crate::alloc::Box::new(btree_cursor))
             }
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
-            let btree_cursor = Box::new(BTreeCursor::new_index(
+            let btree_cursor = BTreeCursor::new_index(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
-            )?);
+            )?;
             let index_info = Arc::new(IndexInfo::new_from_index(index)?);
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -11003,20 +11036,20 @@ pub fn op_open_write(
                 ),
             };
 
-            let btree_cursor: Box<dyn CursorTrait> = match cursor_type {
+            let btree_cursor = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
-                    Box::new(BTreeCursor::new_without_rowid_table(
+                    BTreeCursor::new_without_rowid_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                         table_rc.as_ref(),
                         num_columns,
-                    ))
+                    )
                 }
-                _ => Box::new(BTreeCursor::new_table(
+                _ => BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     num_columns,
-                )),
+                ),
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -11727,12 +11760,12 @@ const SEQ_COMMIT_STATUS_CONFLICT_RETRY: i64 = 1;
 /// "no prior mv_tx for this db" (must be restored to `None`).
 fn encode_saved_outer_mv_tx(
     outer: Option<(TxID, crate::translate::emitter::TransactionMode)>,
-) -> Vec<u8> {
+) -> crate::alloc::Vec<u8> {
     use crate::translate::emitter::TransactionMode;
     let Some((tx_id, mode)) = outer else {
-        return Vec::new();
+        return crate::alloc::Vec::new();
     };
-    let mut buf = Vec::with_capacity(9);
+    let mut buf = crate::alloc::Vec::with_capacity(9);
     buf.extend_from_slice(&tx_id.to_le_bytes());
     let mode_tag: u8 = match mode {
         TransactionMode::None => 0,
@@ -11806,7 +11839,7 @@ pub fn op_sequence_begin_inner_tx(
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
         state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-        state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+        state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::Vec::new()));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     };
@@ -11815,7 +11848,7 @@ pub fn op_sequence_begin_inner_tx(
     if let Some((outer_id, _)) = outer_tx {
         if mv_store.is_exclusive_tx(&outer_id) {
             state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_SKIPPED));
-            state.registers[*saved_outer_reg].set_value(Value::Blob(Vec::new()));
+            state.registers[*saved_outer_reg].set_value(Value::Blob(crate::alloc::Vec::new()));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -12097,8 +12130,8 @@ pub fn op_page_count(
 pub struct OpParseSchemaInner {
     stmt: crate::Statement,
     schema_arc: Arc<Schema>,
-    from_sql_indexes: Vec<crate::util::UnparsedFromSqlIndex>,
-    automatic_indices: crate::HashMap<String, Vec<(String, i64)>>,
+    from_sql_indexes: crate::alloc::Vec<crate::util::UnparsedFromSqlIndex>,
+    automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
@@ -12193,7 +12226,7 @@ pub fn op_parse_schema(
     *state.active_op_state.parse_schema() = Some(Box::new(OpParseSchemaInner {
         stmt,
         schema_arc,
-        from_sql_indexes: Vec::with_capacity(10),
+        from_sql_indexes: crate::alloc::Vec::try_with_capacity_ext(10)?,
         automatic_indices: Default::default(),
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
@@ -13022,7 +13055,7 @@ pub enum OpOpenEphemeralState {
     // clippy complains this variant is too big when compared to the rest of the variants
     // so it says we need to box it here
     Rewind {
-        cursor: Box<dyn CursorTrait>,
+        cursor: crate::alloc::Box<dyn CursorTrait>,
         temp_file: Option<TempFile>,
     },
 }
@@ -13154,7 +13187,7 @@ pub fn op_open_ephemeral(
                 ))
             }?;
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::Rewind {
-                cursor: Box::new(cursor),
+                cursor: crate::alloc::Box::new(cursor),
                 temp_file: temp_file.take(),
             };
         }
@@ -13259,39 +13292,39 @@ pub fn op_open_dup(
                     "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
                 ));
             }
-            let cursor: Box<dyn CursorTrait> = if table.has_rowid {
-                Box::new(BTreeCursor::new_table(
+            let cursor = if table.has_rowid {
+                BTreeCursor::new_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.columns().len(),
-                ))
+                )
             } else {
-                Box::new(BTreeCursor::new_without_rowid_table(
+                BTreeCursor::new_without_rowid_table(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                ))
+                )
             };
-            let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
+            let cursor: crate::alloc::Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    Box::new(MvCursor::new(
+                    crate::alloc::Box::new(MvCursor::new(
                         mv_store,
                         &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
-                        cursor,
+                        Box::new(cursor),
                     )?)
                 } else {
-                    cursor
+                    crate::alloc::Box::new(cursor)
                 }
             } else {
-                cursor
+                crate::alloc::Box::new(cursor)
             };
             let cursors = &mut state.cursors;
             cursors
@@ -14106,9 +14139,9 @@ pub fn op_add_column(
         let btree = Arc::make_mut(btree);
         btree.columns_mut().push((**column).clone());
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints.clone_from(check_constraints);
+        btree.check_constraints = check_constraints.try_to_vec_ext()?;
         // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys.clone_from(foreign_keys);
+        btree.foreign_keys = foreign_keys.try_to_vec_ext()?;
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
@@ -14376,7 +14409,7 @@ pub fn op_alter_column(
                     let view = Arc::make_mut(view_arc);
                     view.sql = rewritten.sql;
                     view.select_stmt = rewritten.select_stmt;
-                    view.columns = rewritten.columns;
+                    view.columns = rewritten.columns.into_iter().try_collect()?;
                 }
                 Ok(())
             })?;
@@ -14616,9 +14649,9 @@ pub fn op_hash_build(
                 && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(data.num_keys),
+            key_values: crate::alloc::Vec::with_capacity(data.num_keys),
             key_idx: 0,
-            payload_values: Vec::with_capacity(data.num_payload),
+            payload_values: crate::alloc::Vec::with_capacity(data.num_payload),
             payload_idx: 0,
             rowid: None,
             cursor_id: data.cursor_id,
@@ -14643,7 +14676,7 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data.collations.try_to_vec_ext()?,
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -14704,9 +14737,9 @@ pub fn op_hash_build(
     if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let pending = PendingHashInsert {
-            key_values: std::mem::take(&mut op_state.key_values),
+            key_values: std::mem::replace(&mut op_state.key_values, TursoAllocExt::new()),
             rowid,
-            payload_values: std::mem::take(&mut op_state.payload_values),
+            payload_values: std::mem::replace(&mut op_state.payload_values, TursoAllocExt::new()),
         };
         match ht.insert_pending(pending, Some(&mut state.metrics.hash_join))? {
             HashInsertResult::Done => {}
@@ -14747,7 +14780,7 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.clone(),
+            collations: data.collations.try_to_vec_ext()?,
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -14852,7 +14885,7 @@ pub fn op_hash_probe(
                 )
             } else {
                 // Different hash table, read fresh keys
-                let mut keys = Vec::with_capacity(num_keys);
+                let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)?;
                 for i in 0..num_keys {
                     let reg = &state.registers[key_start_reg + i];
                     keys.push(reg.get_value().clone());
@@ -14861,7 +14894,7 @@ pub fn op_hash_probe(
             }
         } else {
             // First entry, read probe keys from registers
-            let mut keys = Vec::with_capacity(num_keys);
+            let mut keys = crate::alloc::Vec::try_with_capacity_ext(num_keys)?;
             for i in 0..num_keys {
                 let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
@@ -14905,7 +14938,7 @@ pub fn op_hash_probe(
                     IOResult::Done(()) => {}
                     IOResult::IO(io) => {
                         *state.active_op_state.hash_probe() = Some(OpHashProbeState {
-                            probe_keys: Vec::new(), // keys consumed
+                            probe_keys: crate::alloc::Vec::new(), // keys consumed
                             hash_table_id,
                             partition_idx,
                             probe_buffered: true,
