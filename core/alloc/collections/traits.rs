@@ -42,6 +42,15 @@ pub trait TursoBinaryHeapExt<T>: Sized {
     fn try_push(&mut self, value: T) -> Result<(), TryReserveError>;
 }
 
+pub trait TursoSliceExt<T: Clone> {
+    /// Copies the slice into a freshly allocated `crate::alloc::Vec`.
+    ///
+    /// The `_ext` suffix avoids colliding with the inherent `to_vec` on
+    /// slices, which always allocates in the global allocator.
+    fn to_vec_ext(&self) -> crate::alloc::Vec<T>;
+    fn try_to_vec_ext(&self) -> Result<crate::alloc::Vec<T>, TryReserveError>;
+}
+
 pub trait TursoFromIterator<T>: Sized {
     fn try_from_iter<I>(iter: I) -> Result<Self, TryReserveError>
     where

@@ -1,4 +1,6 @@
-use super::{TryClone, TursoAllocExt, TursoFromIterator, TursoTryWithCapacityExt, TursoVecExt};
+use super::{
+    TryClone, TursoAllocExt, TursoFromIterator, TursoSliceExt, TursoTryWithCapacityExt, TursoVecExt,
+};
 #[cfg(nightly)]
 use crate::alloc::TursoAllocator;
 use crate::alloc::{TryReserveError, Vec};
@@ -75,6 +77,23 @@ impl<T> TursoFromIterator<T> for Vec<T> {
     {
         self.extend(iter);
         Ok(())
+    }
+}
+
+impl<T: Clone> TursoSliceExt<T> for [T] {
+    #[inline(always)]
+    fn to_vec_ext(&self) -> Vec<T> {
+        let mut values = vec_with_capacity(self.len());
+        values.extend_from_slice(self);
+        values
+    }
+
+    #[inline(always)]
+    fn try_to_vec_ext(&self) -> Result<Vec<T>, TryReserveError> {
+        let mut values: Vec<T> = vec();
+        values.try_reserve(self.len())?;
+        values.extend_from_slice(self);
+        Ok(values)
     }
 }
 
