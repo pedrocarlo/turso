@@ -1,4 +1,4 @@
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, VecDeque};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -13,7 +13,7 @@ use crate::{
     Result,
 };
 use crate::{turso_assert, turso_debug_assert};
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 

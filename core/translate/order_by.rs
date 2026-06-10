@@ -158,7 +158,7 @@ impl EmitOrderBy {
         t_ctx: &mut TranslateCtx,
         result_columns: &[ResultSetColumn],
         order_by: &[(
-            Box<ast::Expr>,
+            std::boxed::Box<ast::Expr>,
             SortOrder,
             Option<turso_parser::ast::NullsOrder>,
         )],
@@ -314,8 +314,9 @@ impl EmitOrderBy {
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
                 columns: key_len,
-                order_collations_nulls,
-                comparators,
+                // Insn fields still use std collections; convert at the boundary.
+                order_collations_nulls: order_collations_nulls.into_iter().collect(),
+                comparators: comparators.into_iter().collect(),
             });
         }
         Ok(())
@@ -732,7 +733,7 @@ pub struct OrderByRemapping {
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 pub fn order_by_deduplicate_result_columns(
     order_by: &[(
-        Box<ast::Expr>,
+        std::boxed::Box<ast::Expr>,
         SortOrder,
         Option<turso_parser::ast::NullsOrder>,
     )],

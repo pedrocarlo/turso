@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::index_method::IndexMethodConfiguration;
@@ -204,13 +205,15 @@ pub fn translate_create_index(
         name: idx_name.clone(),
         table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
-        columns,
+        columns: columns.into_iter().try_collect()?,
         unique,
         ephemeral: false,
         has_rowid: tbl.has_rowid,
         // store the *original* where clause, because we need to rewrite it
         // before translating, and it cannot reference a table alias
-        where_clause: where_clause.clone(),
+        where_clause: where_clause
+            .as_deref()
+            .map(|e| crate::alloc::TursoNewExt::new(e.clone())),
         index_method: index_method.clone(),
         on_conflict: None,
     });
@@ -914,7 +917,7 @@ fn resolve_sorted_columns_with_resolver(
             pos_in_table: EXPR_INDEX_SENTINEL,
             collation: explicit_collation,
             default: None,
-            expr: Some(sc.expr.clone()),
+            expr: Some(crate::alloc::TursoNewExt::new((*sc.expr).clone())),
         });
     }
     Ok(resolved)
@@ -1217,7 +1220,7 @@ pub fn resolve_index_method_parameters(
                             let hex_byte = std::str::from_utf8(pair).unwrap();
                             u8::from_str_radix(hex_byte, 16).unwrap()
                         })
-                        .collect(),
+                        .try_collect()?,
                 ),
                 _ => bail_parse_error!("parameters must be constant literals"),
             },

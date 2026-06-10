@@ -7,6 +7,7 @@
 //!
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
+use crate::alloc::TursoSliceExt;
 use crate::function::AggFunc;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
@@ -1931,7 +1932,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            ast::Literal::Blob(b) => Ok(Value::Blob(b.as_bytes().try_to_vec_ext()?)),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(

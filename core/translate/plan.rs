@@ -1758,7 +1758,7 @@ where
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if overflow_idx >= overflow.len() {
                 overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
                 overflow.resize(overflow_idx + 1, 0);
@@ -1865,7 +1865,7 @@ where
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
         if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(alloc::Vec::new);
+            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
             if self_ov.len() < other_ov.len() {
                 self_ov.try_reserve(other_ov.len() - self_ov.len())?;
                 self_ov.resize(other_ov.len(), 0);
@@ -2288,7 +2288,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<crate::alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(
@@ -2305,7 +2305,7 @@ impl JoinedTable {
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(Plan::Select(Box::new(plan))),
+            plan: crate::alloc::TursoNewExt::new(Plan::Select(Box::new(plan))),
             columns,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -2401,7 +2401,7 @@ impl JoinedTable {
                     ColDef::default(),
                 )
             })
-            .collect::<Vec<_>>();
+            .try_collect::<crate::alloc::Vec<_>>()?;
 
         for (i, column) in columns.iter_mut().enumerate() {
             if super::expr::expr_is_array(&result_columns[i].expr, Some(table_references)) {
@@ -2423,7 +2423,7 @@ impl JoinedTable {
         });
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
-            plan: Box::new(plan),
+            plan: crate::alloc::TursoNewExt::new(plan),
             columns,
             result_columns_start_reg: None,
             materialized_cursor_id: None,

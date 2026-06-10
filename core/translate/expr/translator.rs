@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::alloc::TursoVecExt;
+
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
 pub enum NoConstantOptReason {
@@ -548,12 +550,16 @@ pub fn translate_expr(
                 if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
-                    let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
-                        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
-                        Some(ast::TypeSize::TypeSize(e1, e2)) => {
-                            vec![e1.clone(), e2.clone()]
+                    let ty_params: crate::alloc::Vec<crate::alloc::Box<ast::Expr>> = match &tn.size
+                    {
+                        Some(ast::TypeSize::MaxSize(e)) => {
+                            crate::alloc::try_vec![crate::alloc::TursoNewExt::new((**e).clone())]?
                         }
-                        None => Vec::new(),
+                        Some(ast::TypeSize::TypeSize(e1, e2)) => crate::alloc::try_vec![
+                            crate::alloc::TursoNewExt::new((**e1).clone()),
+                            crate::alloc::TursoNewExt::new((**e2).clone())
+                        ]?,
+                        None => crate::alloc::vec![],
                     };
 
                     // Domains: apply parent encode chain, then validate constraints

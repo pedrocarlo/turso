@@ -8,7 +8,7 @@ use super::{
         WhereTerm,
     },
 };
-use crate::alloc::TursoIteratorExt;
+use crate::alloc::{TursoIteratorExt, TursoVecExt, VecDeque};
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
@@ -63,7 +63,7 @@ use order::{
     EliminatesSortBy, OrderTargetPurpose,
 };
 use rustc_hash::FxHashMap as HashMap;
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{cmp::Ordering, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
@@ -163,9 +163,11 @@ impl AvailableIndexes {
             .iter()
             .find(|table_ref| table_ref.table.get_name() == table_name)
             .expect("test table should exist");
+        // or_default() needs Default, which the alias collections lack on nightly
+        #[allow(clippy::unwrap_or_default)]
         self.indexes_by_table_id
             .entry(table_ref.internal_id)
-            .or_default()
+            .or_insert_with(<VecDeque<_> as crate::alloc::TursoAllocExt>::new)
             .push_front(index);
     }
 }
@@ -1122,7 +1124,7 @@ fn update_from_scratch_col_name(idx: usize) -> String {
     format!("__update_from_{idx}")
 }
 
-fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
+fn update_from_scratch_columns(set_clause_count: usize) -> Result<crate::alloc::Vec<Column>> {
     (0..set_clause_count)
         .map(|idx| {
             // Keep scratch-table columns at BLOB affinity so materializing SET payloads
@@ -1137,7 +1139,8 @@ fn update_from_scratch_columns(set_clause_count: usize) -> Vec<Column> {
                 ColDef::default(),
             )
         })
-        .collect()
+        .try_collect()
+        .map_err(Into::into)
 }
 
 /// Build the SELECT that gathers the stable write set for an UPDATE before the
@@ -1154,19 +1157,19 @@ fn build_update_write_set_plan(
     let scratch_table_id = program.table_reference_counter.next();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     let columns = if is_update_from {
-        update_from_scratch_columns(plan.set_clauses.len())
+        update_from_scratch_columns(plan.set_clauses.len())?
     } else {
-        vec![(*ROWID_COLUMN).clone()]
+        crate::alloc::try_vec![(*ROWID_COLUMN).clone()]?
     };
     let ephemeral_table = Arc::new(BTreeTable::new(
         0, // root_page, not relevant for ephemeral table definition
         "ephemeral_scratch".to_string(),
-        vec![],
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 
@@ -3142,27 +3145,29 @@ fn ephemeral_index_build(
     table_reference: &JoinedTable,
     constraint_refs: &[RangeConstraintRef],
 ) -> Index {
-    let mut ephemeral_columns: Vec<IndexColumn> = table_reference
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let expr = match c.generated_type() {
-                GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
-                GeneratedType::NotGenerated => None,
-            };
-            IndexColumn {
-                name: c.name.clone().unwrap(),
-                order: SortOrder::Asc,
-                pos_in_table: i,
-                collation: c.collation_opt(),
-                default: c.default.clone(),
-                expr: expr.map(Box::new),
-            }
-        })
-        // only include columns that are used in the query
-        .filter(|c| table_reference.column_is_used(c.pos_in_table))
-        .collect();
+    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = crate::alloc::vec![];
+    ephemeral_columns.extend(
+        table_reference
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let expr = match c.generated_type() {
+                    GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                    GeneratedType::NotGenerated => None,
+                };
+                IndexColumn {
+                    name: c.name.clone().unwrap(),
+                    order: SortOrder::Asc,
+                    pos_in_table: i,
+                    collation: c.collation_opt(),
+                    default: c.default.clone(),
+                    expr: expr.map(crate::alloc::TursoNewExt::new),
+                }
+            })
+            // only include columns that are used in the query
+            .filter(|c| table_reference.column_is_used(c.pos_in_table)),
+    );
     // sort so that constraints first, then rest in whatever order they were in in the table
     ephemeral_columns.sort_by(|a, b| {
         let a_constraint = constraint_refs

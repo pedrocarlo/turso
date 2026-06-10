@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::schema::{Index, IndexColumn, PseudoCursorType};
 use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
@@ -562,7 +563,7 @@ fn create_dedupe_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,
@@ -783,7 +784,7 @@ fn create_collection_index(
             collation: None,
             expr: None,
         })
-        .collect::<Vec<_>>();
+        .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in columns.iter_mut().enumerate() {
         let left_collation = get_collseq_from_expr(
             &left_select.result_columns[i].expr,

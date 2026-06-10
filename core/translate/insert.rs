@@ -1913,14 +1913,21 @@ fn resolve_defaults_in_row(
             })
         };
         *expr = match col {
-            Some(col) => col.default.clone().unwrap_or_else(|| {
-                if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                    if let Some(default_expr) = resolved.default_expr() {
-                        return Box::new(default_expr.clone());
+            Some(col) => col
+                .default
+                .as_deref()
+                .cloned()
+                .map(Box::new)
+                .unwrap_or_else(|| {
+                    if let Ok(Some(resolved)) =
+                        resolver.schema().resolve_type(&col.ty_str, is_strict)
+                    {
+                        if let Some(default_expr) = resolved.default_expr() {
+                            return Box::new(default_expr.clone());
+                        }
                     }
-                }
-                Box::new(ast::Expr::Literal(ast::Literal::Null))
-            }),
+                    Box::new(ast::Expr::Literal(ast::Literal::Null))
+                }),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
     }
@@ -1950,16 +1957,20 @@ fn bind_insert(
                 .iter()
                 .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
-                    c.default.clone().unwrap_or_else(|| {
-                        if let Ok(Some(resolved)) =
-                            resolver.schema().resolve_type(&c.ty_str, is_strict)
-                        {
-                            if let Some(default_expr) = resolved.default_expr() {
-                                return Box::new(default_expr.clone());
+                    c.default
+                        .as_deref()
+                        .cloned()
+                        .map(Box::new)
+                        .unwrap_or_else(|| {
+                            if let Ok(Some(resolved)) =
+                                resolver.schema().resolve_type(&c.ty_str, is_strict)
+                            {
+                                if let Some(default_expr) = resolved.default_expr() {
+                                    return Box::new(default_expr.clone());
+                                }
                             }
-                        }
-                        Box::new(ast::Expr::Literal(ast::Literal::Null))
-                    })
+                            Box::new(ast::Expr::Literal(ast::Literal::Null))
+                        })
                 })
                 .collect();
         }
@@ -2323,15 +2334,20 @@ fn init_source_emission<'a>(
             let num_values = storable_columns.len();
             let is_strict = table.is_strict();
             values.extend(storable_columns.iter().map(|c| {
-                c.default.clone().unwrap_or_else(|| {
-                    if let Ok(Some(resolved)) = resolver.schema().resolve_type(&c.ty_str, is_strict)
-                    {
-                        if let Some(default_expr) = resolved.default_expr() {
-                            return Box::new(default_expr.clone());
+                c.default
+                    .as_deref()
+                    .cloned()
+                    .map(Box::new)
+                    .unwrap_or_else(|| {
+                        if let Ok(Some(resolved)) =
+                            resolver.schema().resolve_type(&c.ty_str, is_strict)
+                        {
+                            if let Some(default_expr) = resolved.default_expr() {
+                                return Box::new(default_expr.clone());
+                            }
                         }
-                    }
-                    Box::new(ast::Expr::Literal(ast::Literal::Null))
-                })
+                        Box::new(ast::Expr::Literal(ast::Literal::Null))
+                    })
             }));
             (
                 num_values,

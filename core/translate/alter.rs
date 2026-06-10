@@ -10,6 +10,7 @@ use super::{
     update::translate_update_for_schema_change,
 };
 use crate::{
+    alloc::{TursoIteratorExt, TursoSliceExt},
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
@@ -420,7 +421,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
                     let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
                     u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
                 })
-                .collect(),
+                .try_collect()?,
         )),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
@@ -742,7 +743,7 @@ fn emit_add_column_check_validation(
                 for dc in &td.domain_checks {
                     let rewritten =
                         crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
-                    all_checks.push((dc.name.clone(), rewritten));
+                    all_checks.push((dc.name.clone(), Box::new(*rewritten)));
                 }
             }
         }
@@ -1308,7 +1309,7 @@ pub fn translate_alter_table(
                     .resolve_type(&column.ty_str, btree.is_strict)
                 {
                     if let Some(type_default) = resolved.default_expr() {
-                        column.default = Some(Box::new(type_default.clone()));
+                        column.default = Some(crate::alloc::TursoNewExt::new(type_default.clone()));
                     }
                 }
             }
@@ -1341,8 +1342,7 @@ pub fn translate_alter_table(
                                 .columns
                                 .iter()
                                 .map(|c| normalize_ident(c.col_name.as_str()))
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
+                                .try_collect()?,
                             on_delete: clause
                                 .args
                                 .iter()
@@ -1365,7 +1365,9 @@ pub fn translate_alter_table(
                                     }
                                 })
                                 .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: Box::from([new_column_name.to_string()]),
+                            child_columns: [new_column_name.to_string()]
+                                .into_iter()
+                                .try_collect()?,
                             deferred: match defer_clause {
                                 Some(d) => {
                                     d.deferrable
@@ -1522,8 +1524,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: table_name.to_owned(),
                         column: Box::new(column),
-                        check_constraints: btree.check_constraints.clone(),
-                        foreign_keys: btree.foreign_keys.clone(),
+                        check_constraints: btree.check_constraints.to_vec(),
+                        foreign_keys: btree.foreign_keys.to_vec(),
                     });
                 },
             )?
@@ -2748,7 +2750,7 @@ fn rewrite_trigger_sql_for_column_rename(
             new_event,
             for_each_row,
             new_when_clause.as_deref().cloned(),
-            new_commands.clone(),
+            new_commands.try_to_vec_ext()?,
             temporary,
             Some(target_database_id),
         );

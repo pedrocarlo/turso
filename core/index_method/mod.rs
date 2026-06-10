@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
 
 use crate::{
+    alloc::TursoIteratorExt,
     schema::IndexColumn,
     storage::btree::BTreeCursor,
     types::{IOResult, IndexInfo, KeyInfo},
@@ -207,7 +208,7 @@ pub(crate) fn open_index_cursor(
     cursor.index_info = Some(Arc::new(IndexInfo {
         has_rowid: false,
         num_cols: keys.len(),
-        key_info: keys,
+        key_info: keys.into_iter().try_collect()?,
         is_unique: scratch.unique,
     }));
     Ok(cursor)

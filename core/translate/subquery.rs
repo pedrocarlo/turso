@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
-    alloc::TursoIteratorExt,
+    alloc::{TursoIteratorExt, TursoSliceExt},
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
@@ -861,7 +861,7 @@ fn get_subquery_parser<'a>(
                     .enumerate()
                     .map(|(i, c)| {
                         let rhs_collation = get_collseq_from_expr(&c.expr, table_references)?;
-                        Ok(IndexColumn {
+                        Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             pos_in_table: i,
@@ -870,7 +870,7 @@ fn get_subquery_parser<'a>(
                             expr: None,
                         })
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
                 let ephemeral_index = Arc::new(Index {
                     columns,
@@ -1686,12 +1686,12 @@ fn emit_materialized_subquery_table(
     let ephemeral_table = Arc::new(BTreeTable::new(
         0,
         String::new(),
-        vec![],
-        columns.to_vec(),
+        crate::alloc::vec![],
+        columns.try_to_vec_ext()?,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 

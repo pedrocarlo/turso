@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
@@ -1197,16 +1198,20 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
-        let columns = view_guard.column_schema.flat_columns();
+        let columns = view_guard
+            .column_schema
+            .flat_columns()
+            .into_iter()
+            .try_collect()?;
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         drop(view_guard);

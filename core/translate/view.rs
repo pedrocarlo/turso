@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
@@ -75,7 +76,10 @@ pub fn translate_create_materialized_view(
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
-    let view_columns = view_column_schema.flat_columns();
+    let view_columns = view_column_schema
+        .flat_columns()
+        .into_iter()
+        .try_collect()?;
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
@@ -104,12 +108,12 @@ pub fn translate_create_materialized_view(
     let view_table = Arc::new(BTreeTable::new(
         0, // root_page, will be set to actual root page after creation
         normalized_view_name.clone(),
-        vec![], // primary_key_columns — materialized views use implicit rowid
+        crate::alloc::vec![], // primary_key_columns — materialized views use implicit rowid
         view_columns,
         BTreeCharacteristics::HAS_ROWID,
-        vec![],
-        vec![],
-        vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
 

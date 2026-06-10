@@ -869,20 +869,18 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        let key_info = table
-            .primary_key_columns
-            .iter()
-            .map(|(col_name, order)| {
-                let (_, column) = table
-                    .get_column(col_name)
-                    .expect("WITHOUT ROWID primary key column should exist");
-                crate::types::KeyInfo {
-                    sort_order: *order,
-                    collation: column.collation_opt().unwrap_or_default(),
-                    nulls_order: None,
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut key_info: crate::alloc::Vec<crate::types::KeyInfo> =
+            crate::alloc::TursoVecExt::with_capacity(table.primary_key_columns.len());
+        key_info.extend(table.primary_key_columns.iter().map(|(col_name, order)| {
+            let (_, column) = table
+                .get_column(col_name)
+                .expect("WITHOUT ROWID primary key column should exist");
+            crate::types::KeyInfo {
+                sort_order: *order,
+                collation: column.collation_opt().unwrap_or_default(),
+                nulls_order: None,
+            }
+        }));
         cursor.index_info = Some(Arc::new(IndexInfo {
             key_info,
             has_rowid: false,
