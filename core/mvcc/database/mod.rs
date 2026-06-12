@@ -5308,7 +5308,9 @@ impl<Clock: LogicalClock, A: SkiplistAllocator> MvStore<Clock, A> {
         if let Err(e) = self.txs.try_insert(tx_id, tx) {
             // Release everything acquired above, mirroring the vanished-tx
             // bail-out: the transaction was never published.
-            self.commit_coordinator.pager_commit_lock.unlock();
+            if !already_holds_commit_lock {
+                self.commit_coordinator.pager_commit_lock.unlock();
+            }
             if !already_exclusive {
                 self.release_exclusive_tx(&tx_id);
             }

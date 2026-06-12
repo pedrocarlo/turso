@@ -15300,3 +15300,174 @@ fn injected_yield_surfaces_as_step_result_yield() {
     let rows = get_rows(&conn, "SELECT id, v FROM t");
     assert_eq!(rows.len(), 1);
 }
+
+/// Allocation-failure coverage: every fallible MvStore skiplist path must
+/// surface `OutOfMemory` without mutating state, and succeed once the
+/// allocator recovers.
+mod allocation_failure {
+    use super::*;
+    use crate::alloc::FailOnDemandAlloc;
+    use crate::mvcc::persistent_storage::Storage;
+
+    type FailingMvStore = MvStore<MvccClock, FailOnDemandAlloc>;
+
+    fn failing_storage() -> Arc<Storage> {
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("mvstore-oom.log", OpenFlags::Create, false)
+            .unwrap();
+        Arc::new(Storage::new(file, io, None))
+    }
+
+    fn failing_store() -> (Arc<FailingMvStore>, FailOnDemandAlloc) {
+        let alloc = FailOnDemandAlloc::default();
+        let store = MvStore::new_in(MvccClock::new(), failing_storage(), alloc.clone()).unwrap();
+        (Arc::new(store), alloc)
+    }
+
+    /// A pager for `begin_tx`; comes from a throwaway default-allocator
+    /// database, which is fine because the pager is independent of the
+    /// MvStore allocator under test.
+    fn helper_pager() -> (MvccTestDb, Arc<Pager>) {
+        let db = MvccTestDb::new();
+        let pager = db.conn.pager.load().clone();
+        (db, pager)
+    }
+
+    #[test]
+    fn new_in_surfaces_allocation_failure() {
+        let alloc = FailOnDemandAlloc::default();
+        alloc.fail_allocations(true);
+        // The constructor seeds the sqlite_schema rootpage mapping, which
+        // needs a node allocation.
+        assert!(MvStore::new_in(MvccClock::new(), failing_storage(), alloc.clone()).is_err());
+
+        alloc.fail_allocations(false);
+        MvStore::new_in(MvccClock::new(), failing_storage(), alloc).unwrap();
+    }
+
+    #[test]
+    fn begin_tx_failure_releases_checkpoint_guard() {
+        let (store, alloc) = failing_store();
+        let (_db, pager) = helper_pager();
+
+        alloc.fail_allocations(true);
+        assert!(matches!(
+            store.begin_tx(pager.clone()),
+            Err(LimboError::OutOfMemory)
+        ));
+
+        // The blocking-checkpoint read guard must have been released: the
+        // stop-the-world vacuum gate (a write acquisition of the same lock)
+        // would stay Busy forever if begin_tx leaked its guard.
+        store.try_begin_vacuum_gate().unwrap();
+        store.release_vacuum_gate();
+
+        alloc.fail_allocations(false);
+        let tx_id = store.begin_tx(pager).unwrap();
+        assert!(store.txs.get(&tx_id).is_some());
+    }
+
+    #[test]
+    fn insert_failure_leaves_store_and_tx_untouched() {
+        let (store, alloc) = failing_store();
+        let (_db, pager) = helper_pager();
+        let tx_id = store.begin_tx(pager).unwrap();
+
+        let table_id = MVTableId::from(-2);
+        let row = generate_simple_string_row(table_id, 1, "payload");
+
+        alloc.fail_allocations(true);
+        assert!(matches!(
+            store.insert(tx_id, row.clone()),
+            Err(LimboError::OutOfMemory)
+        ));
+        // No version chain, no write-set entry, no savepoint tracking may
+        // reference the version that never landed.
+        assert!(store.rows.is_empty());
+        let tx = store.txs.get(&tx_id).unwrap();
+        assert!(tx.value().write_set.lock().is_empty());
+        drop(tx);
+
+        alloc.fail_allocations(false);
+        store.insert(tx_id, row.clone()).unwrap();
+        let read_back = store.read(tx_id, &row.id).unwrap().unwrap();
+        assert_eq!(read_back.payload(), row.payload());
+    }
+
+    #[test]
+    fn index_rows_map_failure_does_not_create_empty_map() {
+        let (store, alloc) = failing_store();
+        let index_id = MVTableId::from(-5);
+
+        alloc.fail_allocations(true);
+        assert!(store.index_rows_map(index_id).is_err());
+        assert!(store.index_rows.get(&index_id).is_none());
+
+        alloc.fail_allocations(false);
+        store.index_rows_map(index_id).unwrap();
+        assert!(store.index_rows.get(&index_id).is_some());
+    }
+
+    #[test]
+    fn remove_tx_failure_keeps_committed_tx_resolvable() {
+        let (store, alloc) = failing_store();
+        let (_db, pager) = helper_pager();
+        let tx_id = store.begin_tx(pager).unwrap();
+        let row = generate_simple_string_row(MVTableId::from(-2), 1, "payload");
+        store.insert(tx_id, row).unwrap();
+
+        // Simulate the commit state machine having committed the tx; with a
+        // non-empty write set, remove_tx must cache the finalized state.
+        store
+            .txs
+            .get(&tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Committed(42));
+
+        alloc.fail_allocations(true);
+        assert!(matches!(
+            store.remove_tx(tx_id),
+            Err(LimboError::OutOfMemory)
+        ));
+        // The tx must remain resolvable: still in txs, and never half-moved
+        // into finalized_tx_states.
+        assert!(store.txs.get(&tx_id).is_some());
+        assert!(store.finalized_tx_states.get(&tx_id).is_none());
+
+        alloc.fail_allocations(false);
+        store.remove_tx(tx_id).unwrap();
+        assert!(store.txs.get(&tx_id).is_none());
+        assert_eq!(
+            *store.finalized_tx_states.get(&tx_id).unwrap().value(),
+            TransactionState::Committed(42)
+        );
+    }
+
+    #[test]
+    fn rootpage_mapping_failure_does_not_advance_table_id_counter() {
+        let (store, alloc) = failing_store();
+        let table_id = MVTableId::from(-77);
+        let counter_before = store.next_table_id.load(Ordering::SeqCst);
+
+        alloc.fail_allocations(true);
+        assert!(matches!(
+            store.insert_table_id_to_rootpage(table_id, Some(7)),
+            Err(LimboError::OutOfMemory)
+        ));
+        assert!(store.table_id_to_rootpage.get(&table_id).is_none());
+        assert_eq!(store.next_table_id.load(Ordering::SeqCst), counter_before);
+
+        alloc.fail_allocations(false);
+        store
+            .insert_table_id_to_rootpage(table_id, Some(7))
+            .unwrap();
+        assert_eq!(
+            *store.table_id_to_rootpage.get(&table_id).unwrap().value(),
+            Some(7)
+        );
+        assert!(store.next_table_id.load(Ordering::SeqCst) < counter_before);
+    }
+}
