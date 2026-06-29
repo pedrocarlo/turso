@@ -1,6 +1,8 @@
 use crate::alloc::{ConcurrentAllocator, DynAllocator, TryReserveError};
 
+pub type Arc<T, A = DynAllocator> = std::sync::Arc<T, A>;
 pub type ArcSlice<T, A = DynAllocator> = std::sync::Arc<[T], A>;
+pub type Weak<T, A = DynAllocator> = std::sync::Weak<T, A>;
 
 pub fn try_arc_slice_from_slice<T: Clone>(slice: &[T]) -> Result<ArcSlice<T>, TryReserveError> {
     try_arc_slice_from_slice_in(slice, DynAllocator::default())

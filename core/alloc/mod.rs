@@ -20,7 +20,7 @@ pub use allocation_site::{
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
-pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice};
+pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, Arc, ArcSlice, Weak};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 #[cfg(nightly)]
 pub use collections::TursoFromIteratorIn;
@@ -71,7 +71,7 @@ pub type Allocator = TursoAllocator;
 
 #[derive(Clone)]
 pub struct DynAllocator {
-    inner: Arc<dyn ApiAllocator + Send + Sync>,
+    inner: std::sync::Arc<dyn ApiAllocator + Send + Sync>,
 }
 
 impl DynAllocator {
@@ -80,7 +80,7 @@ impl DynAllocator {
         A: ApiAllocator + Send + Sync + 'static,
     {
         Self {
-            inner: Arc::new(alloc),
+            inner: std::sync::Arc::new(alloc),
         }
     }
 }
@@ -108,6 +108,12 @@ unsafe impl ApiAllocator for DynAllocator {
         }
     }
 }
+
+#[cfg(nightly)]
+unsafe impl arc_swap::ArcSwapAllocator for TursoAllocator {}
+
+#[cfg(nightly)]
+unsafe impl arc_swap::ArcSwapAllocator for DynAllocator {}
 
 pub type Box<T> = std::boxed::Box<T>;
 
@@ -209,11 +215,6 @@ pub type VecDeque<T> = std::collections::VecDeque<T>;
 pub type BinaryHeap<T> = std::collections::BinaryHeap<T>;
 
 pub type LinkedList<T> = std::collections::LinkedList<T>;
-
-// TODO: design allocator-aware shared-pointer support that still preserves
-// shuttle's deterministic sync behavior.
-pub type Arc<T> = crate::sync::Arc<T>;
-pub type Weak<T> = crate::sync::Weak<T>;
 
 pub type Rc<T> = std::rc::Rc<T>;
 
