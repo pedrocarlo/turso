@@ -292,3 +292,73 @@ fn test_drop_broken_legacy_view_row() -> anyhow::Result<()> {
     assert_eq!(rows, vec![(42,)]);
     Ok(())
 }
+
+/// Reproducer for the Antithesis finding in ENG-74 (and the bug family in
+/// https://github.com/tursodatabase/turso/issues/7728): a statement paused at
+/// its root-page read keeps using that root page after DROP TABLE frees it and
+/// a subsequent CREATE TABLE + INSERT recycles it with different content. The
+/// resumed seek then descends through stale/recycled pages and trips
+/// `matches!(self.page_type(), Ok(PageType::TableInterior))` in
+/// `PageInner::cell_table_interior_read_rowid`.
+#[test]
+#[ignore = "known-failing (ENG-74): active table seek can use a root page recycled by DROP TABLE/reuse"]
+fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, OpenFlags, StepResult};
+
+    let io = Arc::new(QueuedIo::new());
+    let tmp_dir = tempfile::TempDir::new()?;
+    let path = tmp_dir.path().join("table-interior-drop-reuse.db");
+    let path = path.to_str().unwrap();
+    let db =
+        Database::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)?;
+    let conn = db.connect()?;
+
+    conn.execute("PRAGMA page_size=512")?;
+    conn.execute("PRAGMA cache_size=9")?;
+    conn.execute("PRAGMA cache_spill=ON")?;
+    conn.execute("PRAGMA journal_mode='wal'")?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)")?;
+    for id in 1..=32 {
+        conn.execute(format!("INSERT INTO u VALUES({id}, zeroblob(60))").as_str())?;
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    // Pause the SELECT at its first I/O: the read of the (interior) root page
+    // of `u`.
+    let mut select = conn.prepare("SELECT id, length(b) FROM u WHERE id = 16")?;
+    match select.step()? {
+        StepResult::IO => select._io().step()?,
+        other => anyhow::bail!("SELECT did not yield at the root-page read: {other:?}"),
+    }
+
+    // Free the root page of `u` and recycle it with different content while
+    // the SELECT is still active.
+    conn.execute("DROP TABLE u")?;
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+
+    // Resuming the statement must not interpret recycled pages as `u`'s
+    // B-tree. Completing with no rows (its table is gone) or with a
+    // diagnosable error are both acceptable; panicking is not.
+    let mut rows = Vec::new();
+    loop {
+        match select.step() {
+            Ok(StepResult::IO) => select._io().step()?,
+            Ok(StepResult::Yield) => {}
+            Ok(StepResult::Row) => {
+                let row = select.row().expect("row should be available after Row");
+                rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+            }
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::Interrupt | StepResult::Busy) => {
+                anyhow::bail!("unexpected non-progress result while draining statement")
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(rows, Vec::<(i64, i64)>::new());
+
+    Ok(())
+}
