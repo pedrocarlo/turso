@@ -11411,6 +11411,16 @@ pub fn op_destroy(
                 // position on this B-tree, and once its pages enter the
                 // freelist they can be recycled with unrelated content that
                 // the resumed statement would then misread as its own tree.
+                //
+                // Interleaving statements on one connection is documented,
+                // supported usage (https://www.sqlite.org/isolation.html), so
+                // the engine, not the caller, must refuse the destroy. SQLite
+                // defends this at two layers:
+                // - OP_Destroy in vdbe.c: "This opcode throws an error if
+                //   there are any active reader VMs when it is invoked."
+                //   (`db->nVdbeRead > db->nVDestroy+1` -> SQLITE_LOCKED)
+                // - btreeDropTable in btree.c: "This routine will fail with
+                //   SQLITE_LOCKED if there are any open cursors on the table."
                 if program
                     .connection
                     .n_active_root_statements
