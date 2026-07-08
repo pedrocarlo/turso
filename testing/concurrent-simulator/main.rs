@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
@@ -271,6 +272,16 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 
     let reopen_probability = args.reopen_probability.unwrap_or(opts.reopen_probability);
 
+    // The reopen schedule gets its own RNG stream instead of drawing from
+    // `whopper.rng`. The whopper RNG is also consumed by workload
+    // generation, whose cadence shifts whenever fault probabilities (or any
+    // engine behavior) change how quickly statements finish — sharing the
+    // stream made the reopen pattern for a given seed drift with unrelated
+    // knobs like --allocation-fault-probability, even though the expected
+    // reopen count never changes. `seed` and `seed + 1` are taken by the
+    // whopper and IO RNG streams in lib.rs.
+    let mut reopen_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(2));
+
     let mut whopper = Whopper::new(opts)?;
 
     let max_steps = whopper.max_steps;
@@ -282,8 +293,10 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     progress_index += 1;
 
     let mut loop_err: Option<anyhow::Error> = None;
+    let mut reopen_count: u64 = 0;
     while !whopper.is_done() {
-        if whopper.rng.random_bool(reopen_probability) {
+        if reopen_rng.random_bool(reopen_probability) {
+            reopen_count += 1;
             if let Err(e) = whopper.reopen() {
                 loop_err = Some(e);
                 break;
@@ -324,6 +337,9 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     let allocation_faults = whopper.allocation_fault_count();
     if allocation_faults > 0 {
         println!("\n{allocation_faults} allocation faults injected");
+    }
+    if reopen_count > 0 {
+        println!("\n{reopen_count} database reopens performed");
     }
 
     if args.elle.is_some() {
