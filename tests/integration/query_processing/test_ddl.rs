@@ -295,13 +295,16 @@ fn test_drop_broken_legacy_view_row() -> anyhow::Result<()> {
 
 /// Reproducer for the Antithesis finding in ENG-74 (and the bug family in
 /// https://github.com/tursodatabase/turso/issues/7728): a statement paused at
-/// its root-page read keeps using that root page after DROP TABLE frees it and
-/// a subsequent CREATE TABLE + INSERT recycles it with different content. The
-/// resumed seek then descends through stale/recycled pages and trips
-/// `matches!(self.page_type(), Ok(PageType::TableInterior))` in
+/// its root-page read used to keep using that root page after DROP TABLE freed
+/// it and a subsequent CREATE TABLE + INSERT recycled it with different
+/// content. The resumed seek then descended through stale/recycled pages and
+/// tripped `matches!(self.page_type(), Ok(PageType::TableInterior))` in
 /// `PageInner::cell_table_interior_read_rowid`.
+///
+/// Like SQLite's OP_Destroy, DROP TABLE must instead fail with "database
+/// table is locked" while another statement is active on the connection, and
+/// succeed once that statement finishes.
 #[test]
-#[ignore = "known-failing (ENG-74): active table seek can use a root page recycled by DROP TABLE/reuse"]
 fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyhow::Result<()> {
     use crate::queued_io::QueuedIo;
     use std::sync::Arc;
@@ -333,32 +336,55 @@ fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyho
         other => anyhow::bail!("SELECT did not yield at the root-page read: {other:?}"),
     }
 
-    // Free the root page of `u` and recycle it with different content while
-    // the SELECT is still active.
-    conn.execute("DROP TABLE u")?;
-    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
-    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+    // Freeing `u`'s root page while the SELECT is still active must be
+    // refused, otherwise the recycled page would be misread as `u`'s B-tree
+    // when the SELECT resumes.
+    let err = conn
+        .execute("DROP TABLE u")
+        .expect_err("DROP TABLE must fail while another statement is active");
+    assert!(
+        err.to_string().contains("database table is locked"),
+        "expected table-locked error, got: {err}"
+    );
 
-    // Resuming the statement must not interpret recycled pages as `u`'s
-    // B-tree. Completing with no rows (its table is gone) or with a
-    // diagnosable error are both acceptable; panicking is not.
+    // The paused SELECT resumes against an intact tree and finds its row.
     let mut rows = Vec::new();
     loop {
-        match select.step() {
-            Ok(StepResult::IO) => select._io().step()?,
-            Ok(StepResult::Yield) => {}
-            Ok(StepResult::Row) => {
+        match select.step()? {
+            StepResult::IO => select._io().step()?,
+            StepResult::Yield => {}
+            StepResult::Row => {
                 let row = select.row().expect("row should be available after Row");
                 rows.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
             }
-            Ok(StepResult::Done) => break,
-            Ok(StepResult::Interrupt | StepResult::Busy) => {
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => {
                 anyhow::bail!("unexpected non-progress result while draining statement")
             }
-            Err(_) => break,
         }
     }
-    assert_eq!(rows, Vec::<(i64, i64)>::new());
+    assert_eq!(rows, vec![(16, 60)]);
+
+    // Once the reader has finished, DROP TABLE succeeds and the freed pages
+    // can be recycled safely.
+    conn.execute("DROP TABLE u")?;
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)")?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))")?;
+    let mut check = conn.prepare("PRAGMA integrity_check")?;
+    loop {
+        match check.step()? {
+            StepResult::IO => check._io().step()?,
+            StepResult::Yield => {}
+            StepResult::Row => {
+                let row = check.row().expect("row should be available after Row");
+                assert_eq!(row.get::<String>(0)?, "ok");
+            }
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => {
+                anyhow::bail!("unexpected non-progress result while draining statement")
+            }
+        }
+    }
 
     Ok(())
 }

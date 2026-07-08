@@ -11405,6 +11405,20 @@ pub fn op_destroy(
     loop {
         match state.active_op_state.destroy() {
             OpDestroyState::CreateCursor => {
+                // SQLite's OP_Destroy refuses to free a B-tree while any other
+                // statement is active on the connection (SQLITE_LOCKED,
+                // "database table is locked"): a paused statement may hold a
+                // position on this B-tree, and once its pages enter the
+                // freelist they can be recycled with unrelated content that
+                // the resumed statement would then misread as its own tree.
+                if program
+                    .connection
+                    .n_active_root_statements
+                    .load(Ordering::SeqCst)
+                    > 1
+                {
+                    return Err(LimboError::TableLocked);
+                }
                 // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
                 // table btree cursor for both.
                 let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
