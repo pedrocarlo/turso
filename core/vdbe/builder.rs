@@ -856,6 +856,17 @@ impl ProgramBuilder {
             .reserve(opts.approx_num_labels);
     }
 
+    /// Snapshot of how many instructions, labels and cursors have been emitted so far.
+    /// Used by `#[turso_macros::emission_count]` instrumentation to compare the
+    /// statically derived emission bound of a function against what it actually emitted.
+    pub fn emission_snapshot(&self) -> super::emission::EmissionBound {
+        super::emission::EmissionBound::new(
+            self.insns.len(),
+            self.label_to_resolved_offset.len(),
+            self.cursor_ref.len(),
+        )
+    }
+
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {

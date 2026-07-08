@@ -5,17 +5,23 @@ use crate::vdbe::insn::Insn;
 use crate::Result;
 use turso_parser::ast::{Name, TransactionType};
 
+#[turso_macros::emission_count]
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    program.extend(&ProgramBuilderOpts {
-        num_cursors: 0,
-        approx_num_insns: 0,
-        approx_num_labels: 0,
-    });
+    let attached_db_count = resolver
+        .attached_database_ids_in_search_order()?
+        .into_iter()
+        .count();
+    program.extend(
+        &translate_tx_begin_EMISSIONS
+            .plus(translate_tx_begin_EMISSIONS_LOOP0.times(attached_db_count))
+            .plus(translate_tx_begin_EMISSIONS_LOOP1.times(attached_db_count))
+            .to_opts(),
+    );
     let schema = resolver.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
     match tx_type {
@@ -43,6 +49,10 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
+            #[emissions(per_iter = resolver
+                .attached_database_ids_in_search_order()
+                .map(|ids| ids.into_iter().count())
+                .unwrap_or(0))]
             for db_id in resolver.attached_database_ids_in_search_order()? {
                 let cookie = resolver.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {
@@ -71,6 +81,10 @@ pub fn translate_tx_begin(
                 tx_mode: TransactionMode::Write,
                 schema_cookie: temp_schema_cookie,
             });
+            #[emissions(per_iter = resolver
+                .attached_database_ids_in_search_order()
+                .map(|ids| ids.into_iter().count())
+                .unwrap_or(0))]
             for db_id in resolver.attached_database_ids_in_search_order()? {
                 let cookie = resolver.with_schema(db_id, |s| s.schema_version);
                 program.emit_insn(Insn::Transaction {

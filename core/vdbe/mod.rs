@@ -24,6 +24,7 @@ pub mod affinity;
 pub mod array;
 pub mod bloom_filter;
 pub mod builder;
+pub mod emission;
 pub mod execute;
 pub mod explain;
 #[allow(dead_code)]
