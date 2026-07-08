@@ -388,3 +388,49 @@ fn active_table_seek_after_drop_reuse_must_not_use_recycled_root_page() -> anyho
 
     Ok(())
 }
+
+/// SQLite parity check for the scenario above, driven through rusqlite:
+/// keeping two statements in flight on one connection is legal API usage in
+/// SQLite (not undefined behavior), and SQLite answers the DROP TABLE with
+/// SQLITE_LOCKED ("database table is locked") while the reader is active,
+/// then allows it once the reader finishes. Our `op_destroy` guard mirrors
+/// exactly this behavior.
+#[test]
+fn sqlite_rejects_drop_table_while_statement_active_parity() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let path = tmp_dir.path().join("sqlite-drop-while-active.db");
+    let conn = rusqlite::Connection::open(&path)?;
+    conn.pragma_update(None, "page_size", 512)?;
+    conn.pragma_update(None, "cache_size", 9)?;
+    conn.query_row("PRAGMA journal_mode='wal'", [], |_| Ok(()))?;
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, b BLOB)", [])?;
+    for id in 1..=32 {
+        conn.execute("INSERT INTO u VALUES(?1, zeroblob(60))", [id])?;
+    }
+
+    // Fetch the row but do not step the statement to SQLITE_DONE: the
+    // statement stays active mid-execution, like the paused Turso SELECT.
+    let mut select = conn.prepare("SELECT id, length(b) FROM u WHERE id = 16")?;
+    let mut rows = select.query([])?;
+    let row = rows.next()?.expect("row for id 16 should exist");
+    assert_eq!(row.get::<_, i64>(0)?, 16);
+    assert_eq!(row.get::<_, i64>(1)?, 60);
+
+    let err = conn
+        .execute("DROP TABLE u", [])
+        .expect_err("DROP TABLE must fail while another statement is active");
+    assert!(
+        err.to_string().contains("database table is locked"),
+        "expected table-locked error, got: {err}"
+    );
+
+    // Drain the reader; DROP TABLE then succeeds and the pages can be
+    // recycled safely.
+    assert!(rows.next()?.is_none());
+    conn.execute("DROP TABLE u", [])?;
+    conn.execute("CREATE TABLE reuse(id INTEGER PRIMARY KEY, b BLOB)", [])?;
+    conn.execute("INSERT INTO reuse VALUES(16, zeroblob(5000))", [])?;
+    let ok: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    assert_eq!(ok, "ok");
+    Ok(())
+}
