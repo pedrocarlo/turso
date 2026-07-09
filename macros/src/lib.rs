@@ -88,7 +88,6 @@ mod test;
 
 // Import assertion proc macro implementations
 mod assert;
-mod emission_count;
 #[path = "trace_stack.rs"]
 mod trace_stack_impl;
 
@@ -709,42 +708,6 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn trace_stack(attr: TokenStream, input: TokenStream) -> TokenStream {
     trace_stack_impl::trace_stack_attribute(attr, input)
-}
-
-/// Derive compile-time upper bounds on the `ProgramBuilder` emissions of a
-/// translate function, for preallocating `ProgramBuilderOpts` capacities.
-///
-/// For `fn foo`, generates a `foo_EMISSIONS: EmissionBound` constant counting the
-/// emission call sites outside of loops (`if`/`match` contribute the max of their
-/// arms), plus one `foo_EMISSIONS_LOOP<i>` per-iteration constant per emitting
-/// loop. Loops that emit must be annotated with `#[emissions(per_iter = <expr>)]`
-/// giving an upper bound on their total iterations per call, computed only from
-/// the function's parameters. Calls to other annotated functions listed in
-/// `compose(...)` contribute that callee's `_EMISSIONS` constant.
-///
-/// In debug builds the function is wrapped to compare the derived bound against
-/// the emissions actually observed, reporting on the `emission_estimate` tracing
-/// target — so estimate drift is caught by ordinary test runs.
-///
-/// Only usable on free functions inside `turso_core` that take a
-/// `&mut ProgramBuilder` parameter. See `macros/src/emission_count.rs` for
-/// counting rules and known blind spots.
-///
-/// ```ignore
-/// #[turso_macros::emission_count(compose(translate_condition_expr))]
-/// pub fn emit_foo(program: &mut ProgramBuilder, cols: &[Column]) -> Result<()> {
-///     program.emit_insn(Insn::Null { dest: 1, dest_end: None });
-///     #[emissions(per_iter = cols.len())]
-///     for col in cols {
-///         translate_condition_expr(program, col)?;
-///     }
-///     Ok(())
-/// }
-/// // Generated: emit_foo_EMISSIONS, emit_foo_EMISSIONS_LOOP0
-/// ```
-#[proc_macro_attribute]
-pub fn emission_count(attr: TokenStream, input: TokenStream) -> TokenStream {
-    emission_count::emission_count_attribute(attr, input)
 }
 
 /// Wrap a function body in an allocation-site scope.

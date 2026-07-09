@@ -856,17 +856,6 @@ impl ProgramBuilder {
             .reserve(opts.approx_num_labels);
     }
 
-    /// Snapshot of how many instructions, labels and cursors have been emitted so far.
-    /// Used by `#[turso_macros::emission_count]` instrumentation to compare the
-    /// statically derived emission bound of a function against what it actually emitted.
-    pub fn emission_snapshot(&self) -> super::emission::EmissionBound {
-        super::emission::EmissionBound::new(
-            self.insns.len(),
-            self.label_to_resolved_offset.len(),
-            self.cursor_ref.len(),
-        )
-    }
-
     /// Start a new constant span. The next instruction to be emitted will be the first
     /// instruction in the span.
     pub fn constant_span_start(&mut self) -> usize {
@@ -1042,10 +1031,27 @@ impl ProgramBuilder {
         self.emit_insn(insn);
     }
 
+    /// Reserve exactly `emission.size()` instruction slots, then emit them.
+    ///
+    /// The debug assert is the whole-system exactness check for
+    /// [`Emission`](super::emission::Emission) impls: any impl whose `size()`
+    /// disagrees with what it emits fails every test that translates through it.
+    pub fn emit_all<E: super::emission::Emission>(&mut self, emission: E) {
+        let size = emission.size();
+        self.insns.reserve(size);
+        let start = self.insns.len();
+        emission.emit(self);
+        turso_debug_assert!(
+            self.insns.len() == start + size,
+            "Emission::size() must equal the number of instructions emitted"
+        );
+    }
+
     pub fn close_cursors(&mut self, cursors: &[CursorID]) {
-        for cursor in cursors {
-            self.emit_insn(Insn::Close { cursor_id: *cursor });
-        }
+        self.emit_all(super::emission::Repeat::new(
+            cursors,
+            |cursor: &CursorID| Insn::Close { cursor_id: *cursor },
+        ));
     }
 
     pub fn emit_string8(&mut self, value: String, dest: usize) {

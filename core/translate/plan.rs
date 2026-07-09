@@ -1713,6 +1713,8 @@ pub struct BitSetIter<T, B: std::borrow::Borrow<BitSet<T>>> {
     current: u64,
     /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
     word: usize,
+    /// Total set bits not yet yielded, so the iterator is [`ExactSizeIterator`].
+    remaining: usize,
     _phantom: PhantomData<fn() -> T>,
 }
 
@@ -1729,6 +1731,7 @@ impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<
                 } else {
                     BitSet::<T>::INLINE_BITS + (self.word - 1) * 64
                 };
+                self.remaining -= 1;
                 return Some(T::from(base + bit));
             }
             self.word += 1;
@@ -1736,7 +1739,13 @@ impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<
             self.current = *overflow.get(self.word - 1)?;
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> ExactSizeIterator for BitSetIter<T, B> {}
 
 impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
     type Item = T;
@@ -1744,6 +1753,7 @@ impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
 
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
+            remaining: self.count(),
             current: self.inline,
             bitset: self,
             word: 0,
@@ -1757,7 +1767,10 @@ impl<T: From<usize>> IntoIterator for BitSet<T> {
     type IntoIter = BitSetIter<T, BitSet<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
+        // Compute before moving `self` into the iterator.
+        let remaining = self.count();
         BitSetIter {
+            remaining,
             current: self.inline,
             bitset: self,
             word: 0,
@@ -1768,6 +1781,17 @@ impl<T: From<usize>> IntoIterator for BitSet<T> {
 
 impl<T> BitSet<T> {
     const INLINE_BITS: usize = 64;
+
+    /// returns the number of set bits
+    pub fn count(&self) -> usize {
+        let mut count = self.inline.count_ones() as usize;
+        if let Some(ref ov) = self.overflow {
+            for &word in ov {
+                count += word.count_ones() as usize;
+            }
+        }
+        count
+    }
 }
 
 impl<T: From<usize>> BitSet<T>
@@ -1902,22 +1926,12 @@ where
 
     pub fn iter(&self) -> BitSetIter<T, &Self> {
         BitSetIter {
+            remaining: self.count(),
             current: self.inline,
             bitset: self,
             word: 0,
             _phantom: PhantomData,
         }
-    }
-
-    /// returns the number of set bits
-    pub fn count(&self) -> usize {
-        let mut count = self.inline.count_ones() as usize;
-        if let Some(ref ov) = self.overflow {
-            for &word in ov {
-                count += word.count_ones() as usize;
-            }
-        }
-        count
     }
 
     /// Returns the number of set bits strictly below `index`.
@@ -3981,6 +3995,30 @@ mod tests {
     }
 
     #[test]
+    fn test_bitset_iter_is_exact_size() -> TestResult {
+        // Inline-only, overflow (>64 bits), and empty cases; by-ref and by-value.
+        for bits in [vec![], vec![0, 3, 63], vec![1, 64, 100, 1999]] {
+            let mut mask = BitSet::default();
+            for &bit in &bits {
+                mask.set(bit)?;
+            }
+            assert_eq!(mask.iter().len(), bits.len());
+            let mut iter = mask.iter();
+            for consumed in 1..=bits.len() {
+                iter.next().unwrap();
+                assert_eq!(iter.len(), bits.len() - consumed);
+            }
+            assert!(iter.next().is_none());
+            assert_eq!(iter.len(), 0);
+
+            let owned_iter = mask.into_iter();
+            assert_eq!(owned_iter.len(), bits.len());
+            assert_eq!(owned_iter.count(), bits.len());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_bitset_properties_fuzz() -> TestResult {
         fn sample_other(
             rng: &mut ChaCha8Rng,
@@ -4025,6 +4063,19 @@ mod tests {
                         mask.count(),
                         reference.len(),
                         "step={step} seed={seed} op=count"
+                    );
+                    // ExactSizeIterator: len() agrees with count(), including
+                    // after partial consumption
+                    let mut iter = mask.iter();
+                    assert_eq!(iter.len(), mask.count(), "step={step} seed={seed} op=len");
+                    let skip = reference.len() / 2;
+                    for _ in 0..skip {
+                        iter.next();
+                    }
+                    assert_eq!(
+                        iter.len(),
+                        mask.count() - skip,
+                        "step={step} seed={seed} op=len-partial"
                     );
                 }
                 6 => {
