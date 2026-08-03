@@ -296,6 +296,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
     ) -> Result<()> {
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let (collation, collation_is_explicit) = resolved.collation.into_output();
             outputs.push(Output {
                 id: OutputId::query(block, outputs.len()),
                 name: column.name,
@@ -304,8 +305,8 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                 affinity: resolved.affinity,
                 schema_affinity: resolved.affinity,
                 has_affinity: resolved.has_affinity,
-                collation: resolved.collation,
-                collation_is_explicit: false,
+                collation,
+                collation_is_explicit,
                 name_kind: OutputNameKind::StarExpansion,
             });
         }
@@ -325,6 +326,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
         let resolved = self.analyze_resolved_expr(syntax, scope, policy)?;
+        let (collation, collation_is_explicit) = resolved.collation.into_output();
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),
@@ -344,8 +346,8 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             affinity: resolved.affinity,
             schema_affinity: resolved.affinity,
             has_affinity: resolved.has_affinity,
-            collation: resolved.collation,
-            collation_is_explicit: false,
+            collation,
+            collation_is_explicit,
             name_kind,
         })
     }
@@ -659,6 +661,56 @@ mod tests {
         assert!(matches!(outputs[6].expr, Expr::NotNull(_)));
         assert_eq!(outputs[5].type_fact.storage, Some(Type::Integer));
         assert_eq!(outputs[6].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn explicit_collations_override_inherited_collations() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value COLLATE RTRIM, \
+             value = ('x' || ('y' COLLATE RTRIM)), \
+             (('x' COLLATE RTRIM) || 'y') = value FROM items",
+        )
+        .expect("explicit collations bind into HIR");
+        document
+            .validate()
+            .expect("collated expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+
+        let Expr::Collate { collation, .. } = &outputs[0].expr else {
+            panic!("COLLATE becomes resolved HIR");
+        };
+        assert_eq!(
+            collation.value(),
+            &crate::translate::collate::CollationSeq::Rtrim
+        );
+        assert_eq!(outputs[0].affinity, crate::vdbe::affinity::Affinity::Text);
+        assert!(outputs[0].has_affinity);
+        assert!(outputs[0].collation_is_explicit);
+
+        for output in &outputs[1..] {
+            let Expr::Binary {
+                comparison: Some(comparison),
+                ..
+            } = &output.expr
+            else {
+                panic!("comparison rules are frozen in binary HIR");
+            };
+            assert_eq!(
+                comparison.components[0]
+                    .collation
+                    .as_ref()
+                    .expect("explicit collation reaches comparison")
+                    .value(),
+                &crate::translate::collate::CollationSeq::Rtrim
+            );
+            assert!(output.collation_is_explicit);
+        }
     }
 
     #[test]

@@ -13,11 +13,44 @@ pub(crate) enum NamePrecedence {
     OutputThenSource,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum OutputCollation<'a> {
+#[derive(Clone, Debug)]
+pub(crate) enum ExprCollation {
     Absent,
-    Explicit(&'a hir::ResolvedCollation),
-    Inherited(&'a hir::ResolvedCollation),
+    Explicit(hir::ResolvedCollation),
+    Inherited(hir::ResolvedCollation),
+}
+
+impl ExprCollation {
+    pub(crate) fn inherited(collation: Option<hir::ResolvedCollation>) -> Self {
+        match collation {
+            Some(collation) => Self::Inherited(collation),
+            None => Self::Absent,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Option<&hir::ResolvedCollation> {
+        match self {
+            Self::Absent => None,
+            Self::Explicit(collation) | Self::Inherited(collation) => Some(collation),
+        }
+    }
+
+    pub(crate) fn into_output(self) -> (Option<hir::ResolvedCollation>, bool) {
+        match self {
+            Self::Absent => (None, false),
+            Self::Explicit(collation) => (Some(collation), true),
+            Self::Inherited(collation) => (Some(collation), false),
+        }
+    }
+
+    fn output(collation: Option<hir::ResolvedCollation>, explicit: bool) -> Self {
+        match (collation, explicit) {
+            (None, false) => Self::Absent,
+            (Some(collation), true) => Self::Explicit(collation),
+            (Some(collation), false) => Self::Inherited(collation),
+            (None, true) => unreachable!("explicit output collation must be resolved"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +59,7 @@ pub(crate) struct ResolvedScopeExpr {
     pub(crate) type_fact: TypeFact,
     pub(crate) affinity: Affinity,
     pub(crate) has_affinity: bool,
-    pub(crate) collation: Option<hir::ResolvedCollation>,
+    pub(crate) collation: ExprCollation,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +105,7 @@ impl ScopeColumn {
             type_fact: self.type_fact.clone(),
             affinity: self.affinity,
             has_affinity: self.has_affinity,
-            collation: self.collation.clone(),
+            collation: ExprCollation::inherited(self.collation.clone()),
         }
     }
 }
@@ -196,16 +229,9 @@ impl Scope {
             .or_else(|| self.outer.as_deref()?.output_has_affinity(id))
     }
 
-    pub(crate) fn output_collation(&self, id: OutputId) -> Option<OutputCollation<'_>> {
+    pub(crate) fn output_collation(&self, id: OutputId) -> Option<ExprCollation> {
         self.output(id)
-            .map(
-                |output| match (&output.collation, output.collation_is_explicit) {
-                    (None, false) => OutputCollation::Absent,
-                    (Some(collation), true) => OutputCollation::Explicit(collation),
-                    (Some(collation), false) => OutputCollation::Inherited(collation),
-                    (None, true) => unreachable!("explicit output collation must be resolved"),
-                },
-            )
+            .map(ScopeOutput::collation)
             .or_else(|| self.outer.as_deref()?.output_collation(id))
     }
 
@@ -561,13 +587,17 @@ impl Scope {
 }
 
 impl ScopeOutput {
+    fn collation(&self) -> ExprCollation {
+        ExprCollation::output(self.collation.clone(), self.collation_is_explicit)
+    }
+
     fn resolved(&self) -> ResolvedScopeExpr {
         ResolvedScopeExpr {
             expr: hir::Expr::Output(self.id),
             type_fact: self.type_fact.clone(),
             affinity: self.affinity,
             has_affinity: self.has_affinity,
-            collation: self.collation.clone(),
+            collation: self.collation(),
         }
     }
 }
@@ -590,7 +620,7 @@ fn resolved_rowid(source: SourceId) -> ResolvedScopeExpr {
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
         has_affinity: true,
-        collation: None,
+        collation: ExprCollation::Absent,
     }
 }
 
@@ -704,7 +734,7 @@ mod tests {
         assert!(resolved.has_affinity);
         assert_eq!(resolved.affinity, Affinity::Text);
         assert_eq!(resolved.type_fact.storage, Some(Type::Text));
-        assert!(resolved.collation.is_none());
+        assert!(matches!(resolved.collation, ExprCollation::Absent));
         assert!(matches!(
             resolved.expr,
             Expr::Column(ColumnRef {
@@ -719,7 +749,7 @@ mod tests {
         assert_eq!(resolved.type_fact.storage, Some(Type::Integer));
         assert_eq!(resolved.affinity, Affinity::Integer);
         assert!(resolved.has_affinity);
-        assert!(resolved.collation.is_none());
+        assert!(matches!(resolved.collation, ExprCollation::Absent));
     }
 
     #[test]
@@ -1004,7 +1034,7 @@ mod tests {
             assert_eq!(unqualified.type_fact.storage, Some(Type::Text));
             assert_eq!(unqualified.affinity, Affinity::Text);
             assert!(unqualified.has_affinity);
-            assert!(unqualified.collation.is_none());
+            assert!(matches!(unqualified.collation, ExprCollation::Absent));
             let Expr::MergedColumn(merged) = unqualified.expr else {
                 panic!("USING produces a merged column");
             };
@@ -1221,7 +1251,10 @@ mod tests {
         assert_eq!(expanded[1].resolved.type_fact.storage, Some(Type::Text));
         assert_eq!(expanded[1].resolved.affinity, Affinity::Text);
         assert!(expanded[1].resolved.has_affinity);
-        assert!(expanded[1].resolved.collation.is_none());
+        assert!(matches!(
+            expanded[1].resolved.collation,
+            ExprCollation::Absent
+        ));
 
         let qualified = scope
             .expand_table_star("right")
@@ -1477,7 +1510,7 @@ mod tests {
         ));
         assert!(matches!(
             scope.output_collation(output_id),
-            Some(OutputCollation::Absent)
+            Some(ExprCollation::Absent)
         ));
         assert!(scope
             .output_type(OutputId::query(QueryBlockId::new(QueryId::new(9), 0), 0))
@@ -1498,11 +1531,11 @@ mod tests {
 
         assert!(matches!(
             scope.output_collation(explicit_id),
-            Some(OutputCollation::Explicit(value)) if value.id() == CatalogObjectId::new(10)
+            Some(ExprCollation::Explicit(value)) if value.id() == CatalogObjectId::new(10)
         ));
         assert!(matches!(
             scope.output_collation(inherited_id),
-            Some(OutputCollation::Inherited(value)) if value.id() == CatalogObjectId::new(11)
+            Some(ExprCollation::Inherited(value)) if value.id() == CatalogObjectId::new(11)
         ));
     }
 
@@ -1526,6 +1559,6 @@ mod tests {
         assert_eq!(implicit.type_fact.storage, Some(Type::Integer));
         assert_eq!(implicit.affinity, Affinity::Integer);
         assert!(implicit.has_affinity);
-        assert!(implicit.collation.is_none());
+        assert!(matches!(implicit.collation, ExprCollation::Absent));
     }
 }
