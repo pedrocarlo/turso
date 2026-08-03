@@ -1,5 +1,7 @@
 //! Query-local source-name visibility.
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
 use super::hir::{self, ColumnRef, OutputId, SourceId, TypeFact};
 use crate::{schema::Type, sync::Arc, vdbe::affinity::Affinity, Result};
 
@@ -22,6 +24,7 @@ pub(crate) struct ResolvedScopeExpr {
 
 #[derive(Clone, Debug)]
 struct ScopeColumn {
+    source: SourceId,
     display_name: String,
     lookup_name: String,
     expr: hir::Expr,
@@ -35,6 +38,7 @@ struct ScopeColumn {
 impl ScopeColumn {
     fn from_source(source: SourceId, index: usize, column: &hir::SourceColumn) -> Self {
         Self {
+            source,
             display_name: column.name.clone(),
             lookup_name: crate::util::normalize_ident(&column.name),
             expr: hir::Expr::Column(ColumnRef {
@@ -261,6 +265,104 @@ impl Scope {
             crate::bail_parse_error!("no such column: {}.{}", table, column);
         };
         Ok(Some(found))
+    }
+
+    pub(crate) fn expand_star(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            hir::Expr,
+            TypeFact,
+            Affinity,
+            bool,
+            Option<hir::ResolvedCollation>,
+        )>,
+    > {
+        // Repeated qualifiers are legal across databases. Within one database,
+        // an unmerged visible column makes an unqualified star ambiguous.
+        let mut visible_sources = HashSet::default();
+        let mut visible_identities = HashMap::default();
+        for column in self.visible_columns.iter().filter(|column| !column.hidden) {
+            visible_sources.insert(column.source);
+        }
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| visible_sources.contains(&source.id))
+        {
+            let identity = (source.database, source.qualifier.as_str());
+            if visible_identities.insert(identity, source.id).is_some() {
+                let column = self
+                    .visible_columns
+                    .iter()
+                    .find(|column| !column.hidden && column.source == source.id)
+                    .expect("visible source must own a visible column");
+                crate::bail_parse_error!(
+                    "ambiguous column name: {}.{}",
+                    source.qualifier,
+                    column.display_name
+                );
+            }
+        }
+
+        Ok(self
+            .visible_columns
+            .iter()
+            .filter(|column| !column.hidden)
+            .map(|column| {
+                (
+                    column.display_name.clone(),
+                    column.expr.clone(),
+                    column.type_fact.clone(),
+                    column.affinity,
+                    column.has_affinity,
+                    column.collation.clone(),
+                )
+            })
+            .collect())
+    }
+
+    pub(crate) fn expand_table_star(
+        &self,
+        qualifier: &str,
+    ) -> Result<
+        Vec<(
+            String,
+            hir::Expr,
+            TypeFact,
+            Affinity,
+            bool,
+            Option<hir::ResolvedCollation>,
+        )>,
+    > {
+        let normalized = crate::util::normalize_ident(qualifier);
+        let matching: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|source| source.qualifier == normalized)
+            .collect();
+        if matching.is_empty() {
+            crate::bail_parse_error!("no such table: {}", qualifier);
+        }
+        if matching.len() > 1 {
+            crate::bail_parse_error!("ambiguous table name: {}", qualifier);
+        }
+        Ok(matching[0]
+            .columns
+            .iter()
+            .filter(|column| !column.hidden)
+            .map(|column| {
+                (
+                    column.display_name.clone(),
+                    column.expr.clone(),
+                    column.type_fact.clone(),
+                    column.affinity,
+                    column.has_affinity,
+                    column.collation.clone(),
+                )
+            })
+            .collect())
     }
 
     pub(crate) fn resolve_using_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
@@ -1004,6 +1106,181 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot join using column missing"));
+    }
+
+    #[test]
+    fn star_preserves_order_filters_hidden_and_uses_merged_columns() {
+        let left = source(
+            0,
+            "left",
+            None,
+            vec![
+                column("left_value", false),
+                column("id", false),
+                column("left_hidden", true),
+            ],
+            false,
+        );
+        let right = source(
+            1,
+            "right",
+            None,
+            vec![
+                column("id", false),
+                column("right_value", false),
+                column("right_hidden", true),
+            ],
+            false,
+        );
+        let using = using_column(
+            Expr::Column(ColumnRef {
+                source: left.id,
+                column: 1,
+            }),
+            ColumnRef {
+                source: right.id,
+                column: 0,
+            },
+            MergedColumnValue::Left,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+        scope
+            .apply_using(std::slice::from_ref(&using))
+            .expect("USING identities belong to visible sources");
+
+        let expanded = scope.expand_star().expect("star namespace is valid");
+
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|column| column.0.as_str())
+                .collect::<Vec<_>>(),
+            ["left_value", "id", "right_value"]
+        );
+        assert!(matches!(&expanded[1].1, Expr::MergedColumn(_)));
+        assert_eq!(expanded[1].2.storage, Some(Type::Text));
+        assert_eq!(expanded[1].3, Affinity::Text);
+        assert!(expanded[1].4);
+        assert!(expanded[1].5.is_none());
+
+        let qualified = scope
+            .expand_table_star("right")
+            .expect("qualified star namespace is valid");
+        assert_eq!(
+            qualified
+                .iter()
+                .map(|column| column.0.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "right_value"]
+        );
+        assert!(matches!(
+            &qualified[0].1,
+            Expr::Column(ColumnRef { source, column: 0 }) if *source == right.id
+        ));
+    }
+
+    #[test]
+    fn unqualified_star_allows_same_table_name_from_different_databases() {
+        let main_items = in_database(
+            source(0, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let attached_items = in_database(
+            source(1, "items", None, vec![column("id", false)], false),
+            2,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&main_items, true);
+        scope.add_source(&attached_items, true);
+
+        let expanded = scope
+            .expand_star()
+            .expect("database identity distinguishes repeated table names");
+
+        assert_eq!(expanded.len(), 2);
+    }
+
+    #[test]
+    fn unqualified_star_rejects_repeated_identity_with_visible_columns() {
+        let left = in_database(
+            source(0, "items", None, vec![column("left", false)], false),
+            0,
+        );
+        let right = in_database(
+            source(1, "items", None, vec![column("right", false)], false),
+            0,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let error = scope
+            .expand_star()
+            .expect_err("same database and qualifier make star ambiguous");
+
+        assert!(error
+            .to_string()
+            .contains("ambiguous column name: items.right"));
+    }
+
+    #[test]
+    fn fully_merged_self_join_has_one_unqualified_star_column() {
+        let left = in_database(
+            source(0, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let right = in_database(
+            source(1, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let using = using_column(
+            Expr::Column(ColumnRef {
+                source: left.id,
+                column: 0,
+            }),
+            ColumnRef {
+                source: right.id,
+                column: 0,
+            },
+            MergedColumnValue::Left,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+        scope
+            .apply_using(std::slice::from_ref(&using))
+            .expect("USING identities belong to self-join sources");
+
+        let expanded = scope
+            .expand_star()
+            .expect("fully merged self-join has one visible source identity");
+
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].0, "id");
+        assert!(matches!(&expanded[0].1, Expr::MergedColumn(_)));
+    }
+
+    #[test]
+    fn table_star_reports_missing_and_repeated_qualifiers() {
+        let left = source(0, "items", Some("chosen"), vec![column("id", false)], false);
+        let right = source(1, "other", Some("chosen"), vec![column("id", false)], false);
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let missing = scope
+            .expand_table_star("missing")
+            .expect_err("unknown qualifier cannot expand star");
+        assert!(missing.to_string().contains("no such table: missing"));
+
+        let ambiguous = scope
+            .expand_table_star("chosen")
+            .expect_err("repeated qualifier cannot expand table star");
+        assert!(ambiguous
+            .to_string()
+            .contains("ambiguous table name: chosen"));
     }
 
     #[test]
