@@ -3,12 +3,15 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::Analyzer,
+    analyze::{Analyzer, CatalogObjectKind},
     context::DoubleQuotedDml,
     hir,
-    scope::{NamePrecedence, OutputCollation, ResolvedScopeExpr, Scope},
+    scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope},
 };
-use crate::{schema::Type, vdbe::affinity::Affinity, LimboError, Result};
+use crate::{
+    schema::Type, sync::Arc, translate::collate::CollationSeq, vdbe::affinity::Affinity,
+    LimboError, Result,
+};
 
 /// Clause rules that change expression name visibility.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +38,7 @@ enum ExprTask<'a> {
     Visit(&'a ast::Expr),
     BuildUnary(ast::UnaryOperator),
     BuildBinary(ast::Operator),
+    BuildCollate(&'a ast::Name),
     BuildIsNull,
     BuildNotNull,
 }
@@ -145,6 +149,10 @@ impl Analyzer<'_, '_> {
                         tasks.push(ExprTask::Visit(rhs));
                         tasks.push(ExprTask::Visit(lhs));
                     }
+                    ast::Expr::Collate(expression, name) => {
+                        tasks.push(ExprTask::BuildCollate(name));
+                        tasks.push(ExprTask::Visit(expression));
+                    }
                     ast::Expr::IsNull(expression) => {
                         tasks.push(ExprTask::BuildIsNull);
                         tasks.push(ExprTask::Visit(expression));
@@ -186,7 +194,7 @@ impl Analyzer<'_, '_> {
                     let comparison = operator
                         .is_comparison()
                         .then(|| comparison_semantics(&lhs, &rhs));
-                    let collation = lhs.collation.clone().or_else(|| rhs.collation.clone());
+                    let collation = expression_collation(&lhs.collation, &rhs.collation);
                     values.push(computed_expr(
                         hir::Expr::Binary {
                             lhs: Box::new(lhs.expr),
@@ -199,6 +207,20 @@ impl Analyzer<'_, '_> {
                         type_fact,
                         collation,
                     ));
+                }
+                ExprTask::BuildCollate(name) => {
+                    let inner = pop_expr_value(&mut values)?;
+                    let collation = self.resolve_collation(name)?;
+                    values.push(ResolvedScopeExpr {
+                        expr: hir::Expr::Collate {
+                            expr: Box::new(inner.expr),
+                            collation: collation.clone(),
+                        },
+                        type_fact: inner.type_fact,
+                        affinity: inner.affinity,
+                        has_affinity: inner.has_affinity,
+                        collation: ExprCollation::Explicit(collation),
+                    });
                 }
                 ExprTask::BuildIsNull | ExprTask::BuildNotNull => {
                     let inner = pop_expr_value(&mut values)?;
@@ -236,7 +258,7 @@ impl Analyzer<'_, '_> {
                 expr: hir::Expr::Literal(literal),
                 affinity: Affinity::Blob,
                 has_affinity: false,
-                collation: None,
+                collation: ExprCollation::Absent,
             }),
             hir::Expr::Column(reference) => {
                 let source = self.source(reference.source).ok_or_else(|| {
@@ -264,7 +286,7 @@ impl Analyzer<'_, '_> {
                     type_fact: column.type_fact.clone(),
                     affinity: column.affinity,
                     has_affinity: column.has_affinity,
-                    collation: column.collation.clone(),
+                    collation: ExprCollation::inherited(column.collation.clone()),
                 })
             }
             hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
@@ -272,7 +294,7 @@ impl Analyzer<'_, '_> {
                 type_fact: hir::TypeFact::known(Type::Integer),
                 affinity: Affinity::Integer,
                 has_affinity: true,
-                collation: None,
+                collation: ExprCollation::Absent,
             }),
             hir::Expr::Output(output) => {
                 let type_fact = scope.output_type(output).cloned().ok_or_else(|| {
@@ -286,18 +308,11 @@ impl Analyzer<'_, '_> {
                         "missing output affinity state for {output:?}"
                     ))
                 })?;
-                let collation = match scope.output_collation(output) {
-                    Some(OutputCollation::Absent) => None,
-                    Some(OutputCollation::Inherited(collation)) => Some(collation.clone()),
-                    Some(OutputCollation::Explicit(_)) => {
-                        return super::analyze::unsupported_select();
-                    }
-                    None => {
-                        return Err(LimboError::InternalError(format!(
-                            "missing output collation state for {output:?}"
-                        )))
-                    }
-                };
+                let collation = scope.output_collation(output).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing output collation state for {output:?}"
+                    ))
+                })?;
                 Ok(ResolvedScopeExpr {
                     expr: hir::Expr::Output(output),
                     type_fact,
@@ -308,6 +323,20 @@ impl Analyzer<'_, '_> {
             }
             _ => super::analyze::unsupported_select(),
         }
+    }
+
+    fn resolve_collation(&mut self, name: &ast::Name) -> Result<hir::ResolvedCollation> {
+        let collation = match self.context().symbols().resolve_collation(name.as_str()) {
+            Some(collation) => collation,
+            None => CollationSeq::new(name.as_str())?,
+        };
+        let id = self.catalog_object_id(None, CatalogObjectKind::Collation, collation.to_string());
+        Ok(hir::CatalogObject::new(
+            id,
+            self.context().snapshot(),
+            None,
+            Arc::new(collation),
+        ))
     }
 }
 
@@ -320,7 +349,7 @@ fn pop_expr_value(values: &mut Vec<ResolvedScopeExpr>) -> Result<ResolvedScopeEx
 fn computed_expr(
     expr: hir::Expr,
     type_fact: hir::TypeFact,
-    collation: Option<hir::ResolvedCollation>,
+    collation: ExprCollation,
 ) -> ResolvedScopeExpr {
     ResolvedScopeExpr {
         expr,
@@ -328,6 +357,16 @@ fn computed_expr(
         affinity: Affinity::Blob,
         has_affinity: false,
         collation,
+    }
+}
+
+fn expression_collation(lhs: &ExprCollation, rhs: &ExprCollation) -> ExprCollation {
+    match (lhs, rhs) {
+        (ExprCollation::Explicit(collation), _) => ExprCollation::Explicit(collation.clone()),
+        (_, ExprCollation::Explicit(collation)) => ExprCollation::Explicit(collation.clone()),
+        (ExprCollation::Inherited(collation), _) => ExprCollation::Inherited(collation.clone()),
+        (_, ExprCollation::Inherited(collation)) => ExprCollation::Inherited(collation.clone()),
+        (ExprCollation::Absent, ExprCollation::Absent) => ExprCollation::Absent,
     }
 }
 
@@ -379,7 +418,9 @@ fn comparison_semantics(
     hir::ComparisonSemantics {
         components: vec![hir::ComparisonComponent {
             affinity,
-            collation: lhs.collation.clone().or_else(|| rhs.collation.clone()),
+            collation: expression_collation(&lhs.collation, &rhs.collation)
+                .value()
+                .cloned(),
             array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
         }],
     }
