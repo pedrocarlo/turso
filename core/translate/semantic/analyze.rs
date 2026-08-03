@@ -271,7 +271,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
         let expression = self.analyze_expr(syntax, scope, policy)?;
-        let facts = self.expression_facts(&expression, scope)?;
+        let resolved = self.resolve_expr_facts(expression, scope)?;
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),
@@ -286,13 +286,13 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         Ok(Output {
             id: OutputId::query(block, index),
             name,
-            expr: expression,
-            type_fact: facts.type_fact,
-            affinity: facts.affinity,
-            schema_affinity: facts.affinity,
-            has_affinity: facts.has_affinity,
-            collation: facts.collation,
-            collation_is_explicit: facts.collation_is_explicit,
+            expr: resolved.expr,
+            type_fact: resolved.type_fact,
+            affinity: resolved.affinity,
+            schema_affinity: resolved.affinity,
+            has_affinity: resolved.has_affinity,
+            collation: resolved.collation,
+            collation_is_explicit: false,
             name_kind,
         })
     }
