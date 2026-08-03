@@ -1,0 +1,1118 @@
+//! Query-local source-name visibility.
+
+use super::hir::{self, ColumnRef, OutputId, SourceId, TypeFact};
+use crate::{schema::Type, sync::Arc, vdbe::affinity::Affinity, Result};
+
+/// Namespace order for one SQL clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamePrecedence {
+    SourcesOnly,
+    SourceThenOutput,
+    OutputThenSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedScopeExpr {
+    pub(crate) expr: hir::Expr,
+    pub(crate) type_fact: TypeFact,
+    pub(crate) affinity: Affinity,
+    pub(crate) has_affinity: bool,
+    pub(crate) collation: Option<hir::ResolvedCollation>,
+}
+
+#[derive(Clone, Debug)]
+struct ScopeColumn {
+    display_name: String,
+    lookup_name: String,
+    expr: hir::Expr,
+    type_fact: TypeFact,
+    affinity: Affinity,
+    has_affinity: bool,
+    collation: Option<hir::ResolvedCollation>,
+    hidden: bool,
+}
+
+impl ScopeColumn {
+    fn from_source(source: SourceId, index: usize, column: &hir::SourceColumn) -> Self {
+        Self {
+            display_name: column.name.clone(),
+            lookup_name: crate::util::normalize_ident(&column.name),
+            expr: hir::Expr::Column(ColumnRef {
+                source,
+                column: index,
+            }),
+            type_fact: column.type_fact.clone(),
+            affinity: column.affinity,
+            has_affinity: column.has_affinity,
+            collation: column.collation.clone(),
+            hidden: column.hidden,
+        }
+    }
+
+    fn resolved(&self) -> ResolvedScopeExpr {
+        ResolvedScopeExpr {
+            expr: self.expr.clone(),
+            type_fact: self.type_fact.clone(),
+            affinity: self.affinity,
+            has_affinity: self.has_affinity,
+            collation: self.collation.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScopeSource {
+    id: SourceId,
+    qualifier: String,
+    table_name: String,
+    database: Option<hir::DatabaseId>,
+    database_qualified: bool,
+    columns: Vec<ScopeColumn>,
+    rowid_available: bool,
+    unqualified: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScopeOutput {
+    id: OutputId,
+    name: String,
+    name_kind: hir::OutputNameKind,
+    type_fact: TypeFact,
+    affinity: Affinity,
+    has_affinity: bool,
+    collation: Option<hir::ResolvedCollation>,
+}
+
+/// Source namespace visible from one query block.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Scope {
+    sources: Vec<ScopeSource>,
+    visible_columns: Vec<ScopeColumn>,
+    outputs: Vec<ScopeOutput>,
+    outer: Option<Arc<Scope>>,
+}
+
+impl Scope {
+    pub(crate) fn new(outer: Option<Scope>) -> Self {
+        Self {
+            outer: outer.map(Arc::new),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
+        let columns: Vec<_> = source
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| ScopeColumn::from_source(source.id, index, column))
+            .collect();
+        if unqualified {
+            self.visible_columns.extend(columns.iter().cloned());
+        }
+        self.sources.push(ScopeSource {
+            id: source.id,
+            qualifier: crate::util::normalize_ident(
+                source.alias.as_deref().unwrap_or(&source.name),
+            ),
+            table_name: crate::util::normalize_ident(&source.name),
+            database: source.database,
+            database_qualified: source.alias.is_none(),
+            columns,
+            rowid_available: source.rowid_available,
+            unqualified,
+        });
+    }
+
+    pub(crate) fn set_outputs(&mut self, outputs: &[hir::Output]) {
+        self.outputs = outputs
+            .iter()
+            .map(|output| ScopeOutput {
+                id: output.id,
+                name: crate::util::normalize_ident(&output.name),
+                name_kind: output.name_kind,
+                type_fact: output.type_fact.clone(),
+                affinity: output.affinity,
+                has_affinity: output.has_affinity,
+                collation: output.collation.clone(),
+            })
+            .collect();
+    }
+
+    pub(crate) fn resolve_unqualified(
+        &self,
+        name: &str,
+        precedence: NamePrecedence,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        let normalized = crate::util::normalize_ident(name);
+        let current = match precedence {
+            NamePrecedence::SourcesOnly => self.resolve_source_column(&normalized)?,
+            NamePrecedence::SourceThenOutput => self
+                .resolve_source_column(&normalized)?
+                .or_else(|| self.resolve_output(&normalized)),
+            NamePrecedence::OutputThenSource => {
+                if let Some(output) = self.resolve_output(&normalized) {
+                    // SQLite still reports an ambiguous source name when an
+                    // output alias wins this clause's namespace order.
+                    self.resolve_source_column(&normalized)?;
+                    Some(output)
+                } else {
+                    self.resolve_source_column(&normalized)?
+                }
+            }
+        };
+        if current.is_some() {
+            return Ok(current);
+        }
+        self.outer.as_deref().map_or(Ok(None), |outer| {
+            outer.resolve_unqualified(name, NamePrecedence::SourceThenOutput)
+        })
+    }
+
+    pub(crate) fn resolve_qualified(
+        &self,
+        qualifier: &str,
+        column: &str,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        let normalized_qualifier = crate::util::normalize_ident(qualifier);
+        let normalized_column = crate::util::normalize_ident(column);
+        let matching_sources: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|source| source.qualifier == normalized_qualifier)
+            .collect();
+
+        if matching_sources.is_empty() {
+            return self
+                .outer
+                .as_deref()
+                .map_or(Ok(None), |outer| outer.resolve_qualified(qualifier, column));
+        }
+
+        let mut found = None;
+        for source in matching_sources {
+            let resolved = source
+                .columns
+                .iter()
+                .find(|candidate| candidate.lookup_name == normalized_column)
+                .map(ScopeColumn::resolved)
+                .or_else(|| {
+                    (source.rowid_available && is_rowid_name(&normalized_column))
+                        .then(|| resolved_rowid(source.id))
+                });
+            if resolved.is_some() && found.is_some() {
+                crate::bail_parse_error!("ambiguous column name: {}.{}", qualifier, column);
+            }
+            if resolved.is_some() {
+                found = resolved;
+            }
+        }
+
+        let Some(found) = found else {
+            crate::bail_parse_error!("no such column: {}.{}", qualifier, column);
+        };
+        Ok(Some(found))
+    }
+
+    pub(crate) fn resolve_database_qualified(
+        &self,
+        database: hir::DatabaseId,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        let normalized_table = crate::util::normalize_ident(table);
+        let normalized_column = crate::util::normalize_ident(column);
+        let matching_sources: Vec<_> = self
+            .sources
+            .iter()
+            .filter(|source| {
+                source.database_qualified
+                    && source.database == Some(database)
+                    && source.table_name == normalized_table
+            })
+            .collect();
+
+        if matching_sources.is_empty() {
+            return self.outer.as_deref().map_or(Ok(None), |outer| {
+                outer.resolve_database_qualified(database, table, column)
+            });
+        }
+
+        let mut found = None;
+        for source in matching_sources {
+            let resolved = source
+                .columns
+                .iter()
+                .find(|candidate| candidate.lookup_name == normalized_column)
+                .map(ScopeColumn::resolved)
+                .or_else(|| {
+                    (source.rowid_available && is_rowid_name(&normalized_column))
+                        .then(|| resolved_rowid(source.id))
+                });
+            if resolved.is_some() && found.is_some() {
+                crate::bail_parse_error!("ambiguous column name: {}.{}", table, column);
+            }
+            if resolved.is_some() {
+                found = resolved;
+            }
+        }
+
+        let Some(found) = found else {
+            crate::bail_parse_error!("no such column: {}.{}", table, column);
+        };
+        Ok(Some(found))
+    }
+
+    pub(crate) fn resolve_using_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
+        let normalized = crate::util::normalize_ident(name);
+        self.visible_columns
+            .iter()
+            .find(|column| column.lookup_name == normalized)
+            .map(ScopeColumn::resolved)
+            .ok_or_else(|| {
+                crate::LimboError::ParseError(format!(
+                    "cannot join using column {name} - column not present in both tables"
+                ))
+            })
+    }
+
+    pub(crate) fn resolve_natural_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
+        let normalized = crate::util::normalize_ident(name);
+        let mut matches = self
+            .visible_columns
+            .iter()
+            .filter(|column| !column.hidden && column.lookup_name == normalized);
+        let Some(column) = matches.next() else {
+            return Err(crate::LimboError::InternalError(format!(
+                "NATURAL join column {name} disappeared from the visible scope"
+            )));
+        };
+        if matches.next().is_some() {
+            crate::bail_parse_error!("ambiguous column name: {name}");
+        }
+        Ok(column.resolved())
+    }
+
+    pub(crate) fn natural_common_columns(&self, right: &hir::Source) -> Vec<String> {
+        right
+            .columns
+            .iter()
+            .filter(|column| !column.hidden)
+            .filter_map(|right_column| {
+                let lookup = crate::util::normalize_ident(&right_column.name);
+                self.visible_columns
+                    .iter()
+                    .find(|left_column| !left_column.hidden && left_column.lookup_name == lookup)
+                    .map(|left_column| left_column.display_name.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_using(&mut self, columns: &[hir::UsingColumn]) -> Result<()> {
+        for using in columns {
+            let right_position = self.visible_columns.iter().position(|column| {
+                matches!(
+                    &column.expr,
+                    hir::Expr::Column(reference) if *reference == using.right
+                )
+            });
+            let Some(right_position) = right_position else {
+                return Err(crate::LimboError::InternalError(format!(
+                    "USING column {} did not belong to the right source",
+                    using.name
+                )));
+            };
+            let lookup_name = crate::util::normalize_ident(&using.name);
+            let left_position = self
+                .visible_columns
+                .iter()
+                .enumerate()
+                .find(|(position, column)| {
+                    *position != right_position
+                        && column.lookup_name == lookup_name
+                        && same_join_column(&column.expr, &using.left)
+                })
+                .map(|(position, _)| position);
+            let Some(left_position) = left_position else {
+                return Err(crate::LimboError::InternalError(format!(
+                    "USING column {} did not belong to the left sources",
+                    using.name
+                )));
+            };
+
+            let merged = hir::Expr::MergedColumn(hir::MergedColumn {
+                left: using.left.clone(),
+                right: using.right,
+                value: using.value,
+                type_fact: using.type_fact.clone(),
+                affinity: using.affinity,
+                has_affinity: using.has_affinity,
+                collation: using.collation.clone(),
+            });
+
+            match using.value {
+                hir::MergedColumnValue::Left | hir::MergedColumnValue::Coalesce => {
+                    let left = &mut self.visible_columns[left_position];
+                    left.expr = merged;
+                    left.type_fact = using.type_fact.clone();
+                    left.affinity = using.affinity;
+                    left.has_affinity = using.has_affinity;
+                    left.collation = using.collation.clone();
+                    self.visible_columns.remove(right_position);
+                }
+                hir::MergedColumnValue::Right => {
+                    let right = &mut self.visible_columns[right_position];
+                    right.expr = merged;
+                    right.type_fact = using.type_fact.clone();
+                    right.affinity = using.affinity;
+                    right.has_affinity = using.has_affinity;
+                    right.collation = using.collation.clone();
+                    self.visible_columns.remove(left_position);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_source_column(&self, name: &str) -> Result<Option<ResolvedScopeExpr>> {
+        let mut found = None;
+        for column in self
+            .visible_columns
+            .iter()
+            .filter(|column| column.lookup_name == name)
+        {
+            if found.is_some() {
+                crate::bail_parse_error!("ambiguous column name: {}", name);
+            }
+            found = Some(column.resolved());
+        }
+        if found.is_some() {
+            return Ok(found);
+        }
+
+        if !is_rowid_name(name) {
+            return Ok(None);
+        }
+        for source in self
+            .sources
+            .iter()
+            .filter(|source| source.unqualified && source.rowid_available)
+        {
+            if found.is_some() {
+                crate::bail_parse_error!("ambiguous column name: {}", name);
+            }
+            found = Some(resolved_rowid(source.id));
+        }
+        Ok(found)
+    }
+
+    fn resolve_output(&self, name: &str) -> Option<ResolvedScopeExpr> {
+        self.outputs
+            .iter()
+            .find(|output| {
+                output.name_kind == hir::OutputNameKind::ExplicitAlias && output.name == name
+            })
+            .or_else(|| self.outputs.iter().find(|output| output.name == name))
+            .map(|output| ResolvedScopeExpr {
+                expr: hir::Expr::Output(output.id),
+                type_fact: output.type_fact.clone(),
+                affinity: output.affinity,
+                has_affinity: output.has_affinity,
+                collation: output.collation.clone(),
+            })
+    }
+}
+
+fn same_join_column(left: &hir::Expr, right: &hir::Expr) -> bool {
+    match (left, right) {
+        (hir::Expr::Column(left), hir::Expr::Column(right)) => left == right,
+        (hir::Expr::MergedColumn(left), hir::Expr::MergedColumn(right)) => {
+            left.right == right.right
+                && left.value == right.value
+                && same_join_column(&left.left, &right.left)
+        }
+        _ => false,
+    }
+}
+
+fn resolved_rowid(source: SourceId) -> ResolvedScopeExpr {
+    ResolvedScopeExpr {
+        expr: hir::Expr::RowId(source),
+        type_fact: TypeFact::known(Type::Integer),
+        affinity: Affinity::Integer,
+        has_affinity: true,
+        collation: None,
+    }
+}
+
+fn is_rowid_name(name: &str) -> bool {
+    matches!(name, "rowid" | "_rowid_" | "oid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::semantic::hir::{
+        ColumnReadExpression, ComparisonComponent, ComparisonSemantics, DatabaseId, Expr,
+        IndexCoverage, IndexHint, MergedColumnValue, Output, OutputNameKind, QueryBlockId, QueryId,
+        Source, SourceColumn, SourceKind, SourceOwner, UsingColumn,
+    };
+    use turso_parser::ast::Literal;
+
+    fn column(name: &str, hidden: bool) -> SourceColumn {
+        SourceColumn {
+            name: name.to_string(),
+            type_fact: TypeFact::known(Type::Text),
+            affinity: Affinity::Text,
+            has_affinity: true,
+            collation: None,
+            hidden,
+            rowid_alias: false,
+        }
+    }
+
+    fn source(
+        id: usize,
+        name: &str,
+        alias: Option<&str>,
+        columns: Vec<SourceColumn>,
+        rowid_available: bool,
+    ) -> Source {
+        let width = columns.len();
+        Source {
+            id: SourceId::new(id),
+            owner: SourceOwner::Root,
+            database: None,
+            name: name.to_string(),
+            alias: alias.map(str::to_string),
+            kind: SourceKind::SchemaExpression,
+            columns,
+            generated_expressions: vec![ColumnReadExpression::Absent; width],
+            default_expressions: vec![ColumnReadExpression::Absent; width],
+            column_type_programs: vec![None; width],
+            check_constraints: None,
+            rowid_available,
+            index_hint: IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        }
+    }
+
+    fn output(position: usize, name: &str, name_kind: OutputNameKind) -> Output {
+        let block = QueryBlockId::new(QueryId::new(0), 0);
+        Output {
+            id: OutputId::query(block, position),
+            name: name.to_string(),
+            expr: Expr::Literal(Literal::Null),
+            type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
+            schema_affinity: Affinity::Integer,
+            has_affinity: true,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind,
+        }
+    }
+
+    fn in_database(mut source: Source, database: usize) -> Source {
+        source.database = Some(DatabaseId::new(database));
+        source
+    }
+
+    fn using_column(left: Expr, right: ColumnRef, value: MergedColumnValue) -> UsingColumn {
+        UsingColumn {
+            name: "id".to_string(),
+            left: Box::new(left),
+            right,
+            value,
+            type_fact: TypeFact::known(Type::Text),
+            affinity: Affinity::Text,
+            has_affinity: true,
+            collation: None,
+            comparison: ComparisonSemantics {
+                components: vec![ComparisonComponent {
+                    affinity: Affinity::Text,
+                    collation: None,
+                    array: false,
+                }],
+            },
+        }
+    }
+
+    fn expect_column(resolved: ResolvedScopeExpr, source: SourceId, column: usize) {
+        assert!(resolved.has_affinity);
+        assert_eq!(resolved.affinity, Affinity::Text);
+        assert_eq!(resolved.type_fact.storage, Some(Type::Text));
+        assert!(resolved.collation.is_none());
+        assert!(matches!(
+            resolved.expr,
+            Expr::Column(ColumnRef {
+                source: actual_source,
+                column: actual_column,
+            }) if actual_source == source && actual_column == column
+        ));
+    }
+
+    fn expect_output(resolved: ResolvedScopeExpr, output: OutputId) {
+        assert!(matches!(resolved.expr, Expr::Output(actual) if actual == output));
+        assert_eq!(resolved.type_fact.storage, Some(Type::Integer));
+        assert_eq!(resolved.affinity, Affinity::Integer);
+        assert!(resolved.has_affinity);
+        assert!(resolved.collation.is_none());
+    }
+
+    #[test]
+    fn unqualified_names_bind_case_insensitively_including_hidden_columns() {
+        let items = source(
+            0,
+            "items",
+            None,
+            vec![column("visible", false), column("Secret", true)],
+            false,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+
+        let resolved = scope
+            .resolve_unqualified("sEcReT", NamePrecedence::SourcesOnly)
+            .expect("source namespace is valid")
+            .expect("hidden column remains name-addressable");
+
+        expect_column(resolved, items.id, 1);
+    }
+
+    #[test]
+    fn duplicate_unqualified_columns_are_ambiguous() {
+        let left = source(0, "left", None, vec![column("id", false)], false);
+        let right = source(1, "right", None, vec![column("id", false)], false);
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let error = scope
+            .resolve_unqualified("id", NamePrecedence::SourcesOnly)
+            .expect_err("duplicate visible columns are ambiguous");
+
+        assert!(error.to_string().contains("ambiguous column name: id"));
+    }
+
+    #[test]
+    fn qualified_names_use_alias_and_report_missing_columns() {
+        let items = source(
+            0,
+            "items",
+            Some("chosen"),
+            vec![column("value", false)],
+            false,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+
+        let resolved = scope
+            .resolve_qualified("CHOSEN", "VALUE")
+            .expect("source namespace is valid")
+            .expect("alias resolves");
+        expect_column(resolved, items.id, 0);
+
+        let error = scope
+            .resolve_qualified("chosen", "missing")
+            .expect_err("matched qualifier owns no such column");
+        assert!(error.to_string().contains("no such column: chosen.missing"));
+    }
+
+    #[test]
+    fn duplicate_qualified_columns_are_ambiguous() {
+        let left = source(
+            0,
+            "left_items",
+            Some("chosen"),
+            vec![column("id", false)],
+            false,
+        );
+        let right = source(
+            1,
+            "right_items",
+            Some("chosen"),
+            vec![column("id", false)],
+            false,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let error = scope
+            .resolve_qualified("chosen", "id")
+            .expect_err("duplicate qualified columns are ambiguous");
+
+        assert!(error
+            .to_string()
+            .contains("ambiguous column name: chosen.id"));
+    }
+
+    #[test]
+    fn local_scope_wins_before_outer_scope() {
+        let outer_items = source(0, "outer_items", None, vec![column("id", false)], false);
+        let mut outer = Scope::default();
+        outer.add_source(&outer_items, true);
+
+        let inner_items = source(1, "inner_items", None, vec![column("id", false)], false);
+        let mut inner = Scope::new(Some(outer));
+        inner.add_source(&inner_items, true);
+
+        let resolved = inner
+            .resolve_unqualified("id", NamePrecedence::SourcesOnly)
+            .expect("source namespace is valid")
+            .expect("local column resolves");
+
+        expect_column(resolved, inner_items.id, 0);
+    }
+
+    #[test]
+    fn missing_local_qualifier_falls_back_to_outer_scope() {
+        let outer_items = source(
+            0,
+            "outer_items",
+            Some("parent"),
+            vec![column("id", false)],
+            false,
+        );
+        let mut outer = Scope::default();
+        outer.add_source(&outer_items, true);
+        let inner = Scope::new(Some(outer));
+
+        let resolved = inner
+            .resolve_qualified("parent", "id")
+            .expect("source namespace is valid")
+            .expect("outer qualified column resolves");
+
+        expect_column(resolved, outer_items.id, 0);
+    }
+
+    #[test]
+    fn matched_local_qualifier_blocks_outer_fallback() {
+        let outer_items = source(
+            0,
+            "outer_items",
+            Some("chosen"),
+            vec![column("id", false)],
+            false,
+        );
+        let mut outer = Scope::default();
+        outer.add_source(&outer_items, true);
+
+        let inner_items = source(
+            1,
+            "inner_items",
+            Some("chosen"),
+            vec![column("other", false)],
+            false,
+        );
+        let mut inner = Scope::new(Some(outer));
+        inner.add_source(&inner_items, true);
+
+        let error = inner
+            .resolve_qualified("chosen", "id")
+            .expect_err("local qualifier prevents outer-column fallback");
+
+        assert!(error.to_string().contains("no such column: chosen.id"));
+    }
+
+    #[test]
+    fn database_qualified_names_bind_columns_and_rowids() {
+        let items = in_database(
+            source(0, "Items", None, vec![column("Value", false)], true),
+            2,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+
+        let value = scope
+            .resolve_database_qualified(DatabaseId::new(2), "items", "value")
+            .expect("source namespace is valid")
+            .expect("database-qualified column resolves");
+        expect_column(value, items.id, 0);
+
+        let rowid = scope
+            .resolve_database_qualified(DatabaseId::new(2), "ITEMS", "_RoWiD_")
+            .expect("source namespace is valid")
+            .expect("database-qualified rowid resolves");
+        assert!(matches!(rowid.expr, Expr::RowId(source) if source == items.id));
+
+        let wrong_database = scope
+            .resolve_database_qualified(DatabaseId::new(1), "items", "value")
+            .expect("source namespace is valid");
+        assert!(wrong_database.is_none());
+    }
+
+    #[test]
+    fn alias_hides_database_qualified_table_name() {
+        let items = in_database(
+            source(0, "items", Some("chosen"), vec![column("id", false)], false),
+            0,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+
+        let database_qualified = scope
+            .resolve_database_qualified(DatabaseId::new(0), "items", "id")
+            .expect("source namespace is valid");
+        assert!(database_qualified.is_none());
+
+        let aliased = scope
+            .resolve_qualified("chosen", "id")
+            .expect("source namespace is valid")
+            .expect("alias resolves");
+        expect_column(aliased, items.id, 0);
+    }
+
+    #[test]
+    fn duplicate_database_qualified_columns_are_ambiguous() {
+        let left = in_database(
+            source(0, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let right = in_database(
+            source(1, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let error = scope
+            .resolve_database_qualified(DatabaseId::new(0), "items", "id")
+            .expect_err("duplicate database-qualified columns are ambiguous");
+
+        assert!(error
+            .to_string()
+            .contains("ambiguous column name: items.id"));
+    }
+
+    #[test]
+    fn matched_local_database_table_blocks_outer_fallback() {
+        let outer_items = in_database(
+            source(0, "items", None, vec![column("id", false)], false),
+            0,
+        );
+        let mut outer = Scope::default();
+        outer.add_source(&outer_items, true);
+
+        let inner_items = in_database(
+            source(1, "items", None, vec![column("other", false)], false),
+            0,
+        );
+        let mut inner = Scope::new(Some(outer));
+        inner.add_source(&inner_items, true);
+
+        let error = inner
+            .resolve_database_qualified(DatabaseId::new(0), "items", "id")
+            .expect_err("local database table prevents outer-column fallback");
+
+        assert!(error.to_string().contains("no such column: items.id"));
+    }
+
+    #[test]
+    fn using_exposes_one_merged_column_and_keeps_qualified_columns() {
+        for value in [
+            MergedColumnValue::Left,
+            MergedColumnValue::Right,
+            MergedColumnValue::Coalesce,
+        ] {
+            let left = source(0, "left", None, vec![column("id", false)], false);
+            let right = source(1, "right", None, vec![column("id", false)], false);
+            let left_ref = ColumnRef {
+                source: left.id,
+                column: 0,
+            };
+            let right_ref = ColumnRef {
+                source: right.id,
+                column: 0,
+            };
+            let using = using_column(Expr::Column(left_ref), right_ref, value);
+            let mut scope = Scope::default();
+            scope.add_source(&left, true);
+            scope.add_source(&right, true);
+            scope
+                .apply_using(std::slice::from_ref(&using))
+                .expect("USING identities belong to visible sources");
+
+            let unqualified = scope
+                .resolve_unqualified("id", NamePrecedence::SourcesOnly)
+                .expect("merged namespace is valid")
+                .expect("merged column resolves");
+            assert_eq!(unqualified.type_fact.storage, Some(Type::Text));
+            assert_eq!(unqualified.affinity, Affinity::Text);
+            assert!(unqualified.has_affinity);
+            assert!(unqualified.collation.is_none());
+            let Expr::MergedColumn(merged) = unqualified.expr else {
+                panic!("USING produces a merged column");
+            };
+            assert!(matches!(*merged.left, Expr::Column(actual) if actual == left_ref));
+            assert_eq!(merged.right, right_ref);
+            assert_eq!(merged.value, value);
+
+            let qualified_left = scope
+                .resolve_qualified("left", "id")
+                .expect("source namespace is valid")
+                .expect("left column remains qualified");
+            expect_column(qualified_left, left.id, 0);
+            let qualified_right = scope
+                .resolve_qualified("right", "id")
+                .expect("source namespace is valid")
+                .expect("right column remains qualified");
+            expect_column(qualified_right, right.id, 0);
+        }
+    }
+
+    #[test]
+    fn using_can_extend_an_earlier_merged_column() {
+        let left = source(0, "left", None, vec![column("id", false)], false);
+        let middle = source(1, "middle", None, vec![column("id", false)], false);
+        let right = source(2, "right", None, vec![column("id", false)], false);
+        let left_ref = ColumnRef {
+            source: left.id,
+            column: 0,
+        };
+        let middle_ref = ColumnRef {
+            source: middle.id,
+            column: 0,
+        };
+        let right_ref = ColumnRef {
+            source: right.id,
+            column: 0,
+        };
+        let first = using_column(Expr::Column(left_ref), middle_ref, MergedColumnValue::Left);
+        let first_expr = Expr::MergedColumn(hir::MergedColumn {
+            left: first.left.clone(),
+            right: first.right,
+            value: first.value,
+            type_fact: first.type_fact.clone(),
+            affinity: first.affinity,
+            has_affinity: first.has_affinity,
+            collation: first.collation.clone(),
+        });
+        let second = using_column(first_expr, right_ref, MergedColumnValue::Coalesce);
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&middle, true);
+        scope
+            .apply_using(std::slice::from_ref(&first))
+            .expect("first USING identities are valid");
+        scope.add_source(&right, true);
+        scope
+            .apply_using(std::slice::from_ref(&second))
+            .expect("earlier merged column remains a valid left identity");
+
+        let resolved = scope
+            .resolve_unqualified("id", NamePrecedence::SourcesOnly)
+            .expect("merged namespace is valid")
+            .expect("three-way merged column resolves");
+        let Expr::MergedColumn(merged) = resolved.expr else {
+            panic!("second USING produces a merged column");
+        };
+        assert_eq!(merged.right, right_ref);
+        assert_eq!(merged.value, MergedColumnValue::Coalesce);
+        assert!(matches!(*merged.left, Expr::MergedColumn(_)));
+    }
+
+    #[test]
+    fn natural_columns_ignore_hidden_columns() {
+        let left = source(
+            0,
+            "left",
+            None,
+            vec![
+                column("ID", false),
+                column("left_hidden", true),
+                column("right_hidden", false),
+            ],
+            false,
+        );
+        let right = source(
+            1,
+            "right",
+            None,
+            vec![
+                column("id", false),
+                column("left_hidden", false),
+                column("right_hidden", true),
+            ],
+            false,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+
+        assert_eq!(scope.natural_common_columns(&right), vec!["ID"]);
+        let resolved = scope
+            .resolve_natural_left("id")
+            .expect("visible NATURAL column resolves");
+        expect_column(resolved, left.id, 0);
+    }
+
+    #[test]
+    fn natural_join_rejects_ambiguous_left_column() {
+        let first = source(0, "first", None, vec![column("id", false)], false);
+        let second = source(1, "second", None, vec![column("id", false)], false);
+        let mut scope = Scope::default();
+        scope.add_source(&first, true);
+        scope.add_source(&second, true);
+
+        let error = scope
+            .resolve_natural_left("id")
+            .expect_err("NATURAL left column must be unique");
+
+        assert!(error.to_string().contains("ambiguous column name: id"));
+    }
+
+    #[test]
+    fn using_rejects_source_identities_outside_visible_sides() {
+        let left = source(0, "left", None, vec![column("id", false)], false);
+        let right = source(1, "right", None, vec![column("id", false)], false);
+        let using = using_column(
+            Expr::Column(ColumnRef {
+                source: left.id,
+                column: 0,
+            }),
+            ColumnRef {
+                source: SourceId::new(99),
+                column: 0,
+            },
+            MergedColumnValue::Left,
+        );
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+
+        let error = scope
+            .apply_using(std::slice::from_ref(&using))
+            .expect_err("unknown right identity violates scope invariant");
+
+        assert!(error
+            .to_string()
+            .contains("USING column id did not belong to the right source"));
+    }
+
+    #[test]
+    fn using_reports_missing_left_column() {
+        let scope = Scope::default();
+
+        let error = scope
+            .resolve_using_left("missing")
+            .expect_err("USING requires a visible left column");
+
+        assert!(error
+            .to_string()
+            .contains("cannot join using column missing"));
+    }
+
+    #[test]
+    fn source_then_output_prefers_source_and_uses_alias_as_fallback() {
+        let items = source(0, "items", None, vec![column("name", false)], false);
+        let outputs = [
+            output(0, "name", OutputNameKind::ExplicitAlias),
+            output(1, "alias_only", OutputNameKind::ExplicitAlias),
+        ];
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+        scope.set_outputs(&outputs);
+
+        let source_result = scope
+            .resolve_unqualified("name", NamePrecedence::SourceThenOutput)
+            .expect("source namespace is valid")
+            .expect("source column resolves");
+        expect_column(source_result, items.id, 0);
+
+        let output_result = scope
+            .resolve_unqualified("alias_only", NamePrecedence::SourceThenOutput)
+            .expect("output namespace is valid")
+            .expect("output alias resolves as fallback");
+        expect_output(output_result, outputs[1].id);
+    }
+
+    #[test]
+    fn output_then_source_prefers_alias() {
+        let items = source(0, "items", None, vec![column("name", false)], false);
+        let outputs = [output(0, "name", OutputNameKind::ExplicitAlias)];
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+        scope.set_outputs(&outputs);
+
+        let resolved = scope
+            .resolve_unqualified("name", NamePrecedence::OutputThenSource)
+            .expect("source namespace is valid")
+            .expect("output alias resolves first");
+
+        expect_output(resolved, outputs[0].id);
+    }
+
+    #[test]
+    fn output_first_lookup_still_rejects_ambiguous_sources() {
+        let left = source(0, "left", None, vec![column("name", false)], false);
+        let right = source(1, "right", None, vec![column("name", false)], false);
+        let outputs = [output(0, "name", OutputNameKind::ExplicitAlias)];
+        let mut scope = Scope::default();
+        scope.add_source(&left, true);
+        scope.add_source(&right, true);
+        scope.set_outputs(&outputs);
+
+        let error = scope
+            .resolve_unqualified("name", NamePrecedence::OutputThenSource)
+            .expect_err("ambiguous sources remain an error");
+
+        assert!(error.to_string().contains("ambiguous column name: name"));
+    }
+
+    #[test]
+    fn explicit_alias_wins_over_inferred_output_name() {
+        let outputs = [
+            output(0, "chosen", OutputNameKind::Inferred),
+            output(1, "chosen", OutputNameKind::ExplicitAlias),
+        ];
+        let mut scope = Scope::default();
+        scope.set_outputs(&outputs);
+
+        let resolved = scope
+            .resolve_unqualified("chosen", NamePrecedence::OutputThenSource)
+            .expect("output namespace is valid")
+            .expect("matching output resolves");
+
+        expect_output(resolved, outputs[1].id);
+    }
+
+    #[test]
+    fn source_only_lookup_ignores_output_names() {
+        let outputs = [output(0, "chosen", OutputNameKind::ExplicitAlias)];
+        let mut scope = Scope::default();
+        scope.set_outputs(&outputs);
+
+        let resolved = scope
+            .resolve_unqualified("chosen", NamePrecedence::SourcesOnly)
+            .expect("source namespace is valid");
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn declared_rowid_name_shadows_implicit_rowid() {
+        let items = source(0, "items", None, vec![column("rowid", false)], true);
+        let mut scope = Scope::default();
+        scope.add_source(&items, true);
+
+        let declared = scope
+            .resolve_unqualified("rowid", NamePrecedence::SourcesOnly)
+            .expect("source namespace is valid")
+            .expect("declared rowid column resolves");
+        expect_column(declared, items.id, 0);
+
+        let implicit = scope
+            .resolve_unqualified("oid", NamePrecedence::SourcesOnly)
+            .expect("source namespace is valid")
+            .expect("implicit rowid alias resolves");
+        assert!(matches!(implicit.expr, Expr::RowId(source) if source == items.id));
+        assert_eq!(implicit.type_fact.storage, Some(Type::Integer));
+        assert_eq!(implicit.affinity, Affinity::Integer);
+        assert!(implicit.has_affinity);
+        assert!(implicit.collation.is_none());
+    }
+}
