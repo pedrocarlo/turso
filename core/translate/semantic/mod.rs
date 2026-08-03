@@ -2,6 +2,7 @@
 
 mod analyze;
 pub(crate) mod context;
+mod expr;
 pub(crate) mod hir;
 mod scope;
 

@@ -7,11 +7,13 @@ use crate::{
 
 use super::{
     context::SemanticContext,
+    expr::ExprPolicy,
     hir::{
         BoundSchemaProgram, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument, HirRoot, Output,
         OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
         QueryRoot, Source, TypeFact,
     },
+    scope::Scope,
     AnalyzeInput,
 };
 
@@ -41,7 +43,7 @@ pub(crate) fn analyze(
     Ok(document)
 }
 
-struct Analyzer<'context, 'catalog> {
+pub(super) struct Analyzer<'context, 'catalog> {
     context: &'context SemanticContext<'catalog>,
     queries: Vec<Option<Query>>,
     sources: Vec<Option<Source>>,
@@ -50,7 +52,7 @@ struct Analyzer<'context, 'catalog> {
 }
 
 impl<'context, 'catalog> Analyzer<'context, 'catalog> {
-    fn new(context: &'context SemanticContext<'catalog>) -> Self {
+    pub(super) fn new(context: &'context SemanticContext<'catalog>) -> Self {
         Self {
             context,
             queries: Vec::new(),
@@ -58,6 +60,10 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
         }
+    }
+
+    pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
+        self.context
     }
 
     fn reserve_query(&mut self) -> QueryId {
@@ -156,10 +162,11 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
         let query_id = self.reserve_query();
         let block_id = QueryBlockId::new(query_id, 0);
+        let scope = Scope::default();
         let outputs = columns
             .iter()
             .enumerate()
-            .map(|(index, column)| analyze_literal_output(block_id, index, column))
+            .map(|(index, column)| self.analyze_output(block_id, index, column, &scope))
             .collect::<Result<Vec<_>>>()?;
         let output_ids = outputs.iter().map(|output| output.id).collect();
 
@@ -193,44 +200,47 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
         Ok(query_id)
     }
-}
+    fn analyze_output(
+        &mut self,
+        block: QueryBlockId,
+        index: usize,
+        column: &ast::ResultColumn,
+        scope: &Scope,
+    ) -> Result<Output> {
+        let ast::ResultColumn::Expr(expression, alias) = column else {
+            return unsupported_select();
+        };
+        let syntax = expression;
+        let expression = self.analyze_expr(syntax, scope, ExprPolicy::select())?;
+        let Expr::Literal(literal) = &expression else {
+            return unsupported_select();
+        };
+        let (name, name_kind) = match alias {
+            Some(alias) if alias.is_explicit() => (
+                alias.name().as_str().to_string(),
+                OutputNameKind::ExplicitAlias,
+            ),
+            Some(ast::As::ImplicitColumnName(name)) => {
+                (name.as_str().to_string(), OutputNameKind::Inferred)
+            }
+            None => (syntax.to_string(), OutputNameKind::Inferred),
+            Some(_) => unreachable!("all explicit aliases were handled"),
+        };
+        let type_fact = literal_type_fact(literal)?;
 
-fn analyze_literal_output(
-    block: QueryBlockId,
-    index: usize,
-    column: &ast::ResultColumn,
-) -> Result<Output> {
-    let ast::ResultColumn::Expr(expression, alias) = column else {
-        return unsupported_select();
-    };
-    let ast::Expr::Literal(literal) = expression.as_ref() else {
-        return unsupported_select();
-    };
-    let (name, name_kind) = match alias {
-        Some(alias) if alias.is_explicit() => (
-            alias.name().as_str().to_string(),
-            OutputNameKind::ExplicitAlias,
-        ),
-        Some(ast::As::ImplicitColumnName(name)) => {
-            (name.as_str().to_string(), OutputNameKind::Inferred)
-        }
-        None => (expression.to_string(), OutputNameKind::Inferred),
-        Some(_) => unreachable!("all explicit aliases were handled"),
-    };
-    let type_fact = literal_type_fact(literal)?;
-
-    Ok(Output {
-        id: OutputId::query(block, index),
-        name,
-        expr: Expr::Literal(literal.clone()),
-        type_fact,
-        affinity: Affinity::Blob,
-        schema_affinity: Affinity::Blob,
-        has_affinity: false,
-        collation: None,
-        collation_is_explicit: false,
-        name_kind,
-    })
+        Ok(Output {
+            id: OutputId::query(block, index),
+            name,
+            expr: expression,
+            type_fact,
+            affinity: Affinity::Blob,
+            schema_affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind,
+        })
+    }
 }
 
 fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
@@ -256,7 +266,7 @@ fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
     Ok(TypeFact::known(storage))
 }
 
-fn unsupported_select<T>() -> Result<T> {
+pub(super) fn unsupported_select<T>() -> Result<T> {
     Err(LimboError::ParseError(
         "semantic analysis accepts source-free literal SELECT statements".to_string(),
     ))
@@ -274,7 +284,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::translate::semantic::hir::{HirRoot, OutputNameKind};
+    use crate::translate::semantic::{
+        context::DoubleQuotedDml,
+        hir::{HirRoot, OutputNameKind},
+    };
 
     fn parse_statement(sql: &str) -> ast::Stmt {
         let command = Parser::new(sql.as_bytes())
@@ -326,8 +339,41 @@ mod tests {
     fn unresolved_names_do_not_enter_hir() {
         let error = analyze_sql("SELECT missing_name")
             .expect_err("unresolved name must fail semantic analysis");
-        assert!(error
-            .to_string()
-            .contains("source-free literal SELECT statements"));
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: missing_name"
+        );
+    }
+
+    #[test]
+    fn unresolved_double_quoted_names_follow_dqs_setting() {
+        let document = analyze_sql("SELECT \"missing name\"")
+            .expect("enabled DQS converts unresolved name to text");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        assert!(matches!(
+            &output.expr,
+            Expr::Literal(ast::Literal::String(value)) if value == "'missing name'"
+        ));
+        assert_eq!(output.type_fact.storage, Some(Type::Text));
+
+        let schema = Schema::new();
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            &schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        )
+        .with_dqs_dml(DoubleQuotedDml::Disabled);
+        let statement = parse_statement("SELECT \"missing name\"");
+        let error = analyze(&context, AnalyzeInput::Statement(&statement))
+            .expect_err("disabled DQS keeps unresolved name error");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: missing name"
+        );
     }
 }
