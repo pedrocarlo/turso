@@ -8,8 +8,9 @@ use crate::{
 use super::{
     context::SemanticContext,
     hir::{
-        DatabaseId, DatabaseSnapshot, Expr, HirDocument, HirRoot, Output, OutputId, OutputNameKind,
-        Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, TypeFact,
+        BoundSchemaProgram, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument, HirRoot, Output,
+        OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
+        QueryRoot, Source, TypeFact,
     },
     AnalyzeInput,
 };
@@ -18,92 +19,180 @@ pub(crate) fn analyze(
     context: &SemanticContext<'_>,
     input: AnalyzeInput<'_>,
 ) -> Result<HirDocument> {
-    let document = match input {
-        AnalyzeInput::Statement(ast::Stmt::Select(select)) => analyze_select(context, select)?,
+    let mut analyzer = Analyzer::new(context);
+    let root = match input {
+        AnalyzeInput::Statement(ast::Stmt::Select(select)) => {
+            let query = analyzer.analyze_select(select)?;
+            HirRoot::Query(QueryRoot {
+                query,
+                trigger: None,
+            })
+        }
         AnalyzeInput::Statement(_) => {
             return Err(LimboError::ParseError(
                 "semantic analysis accepts SELECT statements".to_string(),
             ));
         }
     };
+    let document = analyzer.finish(root)?;
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
     })?;
     Ok(document)
 }
 
-fn analyze_select(context: &SemanticContext<'_>, select: &ast::Select) -> Result<HirDocument> {
-    if select.with.is_some()
-        || !select.body.compounds.is_empty()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
-    {
-        return unsupported_select();
+struct Analyzer<'context, 'catalog> {
+    context: &'context SemanticContext<'catalog>,
+    queries: Vec<Option<Query>>,
+    sources: Vec<Option<Source>>,
+    ctes: Vec<Option<Cte>>,
+    schema_programs: Vec<Option<BoundSchemaProgram>>,
+}
+
+impl<'context, 'catalog> Analyzer<'context, 'catalog> {
+    fn new(context: &'context SemanticContext<'catalog>) -> Self {
+        Self {
+            context,
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+        }
     }
 
-    let ast::OneSelect::Select {
-        distinctness,
-        columns,
-        from,
-        where_clause,
-        group_by,
-        window_clause,
-    } = &select.body.select
-    else {
-        return unsupported_select();
-    };
-    if from.is_some() || where_clause.is_some() || group_by.is_some() || !window_clause.is_empty() {
-        return unsupported_select();
+    fn reserve_query(&mut self) -> QueryId {
+        let id = QueryId::new(self.queries.len());
+        self.queries.push(None);
+        id
     }
 
-    let query_id = QueryId::new(0);
-    let block_id = QueryBlockId::new(query_id, 0);
-    let outputs = columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| analyze_literal_output(block_id, index, column))
-        .collect::<Result<Vec<_>>>()?;
-    let output_ids = outputs.iter().map(|output| output.id).collect();
+    fn insert_query(&mut self, id: QueryId, query: Query) -> Result<()> {
+        if query.id != id {
+            return Err(LimboError::InternalError(format!(
+                "query {} was inserted into slot {}",
+                query.id, id
+            )));
+        }
+        Self::insert_reserved(&mut self.queries, id.index(), query, "query")
+    }
 
-    Ok(HirDocument {
-        snapshot: context.snapshot(),
-        databases: vec![DatabaseSnapshot {
-            database: DatabaseId::new(MAIN_DB_ID),
-            schema_version: context.main_schema().schema_version,
-        }],
-        root: HirRoot::Query(QueryRoot {
-            query: query_id,
-            trigger: None,
-        }),
-        queries: vec![Query {
-            id: query_id,
-            parent: None,
-            captures: Vec::new(),
-            reachable_ctes: Vec::new(),
-            blocks: vec![QueryBlock {
-                id: block_id,
-                from: None,
-                outputs,
-                aggregate_count: 0,
-                window_function_count: 0,
-                body: QueryBlockBody::Select {
-                    distinctness: *distinctness,
-                    filter: None,
-                    grouping: None,
-                    windows: Vec::new(),
-                },
+    fn insert_reserved<T>(
+        arena: &mut [Option<T>],
+        index: usize,
+        value: T,
+        kind: &str,
+    ) -> Result<()> {
+        let Some(slot) = arena.get_mut(index) else {
+            return Err(LimboError::InternalError(format!(
+                "{kind} slot {index} was not reserved"
+            )));
+        };
+        if slot.is_some() {
+            return Err(LimboError::InternalError(format!(
+                "{kind} slot {index} was filled twice"
+            )));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    fn finish_arena<T>(arena: Vec<Option<T>>, kind: &str) -> Result<Vec<T>> {
+        arena
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "reserved {kind} slot {index} was not filled"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn finish(self, root: HirRoot) -> Result<HirDocument> {
+        Ok(HirDocument {
+            snapshot: self.context.snapshot(),
+            databases: vec![DatabaseSnapshot {
+                database: DatabaseId::new(MAIN_DB_ID),
+                schema_version: self.context.main_schema().schema_version,
             }],
-            first: block_id,
-            compounds: Vec::new(),
-            order_by: Vec::new(),
-            limit: None,
-            output: output_ids,
-        }],
-        sources: Vec::new(),
-        ctes: Vec::new(),
-        schema_programs: Vec::new(),
-        cdc: None,
-    })
+            root,
+            queries: Self::finish_arena(self.queries, "query")?,
+            sources: Self::finish_arena(self.sources, "source")?,
+            ctes: Self::finish_arena(self.ctes, "CTE")?,
+            schema_programs: Self::finish_arena(self.schema_programs, "schema program")?,
+            cdc: None,
+        })
+    }
+
+    fn analyze_select(&mut self, select: &ast::Select) -> Result<QueryId> {
+        if select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+        {
+            return unsupported_select();
+        }
+
+        let ast::OneSelect::Select {
+            distinctness,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+        } = &select.body.select
+        else {
+            return unsupported_select();
+        };
+        if from.is_some()
+            || where_clause.is_some()
+            || group_by.is_some()
+            || !window_clause.is_empty()
+        {
+            return unsupported_select();
+        }
+
+        let query_id = self.reserve_query();
+        let block_id = QueryBlockId::new(query_id, 0);
+        let outputs = columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| analyze_literal_output(block_id, index, column))
+            .collect::<Result<Vec<_>>>()?;
+        let output_ids = outputs.iter().map(|output| output.id).collect();
+
+        self.insert_query(
+            query_id,
+            Query {
+                id: query_id,
+                parent: None,
+                captures: Vec::new(),
+                reachable_ctes: Vec::new(),
+                blocks: vec![QueryBlock {
+                    id: block_id,
+                    from: None,
+                    outputs,
+                    aggregate_count: 0,
+                    window_function_count: 0,
+                    body: QueryBlockBody::Select {
+                        distinctness: *distinctness,
+                        filter: None,
+                        grouping: None,
+                        windows: Vec::new(),
+                    },
+                }],
+                first: block_id,
+                compounds: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                output: output_ids,
+            },
+        )?;
+
+        Ok(query_id)
+    }
 }
 
 fn analyze_literal_output(

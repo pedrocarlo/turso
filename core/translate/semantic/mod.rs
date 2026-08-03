@@ -3,6 +3,7 @@
 mod analyze;
 pub(crate) mod context;
 pub(crate) mod hir;
+mod scope;
 
 pub(crate) use analyze::analyze;
 
