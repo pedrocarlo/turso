@@ -74,6 +74,66 @@ impl Analyzer<'_, '_> {
                     column.as_str()
                 );
             }
+            ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                self.analyze_expr(&expressions[0], scope, policy)
+            }
+            ast::Expr::Unary(operator, expression) => Ok(hir::Expr::Unary {
+                operator: *operator,
+                expr: Box::new(self.analyze_expr(expression, scope, policy)?),
+            }),
+            ast::Expr::Binary(expression, ast::Operator::Is, rhs)
+                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+            {
+                Ok(hir::Expr::IsNull(Box::new(
+                    self.analyze_expr(expression, scope, policy)?,
+                )))
+            }
+            ast::Expr::Binary(expression, ast::Operator::IsNot, rhs)
+                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+            {
+                Ok(hir::Expr::NotNull(Box::new(
+                    self.analyze_expr(expression, scope, policy)?,
+                )))
+            }
+            ast::Expr::Binary(lhs, ast::Operator::Is, expression)
+                if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+            {
+                Ok(hir::Expr::IsNull(Box::new(
+                    self.analyze_expr(expression, scope, policy)?,
+                )))
+            }
+            ast::Expr::Binary(lhs, ast::Operator::IsNot, expression)
+                if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+            {
+                Ok(hir::Expr::NotNull(Box::new(
+                    self.analyze_expr(expression, scope, policy)?,
+                )))
+            }
+            ast::Expr::Binary(lhs, operator, rhs) => {
+                let lhs = self.analyze_expr(lhs, scope, policy)?;
+                let lhs = self.resolve_expr_facts(lhs, scope)?;
+                let rhs = self.analyze_expr(rhs, scope, policy)?;
+                let rhs = self.resolve_expr_facts(rhs, scope)?;
+                let array_concat = *operator == ast::Operator::Concat
+                    && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
+                let comparison = operator
+                    .is_comparison()
+                    .then(|| comparison_semantics(&lhs, &rhs));
+                Ok(hir::Expr::Binary {
+                    lhs: Box::new(lhs.expr),
+                    operator: *operator,
+                    rhs: Box::new(rhs.expr),
+                    array_concat,
+                    custom: None,
+                    comparison,
+                })
+            }
+            ast::Expr::IsNull(expression) => Ok(hir::Expr::IsNull(Box::new(
+                self.analyze_expr(expression, scope, policy)?,
+            ))),
+            ast::Expr::NotNull(expression) => Ok(hir::Expr::NotNull(Box::new(
+                self.analyze_expr(expression, scope, policy)?,
+            ))),
             _ => super::analyze::unsupported_select(),
         }
     }
@@ -83,13 +143,14 @@ impl Analyzer<'_, '_> {
         expression: hir::Expr,
         scope: &Scope,
     ) -> Result<ResolvedScopeExpr> {
-        let (type_fact, affinity, has_affinity, collation) = match &expression {
-            hir::Expr::Literal(literal) => (
-                super::analyze::literal_type_fact(literal)?,
-                Affinity::Blob,
-                false,
-                None,
-            ),
+        match expression {
+            hir::Expr::Literal(literal) => Ok(ResolvedScopeExpr {
+                type_fact: super::analyze::literal_type_fact(&literal)?,
+                expr: hir::Expr::Literal(literal),
+                affinity: Affinity::Blob,
+                has_affinity: false,
+                collation: None,
+            }),
             hir::Expr::Column(reference) => {
                 let source = self.source(reference.source).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -111,32 +172,34 @@ impl Analyzer<'_, '_> {
                         return super::analyze::unsupported_select();
                     }
                 }
-                (
-                    column.type_fact.clone(),
-                    column.affinity,
-                    column.has_affinity,
-                    column.collation.clone(),
-                )
+                Ok(ResolvedScopeExpr {
+                    expr: hir::Expr::Column(reference),
+                    type_fact: column.type_fact.clone(),
+                    affinity: column.affinity,
+                    has_affinity: column.has_affinity,
+                    collation: column.collation.clone(),
+                })
             }
-            hir::Expr::RowId(_) => (
-                hir::TypeFact::known(Type::Integer),
-                Affinity::Integer,
-                true,
-                None,
-            ),
+            hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
+                expr: hir::Expr::RowId(source),
+                type_fact: hir::TypeFact::known(Type::Integer),
+                affinity: Affinity::Integer,
+                has_affinity: true,
+                collation: None,
+            }),
             hir::Expr::Output(output) => {
-                let type_fact = scope.output_type(*output).cloned().ok_or_else(|| {
+                let type_fact = scope.output_type(output).cloned().ok_or_else(|| {
                     LimboError::InternalError(format!("missing output facts for {output:?}"))
                 })?;
-                let affinity = scope.output_affinity(*output).ok_or_else(|| {
+                let affinity = scope.output_affinity(output).ok_or_else(|| {
                     LimboError::InternalError(format!("missing output affinity for {output:?}"))
                 })?;
-                let has_affinity = scope.output_has_affinity(*output).ok_or_else(|| {
+                let has_affinity = scope.output_has_affinity(output).ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "missing output affinity state for {output:?}"
                     ))
                 })?;
-                let collation = match scope.output_collation(*output) {
+                let collation = match scope.output_collation(output) {
                     Some(OutputCollation::Absent) => None,
                     Some(OutputCollation::Inherited(collation)) => Some(collation.clone()),
                     Some(OutputCollation::Explicit(_)) => {
@@ -148,17 +211,147 @@ impl Analyzer<'_, '_> {
                         )))
                     }
                 };
-                (type_fact, affinity, has_affinity, collation)
+                Ok(ResolvedScopeExpr {
+                    expr: hir::Expr::Output(output),
+                    type_fact,
+                    affinity,
+                    has_affinity,
+                    collation,
+                })
             }
-            _ => return super::analyze::unsupported_select(),
-        };
-        Ok(ResolvedScopeExpr {
-            expr: expression,
-            type_fact,
+            hir::Expr::Unary { operator, expr } => {
+                let inner = self.resolve_expr_facts(*expr, scope)?;
+                let type_fact = match operator {
+                    ast::UnaryOperator::Positive | ast::UnaryOperator::Negative => {
+                        hir::TypeFact::arithmetic_result(
+                            &inner.type_fact,
+                            &hir::TypeFact::known(Type::Integer),
+                        )
+                    }
+                    ast::UnaryOperator::BitwiseNot | ast::UnaryOperator::Not => {
+                        hir::TypeFact::known(Type::Integer)
+                    }
+                };
+                Ok(computed_expr(
+                    hir::Expr::Unary {
+                        operator,
+                        expr: Box::new(inner.expr),
+                    },
+                    type_fact,
+                    inner.collation,
+                ))
+            }
+            hir::Expr::Binary {
+                lhs,
+                operator,
+                rhs,
+                array_concat,
+                custom,
+                comparison,
+            } => {
+                let lhs = self.resolve_expr_facts(*lhs, scope)?;
+                let rhs = self.resolve_expr_facts(*rhs, scope)?;
+                let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
+                let collation = lhs.collation.clone().or_else(|| rhs.collation.clone());
+                Ok(computed_expr(
+                    hir::Expr::Binary {
+                        lhs: Box::new(lhs.expr),
+                        operator,
+                        rhs: Box::new(rhs.expr),
+                        array_concat,
+                        custom,
+                        comparison,
+                    },
+                    type_fact,
+                    collation,
+                ))
+            }
+            hir::Expr::IsNull(expr) => {
+                let inner = self.resolve_expr_facts(*expr, scope)?;
+                Ok(computed_expr(
+                    hir::Expr::IsNull(Box::new(inner.expr)),
+                    hir::TypeFact::known(Type::Integer),
+                    inner.collation,
+                ))
+            }
+            hir::Expr::NotNull(expr) => {
+                let inner = self.resolve_expr_facts(*expr, scope)?;
+                Ok(computed_expr(
+                    hir::Expr::NotNull(Box::new(inner.expr)),
+                    hir::TypeFact::known(Type::Integer),
+                    inner.collation,
+                ))
+            }
+            _ => super::analyze::unsupported_select(),
+        }
+    }
+}
+
+fn computed_expr(
+    expr: hir::Expr,
+    type_fact: hir::TypeFact,
+    collation: Option<hir::ResolvedCollation>,
+) -> ResolvedScopeExpr {
+    ResolvedScopeExpr {
+        expr,
+        type_fact,
+        affinity: Affinity::Blob,
+        has_affinity: false,
+        collation,
+    }
+}
+
+fn binary_type_fact(
+    operator: ast::Operator,
+    lhs: &hir::TypeFact,
+    rhs: &hir::TypeFact,
+) -> hir::TypeFact {
+    use ast::Operator;
+
+    match operator {
+        Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide => {
+            hir::TypeFact::arithmetic_result(lhs, rhs)
+        }
+        Operator::Concat => hir::TypeFact::concat_result(lhs, rhs),
+        Operator::ArrowRight | Operator::ArrowRightShift => hir::TypeFact::dynamic(),
+        Operator::Modulus
+        | Operator::And
+        | Operator::Or
+        | Operator::BitwiseAnd
+        | Operator::BitwiseOr
+        | Operator::BitwiseNot
+        | Operator::LeftShift
+        | Operator::RightShift
+        | Operator::Equals
+        | Operator::NotEquals
+        | Operator::Less
+        | Operator::LessEquals
+        | Operator::Greater
+        | Operator::GreaterEquals
+        | Operator::Is
+        | Operator::IsNot
+        | Operator::ArrayContains
+        | Operator::ArrayOverlap => hir::TypeFact::known(Type::Integer),
+    }
+}
+
+fn comparison_semantics(
+    lhs: &ResolvedScopeExpr,
+    rhs: &ResolvedScopeExpr,
+) -> hir::ComparisonSemantics {
+    let affinity = match (lhs.has_affinity, rhs.has_affinity) {
+        (true, true) if lhs.affinity.is_numeric() || rhs.affinity.is_numeric() => Affinity::Numeric,
+        (true, true) => Affinity::Blob,
+        (true, false) => lhs.affinity,
+        (false, true) => rhs.affinity,
+        (false, false) => Affinity::Blob,
+    };
+    hir::ComparisonSemantics {
+        components: vec![hir::ComparisonComponent {
             affinity,
-            has_affinity,
-            collation,
-        })
+            collation: lhs.collation.clone().or_else(|| rhs.collation.clone()),
+            array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
+        }],
     }
 }
 

@@ -598,6 +598,71 @@ mod tests {
     }
 
     #[test]
+    fn basic_expressions_become_closed_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT -id, NOT value, score + 1.5, value || 'x', \
+             value = 'x', value IS NULL, value NOTNULL FROM items",
+        )
+        .expect("basic expressions have valid SQL meaning");
+        document
+            .validate()
+            .expect("basic expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 7);
+        assert!(matches!(
+            outputs[0].expr,
+            Expr::Unary {
+                operator: ast::UnaryOperator::Negative,
+                ..
+            }
+        ));
+        assert_eq!(outputs[0].type_fact.storage, Some(Type::Integer));
+        assert!(matches!(
+            outputs[1].expr,
+            Expr::Unary {
+                operator: ast::UnaryOperator::Not,
+                ..
+            }
+        ));
+        assert_eq!(outputs[1].type_fact.storage, Some(Type::Integer));
+        assert_eq!(outputs[2].type_fact.storage, Some(Type::Real));
+        assert_eq!(outputs[3].type_fact.storage, Some(Type::Text));
+        assert!(outputs.iter().all(|output| !output.has_affinity));
+
+        let Expr::Binary {
+            operator: ast::Operator::Equals,
+            comparison: Some(comparison),
+            ..
+        } = &outputs[4].expr
+        else {
+            panic!("comparison becomes binary HIR with frozen rules");
+        };
+        assert_eq!(comparison.components.len(), 1);
+        assert_eq!(
+            comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Text
+        );
+        assert_eq!(
+            comparison.components[0]
+                .collation
+                .as_ref()
+                .expect("declared collation reaches comparison")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert!(matches!(outputs[5].expr, Expr::IsNull(_)));
+        assert!(matches!(outputs[6].expr, Expr::NotNull(_)));
+        assert_eq!(outputs[5].type_fact.storage, Some(Type::Integer));
+        assert_eq!(outputs[6].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
     fn table_star_uses_alias_visibility() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(&schema, "SELECT i.* FROM items AS i")
