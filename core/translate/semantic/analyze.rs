@@ -14,7 +14,7 @@ use super::{
         HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId,
         QueryId, QueryRoot, Source, SourceId, TypeFact,
     },
-    scope::Scope,
+    scope::{ExpandedColumn, Scope},
     AnalyzeInput,
 };
 
@@ -210,6 +210,13 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         if where_clause.is_some() || group_by.is_some() || !window_clause.is_empty() {
             return unsupported_select();
         }
+        if from.is_none()
+            && columns
+                .iter()
+                .any(|column| matches!(column, ast::ResultColumn::Star))
+        {
+            crate::bail_parse_error!("no tables specified");
+        }
 
         let query_id = self.reserve_query();
         let block_id = QueryBlockId::new(query_id, 0);
@@ -221,11 +228,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             }
             None => (None, Scope::default()),
         };
-        let outputs = columns
-            .iter()
-            .enumerate()
-            .map(|(index, column)| self.analyze_output(block_id, index, column, &scope))
-            .collect::<Result<Vec<_>>>()?;
+        let outputs = self.analyze_outputs(block_id, columns, &scope)?;
         let output_ids = outputs.iter().map(|output| output.id).collect();
 
         self.insert_query(
@@ -258,6 +261,57 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
         Ok(query_id)
     }
+
+    fn analyze_outputs(
+        &mut self,
+        block: QueryBlockId,
+        columns: &[ast::ResultColumn],
+        scope: &Scope,
+    ) -> Result<Vec<Output>> {
+        let mut outputs = Vec::with_capacity(columns.len());
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(_, _) => {
+                    outputs.push(self.analyze_output(block, outputs.len(), column, scope)?);
+                }
+                ast::ResultColumn::Star => {
+                    let expanded = scope.expand_star()?;
+                    self.append_star_outputs(block, &mut outputs, expanded, scope)?;
+                }
+                ast::ResultColumn::TableStar(table) => {
+                    let expanded = scope.expand_table_star(table.as_str())?;
+                    self.append_star_outputs(block, &mut outputs, expanded, scope)?;
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    fn append_star_outputs(
+        &self,
+        block: QueryBlockId,
+        outputs: &mut Vec<Output>,
+        expanded: Vec<ExpandedColumn>,
+        scope: &Scope,
+    ) -> Result<()> {
+        for column in expanded {
+            let resolved = self.resolve_expr_facts(column.resolved.expr, scope)?;
+            outputs.push(Output {
+                id: OutputId::query(block, outputs.len()),
+                name: column.name,
+                expr: resolved.expr,
+                type_fact: resolved.type_fact,
+                affinity: resolved.affinity,
+                schema_affinity: resolved.affinity,
+                has_affinity: resolved.has_affinity,
+                collation: resolved.collation,
+                collation_is_explicit: false,
+                name_kind: OutputNameKind::StarExpansion,
+            });
+        }
+        Ok(())
+    }
+
     fn analyze_output(
         &mut self,
         block: QueryBlockId,
@@ -502,6 +556,68 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn stars_become_ordered_hir_outputs() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT *, score FROM items")
+            .expect("star expands against the FROM scope");
+        document
+            .validate()
+            .expect("star expansion produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(
+            block
+                .outputs
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "value", "score", "score"]
+        );
+        for (index, output) in block.outputs.iter().enumerate() {
+            assert_eq!(output.id, OutputId::query(block.id, index));
+        }
+        assert!(block.outputs[..3]
+            .iter()
+            .all(|output| output.name_kind == OutputNameKind::StarExpansion));
+        assert_eq!(block.outputs[3].name_kind, OutputNameKind::Inferred);
+        assert_eq!(
+            block.outputs[1]
+                .collation
+                .as_ref()
+                .expect("star preserves declared collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert!(!block.outputs[1].collation_is_explicit);
+    }
+
+    #[test]
+    fn table_star_uses_alias_visibility() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT i.* FROM items AS i")
+            .expect("table alias expands star");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.outputs.len(), 3);
+        assert!(block
+            .outputs
+            .iter()
+            .all(|output| output.name_kind == OutputNameKind::StarExpansion));
+
+        let hidden_name = analyze_sql_with_schema(&schema, "SELECT items.* FROM items AS i")
+            .expect_err("alias hides the original table name");
+        assert_eq!(hidden_name.to_string(), "Parse error: no such table: items");
+
+        let no_from = analyze_sql("SELECT *").expect_err("star requires a FROM source");
+        assert_eq!(no_from.to_string(), "Parse error: no tables specified");
     }
 
     #[test]
