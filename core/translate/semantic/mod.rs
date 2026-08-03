@@ -4,6 +4,7 @@ mod analyze;
 pub(crate) mod context;
 mod expr;
 pub(crate) mod hir;
+mod query;
 mod scope;
 
 pub(crate) use analyze::analyze;

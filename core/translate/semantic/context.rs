@@ -3,7 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    dialect::Dialect, schema::Schema, sync::Arc, util::normalize_ident, SymbolTable, MAIN_DB_ID,
+    dialect::Dialect,
+    schema::{Schema, Table},
+    sync::Arc,
+    util::normalize_ident,
+    LimboError, Result, SymbolTable, MAIN_DB_ID,
 };
 
 use super::hir::{CatalogSnapshot, DatabaseId};
@@ -80,6 +84,27 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) fn database(&self, name: &str) -> Option<DatabaseId> {
         self.database_names.get(&normalize_ident(name)).copied()
+    }
+
+    pub(crate) fn resolve_table(
+        &self,
+        name: &turso_parser::ast::QualifiedName,
+    ) -> Result<(DatabaseId, Arc<Table>)> {
+        let database = match &name.db_name {
+            Some(database) => self.database(database.as_str()).ok_or_else(|| {
+                LimboError::InvalidArgument(format!(
+                    "no such database: {}",
+                    normalize_ident(database.as_str())
+                ))
+            })?,
+            None => DatabaseId::new(MAIN_DB_ID),
+        };
+        let table_name = normalize_ident(name.name.as_str());
+        let table = self
+            .main_schema
+            .get_table(&table_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
+        Ok((database, table))
     }
 
     pub(crate) const fn dqs_dml(&self) -> DoubleQuotedDml {

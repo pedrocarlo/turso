@@ -6,9 +6,17 @@ use super::{
     analyze::Analyzer,
     context::DoubleQuotedDml,
     hir,
-    scope::{NamePrecedence, Scope},
+    scope::{NamePrecedence, OutputCollation, Scope},
 };
-use crate::Result;
+use crate::{schema::Type, vdbe::affinity::Affinity, LimboError, Result};
+
+pub(super) struct ExprFacts {
+    pub(super) type_fact: hir::TypeFact,
+    pub(super) affinity: Affinity,
+    pub(super) has_affinity: bool,
+    pub(super) collation: Option<hir::ResolvedCollation>,
+    pub(super) collation_is_explicit: bool,
+}
 
 /// Clause rules that change expression name visibility.
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +81,89 @@ impl Analyzer<'_, '_> {
                     table.as_str(),
                     column.as_str()
                 );
+            }
+            _ => super::analyze::unsupported_select(),
+        }
+    }
+
+    pub(super) fn expression_facts(
+        &self,
+        expression: &hir::Expr,
+        scope: &Scope,
+    ) -> Result<ExprFacts> {
+        match expression {
+            hir::Expr::Literal(literal) => Ok(ExprFacts {
+                type_fact: super::analyze::literal_type_fact(literal)?,
+                affinity: Affinity::Blob,
+                has_affinity: false,
+                collation: None,
+                collation_is_explicit: false,
+            }),
+            hir::Expr::Column(reference) => {
+                let source = self.source(reference.source).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing semantic source {}",
+                        reference.source
+                    ))
+                })?;
+                let column = source.columns.get(reference.column).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing semantic column {}.{}",
+                        reference.source, reference.column
+                    ))
+                })?;
+                for state in [
+                    &source.generated_expressions[reference.column],
+                    &source.default_expressions[reference.column],
+                ] {
+                    if matches!(state, hir::ColumnReadExpression::NotRequired) {
+                        return super::analyze::unsupported_select();
+                    }
+                }
+                Ok(ExprFacts {
+                    type_fact: column.type_fact.clone(),
+                    affinity: column.affinity,
+                    has_affinity: column.has_affinity,
+                    collation: column.collation.clone(),
+                    collation_is_explicit: false,
+                })
+            }
+            hir::Expr::RowId(_) => Ok(ExprFacts {
+                type_fact: hir::TypeFact::known(Type::Integer),
+                affinity: Affinity::Integer,
+                has_affinity: true,
+                collation: None,
+                collation_is_explicit: false,
+            }),
+            hir::Expr::Output(output) => {
+                let type_fact = scope.output_type(*output).cloned().ok_or_else(|| {
+                    LimboError::InternalError(format!("missing output facts for {output:?}"))
+                })?;
+                let affinity = scope.output_affinity(*output).ok_or_else(|| {
+                    LimboError::InternalError(format!("missing output affinity for {output:?}"))
+                })?;
+                let has_affinity = scope.output_has_affinity(*output).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing output affinity state for {output:?}"
+                    ))
+                })?;
+                let (collation, collation_is_explicit) = match scope.output_collation(*output) {
+                    Some(OutputCollation::Absent) => (None, false),
+                    Some(OutputCollation::Explicit(collation)) => (Some(collation.clone()), true),
+                    Some(OutputCollation::Inherited(collation)) => (Some(collation.clone()), false),
+                    None => {
+                        return Err(LimboError::InternalError(format!(
+                            "missing output collation state for {output:?}"
+                        )))
+                    }
+                };
+                Ok(ExprFacts {
+                    type_fact,
+                    affinity,
+                    has_affinity,
+                    collation,
+                    collation_is_explicit,
+                })
             }
             _ => super::analyze::unsupported_select(),
         }

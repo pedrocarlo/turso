@@ -1,17 +1,18 @@
+use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast;
 
 use crate::{
-    numeric::Numeric, schema::Type, util::parse_numeric_literal, vdbe::affinity::Affinity,
-    LimboError, Result, Value, MAIN_DB_ID,
+    numeric::Numeric, schema::Type, util::parse_numeric_literal, LimboError, Result, Value,
+    MAIN_DB_ID,
 };
 
 use super::{
     context::SemanticContext,
     expr::ExprPolicy,
     hir::{
-        BoundSchemaProgram, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument, HirRoot, Output,
-        OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
-        QueryRoot, Source, TypeFact,
+        BoundSchemaProgram, CatalogObjectId, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument,
+        HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId,
+        QueryId, QueryRoot, Source, SourceId, TypeFact,
     },
     scope::Scope,
     AnalyzeInput,
@@ -49,6 +50,20 @@ pub(super) struct Analyzer<'context, 'catalog> {
     sources: Vec<Option<Source>>,
     ctes: Vec<Option<Cte>>,
     schema_programs: Vec<Option<BoundSchemaProgram>>,
+    catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum CatalogObjectKind {
+    Table,
+    Collation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CatalogIdentity {
+    database: Option<DatabaseId>,
+    kind: CatalogObjectKind,
+    name: String,
 }
 
 impl<'context, 'catalog> Analyzer<'context, 'catalog> {
@@ -59,6 +74,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             sources: Vec::new(),
             ctes: Vec::new(),
             schema_programs: Vec::new(),
+            catalog_ids: HashMap::default(),
         }
     }
 
@@ -69,6 +85,45 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
     fn reserve_query(&mut self) -> QueryId {
         let id = QueryId::new(self.queries.len());
         self.queries.push(None);
+        id
+    }
+
+    pub(super) fn reserve_source(&mut self) -> SourceId {
+        let id = SourceId::new(self.sources.len());
+        self.sources.push(None);
+        id
+    }
+
+    pub(super) fn insert_source(&mut self, id: SourceId, source: Source) -> Result<()> {
+        if source.id != id {
+            return Err(LimboError::InternalError(format!(
+                "source {} was inserted into slot {}",
+                source.id, id
+            )));
+        }
+        Self::insert_reserved(&mut self.sources, id.index(), source, "source")
+    }
+
+    pub(super) fn source(&self, id: SourceId) -> Option<&Source> {
+        self.sources.get(id.index())?.as_ref()
+    }
+
+    pub(super) fn catalog_object_id(
+        &mut self,
+        database: Option<DatabaseId>,
+        kind: CatalogObjectKind,
+        name: impl Into<String>,
+    ) -> CatalogObjectId {
+        let identity = CatalogIdentity {
+            database,
+            kind,
+            name: name.into(),
+        };
+        if let Some(id) = self.catalog_ids.get(&identity) {
+            return *id;
+        }
+        let id = CatalogObjectId::new(self.catalog_ids.len() as u64);
+        self.catalog_ids.insert(identity, id);
         id
     }
 
@@ -152,17 +207,20 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         else {
             return unsupported_select();
         };
-        if from.is_some()
-            || where_clause.is_some()
-            || group_by.is_some()
-            || !window_clause.is_empty()
-        {
+        if where_clause.is_some() || group_by.is_some() || !window_clause.is_empty() {
             return unsupported_select();
         }
 
         let query_id = self.reserve_query();
         let block_id = QueryBlockId::new(query_id, 0);
-        let scope = Scope::default();
+        let (from, scope) = match from {
+            Some(from) => {
+                let (from, scope) =
+                    self.analyze_from_clause(from, super::hir::SourceOwner::QueryBlock(block_id))?;
+                (Some(from), scope)
+            }
+            None => (None, Scope::default()),
+        };
         let outputs = columns
             .iter()
             .enumerate()
@@ -179,7 +237,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                 reachable_ctes: Vec::new(),
                 blocks: vec![QueryBlock {
                     id: block_id,
-                    from: None,
+                    from,
                     outputs,
                     aggregate_count: 0,
                     window_function_count: 0,
@@ -213,9 +271,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
         let expression = self.analyze_expr(syntax, scope, policy)?;
-        let Expr::Literal(literal) = &expression else {
-            return unsupported_select();
-        };
+        let facts = self.expression_facts(&expression, scope)?;
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),
@@ -227,24 +283,22 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             None => (syntax.to_string(), OutputNameKind::Inferred),
             Some(_) => unreachable!("all explicit aliases were handled"),
         };
-        let type_fact = literal_type_fact(literal)?;
-
         Ok(Output {
             id: OutputId::query(block, index),
             name,
             expr: expression,
-            type_fact,
-            affinity: Affinity::Blob,
-            schema_affinity: Affinity::Blob,
-            has_affinity: false,
-            collation: None,
-            collation_is_explicit: false,
+            type_fact: facts.type_fact,
+            affinity: facts.affinity,
+            schema_affinity: facts.affinity,
+            has_affinity: facts.has_affinity,
+            collation: facts.collation,
+            collation_is_explicit: facts.collation_is_explicit,
             name_kind,
         })
     }
 }
 
-fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
+pub(super) fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
     let storage = match literal {
         ast::Literal::Numeric(value) => match parse_numeric_literal(value)? {
             Value::Numeric(Numeric::Integer(_)) => Type::Integer,
@@ -279,7 +333,7 @@ mod tests {
 
     use crate::{
         dialect::SqliteDialect,
-        schema::{Schema, Type},
+        schema::{BTreeTable, Schema, Type},
         sync::Arc,
         SymbolTable,
     };
@@ -287,7 +341,7 @@ mod tests {
     use super::*;
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
-        hir::{HirRoot, OutputNameKind},
+        hir::{HirRoot, OutputNameKind, SourceKind, SourceOwner},
     };
 
     fn parse_statement(sql: &str) -> ast::Stmt {
@@ -303,15 +357,34 @@ mod tests {
 
     fn analyze_sql(sql: &str) -> Result<HirDocument> {
         let schema = Schema::new();
+        analyze_sql_with_schema(&schema, sql)
+    }
+
+    fn analyze_sql_with_schema(schema: &Schema, sql: &str) -> Result<HirDocument> {
         let symbols = SymbolTable::new();
         let context = SemanticContext::for_main_schema_object(
-            &schema,
+            schema,
             &symbols,
             true,
             Arc::new(SqliteDialect),
         );
         let statement = parse_statement(sql);
         analyze(&context, AnalyzeInput::Statement(&statement))
+    }
+
+    fn schema_with_items() -> Schema {
+        let mut schema = Schema::new();
+        let table = Arc::new(
+            BTreeTable::from_sql(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT COLLATE NOCASE, score REAL)",
+                2,
+            )
+            .expect("fixed table schema parses"),
+        );
+        schema
+            .add_btree_table(table)
+            .expect("fixed table name is unique");
+        schema
     }
 
     #[test]
@@ -376,5 +449,86 @@ mod tests {
             error.to_string(),
             "Parse error: no such column: missing name"
         );
+    }
+
+    #[test]
+    fn plain_table_select_becomes_closed_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value, items.score, main.items.id, rowid FROM items",
+        )
+        .expect("plain table SELECT has valid SQL meaning");
+        document.validate().expect("analyzer returns closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let block = &query.blocks[0];
+        let from = block.from.as_ref().expect("FROM is preserved");
+        let source = document.source(from.first).expect("source exists");
+        assert_eq!(source.owner, SourceOwner::QueryBlock(block.id));
+        assert_eq!(source.name, "items");
+        assert!(matches!(&source.kind, SourceKind::Table(_)));
+        assert_eq!(source.columns.len(), 3);
+
+        assert!(matches!(
+            &block.outputs[0].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 1
+        ));
+        assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            block.outputs[0].affinity,
+            crate::vdbe::affinity::Affinity::Text
+        );
+        assert!(block.outputs[0].has_affinity);
+        assert_eq!(
+            block.outputs[0]
+                .collation
+                .as_ref()
+                .expect("declared collation is preserved")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert!(!block.outputs[0].collation_is_explicit);
+        assert!(matches!(
+            &block.outputs[1].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 2
+        ));
+        assert!(matches!(
+            &block.outputs[2].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 0
+        ));
+        assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
+        assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn table_alias_controls_hir_name_visibility() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT i.value FROM items AS i")
+            .expect("alias-qualified column resolves");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("FROM exists").first)
+            .expect("source exists");
+        assert_eq!(source.alias.as_deref(), Some("i"));
+
+        let error = analyze_sql_with_schema(&schema, "SELECT main.items.value FROM items AS i")
+            .expect_err("alias hides database-qualified table name");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: main.items.value"
+        );
+    }
+
+    #[test]
+    fn missing_table_fails_before_hir_is_built() {
+        let error = analyze_sql("SELECT value FROM absent").expect_err("table must exist");
+        assert_eq!(error.to_string(), "Parse error: no such table: absent");
     }
 }
