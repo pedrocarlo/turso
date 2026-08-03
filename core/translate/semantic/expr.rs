@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
+    context::DoubleQuotedDml,
     hir,
     scope::{NamePrecedence, Scope},
 };
@@ -17,10 +18,10 @@ pub(crate) struct ExprPolicy {
 }
 
 impl ExprPolicy {
-    pub(crate) const fn select() -> Self {
+    pub(crate) const fn select(dqs_dml: DoubleQuotedDml) -> Self {
         Self {
             precedence: NamePrecedence::SourcesOnly,
-            allow_dqs_fallback: true,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
         }
     }
 
@@ -45,10 +46,7 @@ impl Analyzer<'_, '_> {
                 {
                     return Ok(resolved.expr);
                 }
-                if policy.allow_dqs_fallback
-                    && self.context().dqs_dml().is_enabled()
-                    && name.quoted_with('"')
-                {
+                if policy.allow_dqs_fallback && name.quoted_with('"') {
                     return Ok(hir::Expr::Literal(ast::Literal::String(name.as_literal())));
                 }
                 crate::bail_parse_error!("no such column: {}", name.as_str());
@@ -147,12 +145,7 @@ mod tests {
         }
     }
 
-    fn analyze_expression(
-        syntax: &ast::Expr,
-        scope: &Scope,
-        dqs: DoubleQuotedDml,
-        policy: ExprPolicy,
-    ) -> Result<Expr> {
+    fn analyze_expression(syntax: &ast::Expr, scope: &Scope, policy: ExprPolicy) -> Result<Expr> {
         let schema = Schema::new();
         let symbols = SymbolTable::new();
         let context = SemanticContext::for_main_schema_object(
@@ -160,8 +153,7 @@ mod tests {
             &symbols,
             true,
             Arc::new(SqliteDialect),
-        )
-        .with_dqs_dml(dqs);
+        );
         Analyzer::new(&context).analyze_expr(syntax, scope, policy)
     }
 
@@ -187,8 +179,7 @@ mod tests {
                 analyze_expression(
                     &expression(sql),
                     &scope,
-                    DoubleQuotedDml::Enabled,
-                    ExprPolicy::select(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
                 )
                 .expect("name resolves"),
             );
@@ -198,8 +189,7 @@ mod tests {
             analyze_expression(
                 &ast::Expr::Name(ast::Name::exact("value".to_string())),
                 &scope,
-                DoubleQuotedDml::Enabled,
-                ExprPolicy::select(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("Name node follows identifier rules"),
         );
@@ -214,8 +204,7 @@ mod tests {
         let missing_table = analyze_expression(
             &expression("SELECT absent.value"),
             &scope,
-            DoubleQuotedDml::Enabled,
-            ExprPolicy::select(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
         )
         .expect_err("unknown qualifier fails");
         assert_eq!(
@@ -226,8 +215,7 @@ mod tests {
         let missing_column = analyze_expression(
             &expression("SELECT items.absent"),
             &scope,
-            DoubleQuotedDml::Enabled,
-            ExprPolicy::select(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
         )
         .expect_err("known qualifier with unknown column fails");
         assert_eq!(
@@ -241,8 +229,7 @@ mod tests {
         let error = analyze_expression(
             &expression("SELECT \"missing\""),
             &Scope::default(),
-            DoubleQuotedDml::Enabled,
-            ExprPolicy::select().without_dqs_fallback(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled).without_dqs_fallback(),
         )
         .expect_err("clause policy disables DQS");
         assert_eq!(error.to_string(), "Parse error: no such column: missing");

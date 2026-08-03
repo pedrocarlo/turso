@@ -211,7 +211,8 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             return unsupported_select();
         };
         let syntax = expression;
-        let expression = self.analyze_expr(syntax, scope, ExprPolicy::select())?;
+        let policy = ExprPolicy::select(self.context.dqs_dml());
+        let expression = self.analyze_expr(syntax, scope, policy)?;
         let Expr::Literal(literal) = &expression else {
             return unsupported_select();
         };
