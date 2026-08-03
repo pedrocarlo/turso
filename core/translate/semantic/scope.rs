@@ -13,6 +13,13 @@ pub(crate) enum NamePrecedence {
     OutputThenSource,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OutputCollation<'a> {
+    Absent,
+    Explicit(&'a hir::ResolvedCollation),
+    Inherited(&'a hir::ResolvedCollation),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedScopeExpr {
     pub(crate) expr: hir::Expr,
@@ -81,10 +88,12 @@ struct ScopeOutput {
     id: OutputId,
     name: String,
     name_kind: hir::OutputNameKind,
+    expr: hir::Expr,
     type_fact: TypeFact,
     affinity: Affinity,
     has_affinity: bool,
     collation: Option<hir::ResolvedCollation>,
+    collation_is_explicit: bool,
 }
 
 /// Source namespace visible from one query block.
@@ -135,12 +144,69 @@ impl Scope {
                 id: output.id,
                 name: crate::util::normalize_ident(&output.name),
                 name_kind: output.name_kind,
+                expr: output.expr.clone(),
                 type_fact: output.type_fact.clone(),
                 affinity: output.affinity,
                 has_affinity: output.has_affinity,
                 collation: output.collation.clone(),
+                collation_is_explicit: output.collation_is_explicit,
             })
             .collect();
+    }
+
+    pub(crate) fn resolve_output_ordinal(
+        &self,
+        ordinal: usize,
+        clause: &str,
+    ) -> Result<ResolvedScopeExpr> {
+        let Some(output) = ordinal
+            .checked_sub(1)
+            .and_then(|index| self.outputs.get(index))
+        else {
+            crate::bail_parse_error!(
+                "{} term out of range - should be between 1 and {}",
+                clause,
+                self.outputs.len()
+            );
+        };
+        Ok(output.resolved())
+    }
+
+    pub(crate) fn output_type(&self, id: OutputId) -> Option<&TypeFact> {
+        self.output(id)
+            .map(|output| &output.type_fact)
+            .or_else(|| self.outer.as_deref()?.output_type(id))
+    }
+
+    pub(crate) fn output_affinity(&self, id: OutputId) -> Option<Affinity> {
+        self.output(id)
+            .map(|output| output.affinity)
+            .or_else(|| self.outer.as_deref()?.output_affinity(id))
+    }
+
+    pub(crate) fn output_has_affinity(&self, id: OutputId) -> Option<bool> {
+        self.output(id)
+            .map(|output| output.has_affinity)
+            .or_else(|| self.outer.as_deref()?.output_has_affinity(id))
+    }
+
+    pub(crate) fn output_collation(&self, id: OutputId) -> Option<OutputCollation<'_>> {
+        self.output(id)
+            .map(
+                |output| match (&output.collation, output.collation_is_explicit) {
+                    (None, false) => OutputCollation::Absent,
+                    (Some(collation), true) => OutputCollation::Explicit(collation),
+                    (Some(collation), false) => OutputCollation::Inherited(collation),
+                    (None, true) => unreachable!("explicit output collation must be resolved"),
+                },
+            )
+            .or_else(|| self.outer.as_deref()?.output_collation(id))
+    }
+
+    pub(crate) fn output_expr(&self, id: OutputId) -> Option<&hir::Expr> {
+        self.output(id)
+            .map(|output| &output.expr)
+            .or_else(|| self.outer.as_deref()?.output_expr(id))
     }
 
     pub(crate) fn resolve_unqualified(
@@ -515,13 +581,23 @@ impl Scope {
                 output.name_kind == hir::OutputNameKind::ExplicitAlias && output.name == name
             })
             .or_else(|| self.outputs.iter().find(|output| output.name == name))
-            .map(|output| ResolvedScopeExpr {
-                expr: hir::Expr::Output(output.id),
-                type_fact: output.type_fact.clone(),
-                affinity: output.affinity,
-                has_affinity: output.has_affinity,
-                collation: output.collation.clone(),
-            })
+            .map(ScopeOutput::resolved)
+    }
+
+    fn output(&self, id: OutputId) -> Option<&ScopeOutput> {
+        self.outputs.iter().find(|output| output.id == id)
+    }
+}
+
+impl ScopeOutput {
+    fn resolved(&self) -> ResolvedScopeExpr {
+        ResolvedScopeExpr {
+            expr: hir::Expr::Output(self.id),
+            type_fact: self.type_fact.clone(),
+            affinity: self.affinity,
+            has_affinity: self.has_affinity,
+            collation: self.collation.clone(),
+        }
     }
 }
 
@@ -554,10 +630,12 @@ fn is_rowid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::collate::CollationSeq;
     use crate::translate::semantic::hir::{
-        ColumnReadExpression, ComparisonComponent, ComparisonSemantics, DatabaseId, Expr,
-        IndexCoverage, IndexHint, MergedColumnValue, Output, OutputNameKind, QueryBlockId, QueryId,
-        Source, SourceColumn, SourceKind, SourceOwner, UsingColumn,
+        CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression, ComparisonComponent,
+        ComparisonSemantics, DatabaseId, Expr, IndexCoverage, IndexHint, MergedColumnValue, Output,
+        OutputNameKind, QueryBlockId, QueryId, Source, SourceColumn, SourceKind, SourceOwner,
+        UsingColumn,
     };
     use turso_parser::ast::Literal;
 
@@ -615,6 +693,15 @@ mod tests {
             collation_is_explicit: false,
             name_kind,
         }
+    }
+
+    fn collation(id: u64) -> hir::ResolvedCollation {
+        CatalogObject::new(
+            CatalogObjectId::new(id),
+            CatalogSnapshot::from_id(1),
+            None,
+            Arc::new(CollationSeq::NoCase),
+        )
     }
 
     fn in_database(mut source: Source, database: usize) -> Source {
@@ -1368,6 +1455,84 @@ mod tests {
             .expect("source namespace is valid");
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn output_ordinals_are_one_based_and_keep_output_facts() {
+        let outputs = [
+            output(0, "first", OutputNameKind::Inferred),
+            output(1, "second", OutputNameKind::Inferred),
+        ];
+        let mut scope = Scope::default();
+        scope.set_outputs(&outputs);
+
+        let resolved = scope
+            .resolve_output_ordinal(2, "ORDER BY")
+            .expect("second output ordinal resolves");
+        expect_output(resolved, outputs[1].id);
+
+        for ordinal in [0, 3] {
+            let error = scope
+                .resolve_output_ordinal(ordinal, "ORDER BY")
+                .expect_err("out-of-range ordinal is rejected");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: ORDER BY term out of range - should be between 1 and 2"
+            );
+        }
+    }
+
+    #[test]
+    fn output_metadata_is_available_from_nested_scopes() {
+        let mut output = output(0, "value", OutputNameKind::Inferred);
+        output.expr = Expr::Literal(Literal::Numeric("7".into()));
+        output.type_fact = TypeFact::known(Type::Real);
+        output.affinity = Affinity::Real;
+        output.has_affinity = false;
+        let output_id = output.id;
+        let mut outer = Scope::default();
+        outer.set_outputs(&[output]);
+        let scope = Scope::new(Some(outer));
+
+        assert_eq!(
+            scope.output_type(output_id).unwrap().storage,
+            Some(Type::Real)
+        );
+        assert_eq!(scope.output_affinity(output_id), Some(Affinity::Real));
+        assert_eq!(scope.output_has_affinity(output_id), Some(false));
+        assert!(matches!(
+            scope.output_expr(output_id),
+            Some(Expr::Literal(Literal::Numeric(value))) if value == "7"
+        ));
+        assert!(matches!(
+            scope.output_collation(output_id),
+            Some(OutputCollation::Absent)
+        ));
+        assert!(scope
+            .output_type(OutputId::query(QueryBlockId::new(QueryId::new(9), 0), 0))
+            .is_none());
+    }
+
+    #[test]
+    fn output_collation_distinguishes_explicit_and_inherited_values() {
+        let mut explicit = output(0, "explicit", OutputNameKind::Inferred);
+        explicit.collation = Some(collation(10));
+        explicit.collation_is_explicit = true;
+        let mut inherited = output(1, "inherited", OutputNameKind::Inferred);
+        inherited.collation = Some(collation(11));
+        let explicit_id = explicit.id;
+        let inherited_id = inherited.id;
+        let mut scope = Scope::default();
+        scope.set_outputs(&[explicit, inherited]);
+
+        assert!(matches!(
+            scope.output_collation(explicit_id),
+            Some(OutputCollation::Explicit(value)) if value.id() == CatalogObjectId::new(10)
+        ));
+        assert!(matches!(
+            scope.output_collation(inherited_id),
+            Some(OutputCollation::Inherited(value)) if value.id() == CatalogObjectId::new(11)
+        ));
     }
 
     #[test]
