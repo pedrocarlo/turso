@@ -30,6 +30,12 @@ pub(crate) struct ResolvedScopeExpr {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ExpandedColumn {
+    pub(crate) name: String,
+    pub(crate) resolved: ResolvedScopeExpr,
+}
+
+#[derive(Clone, Debug)]
 struct ScopeColumn {
     source: SourceId,
     display_name: String,
@@ -333,18 +339,7 @@ impl Scope {
         Ok(Some(found))
     }
 
-    pub(crate) fn expand_star(
-        &self,
-    ) -> Result<
-        Vec<(
-            String,
-            hir::Expr,
-            TypeFact,
-            Affinity,
-            bool,
-            Option<hir::ResolvedCollation>,
-        )>,
-    > {
+    pub(crate) fn expand_star(&self) -> Result<Vec<ExpandedColumn>> {
         // Repeated qualifiers are legal across databases. Within one database,
         // an unmerged visible column makes an unqualified star ambiguous.
         let mut visible_sources = HashSet::default();
@@ -376,32 +371,14 @@ impl Scope {
             .visible_columns
             .iter()
             .filter(|column| !column.hidden)
-            .map(|column| {
-                (
-                    column.display_name.clone(),
-                    column.expr.clone(),
-                    column.type_fact.clone(),
-                    column.affinity,
-                    column.has_affinity,
-                    column.collation.clone(),
-                )
+            .map(|column| ExpandedColumn {
+                name: column.display_name.clone(),
+                resolved: column.resolved(),
             })
             .collect())
     }
 
-    pub(crate) fn expand_table_star(
-        &self,
-        qualifier: &str,
-    ) -> Result<
-        Vec<(
-            String,
-            hir::Expr,
-            TypeFact,
-            Affinity,
-            bool,
-            Option<hir::ResolvedCollation>,
-        )>,
-    > {
+    pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn>> {
         let normalized = crate::util::normalize_ident(qualifier);
         let matching: Vec<_> = self
             .sources
@@ -418,15 +395,9 @@ impl Scope {
             .columns
             .iter()
             .filter(|column| !column.hidden)
-            .map(|column| {
-                (
-                    column.display_name.clone(),
-                    column.expr.clone(),
-                    column.type_fact.clone(),
-                    column.affinity,
-                    column.has_affinity,
-                    column.collation.clone(),
-                )
+            .map(|column| ExpandedColumn {
+                name: column.display_name.clone(),
+                resolved: column.resolved(),
             })
             .collect())
     }
@@ -1242,15 +1213,15 @@ mod tests {
         assert_eq!(
             expanded
                 .iter()
-                .map(|column| column.0.as_str())
+                .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             ["left_value", "id", "right_value"]
         );
-        assert!(matches!(&expanded[1].1, Expr::MergedColumn(_)));
-        assert_eq!(expanded[1].2.storage, Some(Type::Text));
-        assert_eq!(expanded[1].3, Affinity::Text);
-        assert!(expanded[1].4);
-        assert!(expanded[1].5.is_none());
+        assert!(matches!(&expanded[1].resolved.expr, Expr::MergedColumn(_)));
+        assert_eq!(expanded[1].resolved.type_fact.storage, Some(Type::Text));
+        assert_eq!(expanded[1].resolved.affinity, Affinity::Text);
+        assert!(expanded[1].resolved.has_affinity);
+        assert!(expanded[1].resolved.collation.is_none());
 
         let qualified = scope
             .expand_table_star("right")
@@ -1258,12 +1229,12 @@ mod tests {
         assert_eq!(
             qualified
                 .iter()
-                .map(|column| column.0.as_str())
+                .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             ["id", "right_value"]
         );
         assert!(matches!(
-            &qualified[0].1,
+            &qualified[0].resolved.expr,
             Expr::Column(ColumnRef { source, column: 0 }) if *source == right.id
         ));
     }
@@ -1345,8 +1316,8 @@ mod tests {
             .expect("fully merged self-join has one visible source identity");
 
         assert_eq!(expanded.len(), 1);
-        assert_eq!(expanded[0].0, "id");
-        assert!(matches!(&expanded[0].1, Expr::MergedColumn(_)));
+        assert_eq!(expanded[0].name, "id");
+        assert!(matches!(&expanded[0].resolved.expr, Expr::MergedColumn(_)));
     }
 
     #[test]
