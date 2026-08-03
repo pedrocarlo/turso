@@ -295,7 +295,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         scope: &Scope,
     ) -> Result<()> {
         for column in expanded {
-            let resolved = self.resolve_expr_facts(column.resolved.expr, scope)?;
+            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
             outputs.push(Output {
                 id: OutputId::query(block, outputs.len()),
                 name: column.name,
@@ -324,8 +324,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         };
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
-        let expression = self.analyze_expr(syntax, scope, policy)?;
-        let resolved = self.resolve_expr_facts(expression, scope)?;
+        let resolved = self.analyze_resolved_expr(syntax, scope, policy)?;
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),

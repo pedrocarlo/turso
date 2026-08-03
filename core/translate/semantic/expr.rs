@@ -31,6 +31,14 @@ impl ExprPolicy {
     }
 }
 
+enum ExprTask<'a> {
+    Visit(&'a ast::Expr),
+    BuildUnary(ast::UnaryOperator),
+    BuildBinary(ast::Operator),
+    BuildIsNull,
+    BuildNotNull,
+}
+
 impl Analyzer<'_, '_> {
     pub(crate) fn analyze_expr(
         &mut self,
@@ -38,107 +46,186 @@ impl Analyzer<'_, '_> {
         scope: &Scope,
         policy: ExprPolicy,
     ) -> Result<hir::Expr> {
-        match syntax {
-            ast::Expr::Literal(literal) => Ok(hir::Expr::Literal(literal.clone())),
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if let Some(resolved) =
-                    scope.resolve_unqualified(name.as_str(), policy.precedence)?
-                {
-                    return Ok(resolved.expr);
-                }
-                if policy.allow_dqs_fallback && name.quoted_with('"') {
-                    return Ok(hir::Expr::Literal(ast::Literal::String(name.as_literal())));
-                }
-                crate::bail_parse_error!("no such column: {}", name.as_str());
-            }
-            ast::Expr::Qualified(table, column) => {
-                if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
-                    return Ok(resolved.expr);
-                }
-                crate::bail_parse_error!("no such table: {}", table.as_str());
-            }
-            ast::Expr::DoublyQualified(database, table, column) => {
-                if let Some(database_id) = self.context().database(database.as_str()) {
-                    if let Some(resolved) = scope.resolve_database_qualified(
-                        database_id,
-                        table.as_str(),
-                        column.as_str(),
-                    )? {
-                        return Ok(resolved.expr);
-                    }
-                }
-                crate::bail_parse_error!(
-                    "no such column: {}.{}.{}",
-                    database.as_str(),
-                    table.as_str(),
-                    column.as_str()
-                );
-            }
-            ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
-                self.analyze_expr(&expressions[0], scope, policy)
-            }
-            ast::Expr::Unary(operator, expression) => Ok(hir::Expr::Unary {
-                operator: *operator,
-                expr: Box::new(self.analyze_expr(expression, scope, policy)?),
-            }),
-            ast::Expr::Binary(expression, ast::Operator::Is, rhs)
-                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-            {
-                Ok(hir::Expr::IsNull(Box::new(
-                    self.analyze_expr(expression, scope, policy)?,
-                )))
-            }
-            ast::Expr::Binary(expression, ast::Operator::IsNot, rhs)
-                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-            {
-                Ok(hir::Expr::NotNull(Box::new(
-                    self.analyze_expr(expression, scope, policy)?,
-                )))
-            }
-            ast::Expr::Binary(lhs, ast::Operator::Is, expression)
-                if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-            {
-                Ok(hir::Expr::IsNull(Box::new(
-                    self.analyze_expr(expression, scope, policy)?,
-                )))
-            }
-            ast::Expr::Binary(lhs, ast::Operator::IsNot, expression)
-                if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-            {
-                Ok(hir::Expr::NotNull(Box::new(
-                    self.analyze_expr(expression, scope, policy)?,
-                )))
-            }
-            ast::Expr::Binary(lhs, operator, rhs) => {
-                let lhs = self.analyze_expr(lhs, scope, policy)?;
-                let lhs = self.resolve_expr_facts(lhs, scope)?;
-                let rhs = self.analyze_expr(rhs, scope, policy)?;
-                let rhs = self.resolve_expr_facts(rhs, scope)?;
-                let array_concat = *operator == ast::Operator::Concat
-                    && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
-                let comparison = operator
-                    .is_comparison()
-                    .then(|| comparison_semantics(&lhs, &rhs));
-                Ok(hir::Expr::Binary {
-                    lhs: Box::new(lhs.expr),
-                    operator: *operator,
-                    rhs: Box::new(rhs.expr),
-                    array_concat,
-                    custom: None,
-                    comparison,
-                })
-            }
-            ast::Expr::IsNull(expression) => Ok(hir::Expr::IsNull(Box::new(
-                self.analyze_expr(expression, scope, policy)?,
-            ))),
-            ast::Expr::NotNull(expression) => Ok(hir::Expr::NotNull(Box::new(
-                self.analyze_expr(expression, scope, policy)?,
-            ))),
-            _ => super::analyze::unsupported_select(),
-        }
+        Ok(self.analyze_resolved_expr(syntax, scope, policy)?.expr)
     }
 
-    pub(super) fn resolve_expr_facts(
+    pub(super) fn analyze_resolved_expr(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<ResolvedScopeExpr> {
+        let mut tasks = vec![ExprTask::Visit(syntax)];
+        let mut values = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                ExprTask::Visit(syntax) => match syntax {
+                    ast::Expr::Literal(literal) => values.push(
+                        self.resolve_atomic_expr(hir::Expr::Literal(literal.clone()), scope)?,
+                    ),
+                    ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                        let expression =
+                            match scope.resolve_unqualified(name.as_str(), policy.precedence)? {
+                                Some(resolved) => resolved.expr,
+                                None if policy.allow_dqs_fallback && name.quoted_with('"') => {
+                                    hir::Expr::Literal(ast::Literal::String(name.as_literal()))
+                                }
+                                None => {
+                                    crate::bail_parse_error!("no such column: {}", name.as_str())
+                                }
+                            };
+                        values.push(self.resolve_atomic_expr(expression, scope)?);
+                    }
+                    ast::Expr::Qualified(table, column) => {
+                        let Some(resolved) =
+                            scope.resolve_qualified(table.as_str(), column.as_str())?
+                        else {
+                            crate::bail_parse_error!("no such table: {}", table.as_str());
+                        };
+                        values.push(self.resolve_atomic_expr(resolved.expr, scope)?);
+                    }
+                    ast::Expr::DoublyQualified(database, table, column) => {
+                        let Some(database_id) = self.context().database(database.as_str()) else {
+                            crate::bail_parse_error!(
+                                "no such column: {}.{}.{}",
+                                database.as_str(),
+                                table.as_str(),
+                                column.as_str()
+                            );
+                        };
+                        let Some(resolved) = scope.resolve_database_qualified(
+                            database_id,
+                            table.as_str(),
+                            column.as_str(),
+                        )?
+                        else {
+                            crate::bail_parse_error!(
+                                "no such column: {}.{}.{}",
+                                database.as_str(),
+                                table.as_str(),
+                                column.as_str()
+                            );
+                        };
+                        values.push(self.resolve_atomic_expr(resolved.expr, scope)?);
+                    }
+                    ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                        tasks.push(ExprTask::Visit(&expressions[0]));
+                    }
+                    ast::Expr::Unary(operator, expression) => {
+                        tasks.push(ExprTask::BuildUnary(*operator));
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::Binary(expression, ast::Operator::Is, rhs)
+                        if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+                    {
+                        tasks.push(ExprTask::BuildIsNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::Binary(expression, ast::Operator::IsNot, rhs)
+                        if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+                    {
+                        tasks.push(ExprTask::BuildNotNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::Binary(lhs, ast::Operator::Is, expression)
+                        if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+                    {
+                        tasks.push(ExprTask::BuildIsNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::Binary(lhs, ast::Operator::IsNot, expression)
+                        if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+                    {
+                        tasks.push(ExprTask::BuildNotNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::Binary(lhs, operator, rhs) => {
+                        tasks.push(ExprTask::BuildBinary(*operator));
+                        tasks.push(ExprTask::Visit(rhs));
+                        tasks.push(ExprTask::Visit(lhs));
+                    }
+                    ast::Expr::IsNull(expression) => {
+                        tasks.push(ExprTask::BuildIsNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    ast::Expr::NotNull(expression) => {
+                        tasks.push(ExprTask::BuildNotNull);
+                        tasks.push(ExprTask::Visit(expression));
+                    }
+                    _ => return super::analyze::unsupported_select(),
+                },
+                ExprTask::BuildUnary(operator) => {
+                    let inner = pop_expr_value(&mut values)?;
+                    let type_fact = match operator {
+                        ast::UnaryOperator::Positive | ast::UnaryOperator::Negative => {
+                            hir::TypeFact::arithmetic_result(
+                                &inner.type_fact,
+                                &hir::TypeFact::known(Type::Integer),
+                            )
+                        }
+                        ast::UnaryOperator::BitwiseNot | ast::UnaryOperator::Not => {
+                            hir::TypeFact::known(Type::Integer)
+                        }
+                    };
+                    values.push(computed_expr(
+                        hir::Expr::Unary {
+                            operator,
+                            expr: Box::new(inner.expr),
+                        },
+                        type_fact,
+                        inner.collation,
+                    ));
+                }
+                ExprTask::BuildBinary(operator) => {
+                    let rhs = pop_expr_value(&mut values)?;
+                    let lhs = pop_expr_value(&mut values)?;
+                    let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
+                    let array_concat = operator == ast::Operator::Concat
+                        && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
+                    let comparison = operator
+                        .is_comparison()
+                        .then(|| comparison_semantics(&lhs, &rhs));
+                    let collation = lhs.collation.clone().or_else(|| rhs.collation.clone());
+                    values.push(computed_expr(
+                        hir::Expr::Binary {
+                            lhs: Box::new(lhs.expr),
+                            operator,
+                            rhs: Box::new(rhs.expr),
+                            array_concat,
+                            custom: None,
+                            comparison,
+                        },
+                        type_fact,
+                        collation,
+                    ));
+                }
+                ExprTask::BuildIsNull | ExprTask::BuildNotNull => {
+                    let inner = pop_expr_value(&mut values)?;
+                    let expression = match task {
+                        ExprTask::BuildIsNull => hir::Expr::IsNull(Box::new(inner.expr)),
+                        ExprTask::BuildNotNull => hir::Expr::NotNull(Box::new(inner.expr)),
+                        _ => unreachable!(),
+                    };
+                    values.push(computed_expr(
+                        expression,
+                        hir::TypeFact::known(Type::Integer),
+                        inner.collation,
+                    ));
+                }
+            }
+        }
+
+        if values.len() != 1 {
+            return Err(LimboError::InternalError(format!(
+                "expression work stack produced {} values",
+                values.len()
+            )));
+        }
+        Ok(values.pop().expect("expression value count was checked"))
+    }
+
+    pub(super) fn resolve_atomic_expr(
         &self,
         expression: hir::Expr,
         scope: &Scope,
@@ -219,72 +306,15 @@ impl Analyzer<'_, '_> {
                     collation,
                 })
             }
-            hir::Expr::Unary { operator, expr } => {
-                let inner = self.resolve_expr_facts(*expr, scope)?;
-                let type_fact = match operator {
-                    ast::UnaryOperator::Positive | ast::UnaryOperator::Negative => {
-                        hir::TypeFact::arithmetic_result(
-                            &inner.type_fact,
-                            &hir::TypeFact::known(Type::Integer),
-                        )
-                    }
-                    ast::UnaryOperator::BitwiseNot | ast::UnaryOperator::Not => {
-                        hir::TypeFact::known(Type::Integer)
-                    }
-                };
-                Ok(computed_expr(
-                    hir::Expr::Unary {
-                        operator,
-                        expr: Box::new(inner.expr),
-                    },
-                    type_fact,
-                    inner.collation,
-                ))
-            }
-            hir::Expr::Binary {
-                lhs,
-                operator,
-                rhs,
-                array_concat,
-                custom,
-                comparison,
-            } => {
-                let lhs = self.resolve_expr_facts(*lhs, scope)?;
-                let rhs = self.resolve_expr_facts(*rhs, scope)?;
-                let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
-                let collation = lhs.collation.clone().or_else(|| rhs.collation.clone());
-                Ok(computed_expr(
-                    hir::Expr::Binary {
-                        lhs: Box::new(lhs.expr),
-                        operator,
-                        rhs: Box::new(rhs.expr),
-                        array_concat,
-                        custom,
-                        comparison,
-                    },
-                    type_fact,
-                    collation,
-                ))
-            }
-            hir::Expr::IsNull(expr) => {
-                let inner = self.resolve_expr_facts(*expr, scope)?;
-                Ok(computed_expr(
-                    hir::Expr::IsNull(Box::new(inner.expr)),
-                    hir::TypeFact::known(Type::Integer),
-                    inner.collation,
-                ))
-            }
-            hir::Expr::NotNull(expr) => {
-                let inner = self.resolve_expr_facts(*expr, scope)?;
-                Ok(computed_expr(
-                    hir::Expr::NotNull(Box::new(inner.expr)),
-                    hir::TypeFact::known(Type::Integer),
-                    inner.collation,
-                ))
-            }
             _ => super::analyze::unsupported_select(),
         }
     }
+}
+
+fn pop_expr_value(values: &mut Vec<ResolvedScopeExpr>) -> Result<ResolvedScopeExpr> {
+    values.pop().ok_or_else(|| {
+        LimboError::InternalError("expression work stack is missing a value".to_string())
+    })
 }
 
 fn computed_expr(
@@ -430,7 +460,10 @@ mod tests {
             true,
             Arc::new(SqliteDialect),
         );
-        Analyzer::new(&context).analyze_expr(syntax, scope, policy)
+        let mut analyzer = Analyzer::new(&context);
+        let source_id = analyzer.reserve_source();
+        analyzer.insert_source(source_id, source())?;
+        analyzer.analyze_expr(syntax, scope, policy)
     }
 
     fn expect_column(expression: Expr) {
@@ -509,5 +542,50 @@ mod tests {
         )
         .expect_err("clause policy disables DQS");
         assert_eq!(error.to_string(), "Parse error: no such column: missing");
+    }
+
+    #[test]
+    fn deeply_nested_expressions_use_an_explicit_work_stack() {
+        const DEPTH: usize = 20_000;
+
+        let mut syntax = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
+        for _ in 0..DEPTH {
+            syntax = ast::Expr::Unary(ast::UnaryOperator::Positive, Box::new(syntax));
+        }
+
+        let mut analyzed = analyze_expression(
+            &syntax,
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("deep expression binds without using the call stack");
+
+        for _ in 0..DEPTH {
+            let Expr::Unary {
+                operator: ast::UnaryOperator::Positive,
+                expr,
+            } = analyzed
+            else {
+                panic!("expected nested unary HIR expression");
+            };
+            analyzed = *expr;
+        }
+        assert!(matches!(
+            analyzed,
+            Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+        ));
+
+        // Take the parser tree apart iteratively too, so dropping the test input
+        // does not hide analyzer behavior behind the recursive enum destructor.
+        for _ in 0..DEPTH {
+            let ast::Expr::Unary(ast::UnaryOperator::Positive, inner) = syntax else {
+                panic!("expected nested unary parser expression");
+            };
+            syntax = *inner;
+        }
+        assert!(matches!(
+            syntax,
+            ast::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+        ));
     }
 }
