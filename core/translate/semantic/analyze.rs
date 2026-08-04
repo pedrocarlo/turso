@@ -897,6 +897,110 @@ mod tests {
     }
 
     #[test]
+    fn builtin_casts_freeze_targets_and_parameters_in_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT CAST(value AS INTEGER), CAST(value AS TEXT), \
+             CAST(value AS DECIMAL(10, 2)), CAST(value AS CHAR(255)), \
+             CAST(value COLLATE RTRIM AS BLOB), CAST(value AS INTEGER[][]) \
+             FROM items",
+        )
+        .expect("built-in CAST targets have valid SQL meaning");
+        document
+            .validate()
+            .expect("built-in CAST expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 6);
+
+        let expected = [
+            (
+                "INTEGER",
+                Type::Integer,
+                crate::vdbe::affinity::Affinity::Integer,
+                0,
+                0,
+            ),
+            (
+                "TEXT",
+                Type::Text,
+                crate::vdbe::affinity::Affinity::Text,
+                0,
+                0,
+            ),
+            (
+                "DECIMAL",
+                Type::Numeric,
+                crate::vdbe::affinity::Affinity::Numeric,
+                2,
+                0,
+            ),
+            (
+                "CHAR",
+                Type::Text,
+                crate::vdbe::affinity::Affinity::Text,
+                1,
+                0,
+            ),
+            (
+                "BLOB",
+                Type::Blob,
+                crate::vdbe::affinity::Affinity::Blob,
+                0,
+                0,
+            ),
+            (
+                "INTEGER",
+                Type::Blob,
+                crate::vdbe::affinity::Affinity::Integer,
+                0,
+                2,
+            ),
+        ];
+        for (output, (name, storage, affinity, parameters, dimensions)) in
+            outputs.iter().zip(expected)
+        {
+            let Expr::Cast { target, .. } = &output.expr else {
+                panic!("CAST becomes resolved HIR");
+            };
+            assert_eq!(target.name, name);
+            assert_eq!(target.parameters.len(), parameters);
+            assert_eq!(target.array_dimensions, dimensions);
+            assert_eq!(target.type_fact.storage, Some(storage));
+            assert_eq!(target.type_fact.array_dimensions, dimensions);
+            assert_eq!(target.affinity, affinity);
+            assert!(target.programs.encode.is_empty());
+            assert!(target.programs.domain.is_none());
+            assert!(target.programs.apply_builtin_affinity);
+            assert_eq!(output.type_fact, target.type_fact);
+            assert_eq!(output.affinity, affinity);
+            assert!(output.has_affinity);
+        }
+        assert!(outputs[5].type_fact.is_array());
+        assert_eq!(
+            outputs[4]
+                .collation
+                .as_ref()
+                .expect("CAST preserves operand collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::Rtrim
+        );
+        assert!(outputs[4].collation_is_explicit);
+
+        let custom =
+            analyze_sql_with_schema(&schema, "SELECT CAST(value AS VARCHAR(3)) FROM items")
+                .expect_err("custom CAST waits for resolved schema programs");
+        assert_eq!(
+            custom.to_string(),
+            "Parse error: semantic analysis accepts source-free literal SELECT statements"
+        );
+    }
+
+    #[test]
     fn explicit_collations_override_inherited_collations() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
