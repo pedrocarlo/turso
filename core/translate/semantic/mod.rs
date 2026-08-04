@@ -5,6 +5,7 @@ pub(crate) mod context;
 mod expr;
 pub(crate) mod hir;
 mod query;
+mod schema_program;
 mod scope;
 
 pub(crate) use analyze::analyze;

@@ -33,6 +33,13 @@ impl ExprPolicy {
         self.allow_dqs_fallback = false;
         self
     }
+
+    pub(super) const fn schema_expression() -> Self {
+        Self {
+            precedence: NamePrecedence::SourcesOnly,
+            allow_dqs_fallback: false,
+        }
+    }
 }
 
 type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
@@ -423,10 +430,7 @@ impl Analyzer<'_, '_> {
                     .fold(input.collation.clone(), |current, value| {
                         expression_collation(&current, &value.collation)
                     });
-                let target = self.resolve_cast_target(
-                    type_name.as_ref(),
-                    parameters.into_iter().map(|value| value.expr).collect(),
-                )?;
+                let target = self.resolve_cast_target(type_name.as_ref(), parameters)?;
                 let type_fact = target.type_fact.clone();
                 let affinity = target.affinity;
                 Ok(ResolvedScopeExpr {
@@ -568,12 +572,16 @@ impl Analyzer<'_, '_> {
     fn resolve_cast_target(
         &mut self,
         syntax: Option<&ast::Type>,
-        parameters: Vec<hir::Expr>,
+        parameters: Vec<ResolvedScopeExpr>,
     ) -> Result<hir::TypeName> {
+        let parameter_expressions = parameters
+            .iter()
+            .map(|parameter| parameter.expr.clone())
+            .collect();
         let Some(syntax) = syntax else {
             return Ok(hir::TypeName {
                 name: String::new(),
-                parameters,
+                parameters: parameter_expressions,
                 array_dimensions: 0,
                 type_fact: hir::TypeFact::dynamic(),
                 affinity: Affinity::Numeric,
@@ -589,9 +597,7 @@ impl Analyzer<'_, '_> {
                 if syntax.array_dimensions > 0
                     || resolved.leaf().user_params().count() != parameters.len()
                     || resolved.chain.iter().any(|definition| {
-                        definition.encode().is_some()
-                            || definition.not_null
-                            || !definition.domain_checks.is_empty()
+                        definition.not_null || !definition.domain_checks.is_empty()
                     })
                 {
                     return super::analyze::unsupported_select();
@@ -613,6 +619,12 @@ impl Analyzer<'_, '_> {
                         definition,
                     ));
                 }
+                let mut encode = Vec::new();
+                for definition in &custom_chain {
+                    if let Some(call) = self.bind_type_encoder(definition, &parameters)? {
+                        encode.push(call);
+                    }
+                }
                 let type_fact = hir::TypeFact::declared(hir::DeclaredType {
                     name: syntax.name.clone(),
                     storage,
@@ -621,12 +633,12 @@ impl Analyzer<'_, '_> {
                 });
                 return Ok(hir::TypeName {
                     name: syntax.name.clone(),
-                    parameters,
+                    parameters: parameter_expressions,
                     array_dimensions: 0,
                     type_fact,
                     affinity,
                     programs: hir::BoundCastPrograms {
-                        encode: Vec::new(),
+                        encode,
                         domain: None,
                         apply_builtin_affinity: false,
                     },
@@ -647,7 +659,7 @@ impl Analyzer<'_, '_> {
         });
         Ok(hir::TypeName {
             name: syntax.name.clone(),
-            parameters,
+            parameters: parameter_expressions,
             array_dimensions: syntax.array_dimensions,
             type_fact,
             affinity,
