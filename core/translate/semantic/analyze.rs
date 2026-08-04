@@ -1149,6 +1149,70 @@ mod tests {
     }
 
     #[test]
+    fn domain_cast_keeps_inherited_not_null_and_check_programs() {
+        let mut schema = schema_with_items();
+        schema
+            .add_type_from_sql(
+                "CREATE DOMAIN positive_integer AS INTEGER \
+                 CONSTRAINT positive CHECK (value > 0)",
+            )
+            .expect("parent domain definition parses");
+        schema
+            .add_type_from_sql("CREATE DOMAIN required_positive AS positive_integer NOT NULL")
+            .expect("child domain definition parses");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT CAST(value AS required_positive) FROM items",
+        )
+        .expect("domain constraints bind");
+        document
+            .validate()
+            .expect("domain constraints produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("domain CAST becomes resolved HIR");
+        };
+        let domain = target
+            .programs
+            .domain
+            .as_ref()
+            .expect("domain CAST carries constraints");
+        assert_eq!(
+            domain.not_null_description.as_deref(),
+            Some("domain required_positive does not allow null values")
+        );
+        assert_eq!(domain.checks.len(), 1);
+        assert_eq!(
+            domain.checks[0].failure_description,
+            "value for domain positive_integer violates check constraint \"positive\""
+        );
+        assert!(domain.checks[0].call.arguments.is_empty());
+
+        let program = document
+            .schema_program(domain.checks[0].call.program)
+            .expect("domain CHECK program exists");
+        let input = document
+            .source(program.input_source)
+            .expect("domain CHECK input exists");
+        assert_eq!(input.columns.len(), 1);
+        assert_eq!(input.columns[0].name, "value");
+        assert_eq!(input.columns[0].type_fact.storage, target.type_fact.storage);
+        assert!(input.columns[0].type_fact.declared.is_none());
+        let Expr::Binary { lhs, .. } = &program.body else {
+            panic!("domain CHECK becomes binary HIR");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Column(column)
+                if column.source == program.input_source && column.column == 0
+        ));
+    }
+
+    #[test]
     fn explicit_collations_override_inherited_collations() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(

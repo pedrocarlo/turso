@@ -4,8 +4,9 @@ use super::{
     analyze::Analyzer,
     expr::ExprPolicy,
     hir::{
-        self, BoundSchemaCall, BoundSchemaProgram, ColumnReadExpression, DatabaseId, IndexCoverage,
-        IndexHint, ResolvedType, Source, SourceColumn, SourceKind, SourceOwner, TypeFact,
+        self, BoundDomainCheck, BoundDomainConstraints, BoundSchemaCall, BoundSchemaProgram,
+        ColumnReadExpression, DatabaseId, IndexCoverage, IndexHint, ResolvedType, Source,
+        SourceColumn, SourceKind, SourceOwner, TypeFact,
     },
     scope::{ResolvedScopeExpr, Scope},
 };
@@ -62,6 +63,66 @@ impl Analyzer<'_, '_> {
                 .map(|argument| argument.expr.clone())
                 .collect(),
         }))
+    }
+
+    pub(super) fn bind_domain_constraints(
+        &mut self,
+        value_type: &TypeFact,
+        chain: &[ResolvedType],
+    ) -> Result<BoundDomainConstraints> {
+        let domain_name = chain
+            .first()
+            .expect("a resolved domain has at least one definition")
+            .value()
+            .name
+            .as_str();
+        let not_null_description = chain
+            .iter()
+            .any(|definition| definition.value().not_null)
+            .then(|| format!("domain {domain_name} does not allow null values"));
+        let input = [SchemaInput {
+            name: "value".to_string(),
+            type_fact: value_type
+                .storage
+                .map_or_else(TypeFact::dynamic, TypeFact::known),
+        }];
+        let mut checks = Vec::new();
+        for definition in chain {
+            for (index, constraint) in definition.value().domain_checks.iter().enumerate() {
+                if !self.enter_schema_program_binding(definition.id()) {
+                    crate::bail_parse_error!(
+                        "recursive domain CHECK program for domain '{}'",
+                        definition.value().name
+                    );
+                }
+                let result = self.bind_schema_program(
+                    constraint.check.as_ref(),
+                    definition.database(),
+                    &input,
+                );
+                self.leave_schema_program_binding(definition.id());
+                let program = result?;
+                let name = constraint
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_{}", definition.value().name, index));
+                checks.push(BoundDomainCheck {
+                    call: BoundSchemaCall {
+                        program,
+                        arguments: Vec::new(),
+                    },
+                    failure_description: format!(
+                        "value for domain {} violates check constraint \"{}\"",
+                        definition.value().name,
+                        name
+                    ),
+                });
+            }
+        }
+        Ok(BoundDomainConstraints {
+            not_null_description,
+            checks,
+        })
     }
 
     fn bind_schema_program(
