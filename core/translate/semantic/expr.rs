@@ -94,6 +94,25 @@ impl<'a> ExprFrame<'a> {
                     }
                 }
             },
+            ast::Expr::Cast { expr, type_name } => {
+                match type_name
+                    .as_ref()
+                    .and_then(|type_name| type_name.size.as_ref())
+                {
+                    Some(ast::TypeSize::MaxSize(parameter)) => match self.next_child {
+                        0 => Some(parameter.as_ref()),
+                        1 => Some(expr.as_ref()),
+                        _ => None,
+                    },
+                    Some(ast::TypeSize::TypeSize(first, second)) => match self.next_child {
+                        0 => Some(first.as_ref()),
+                        1 => Some(second.as_ref()),
+                        2 => Some(expr.as_ref()),
+                        _ => None,
+                    },
+                    None => (self.next_child == 0).then(|| expr.as_ref()),
+                }
+            }
             _ => None,
         };
         if child.is_some() {
@@ -385,6 +404,42 @@ impl Analyzer<'_, '_> {
                     collation,
                 ))
             }
+            ast::Expr::Cast { type_name, .. } => {
+                let parameter_count = cast_parameter_count(type_name.as_ref());
+                if children.len() != parameter_count + 1 {
+                    return Err(LimboError::InternalError(format!(
+                        "CAST expression expected {} child values, got {}",
+                        parameter_count + 1,
+                        children.len()
+                    )));
+                }
+                let mut children = children.into_iter();
+                let parameters = children.by_ref().take(parameter_count).collect::<Vec<_>>();
+                let input = children
+                    .next()
+                    .expect("CAST child count includes input expression");
+                let collation = parameters
+                    .iter()
+                    .fold(input.collation.clone(), |current, value| {
+                        expression_collation(&current, &value.collation)
+                    });
+                let target = self.resolve_builtin_cast_target(
+                    type_name.as_ref(),
+                    parameters.into_iter().map(|value| value.expr).collect(),
+                )?;
+                let type_fact = target.type_fact.clone();
+                let affinity = target.affinity;
+                Ok(ResolvedScopeExpr {
+                    expr: hir::Expr::Cast {
+                        expr: Box::new(input.expr),
+                        target,
+                    },
+                    type_fact,
+                    affinity,
+                    has_affinity: true,
+                    collation,
+                })
+            }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
                 let collation = self.resolve_collation(name)?;
@@ -508,6 +563,68 @@ impl Analyzer<'_, '_> {
             None,
             Arc::new(collation),
         ))
+    }
+
+    fn resolve_builtin_cast_target(
+        &self,
+        syntax: Option<&ast::Type>,
+        parameters: Vec<hir::Expr>,
+    ) -> Result<hir::TypeName> {
+        let Some(syntax) = syntax else {
+            return Ok(hir::TypeName {
+                name: String::new(),
+                parameters,
+                array_dimensions: 0,
+                type_fact: hir::TypeFact::dynamic(),
+                affinity: Affinity::Numeric,
+                programs: builtin_cast_programs(),
+            });
+        };
+        if self.context().custom_types_enabled()
+            && self
+                .context()
+                .main_schema()
+                .resolve_type_unchecked(&syntax.name)?
+                .is_some()
+        {
+            return super::analyze::unsupported_select();
+        }
+        let affinity = Affinity::affinity(&syntax.name);
+        let storage = if syntax.array_dimensions > 0 {
+            Type::Blob
+        } else {
+            affinity.to_type()
+        };
+        let type_fact = hir::TypeFact::declared(hir::DeclaredType {
+            name: syntax.name.clone(),
+            storage,
+            custom_chain: Vec::new(),
+            array_dimensions: syntax.array_dimensions,
+        });
+        Ok(hir::TypeName {
+            name: syntax.name.clone(),
+            parameters,
+            array_dimensions: syntax.array_dimensions,
+            type_fact,
+            affinity,
+            programs: builtin_cast_programs(),
+        })
+    }
+}
+
+fn cast_parameter_count(type_name: Option<&ast::Type>) -> usize {
+    match type_name.and_then(|type_name| type_name.size.as_ref()) {
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        Some(ast::TypeSize::TypeSize(_, _)) => 2,
+        None => 0,
+    }
+}
+
+fn builtin_cast_programs() -> hir::BoundCastPrograms {
+    hir::BoundCastPrograms {
+        encode: Vec::new(),
+        domain: None,
+        apply_builtin_affinity: true,
     }
 }
 
@@ -758,6 +875,30 @@ mod tests {
             assert!(values.is_empty());
             assert!(comparisons.is_empty());
         }
+    }
+
+    #[test]
+    fn cast_parameters_bind_before_input_expression() {
+        let syntax = ast::Expr::Cast {
+            expr: Box::new(ast::Expr::Id(ast::Name::exact("missing_input".to_string()))),
+            type_name: Some(ast::Type {
+                name: "DECIMAL".to_string(),
+                size: Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Id(
+                    ast::Name::exact("missing_parameter".to_string()),
+                )))),
+                array_dimensions: 0,
+            }),
+        };
+        let error = analyze_expression(
+            &syntax,
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect_err("first unresolved CAST child fails");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: missing_parameter"
+        );
     }
 
     #[test]
