@@ -698,6 +698,118 @@ mod tests {
     }
 
     #[test]
+    fn between_and_in_freeze_comparison_rules_in_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value BETWEEN 'a' AND 'z', \
+             value NOT BETWEEN ('a' COLLATE RTRIM) AND 'z', \
+             value IN (1, 'x'), 1 IN (value) FROM items",
+        )
+        .expect("BETWEEN and list IN expressions have valid SQL meaning");
+        document
+            .validate()
+            .expect("BETWEEN and list IN produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 4);
+        assert!(outputs.iter().all(|output| {
+            output.type_fact.storage == Some(Type::Integer) && !output.has_affinity
+        }));
+
+        let Expr::Between {
+            negated: false,
+            start_comparison,
+            end_comparison,
+            ..
+        } = &outputs[0].expr
+        else {
+            panic!("BETWEEN becomes HIR with two comparisons");
+        };
+        for comparison in [start_comparison, end_comparison] {
+            assert_eq!(
+                comparison.components[0].affinity,
+                crate::vdbe::affinity::Affinity::Text
+            );
+            assert_eq!(
+                comparison.components[0]
+                    .collation
+                    .as_ref()
+                    .expect("column collation reaches both bounds")
+                    .value(),
+                &crate::translate::collate::CollationSeq::NoCase
+            );
+        }
+
+        let Expr::Between {
+            negated: true,
+            start_comparison,
+            end_comparison,
+            ..
+        } = &outputs[1].expr
+        else {
+            panic!("NOT BETWEEN preserves negation");
+        };
+        assert_eq!(
+            start_comparison.components[0]
+                .collation
+                .as_ref()
+                .expect("explicit bound collation wins")
+                .value(),
+            &crate::translate::collate::CollationSeq::Rtrim
+        );
+        assert_eq!(
+            end_comparison.components[0]
+                .collation
+                .as_ref()
+                .expect("other bound keeps column collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+
+        let Expr::InList {
+            negated: false,
+            values,
+            comparisons,
+            ..
+        } = &outputs[2].expr
+        else {
+            panic!("list IN becomes HIR");
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(comparisons.len(), 2);
+        assert!(comparisons.iter().all(|comparison| {
+            comparison.components[0].affinity == crate::vdbe::affinity::Affinity::Text
+                && comparison.components[0]
+                    .collation
+                    .as_ref()
+                    .is_some_and(|collation| {
+                        collation.value() == &crate::translate::collate::CollationSeq::NoCase
+                    })
+        }));
+
+        let Expr::InList { comparisons, .. } = &outputs[3].expr else {
+            panic!("reversed list IN becomes HIR");
+        };
+        assert_eq!(comparisons.len(), 1);
+        assert_eq!(
+            comparisons[0].components[0].affinity,
+            crate::vdbe::affinity::Affinity::Blob
+        );
+        assert_eq!(
+            comparisons[0].components[0]
+                .collation
+                .as_ref()
+                .expect("IN still uses collation from either operand")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+    }
+
+    #[test]
     fn explicit_collations_override_inherited_collations() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(

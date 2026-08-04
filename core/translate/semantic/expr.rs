@@ -66,6 +66,18 @@ impl<'a> ExprFrame<'a> {
                 1 => Some(rhs.as_ref()),
                 _ => None,
             },
+            ast::Expr::Between {
+                lhs, start, end, ..
+            } => match self.next_child {
+                0 => Some(lhs.as_ref()),
+                1 => Some(start.as_ref()),
+                2 => Some(end.as_ref()),
+                _ => None,
+            },
+            ast::Expr::InList { lhs, rhs, .. } => match self.next_child {
+                0 => Some(lhs.as_ref()),
+                index => rhs.get(index - 1).map(Box::as_ref),
+            },
             _ => None,
         };
         if child.is_some() {
@@ -237,6 +249,58 @@ impl Analyzer<'_, '_> {
                         comparison,
                     },
                     type_fact,
+                    collation,
+                ))
+            }
+            ast::Expr::Between { not, .. } => {
+                let [expr, start, end] = expect_expr_children(children)?;
+                let start_comparison = comparison_semantics(&expr, &start);
+                let end_comparison = comparison_semantics(&expr, &end);
+                let collation = expression_collation(
+                    &expression_collation(&expr.collation, &start.collation),
+                    &end.collation,
+                );
+                Ok(computed_expr(
+                    hir::Expr::Between {
+                        expr: Box::new(expr.expr),
+                        negated: *not,
+                        start: Box::new(start.expr),
+                        end: Box::new(end.expr),
+                        start_comparison,
+                        end_comparison,
+                    },
+                    hir::TypeFact::known(Type::Integer),
+                    collation,
+                ))
+            }
+            ast::Expr::InList { not, rhs, .. } => {
+                if children.len() != rhs.len() + 1 {
+                    return Err(LimboError::InternalError(format!(
+                        "IN expression expected {} child values, got {}",
+                        rhs.len() + 1,
+                        children.len()
+                    )));
+                }
+                let mut children = children.into_iter();
+                let lhs = children
+                    .next()
+                    .expect("IN child count includes left expression");
+                let values = children.collect::<Vec<_>>();
+                let comparisons = values
+                    .iter()
+                    .map(|value| in_comparison_semantics(&lhs, value))
+                    .collect();
+                let collation = values.iter().fold(lhs.collation.clone(), |current, value| {
+                    expression_collation(&current, &value.collation)
+                });
+                Ok(computed_expr(
+                    hir::Expr::InList {
+                        lhs: Box::new(lhs.expr),
+                        negated: *not,
+                        values: values.into_iter().map(|value| value.expr).collect(),
+                        comparisons,
+                    },
+                    hir::TypeFact::known(Type::Integer),
                     collation,
                 ))
             }
@@ -483,6 +547,21 @@ fn comparison_semantics(
     }
 }
 
+fn in_comparison_semantics(
+    lhs: &ResolvedScopeExpr,
+    rhs: &ResolvedScopeExpr,
+) -> hir::ComparisonSemantics {
+    hir::ComparisonSemantics {
+        components: vec![hir::ComparisonComponent {
+            affinity: lhs.affinity,
+            collation: expression_collation(&lhs.collation, &rhs.collation)
+                .value()
+                .cloned(),
+            array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +648,35 @@ mod tests {
             expression,
             Expr::Column(column) if column.source == SourceId::new(0) && column.column == 0
         ));
+    }
+
+    #[test]
+    fn empty_in_lists_keep_negation_without_comparisons() {
+        for negated in [false, true] {
+            let syntax = ast::Expr::InList {
+                lhs: Box::new(expression("SELECT 1")),
+                not: negated,
+                rhs: Vec::new(),
+            };
+            let expression = analyze_expression(
+                &syntax,
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("empty IN list binds");
+            let Expr::InList {
+                negated: actual,
+                values,
+                comparisons,
+                ..
+            } = expression
+            else {
+                panic!("empty IN list becomes HIR");
+            };
+            assert_eq!(actual, negated);
+            assert!(values.is_empty());
+            assert!(comparisons.is_empty());
+        }
     }
 
     #[test]
