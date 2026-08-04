@@ -423,7 +423,7 @@ impl Analyzer<'_, '_> {
                     .fold(input.collation.clone(), |current, value| {
                         expression_collation(&current, &value.collation)
                     });
-                let target = self.resolve_builtin_cast_target(
+                let target = self.resolve_cast_target(
                     type_name.as_ref(),
                     parameters.into_iter().map(|value| value.expr).collect(),
                 )?;
@@ -565,8 +565,8 @@ impl Analyzer<'_, '_> {
         ))
     }
 
-    fn resolve_builtin_cast_target(
-        &self,
+    fn resolve_cast_target(
+        &mut self,
         syntax: Option<&ast::Type>,
         parameters: Vec<hir::Expr>,
     ) -> Result<hir::TypeName> {
@@ -580,14 +580,58 @@ impl Analyzer<'_, '_> {
                 programs: builtin_cast_programs(),
             });
         };
-        if self.context().custom_types_enabled()
-            && self
+        if self.context().custom_types_enabled() {
+            if let Some(resolved) = self
                 .context()
                 .main_schema()
                 .resolve_type_unchecked(&syntax.name)?
-                .is_some()
-        {
-            return super::analyze::unsupported_select();
+            {
+                if syntax.array_dimensions > 0
+                    || resolved.leaf().user_params().count() != parameters.len()
+                    || resolved.chain.iter().any(|definition| {
+                        definition.encode().is_some()
+                            || definition.not_null
+                            || !definition.domain_checks.is_empty()
+                    })
+                {
+                    return super::analyze::unsupported_select();
+                }
+                let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
+                let storage = Affinity::affinity(&resolved.primitive).to_type();
+                let affinity = Affinity::affinity(&resolved.primitive);
+                let mut custom_chain = Vec::with_capacity(resolved.chain.len());
+                for definition in resolved.chain {
+                    let id = self.catalog_object_id(
+                        Some(database),
+                        CatalogObjectKind::Type,
+                        crate::util::normalize_ident(&definition.name),
+                    );
+                    custom_chain.push(hir::CatalogObject::new(
+                        id,
+                        self.context().snapshot(),
+                        Some(database),
+                        definition,
+                    ));
+                }
+                let type_fact = hir::TypeFact::declared(hir::DeclaredType {
+                    name: syntax.name.clone(),
+                    storage,
+                    custom_chain,
+                    array_dimensions: 0,
+                });
+                return Ok(hir::TypeName {
+                    name: syntax.name.clone(),
+                    parameters,
+                    array_dimensions: 0,
+                    type_fact,
+                    affinity,
+                    programs: hir::BoundCastPrograms {
+                        encode: Vec::new(),
+                        domain: None,
+                        apply_builtin_affinity: false,
+                    },
+                });
+            }
         }
         let affinity = Affinity::affinity(&syntax.name);
         let storage = if syntax.array_dimensions > 0 {
