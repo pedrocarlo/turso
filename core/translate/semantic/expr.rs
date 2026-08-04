@@ -250,15 +250,28 @@ impl<'a> ExprFrame<'a> {
                     None => (self.next_child == 0).then(|| expr.as_ref()),
                 }
             }
-            ast::Expr::FunctionCall { args, order_by, .. } => {
+            ast::Expr::FunctionCall {
+                args,
+                order_by,
+                filter_over,
+                ..
+            } => {
+                let argument_children = args.len() + order_by.len();
                 if self.next_child < args.len() {
                     args.get(self.next_child).map(Box::as_ref)
-                } else {
+                } else if self.next_child < argument_children {
                     order_by
                         .get(self.next_child - args.len())
                         .map(|term| term.expr.as_ref())
+                } else if self.next_child == argument_children {
+                    filter_over.filter_clause.as_deref()
+                } else {
+                    None
                 }
             }
+            ast::Expr::FunctionCallStar { filter_over, .. } => (self.next_child == 0)
+                .then(|| filter_over.filter_clause.as_deref())
+                .flatten(),
             ast::Expr::Raise(_, message) => {
                 (self.next_child == 0).then(|| message.as_deref()).flatten()
             }
@@ -631,13 +644,11 @@ impl Analyzer<'_, '_> {
                 within_group,
                 filter_over,
             } => {
-                if !within_group.is_empty()
-                    || filter_over.filter_clause.is_some()
-                    || filter_over.over_clause.is_some()
-                {
+                if !within_group.is_empty() || filter_over.over_clause.is_some() {
                     return super::analyze::unsupported_select();
                 }
-                let expected_children = args.len() + order_by.len();
+                let expected_children =
+                    args.len() + order_by.len() + usize::from(filter_over.filter_clause.is_some());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
@@ -649,13 +660,18 @@ impl Analyzer<'_, '_> {
                 let values = children.by_ref().take(args.len()).collect();
                 let order_by = order_by
                     .iter()
-                    .zip(children)
+                    .zip(children.by_ref())
                     .map(|(syntax, value)| FunctionOrderTerm {
                         value,
                         order: syntax.order.unwrap_or(ast::SortOrder::Asc),
                         nulls: syntax.nulls,
                     })
                     .collect();
+                let filter = filter_over.filter_clause.as_ref().map(|_| {
+                    children
+                        .next()
+                        .expect("function child count includes FILTER")
+                });
                 self.build_function_call(
                     name,
                     FunctionInput::Expressions {
@@ -663,15 +679,25 @@ impl Analyzer<'_, '_> {
                         values,
                         order_by,
                     },
+                    filter,
                     functions,
                 )
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
-                expect_no_expr_children(children)?;
-                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                if filter_over.over_clause.is_some() {
                     return super::analyze::unsupported_select();
                 }
-                self.build_function_call(name, FunctionInput::Star, functions)
+                let filter = match filter_over.filter_clause {
+                    Some(_) => {
+                        let [filter] = expect_expr_children(children)?;
+                        Some(filter)
+                    }
+                    None => {
+                        expect_no_expr_children(children)?;
+                        None
+                    }
+                };
+                self.build_function_call(name, FunctionInput::Star, filter, functions)
             }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
@@ -724,6 +750,7 @@ impl Analyzer<'_, '_> {
         &mut self,
         name: &ast::Name,
         input: FunctionInput,
+        filter: Option<ResolvedScopeExpr>,
         functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
         let argument_count = input.argument_count();
@@ -738,15 +765,23 @@ impl Analyzer<'_, '_> {
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         if (input.distinctness().is_some()
             || !input.order_terms().is_empty()
+            || filter.is_some()
             || matches!(&input, FunctionInput::Star))
             && !aggregate
         {
             return super::analyze::unsupported_select();
         }
         if aggregate {
-            if let Some(nested) = nested_aggregate(input.facts()).or_else(|| {
-                nested_aggregate_iter(input.order_terms().iter().map(|term| &term.value))
-            }) {
+            if let Some(nested) = nested_aggregate(input.facts())
+                .or_else(|| {
+                    nested_aggregate_iter(input.order_terms().iter().map(|term| &term.value))
+                })
+                .or_else(|| {
+                    filter
+                        .as_ref()
+                        .and_then(|filter| nested_aggregate_iter([filter]))
+                })
+            {
                 crate::bail_parse_error!("misuse of aggregate function {nested}()");
             }
         }
@@ -760,7 +795,10 @@ impl Analyzer<'_, '_> {
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         let evaluation = match binding {
             FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
-            FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate(binding.id),
+            FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate {
+                id: binding.id,
+                filter: filter.map(|filter| Box::new(filter.expr)),
+            },
             FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
         };
         let arguments = input.into_hir();
@@ -770,7 +808,6 @@ impl Analyzer<'_, '_> {
                 evaluation,
                 arguments,
                 within_group: Vec::new(),
-                filter: None,
                 window: None,
                 result_type: result_type.clone(),
                 custom_type_operation: None,
@@ -1082,7 +1119,7 @@ fn nested_aggregate_iter<'a>(
             let hir::Expr::Function(call) = expression else {
                 return;
             };
-            if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate(_)) {
+            if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) {
                 name = Some(call.function.value().to_string());
             }
         });
