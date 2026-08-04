@@ -10,7 +10,12 @@ use super::{
     scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope},
 };
 use crate::{
-    schema::Type, sync::Arc, translate::collate::CollationSeq, vdbe::affinity::Affinity,
+    function::{Func, ScalarFunc},
+    schema::Type,
+    sync::Arc,
+    translate::collate::CollationSeq,
+    util::normalize_ident,
+    vdbe::affinity::Affinity,
     LimboError, Result,
 };
 
@@ -120,6 +125,7 @@ impl<'a> ExprFrame<'a> {
                     None => (self.next_child == 0).then(|| expr.as_ref()),
                 }
             }
+            ast::Expr::FunctionCall { args, .. } => args.get(self.next_child).map(Box::as_ref),
             _ => None,
         };
         if child.is_some() {
@@ -444,6 +450,72 @@ impl Analyzer<'_, '_> {
                     collation,
                 })
             }
+            ast::Expr::FunctionCall {
+                name,
+                distinctness,
+                args,
+                order_by,
+                within_group,
+                filter_over,
+            } => {
+                if distinctness.is_some()
+                    || !order_by.is_empty()
+                    || !within_group.is_empty()
+                    || filter_over.filter_clause.is_some()
+                    || filter_over.over_clause.is_some()
+                {
+                    return super::analyze::unsupported_select();
+                }
+                if children.len() != args.len() {
+                    return Err(LimboError::InternalError(format!(
+                        "function expression expected {} child values, got {}",
+                        args.len(),
+                        children.len()
+                    )));
+                }
+                let function_name = normalize_ident(name.as_str());
+                let Some(function) = self
+                    .context()
+                    .resolve_function(&function_name, args.len())?
+                else {
+                    crate::bail_parse_error!("no such function: {function_name}");
+                };
+                if !is_scalar_function(&function) {
+                    return super::analyze::unsupported_select();
+                }
+                let result_type = scalar_function_result_type(&function, &children);
+                let id = self.catalog_object_id(
+                    None,
+                    CatalogObjectKind::Function {
+                        argument_count: args.len(),
+                    },
+                    function_name,
+                );
+                let function = hir::CatalogObject::new(
+                    id,
+                    self.context().snapshot(),
+                    None,
+                    Arc::new(function),
+                );
+                Ok(computed_expr(
+                    hir::Expr::Function(hir::FunctionCall {
+                        function,
+                        evaluation: hir::FunctionEvaluation::Scalar,
+                        star: false,
+                        arguments: children.into_iter().map(|child| child.expr).collect(),
+                        distinctness: None,
+                        argument_order: Vec::new(),
+                        within_group: Vec::new(),
+                        filter: None,
+                        window: None,
+                        result_type: result_type.clone(),
+                        custom_type_operation: None,
+                        sequence_operation: None,
+                    }),
+                    result_type,
+                    ExprCollation::Absent,
+                ))
+            }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
                 let collation = self.resolve_collation(name)?;
@@ -734,6 +806,35 @@ fn computed_expr(
         affinity: Affinity::Blob,
         has_affinity: false,
         collation,
+    }
+}
+
+fn is_scalar_function(function: &Func) -> bool {
+    !matches!(
+        function,
+        Func::Agg(_) | Func::Window(_) | Func::AlterTable(_)
+    )
+}
+
+fn scalar_function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
+    match function {
+        Func::Scalar(ScalarFunc::Length) => hir::TypeFact::known(Type::Integer),
+        Func::Scalar(ScalarFunc::Abs) => {
+            arguments
+                .first()
+                .map_or_else(hir::TypeFact::dynamic, |argument| {
+                    match argument.type_fact.storage {
+                        Some(Type::Null) => hir::TypeFact::known(Type::Null),
+                        Some(Type::Integer) => hir::TypeFact::known(Type::Integer),
+                        Some(Type::Real) | Some(Type::Text) | Some(Type::Blob) => {
+                            hir::TypeFact::known(Type::Real)
+                        }
+                        Some(Type::Numeric) => hir::TypeFact::known(Type::Numeric),
+                        None => hir::TypeFact::dynamic(),
+                    }
+                })
+        }
+        _ => hir::TypeFact::dynamic(),
     }
 }
 
