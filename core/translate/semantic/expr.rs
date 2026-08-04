@@ -24,6 +24,13 @@ use crate::{
 pub(crate) struct ExprPolicy {
     precedence: NamePrecedence,
     allow_dqs_fallback: bool,
+    raise: RaisePolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RaisePolicy {
+    AbortOnly,
+    Trigger,
 }
 
 impl ExprPolicy {
@@ -31,6 +38,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: dqs_dml.is_enabled(),
+            raise: RaisePolicy::AbortOnly,
         }
     }
 
@@ -43,6 +51,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: false,
+            raise: RaisePolicy::AbortOnly,
         }
     }
 }
@@ -126,6 +135,9 @@ impl<'a> ExprFrame<'a> {
                 }
             }
             ast::Expr::FunctionCall { args, .. } => args.get(self.next_child).map(Box::as_ref),
+            ast::Expr::Raise(_, message) => {
+                (self.next_child == 0).then(|| message.as_deref()).flatten()
+            }
             _ => None,
         };
         if child.is_some() {
@@ -538,6 +550,27 @@ impl Analyzer<'_, '_> {
                 let [inner] = expect_expr_children(children)?;
                 Ok(null_test_expr(inner, false))
             }
+            ast::Expr::Raise(action, message) => {
+                validate_raise(*action, policy.raise)?;
+                let message = match message {
+                    Some(_) => {
+                        let [message] = expect_expr_children(children)?;
+                        Some(Box::new(message.expr))
+                    }
+                    None => {
+                        expect_no_expr_children(children)?;
+                        None
+                    }
+                };
+                Ok(computed_expr(
+                    hir::Expr::Raise {
+                        action: *action,
+                        message,
+                    },
+                    hir::TypeFact::dynamic(),
+                    ExprCollation::Absent,
+                ))
+            }
             _ => super::analyze::unsupported_select(),
         }
     }
@@ -814,6 +847,15 @@ fn is_scalar_function(function: &Func) -> bool {
         function,
         Func::Agg(_) | Func::Window(_) | Func::AlterTable(_)
     )
+}
+
+fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
+    match (policy, action) {
+        (RaisePolicy::AbortOnly, ast::ResolveType::Abort) | (RaisePolicy::Trigger, _) => Ok(()),
+        (RaisePolicy::AbortOnly, _) => {
+            crate::bail_parse_error!("RAISE() may only be used within a trigger-program")
+        }
+    }
 }
 
 fn scalar_function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
