@@ -465,6 +465,40 @@ mod tests {
     }
 
     #[test]
+    fn parameters_keep_parser_assigned_indexes_and_names() {
+        let document =
+            analyze_sql("SELECT ?, ?3, :named, :named, @other").expect("parameters bind into HIR");
+        document
+            .validate()
+            .expect("parameter expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        let expected = [
+            (1, None),
+            (3, None),
+            (4, Some(":named")),
+            (4, Some(":named")),
+            (5, Some("@other")),
+        ];
+
+        for (output, (index, name)) in outputs.iter().zip(expected) {
+            let Expr::Parameter(parameter) = &output.expr else {
+                panic!("parser variable becomes HIR parameter");
+            };
+            assert_eq!(parameter.index.get(), index);
+            assert_eq!(parameter.name.as_deref(), name);
+            assert!(parameter.type_fact.storage.is_none());
+            assert!(parameter.type_fact.declared.is_none());
+            assert!(!output.has_affinity);
+            assert!(output.collation.is_none());
+            assert!(!output.collation_is_explicit);
+        }
+    }
+
+    #[test]
     fn unresolved_names_do_not_enter_hir() {
         let error = analyze_sql("SELECT missing_name")
             .expect_err("unresolved name must fail semantic analysis");
