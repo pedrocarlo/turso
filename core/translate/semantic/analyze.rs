@@ -57,6 +57,7 @@ pub(super) struct Analyzer<'context, 'catalog> {
 pub(super) enum CatalogObjectKind {
     Table,
     Collation,
+    Type,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -998,6 +999,54 @@ mod tests {
             custom.to_string(),
             "Parse error: semantic analysis accepts source-free literal SELECT statements"
         );
+    }
+
+    #[test]
+    fn custom_cast_without_programs_keeps_resolved_type_chain() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT CAST(value AS BIGINT) FROM items")
+            .expect("BIGINT needs no custom schema program");
+        document
+            .validate()
+            .expect("catalog-resolved CAST produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("custom CAST becomes resolved HIR");
+        };
+        assert_eq!(target.name, "BIGINT");
+        assert_eq!(target.type_fact.storage, Some(Type::Integer));
+        assert_eq!(target.affinity, crate::vdbe::affinity::Affinity::Integer);
+        assert_eq!(
+            target
+                .type_fact
+                .declared
+                .as_ref()
+                .map(|value| value.name.as_str()),
+            Some("BIGINT")
+        );
+        let chain = &target
+            .type_fact
+            .declared
+            .as_ref()
+            .expect("custom target keeps declaration")
+            .custom_chain;
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].value().name, "bigint");
+        assert_eq!(
+            chain[0].database(),
+            Some(DatabaseId::new(crate::MAIN_DB_ID))
+        );
+        assert_eq!(chain[0].snapshot(), document.snapshot);
+        assert!(target.programs.encode.is_empty());
+        assert!(target.programs.domain.is_none());
+        assert!(!target.programs.apply_builtin_affinity);
+        assert_eq!(output.type_fact, target.type_fact);
+        assert_eq!(output.affinity, crate::vdbe::affinity::Affinity::Integer);
+        assert!(output.has_affinity);
     }
 
     #[test]
