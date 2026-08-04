@@ -1239,7 +1239,6 @@ mod tests {
                     order_by,
                 } if values.len() == 1 && order_by.is_empty()
             ));
-            assert!(call.within_group.is_empty());
             assert!(call.window.is_none());
         }
         let Expr::Function(length) = &outputs[0].expr else {
@@ -1399,6 +1398,104 @@ mod tests {
             } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 1)
                 && matches!(filter.as_ref(), Expr::NotNull(_))
         ));
+    }
+
+    #[test]
+    fn ordered_set_aggregates_keep_direct_and_ordered_inputs_separate() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT mode() WITHIN GROUP (ORDER BY value), \
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY score), \
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY value COLLATE BINARY) \
+                 FILTER (WHERE id > 0) FROM items",
+        )
+        .expect("ordered-set aggregates bind");
+        document
+            .validate()
+            .expect("ordered-set aggregates produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 3);
+
+        let Expr::Function(mode) = &block.outputs[0].expr else {
+            panic!("mode becomes a function call");
+        };
+        let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
+            &mode.arguments
+        else {
+            panic!("mode keeps ordered-set arguments");
+        };
+        assert!(direct.is_empty());
+        assert!(matches!(order_by.expr, Expr::Column(_)));
+        assert_eq!(order_by.type_fact.storage, Some(Type::Text));
+        assert!(order_by.collation.is_some());
+        assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Text));
+
+        let Expr::Function(percentile_cont) = &block.outputs[1].expr else {
+            panic!("percentile_cont becomes a function call");
+        };
+        let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
+            &percentile_cont.arguments
+        else {
+            panic!("percentile_cont keeps ordered-set arguments");
+        };
+        assert_eq!(direct.len(), 1);
+        assert!(matches!(order_by.expr, Expr::Column(_)));
+        assert_eq!(order_by.type_fact.storage, Some(Type::Real));
+        assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Real));
+
+        let Expr::Function(percentile_disc) = &block.outputs[2].expr else {
+            panic!("percentile_disc becomes a function call");
+        };
+        let crate::translate::semantic::hir::FunctionArguments::OrderedSet { direct, order_by } =
+            &percentile_disc.arguments
+        else {
+            panic!("percentile_disc keeps ordered-set arguments");
+        };
+        assert_eq!(direct.len(), 1);
+        assert!(matches!(order_by.expr, Expr::Collate { .. }));
+        assert_eq!(order_by.order, ast::SortOrder::Asc);
+        assert!(order_by.nulls.is_none());
+        assert!(order_by.collation.is_some());
+        assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
+        assert!(matches!(
+            &percentile_disc.evaluation,
+            FunctionEvaluation::Aggregate {
+                filter: Some(filter),
+                ..
+            } if matches!(filter.as_ref(), Expr::Binary { .. })
+        ));
+    }
+
+    #[test]
+    fn ordered_set_aggregates_keep_existing_restrictions() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            (
+                "SELECT sum(score) WITHIN GROUP (ORDER BY score) FROM items",
+                "Parse error: WITHIN GROUP is not supported for function sum()",
+            ),
+            (
+                "SELECT mode(score) WITHIN GROUP (ORDER BY value) FROM items",
+                "Parse error: wrong number of arguments to function mode()",
+            ),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY score DESC) FROM items",
+                "Parse error: DESC and NULLS ordering inside WITHIN GROUP are not supported yet",
+            ),
+            (
+                "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY score, id) FROM items",
+                "Parse error: WITHIN GROUP for percentile_disc() must specify exactly one ORDER BY expression",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("unsupported ordered-set form is rejected");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
