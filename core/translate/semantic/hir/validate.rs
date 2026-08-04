@@ -1474,7 +1474,7 @@ impl<'document> HirValidator<'document> {
                 self.visit_exprs(function.arguments.expressions())?;
                 self.visit_order_terms(function.arguments.order_terms())?;
                 self.visit_optional_expr(function.evaluation.filter())?;
-                if let Some(window) = &function.window {
+                if let Some(window) = function.evaluation.window_spec() {
                     self.visit_window_spec(window)?;
                 }
                 Ok(())
@@ -1529,30 +1529,30 @@ impl<'document> HirValidator<'document> {
             crate::function::Func::External(function) => function.func.is_aggregate(),
             _ => false,
         };
-        let window = call.window.is_some()
-            || matches!(call.function.value(), crate::function::Func::Window(_));
+        let window_function = matches!(call.function.value(), crate::function::Func::Window(_));
+        let window_evaluation = matches!(call.evaluation, FunctionEvaluation::Window { .. });
         self.require(
             !matches!(&call.arguments, FunctionArguments::Star) || aggregate,
             "star function arguments belong to a non-aggregate call",
         )?;
         self.require(
-            call.arguments.distinctness().is_none() || aggregate,
+            call.arguments.distinctness().is_none() || (aggregate && !window_evaluation),
             "DISTINCT belongs to a non-aggregate call",
         )?;
         self.require(
-            call.arguments.order_terms().is_empty() || aggregate,
+            call.arguments.order_terms().is_empty() || (aggregate && !window_evaluation),
             "argument ORDER BY belongs to a non-aggregate call",
         )?;
         self.visit_ordered_set_arguments(call)?;
         match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(
-                !aggregate && !window,
+                !aggregate && !window_function,
                 "aggregate or window function has scalar evaluation identity",
             ),
             FunctionEvaluation::Aggregate { id, .. } => {
                 let block = self.query_block(id.block)?;
                 self.require(
-                    aggregate && !window,
+                    aggregate && !window_function,
                     format!("aggregate identity {id:?} belongs to a non-aggregate call"),
                 )?;
                 self.require(
@@ -1560,11 +1560,15 @@ impl<'document> HirValidator<'document> {
                     format!("aggregate identity {id:?} is outside its block"),
                 )
             }
-            FunctionEvaluation::Window(id) => {
+            FunctionEvaluation::Window { id, filter, .. } => {
                 let block = self.query_block(id.block)?;
                 self.require(
-                    window,
+                    aggregate || window_function,
                     format!("window identity {id:?} belongs to a non-window call"),
+                )?;
+                self.require(
+                    filter.is_none() || aggregate,
+                    "FILTER belongs to a non-aggregate window function",
                 )?;
                 self.require(
                     id.index < block.window_function_count,
@@ -1578,6 +1582,10 @@ impl<'document> HirValidator<'document> {
         let FunctionArguments::OrderedSet { direct, order_by } = &call.arguments else {
             return Ok(());
         };
+        self.require(
+            !matches!(call.evaluation, FunctionEvaluation::Window { .. }),
+            "ordered-set arguments belong to a window call",
+        )?;
         let expected_direct = match call.function.value() {
             crate::function::Func::Agg(crate::function::AggFunc::Mode) => 0,
             crate::function::Func::Agg(
@@ -1667,13 +1675,13 @@ impl<'document> HirValidator<'document> {
         self.visit_exprs(&window.partition_by)?;
         self.visit_order_terms(&window.order_by)?;
         let Some(frame) = &window.frame else {
-            return Ok(());
+            return self.invalid("window evaluation has no effective frame");
         };
         self.visit_window_bound(&frame.start)?;
-        if let Some(end) = &frame.end {
-            self.visit_window_bound(end)?;
-        }
-        Ok(())
+        let Some(end) = &frame.end else {
+            return self.invalid("window effective frame has no end bound");
+        };
+        self.visit_window_bound(end)
     }
 
     fn visit_window_bound(&self, bound: &WindowFrameBound) -> ValidationResult {

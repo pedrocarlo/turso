@@ -156,7 +156,7 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
             collect_exprs_references(function.arguments.expressions(), references);
             collect_order_references(function.arguments.order_terms(), references);
             collect_optional_expr_references(function.evaluation.filter(), references);
-            if let Some(window) = &function.window {
+            if let Some(window) = function.evaluation.window_spec() {
                 collect_window_references(window, references);
             }
         }

@@ -278,7 +278,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                     from,
                     outputs,
                     aggregate_count: functions.aggregate_count(),
-                    window_function_count: 0,
+                    window_function_count: functions.window_function_count(),
                     body: QueryBlockBody::Select {
                         distinctness: *distinctness,
                         filter: None,
@@ -1239,7 +1239,6 @@ mod tests {
                     order_by,
                 } if values.len() == 1 && order_by.is_empty()
             ));
-            assert!(call.window.is_none());
         }
         let Expr::Function(length) = &outputs[0].expr else {
             unreachable!();
@@ -1398,6 +1397,141 @@ mod tests {
             } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 1)
                 && matches!(filter.as_ref(), Expr::NotNull(_))
         ));
+    }
+
+    #[test]
+    fn inline_windows_keep_resolved_specs_and_block_local_identities() {
+        use crate::translate::semantic::hir::WindowFrameBound;
+
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT row_number() OVER ( \
+                 PARTITION BY value ORDER BY score DESC NULLS LAST \
+                 ROWS BETWEEN missing PRECEDING AND missing FOLLOWING), \
+             sum(score) FILTER (WHERE id > 0) OVER ( \
+                 PARTITION BY value ORDER BY id \
+                 ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+             first_value(value) OVER (ORDER BY score) \
+             FROM items",
+        )
+        .expect("inline windows bind");
+        document
+            .validate()
+            .expect("inline windows produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 0);
+        assert_eq!(block.window_function_count, 3);
+
+        let Expr::Function(row_number) = &block.outputs[0].expr else {
+            panic!("row_number becomes a function call");
+        };
+        let FunctionEvaluation::Window {
+            id,
+            filter: None,
+            spec,
+        } = &row_number.evaluation
+        else {
+            panic!("row_number has window evaluation");
+        };
+        assert_eq!(
+            *id,
+            crate::translate::semantic::hir::WindowFunctionId::new(block.id, 0)
+        );
+        assert_eq!(spec.partition_by.len(), 1);
+        assert_eq!(spec.order_by.len(), 1);
+        assert_eq!(spec.order_by[0].order, ast::SortOrder::Desc);
+        assert_eq!(spec.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        let frame = spec.frame.as_ref().expect("effective frame is frozen");
+        assert_eq!(frame.mode, ast::FrameMode::Rows);
+        assert!(matches!(frame.start, WindowFrameBound::UnboundedPreceding));
+        assert!(matches!(frame.end, Some(WindowFrameBound::CurrentRow)));
+        assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Integer));
+
+        let Expr::Function(sum) = &block.outputs[1].expr else {
+            panic!("window sum becomes a function call");
+        };
+        let FunctionEvaluation::Window {
+            id,
+            filter: Some(filter),
+            spec,
+        } = &sum.evaluation
+        else {
+            panic!("sum has window evaluation and filter");
+        };
+        assert_eq!(
+            *id,
+            crate::translate::semantic::hir::WindowFunctionId::new(block.id, 1)
+        );
+        assert!(matches!(filter.as_ref(), Expr::Binary { .. }));
+        let frame = spec.frame.as_ref().expect("effective frame is frozen");
+        assert_eq!(frame.mode, ast::FrameMode::Rows);
+        assert!(matches!(frame.start, WindowFrameBound::Preceding(_)));
+        assert!(matches!(frame.end, Some(WindowFrameBound::Following(_))));
+        assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Numeric));
+
+        let Expr::Function(first_value) = &block.outputs[2].expr else {
+            panic!("first_value becomes a function call");
+        };
+        let FunctionEvaluation::Window { spec, .. } = &first_value.evaluation else {
+            panic!("first_value has window evaluation");
+        };
+        let frame = spec.frame.as_ref().expect("default frame is frozen");
+        assert_eq!(frame.mode, ast::FrameMode::Range);
+        assert!(matches!(frame.start, WindowFrameBound::UnboundedPreceding));
+        assert!(matches!(frame.end, Some(WindowFrameBound::CurrentRow)));
+        assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
+    }
+
+    #[test]
+    fn inline_windows_keep_existing_restrictions() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            (
+                "SELECT row_number() FROM items",
+                "Parse error: misuse of window function: row_number()",
+            ),
+            (
+                "SELECT length(value) OVER () FROM items",
+                "Parse error: length may not be used as a window function",
+            ),
+            (
+                "SELECT row_number() FILTER (WHERE id > 0) OVER () FROM items",
+                "Parse error: FILTER clause may only be used with aggregate window functions",
+            ),
+            (
+                "SELECT sum(DISTINCT score) OVER () FROM items",
+                "Parse error: DISTINCT is not supported for window functions",
+            ),
+            (
+                "SELECT sum(score ORDER BY id) OVER () FROM items",
+                "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+            ),
+            (
+                "SELECT sum(score) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
+                "Parse error: RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression",
+            ),
+            (
+                "SELECT array_agg(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
+                "Parse error: array_agg() does not yet support window frames with a moving start; use a frame with UNBOUNDED PRECEDING start",
+            ),
+            (
+                "SELECT sum(max(score)) OVER () FROM items",
+                "Parse error: misuse of aggregate function max()",
+            ),
+            (
+                "SELECT sum(row_number() OVER ()) FROM items",
+                "Parse error: misuse of window function: row_number()",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("unsupported inline window form is rejected");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
