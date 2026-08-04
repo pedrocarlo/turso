@@ -1471,7 +1471,7 @@ impl<'document> HirValidator<'document> {
                 if let Some(operation) = &function.sequence_operation {
                     self.visit_sequence_operation(operation)?;
                 }
-                self.visit_exprs(&function.arguments)?;
+                self.visit_exprs(function.arguments.expressions())?;
                 self.visit_order_terms(&function.argument_order)?;
                 self.visit_order_terms(&function.within_group)?;
                 self.visit_optional_expr(function.filter.as_deref())?;
@@ -1532,6 +1532,19 @@ impl<'document> HirValidator<'document> {
         };
         let window = call.window.is_some()
             || matches!(call.function.value(), crate::function::Func::Window(_));
+        self.require(
+            !matches!(&call.arguments, FunctionArguments::Star) || aggregate,
+            "star function arguments belong to a non-aggregate call",
+        )?;
+        self.require(
+            call.distinctness.is_none() || aggregate,
+            "DISTINCT belongs to a non-aggregate call",
+        )?;
+        self.require(
+            call.distinctness.is_none()
+                || matches!(&call.arguments, FunctionArguments::Expressions(_)),
+            "DISTINCT cannot be combined with star function arguments",
+        )?;
         match call.evaluation {
             FunctionEvaluation::Scalar => self.require(
                 !aggregate && !window,

@@ -153,7 +153,7 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         }
         Expr::Collate { expr, .. } => collect_expr_references(expr, references),
         Expr::Function(function) => {
-            collect_exprs_references(&function.arguments, references);
+            collect_exprs_references(function.arguments.expressions(), references);
             collect_order_references(&function.argument_order, references);
             collect_order_references(&function.within_group, references);
             collect_optional_expr_references(function.filter.as_deref(), references);

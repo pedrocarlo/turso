@@ -190,11 +190,10 @@ pub struct SequenceOperation {
 pub struct FunctionCall {
     pub function: ResolvedFunction,
     /// How this call is evaluated after semantic analysis. Aggregate and
-    /// window identities are owned by one query block; physical planning maps
-    /// those identities to runtime state without matching expression trees.
+    /// window identities are owned by one query block, so later stages do not
+    /// need to match expression trees to identify shared function state.
     pub evaluation: FunctionEvaluation,
-    pub star: bool,
-    pub arguments: Vec<Expr>,
+    pub arguments: FunctionArguments,
     pub distinctness: Option<Distinctness>,
     pub argument_order: Vec<OrderTerm>,
     pub within_group: Vec<OrderTerm>,
@@ -203,6 +202,23 @@ pub struct FunctionCall {
     pub result_type: TypeFact,
     pub custom_type_operation: Option<CustomTypeOperation>,
     pub sequence_operation: Option<SequenceOperation>,
+}
+
+/// Resolved function argument shape. Star cannot coexist with expression
+/// arguments.
+#[derive(Clone, Debug)]
+pub enum FunctionArguments {
+    Star,
+    Expressions(Vec<Expr>),
+}
+
+impl FunctionArguments {
+    pub fn expressions(&self) -> &[Expr] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions(expressions) => expressions,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -421,7 +437,7 @@ impl Expr {
                 }
             }
             Self::Function(call) => {
-                walk_exprs(&call.arguments, visitor);
+                walk_exprs(call.arguments.expressions(), visitor);
                 walk_order_terms(&call.argument_order, visitor);
                 walk_order_terms(&call.within_group, visitor);
                 walk_optional_expr(call.filter.as_deref(), visitor);
