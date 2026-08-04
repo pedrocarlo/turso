@@ -51,13 +51,15 @@ Completed:
 - Immutable AST-to-HIR binding for names, literals, unary and binary operators,
   null tests, parentheses, `COLLATE`, and SQL parameters.
 - Iterative expression analysis, including deep-expression coverage.
+- `BETWEEN`, list `IN`, `CASE`, and built-in `CAST` expressions.
+- Catalog-resolved custom `CAST` targets that need no stored program.
+- Simple custom `CAST` encoders bound against document-owned synthetic inputs.
 
 Remaining expression checkpoints, in agreed order:
 
-1. `BETWEEN` and `IN`.
-2. `CASE`.
-3. `CAST` and resolved cast programs.
-4. Functions.
+1. Finish resolved custom `CAST` programs: functions and `RAISE` in encoders,
+   domains, and arrays.
+2. Functions.
 
 After expression work, resume the original SELECT order at joins. Basic outputs
 were implemented early; join-aware output behavior must still be checked after

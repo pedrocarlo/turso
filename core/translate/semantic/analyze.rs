@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
 
 use crate::{
@@ -12,7 +12,7 @@ use super::{
     hir::{
         BoundSchemaProgram, CatalogObjectId, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument,
         HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId,
-        QueryId, QueryRoot, Source, SourceId, TypeFact,
+        QueryId, QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
     },
     scope::{ExpandedColumn, Scope},
     AnalyzeInput,
@@ -50,6 +50,7 @@ pub(super) struct Analyzer<'context, 'catalog> {
     sources: Vec<Option<Source>>,
     ctes: Vec<Option<Cte>>,
     schema_programs: Vec<Option<BoundSchemaProgram>>,
+    schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
 }
 
@@ -75,6 +76,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             sources: Vec::new(),
             ctes: Vec::new(),
             schema_programs: Vec::new(),
+            schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
         }
     }
@@ -107,6 +109,36 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
 
     pub(super) fn source(&self, id: SourceId) -> Option<&Source> {
         self.sources.get(id.index())?.as_ref()
+    }
+
+    pub(super) fn reserve_schema_program(&mut self) -> SchemaProgramId {
+        let id = SchemaProgramId::new(self.schema_programs.len());
+        self.schema_programs.push(None);
+        id
+    }
+
+    pub(super) fn insert_schema_program(
+        &mut self,
+        id: SchemaProgramId,
+        program: BoundSchemaProgram,
+    ) -> Result<()> {
+        Self::insert_reserved(
+            &mut self.schema_programs,
+            id.index(),
+            program,
+            "schema program",
+        )
+    }
+
+    pub(super) fn enter_schema_program_binding(&mut self, definition: CatalogObjectId) -> bool {
+        self.schema_programs_in_progress.insert(definition)
+    }
+
+    pub(super) fn leave_schema_program_binding(&mut self, definition: CatalogObjectId) {
+        assert!(
+            self.schema_programs_in_progress.remove(&definition),
+            "schema program binding must be active before it finishes"
+        );
     }
 
     pub(super) fn catalog_object_id(
@@ -1047,6 +1079,73 @@ mod tests {
         assert_eq!(output.type_fact, target.type_fact);
         assert_eq!(output.affinity, crate::vdbe::affinity::Affinity::Integer);
         assert!(output.has_affinity);
+    }
+
+    #[test]
+    fn custom_cast_encoder_uses_a_document_owned_input_source() {
+        let mut schema = schema_with_items();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE positive(value INTEGER, minimum INTEGER) BASE INTEGER \
+                 ENCODE CASE WHEN value > minimum THEN value ELSE NULL END",
+            )
+            .expect("custom type definition parses");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT CAST(value AS positive(0)) FROM items")
+                .expect("simple custom encoder binds");
+        document
+            .validate()
+            .expect("custom encoder produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("custom CAST becomes resolved HIR");
+        };
+        assert_eq!(target.programs.encode.len(), 1);
+        assert!(!target.programs.apply_builtin_affinity);
+        let call = &target.programs.encode[0];
+        assert!(matches!(
+            call.arguments.as_slice(),
+            [Expr::Literal(ast::Literal::Numeric(value))] if value == "0"
+        ));
+
+        let program = document
+            .schema_program(call.program)
+            .expect("encoder program exists");
+        let input = document
+            .source(program.input_source)
+            .expect("encoder input source exists");
+        assert!(matches!(input.kind, SourceKind::SchemaExpression));
+        assert_eq!(input.owner, SourceOwner::Root);
+        assert_eq!(input.columns.len(), 2);
+        assert_eq!(input.columns[0].name, "value");
+        assert_eq!(input.columns[1].name, "minimum");
+        assert_eq!(input.columns[0].type_fact.storage, Some(Type::Integer));
+
+        let Expr::Case { when_then, .. } = &program.body else {
+            panic!("stored CASE becomes HIR");
+        };
+        let Expr::Binary { lhs, rhs, .. } = &when_then[0].0 else {
+            panic!("stored condition becomes binary HIR");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Column(column)
+                if column.source == program.input_source && column.column == 0
+        ));
+        assert!(matches!(
+            rhs.as_ref(),
+            Expr::Column(column)
+                if column.source == program.input_source && column.column == 1
+        ));
+        assert!(matches!(
+            &when_then[0].1,
+            Expr::Column(column)
+                if column.source == program.input_source && column.column == 0
+        ));
     }
 
     #[test]
