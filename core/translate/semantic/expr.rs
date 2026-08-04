@@ -1,5 +1,6 @@
 //! Parser-expression conversion into resolved HIR expressions.
 
+use smallvec::SmallVec;
 use turso_parser::ast;
 
 use super::{
@@ -34,13 +35,44 @@ impl ExprPolicy {
     }
 }
 
-enum ExprTask<'a> {
-    Visit(&'a ast::Expr),
-    BuildUnary(ast::UnaryOperator),
-    BuildBinary(ast::Operator),
-    BuildCollate(&'a ast::Name),
-    BuildIsNull,
-    BuildNotNull,
+type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
+
+struct ExprFrame<'a> {
+    syntax: &'a ast::Expr,
+    next_child: usize,
+    resolved_children: ExprChildren,
+}
+
+impl<'a> ExprFrame<'a> {
+    fn new(syntax: &'a ast::Expr) -> Self {
+        Self {
+            syntax,
+            next_child: 0,
+            resolved_children: SmallVec::new(),
+        }
+    }
+
+    fn next_child(&mut self) -> Option<&'a ast::Expr> {
+        let child = match self.syntax {
+            ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                (self.next_child == 0).then(|| expressions[0].as_ref())
+            }
+            ast::Expr::Unary(_, expression)
+            | ast::Expr::Collate(expression, _)
+            | ast::Expr::IsNull(expression)
+            | ast::Expr::NotNull(expression) => (self.next_child == 0).then(|| expression.as_ref()),
+            ast::Expr::Binary(lhs, _, rhs) => match self.next_child {
+                0 => Some(lhs.as_ref()),
+                1 => Some(rhs.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        };
+        if child.is_some() {
+            self.next_child += 1;
+        }
+        child
+    }
 }
 
 impl Analyzer<'_, '_> {
@@ -59,205 +91,179 @@ impl Analyzer<'_, '_> {
         scope: &Scope,
         policy: ExprPolicy,
     ) -> Result<ResolvedScopeExpr> {
-        let mut tasks = vec![ExprTask::Visit(syntax)];
-        let mut values = Vec::new();
+        let mut frames = vec![ExprFrame::new(syntax)];
+        loop {
+            if let Some(child) = frames
+                .last_mut()
+                .expect("root expression frame exists")
+                .next_child()
+            {
+                frames.push(ExprFrame::new(child));
+                continue;
+            }
 
-        while let Some(task) = tasks.pop() {
-            match task {
-                ExprTask::Visit(syntax) => match syntax {
-                    ast::Expr::Literal(literal) => values.push(
-                        self.resolve_atomic_expr(hir::Expr::Literal(literal.clone()), scope)?,
-                    ),
-                    ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                        let expression =
-                            match scope.resolve_unqualified(name.as_str(), policy.precedence)? {
-                                Some(resolved) => resolved.expr,
-                                None if policy.allow_dqs_fallback && name.quoted_with('"') => {
-                                    hir::Expr::Literal(ast::Literal::String(name.as_literal()))
-                                }
-                                None => {
-                                    crate::bail_parse_error!("no such column: {}", name.as_str())
-                                }
-                            };
-                        values.push(self.resolve_atomic_expr(expression, scope)?);
-                    }
-                    ast::Expr::Qualified(table, column) => {
-                        let Some(resolved) =
-                            scope.resolve_qualified(table.as_str(), column.as_str())?
-                        else {
-                            crate::bail_parse_error!("no such table: {}", table.as_str());
-                        };
-                        values.push(self.resolve_atomic_expr(resolved.expr, scope)?);
-                    }
-                    ast::Expr::DoublyQualified(database, table, column) => {
-                        let Some(database_id) = self.context().database(database.as_str()) else {
-                            crate::bail_parse_error!(
-                                "no such column: {}.{}.{}",
-                                database.as_str(),
-                                table.as_str(),
-                                column.as_str()
-                            );
-                        };
-                        let Some(resolved) = scope.resolve_database_qualified(
-                            database_id,
-                            table.as_str(),
-                            column.as_str(),
-                        )?
-                        else {
-                            crate::bail_parse_error!(
-                                "no such column: {}.{}.{}",
-                                database.as_str(),
-                                table.as_str(),
-                                column.as_str()
-                            );
-                        };
-                        values.push(self.resolve_atomic_expr(resolved.expr, scope)?);
-                    }
-                    ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
-                        tasks.push(ExprTask::Visit(&expressions[0]));
-                    }
-                    ast::Expr::Variable(variable) => {
-                        if variable.col_type.is_some() {
-                            return super::analyze::unsupported_select();
-                        }
-                        values.push(self.resolve_atomic_expr(
-                            hir::Expr::Parameter(hir::Parameter {
-                                index: variable.index,
-                                name: variable.name.as_deref().map(str::to_owned),
-                                type_fact: hir::TypeFact::dynamic(),
-                            }),
-                            scope,
-                        )?);
-                    }
-                    ast::Expr::Unary(operator, expression) => {
-                        tasks.push(ExprTask::BuildUnary(*operator));
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::Binary(expression, ast::Operator::Is, rhs)
-                        if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-                    {
-                        tasks.push(ExprTask::BuildIsNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::Binary(expression, ast::Operator::IsNot, rhs)
-                        if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-                    {
-                        tasks.push(ExprTask::BuildNotNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::Binary(lhs, ast::Operator::Is, expression)
-                        if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-                    {
-                        tasks.push(ExprTask::BuildIsNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::Binary(lhs, ast::Operator::IsNot, expression)
-                        if matches!(lhs.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
-                    {
-                        tasks.push(ExprTask::BuildNotNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::Binary(lhs, operator, rhs) => {
-                        tasks.push(ExprTask::BuildBinary(*operator));
-                        tasks.push(ExprTask::Visit(rhs));
-                        tasks.push(ExprTask::Visit(lhs));
-                    }
-                    ast::Expr::Collate(expression, name) => {
-                        tasks.push(ExprTask::BuildCollate(name));
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::IsNull(expression) => {
-                        tasks.push(ExprTask::BuildIsNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    ast::Expr::NotNull(expression) => {
-                        tasks.push(ExprTask::BuildNotNull);
-                        tasks.push(ExprTask::Visit(expression));
-                    }
-                    _ => return super::analyze::unsupported_select(),
-                },
-                ExprTask::BuildUnary(operator) => {
-                    let inner = pop_expr_value(&mut values)?;
-                    let type_fact = match operator {
-                        ast::UnaryOperator::Positive | ast::UnaryOperator::Negative => {
-                            hir::TypeFact::arithmetic_result(
-                                &inner.type_fact,
-                                &hir::TypeFact::known(Type::Integer),
-                            )
-                        }
-                        ast::UnaryOperator::BitwiseNot | ast::UnaryOperator::Not => {
-                            hir::TypeFact::known(Type::Integer)
-                        }
-                    };
-                    values.push(computed_expr(
-                        hir::Expr::Unary {
-                            operator,
-                            expr: Box::new(inner.expr),
-                        },
-                        type_fact,
-                        inner.collation,
-                    ));
-                }
-                ExprTask::BuildBinary(operator) => {
-                    let rhs = pop_expr_value(&mut values)?;
-                    let lhs = pop_expr_value(&mut values)?;
-                    let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
-                    let array_concat = operator == ast::Operator::Concat
-                        && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
-                    let comparison = operator
-                        .is_comparison()
-                        .then(|| comparison_semantics(&lhs, &rhs));
-                    let collation = expression_collation(&lhs.collation, &rhs.collation);
-                    values.push(computed_expr(
-                        hir::Expr::Binary {
-                            lhs: Box::new(lhs.expr),
-                            operator,
-                            rhs: Box::new(rhs.expr),
-                            array_concat,
-                            custom: None,
-                            comparison,
-                        },
-                        type_fact,
-                        collation,
-                    ));
-                }
-                ExprTask::BuildCollate(name) => {
-                    let inner = pop_expr_value(&mut values)?;
-                    let collation = self.resolve_collation(name)?;
-                    values.push(ResolvedScopeExpr {
-                        expr: hir::Expr::Collate {
-                            expr: Box::new(inner.expr),
-                            collation: collation.clone(),
-                        },
-                        type_fact: inner.type_fact,
-                        affinity: inner.affinity,
-                        has_affinity: inner.has_affinity,
-                        collation: ExprCollation::Explicit(collation),
-                    });
-                }
-                ExprTask::BuildIsNull | ExprTask::BuildNotNull => {
-                    let inner = pop_expr_value(&mut values)?;
-                    let expression = match task {
-                        ExprTask::BuildIsNull => hir::Expr::IsNull(Box::new(inner.expr)),
-                        ExprTask::BuildNotNull => hir::Expr::NotNull(Box::new(inner.expr)),
-                        _ => unreachable!(),
-                    };
-                    values.push(computed_expr(
-                        expression,
-                        hir::TypeFact::known(Type::Integer),
-                        inner.collation,
-                    ));
-                }
+            let frame = frames.pop().expect("completed expression frame exists");
+            let resolved = self.build_expr(frame.syntax, frame.resolved_children, scope, policy)?;
+            match frames.last_mut() {
+                Some(parent) => parent.resolved_children.push(resolved),
+                None => return Ok(resolved),
             }
         }
+    }
 
-        if values.len() != 1 {
-            return Err(LimboError::InternalError(format!(
-                "expression work stack produced {} values",
-                values.len()
-            )));
+    fn build_expr(
+        &mut self,
+        syntax: &ast::Expr,
+        children: ExprChildren,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<ResolvedScopeExpr> {
+        match syntax {
+            ast::Expr::Literal(literal) => {
+                expect_no_expr_children(children)?;
+                self.resolve_atomic_expr(hir::Expr::Literal(literal.clone()), scope)
+            }
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                expect_no_expr_children(children)?;
+                let expression =
+                    match scope.resolve_unqualified(name.as_str(), policy.precedence)? {
+                        Some(resolved) => resolved.expr,
+                        None if policy.allow_dqs_fallback && name.quoted_with('"') => {
+                            hir::Expr::Literal(ast::Literal::String(name.as_literal()))
+                        }
+                        None => crate::bail_parse_error!("no such column: {}", name.as_str()),
+                    };
+                self.resolve_atomic_expr(expression, scope)
+            }
+            ast::Expr::Qualified(table, column) => {
+                expect_no_expr_children(children)?;
+                let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())?
+                else {
+                    crate::bail_parse_error!("no such table: {}", table.as_str());
+                };
+                self.resolve_atomic_expr(resolved.expr, scope)
+            }
+            ast::Expr::DoublyQualified(database, table, column) => {
+                expect_no_expr_children(children)?;
+                let Some(database_id) = self.context().database(database.as_str()) else {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}.{}",
+                        database.as_str(),
+                        table.as_str(),
+                        column.as_str()
+                    );
+                };
+                let Some(resolved) = scope.resolve_database_qualified(
+                    database_id,
+                    table.as_str(),
+                    column.as_str(),
+                )?
+                else {
+                    crate::bail_parse_error!(
+                        "no such column: {}.{}.{}",
+                        database.as_str(),
+                        table.as_str(),
+                        column.as_str()
+                    );
+                };
+                self.resolve_atomic_expr(resolved.expr, scope)
+            }
+            ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                let [inner] = expect_expr_children(children)?;
+                Ok(inner)
+            }
+            ast::Expr::Variable(variable) => {
+                expect_no_expr_children(children)?;
+                if variable.col_type.is_some() {
+                    return super::analyze::unsupported_select();
+                }
+                self.resolve_atomic_expr(
+                    hir::Expr::Parameter(hir::Parameter {
+                        index: variable.index,
+                        name: variable.name.as_deref().map(str::to_owned),
+                        type_fact: hir::TypeFact::dynamic(),
+                    }),
+                    scope,
+                )
+            }
+            ast::Expr::Unary(operator, _) => {
+                let [inner] = expect_expr_children(children)?;
+                let type_fact = match operator {
+                    ast::UnaryOperator::Positive | ast::UnaryOperator::Negative => {
+                        hir::TypeFact::arithmetic_result(
+                            &inner.type_fact,
+                            &hir::TypeFact::known(Type::Integer),
+                        )
+                    }
+                    ast::UnaryOperator::BitwiseNot | ast::UnaryOperator::Not => {
+                        hir::TypeFact::known(Type::Integer)
+                    }
+                };
+                Ok(computed_expr(
+                    hir::Expr::Unary {
+                        operator: *operator,
+                        expr: Box::new(inner.expr),
+                    },
+                    type_fact,
+                    inner.collation,
+                ))
+            }
+            ast::Expr::Binary(lhs_syntax, operator, rhs_syntax) => {
+                let [lhs, rhs] = expect_expr_children(children)?;
+                if matches!(rhs_syntax.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                    && matches!(operator, ast::Operator::Is | ast::Operator::IsNot)
+                {
+                    return Ok(null_test_expr(lhs, *operator == ast::Operator::Is));
+                }
+                if matches!(lhs_syntax.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                    && matches!(operator, ast::Operator::Is | ast::Operator::IsNot)
+                {
+                    return Ok(null_test_expr(rhs, *operator == ast::Operator::Is));
+                }
+                let type_fact = binary_type_fact(*operator, &lhs.type_fact, &rhs.type_fact);
+                let array_concat = *operator == ast::Operator::Concat
+                    && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
+                let comparison = operator
+                    .is_comparison()
+                    .then(|| comparison_semantics(&lhs, &rhs));
+                let collation = expression_collation(&lhs.collation, &rhs.collation);
+                Ok(computed_expr(
+                    hir::Expr::Binary {
+                        lhs: Box::new(lhs.expr),
+                        operator: *operator,
+                        rhs: Box::new(rhs.expr),
+                        array_concat,
+                        custom: None,
+                        comparison,
+                    },
+                    type_fact,
+                    collation,
+                ))
+            }
+            ast::Expr::Collate(_, name) => {
+                let [inner] = expect_expr_children(children)?;
+                let collation = self.resolve_collation(name)?;
+                Ok(ResolvedScopeExpr {
+                    expr: hir::Expr::Collate {
+                        expr: Box::new(inner.expr),
+                        collation: collation.clone(),
+                    },
+                    type_fact: inner.type_fact,
+                    affinity: inner.affinity,
+                    has_affinity: inner.has_affinity,
+                    collation: ExprCollation::Explicit(collation),
+                })
+            }
+            ast::Expr::IsNull(_) => {
+                let [inner] = expect_expr_children(children)?;
+                Ok(null_test_expr(inner, true))
+            }
+            ast::Expr::NotNull(_) => {
+                let [inner] = expect_expr_children(children)?;
+                Ok(null_test_expr(inner, false))
+            }
+            _ => super::analyze::unsupported_select(),
         }
-        Ok(values.pop().expect("expression value count was checked"))
     }
 
     pub(super) fn resolve_atomic_expr(
@@ -360,10 +366,41 @@ impl Analyzer<'_, '_> {
     }
 }
 
-fn pop_expr_value(values: &mut Vec<ResolvedScopeExpr>) -> Result<ResolvedScopeExpr> {
-    values.pop().ok_or_else(|| {
-        LimboError::InternalError("expression work stack is missing a value".to_string())
-    })
+fn expect_no_expr_children(children: ExprChildren) -> Result<()> {
+    if children.is_empty() {
+        Ok(())
+    } else {
+        Err(LimboError::InternalError(format!(
+            "leaf expression produced {} child values",
+            children.len()
+        )))
+    }
+}
+
+fn expect_expr_children<const N: usize>(children: ExprChildren) -> Result<[ResolvedScopeExpr; N]> {
+    if children.len() != N {
+        return Err(LimboError::InternalError(format!(
+            "expression expected {N} child values, got {}",
+            children.len()
+        )));
+    }
+    let mut children = children.into_iter();
+    Ok(std::array::from_fn(|_| {
+        children.next().expect("expression child count was checked")
+    }))
+}
+
+fn null_test_expr(inner: ResolvedScopeExpr, is_null: bool) -> ResolvedScopeExpr {
+    let expression = if is_null {
+        hir::Expr::IsNull(Box::new(inner.expr))
+    } else {
+        hir::Expr::NotNull(Box::new(inner.expr))
+    };
+    computed_expr(
+        expression,
+        hir::TypeFact::known(Type::Integer),
+        inner.collation,
+    )
 }
 
 fn computed_expr(
@@ -606,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_expressions_use_an_explicit_work_stack() {
+    fn deeply_nested_expressions_use_expression_frames() {
         const DEPTH: usize = 20_000;
 
         let mut syntax = ast::Expr::Literal(ast::Literal::Numeric("1".to_string()));
