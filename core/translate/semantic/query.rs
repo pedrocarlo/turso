@@ -111,12 +111,11 @@ impl Analyzer<'_, '_> {
         let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
-            if column.array_dimensions() > 0
-                || self
-                    .context()
-                    .main_schema()
-                    .get_type_def(&column.ty_str, is_strict)
-                    .is_some()
+            if self
+                .context()
+                .main_schema()
+                .get_type_def(&column.ty_str, is_strict)
+                .is_some()
             {
                 return super::analyze::unsupported_select();
             }
@@ -127,7 +126,7 @@ impl Analyzer<'_, '_> {
                     name: column.ty_str.clone(),
                     storage: column.ty(),
                     custom_chain: Vec::new(),
-                    array_dimensions: 0,
+                    array_dimensions: column.array_dimensions(),
                 })
             };
             let collation = column.collation_opt().map(|collation| {

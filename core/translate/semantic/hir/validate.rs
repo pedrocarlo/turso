@@ -1818,7 +1818,23 @@ impl<'document> HirValidator<'document> {
     }
 
     fn visit_type_fact(&self, fact: &TypeFact) -> ValidationResult {
+        if fact.array_dimensions > 0 {
+            self.require(
+                fact.storage == Some(crate::schema::Type::Blob),
+                "array type fact does not use BLOB runtime storage",
+            )?;
+        }
         if let Some(declared) = &fact.declared {
+            self.require(
+                declared.array_dimensions == fact.array_dimensions,
+                "declared type rank disagrees with its type fact",
+            )?;
+            if fact.array_dimensions == 0 {
+                self.require(
+                    fact.storage == Some(declared.storage),
+                    "declared scalar storage disagrees with its type fact",
+                )?;
+            }
             for resolved_type in &declared.custom_chain {
                 self.visit_catalog_object(resolved_type, "declared type")?;
             }
@@ -1907,11 +1923,10 @@ impl<'document> HirValidator<'document> {
             )?;
         }
         let type_fact = &source_definition.columns[column].type_fact;
-        let needs_type_programs = type_fact.array_dimensions > 0
-            || type_fact
-                .declared
-                .as_ref()
-                .is_some_and(|declared| !declared.custom_chain.is_empty());
+        let needs_type_programs = type_fact
+            .declared
+            .as_ref()
+            .is_some_and(|declared| !declared.custom_chain.is_empty());
         self.require(
             source_definition.column_type_programs[column].is_some() == needs_type_programs,
             format!("source {source} column {column} has incomplete type programs"),
@@ -1936,11 +1951,6 @@ impl<'document> HirValidator<'document> {
                         .filter(|definition| definition.value().decode().is_some())
                         .count(),
                 format!("source {source} column {column} has incomplete DECODE programs"),
-            )?;
-            self.require(
-                programs.array.as_ref().map(|array| array.dimensions)
-                    == (type_fact.array_dimensions > 0).then_some(type_fact.array_dimensions),
-                format!("source {source} column {column} has incorrect array storage metadata"),
             )?;
             let expected_encode_nulls = type_fact.array_dimensions == 0
                 && chain.iter().any(|definition| definition.value().not_null);

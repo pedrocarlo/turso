@@ -59,12 +59,16 @@ Completed:
   custom `CAST` encoders.
 - `RAISE(ABORT, ...)` expressions, including built-in custom-type encoders such
   as `VARCHAR`.
+- Built-in array table columns. `SourceColumn::type_fact` carries array rank and
+  element type without adding semantic storage metadata beside the column.
 
 Remaining expression checkpoints, in agreed order:
 
-1. Finish resolved custom `CAST` programs for arrays.
-2. Finish function forms: aggregates, windows, argument ordering, filters, and
+1. Finish function forms: aggregates, windows, argument ordering, filters, and
    special custom-type or sequence calls.
+
+Custom-type table columns, including custom array element programs, remain
+separate from built-in array columns.
 
 After expression work, resume the original SELECT order at joins. Basic outputs
 were implemented early; join-aware output behavior must still be checked after

@@ -319,7 +319,11 @@ impl TypeFact {
 
     pub fn declared(declared: DeclaredType) -> Self {
         Self {
-            storage: Some(declared.storage),
+            storage: Some(if declared.array_dimensions > 0 {
+                Type::Blob
+            } else {
+                declared.storage
+            }),
             array_dimensions: declared.array_dimensions,
             array_rank_unbounded: false,
             declared: Some(declared),
@@ -328,6 +332,32 @@ impl TypeFact {
 
     pub const fn is_array(&self) -> bool {
         self.array_dimensions > 0 || self.array_rank_unbounded
+    }
+
+    /// Type of one value stored inside this array. The declared type keeps the
+    /// scalar storage class while the outer fact uses BLOB storage.
+    pub fn array_element(&self) -> Option<Self> {
+        if self.array_dimensions == 0 {
+            return self.array_rank_unbounded.then(Self::dynamic);
+        }
+        let dimensions = self.array_dimensions - 1;
+        let mut declared = self.declared.clone();
+        if let Some(declared) = &mut declared {
+            declared.array_dimensions = dimensions;
+            if dimensions == 0 && declared.name.eq_ignore_ascii_case("ANY") {
+                return Some(Self::dynamic());
+            }
+        }
+        Some(Self {
+            storage: if dimensions > 0 {
+                Some(Type::Blob)
+            } else {
+                declared.as_ref().map(|declared| declared.storage)
+            },
+            declared,
+            array_dimensions: dimensions,
+            array_rank_unbounded: self.array_rank_unbounded,
+        })
     }
 
     /// Merge expressions whose runtime value is selected from one argument,
@@ -508,19 +538,16 @@ impl TypeFact {
                     && lhs.custom_chain == rhs.custom_chain =>
             {
                 let mut declared = lhs.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
             (Some(declared), None) if !rhs.is_array() => {
                 let mut declared = declared.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
             (None, Some(declared)) if !lhs.is_array() => {
                 let mut declared = declared.clone();
-                declared.storage = Type::Blob;
                 declared.array_dimensions = array_dimensions;
                 Some(declared)
             }
