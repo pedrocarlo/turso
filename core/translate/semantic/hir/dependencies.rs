@@ -154,8 +154,7 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::Collate { expr, .. } => collect_expr_references(expr, references),
         Expr::Function(function) => {
             collect_exprs_references(function.arguments.expressions(), references);
-            collect_order_references(function.arguments.order_by(), references);
-            collect_order_references(&function.within_group, references);
+            collect_order_references(function.arguments.order_terms(), references);
             collect_optional_expr_references(function.evaluation.filter(), references);
             if let Some(window) = &function.window {
                 collect_window_references(window, references);

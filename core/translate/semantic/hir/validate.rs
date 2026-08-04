@@ -1472,8 +1472,7 @@ impl<'document> HirValidator<'document> {
                     self.visit_sequence_operation(operation)?;
                 }
                 self.visit_exprs(function.arguments.expressions())?;
-                self.visit_order_terms(function.arguments.order_by())?;
-                self.visit_order_terms(&function.within_group)?;
+                self.visit_order_terms(function.arguments.order_terms())?;
                 self.visit_optional_expr(function.evaluation.filter())?;
                 if let Some(window) = &function.window {
                     self.visit_window_spec(window)?;
@@ -1541,9 +1540,10 @@ impl<'document> HirValidator<'document> {
             "DISTINCT belongs to a non-aggregate call",
         )?;
         self.require(
-            call.arguments.order_by().is_empty() || aggregate,
+            call.arguments.order_terms().is_empty() || aggregate,
             "argument ORDER BY belongs to a non-aggregate call",
         )?;
+        self.visit_ordered_set_arguments(call)?;
         match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(
                 !aggregate && !window,
@@ -1572,6 +1572,27 @@ impl<'document> HirValidator<'document> {
                 )
             }
         }
+    }
+
+    fn visit_ordered_set_arguments(&self, call: &FunctionCall) -> ValidationResult {
+        let FunctionArguments::OrderedSet { direct, order_by } = &call.arguments else {
+            return Ok(());
+        };
+        let expected_direct = match call.function.value() {
+            crate::function::Func::Agg(crate::function::AggFunc::Mode) => 0,
+            crate::function::Func::Agg(
+                crate::function::AggFunc::PercentileCont | crate::function::AggFunc::PercentileDisc,
+            ) => 1,
+            _ => return self.invalid("ordered-set arguments belong to an unsupported function"),
+        };
+        self.require(
+            direct.len() == expected_direct,
+            "ordered-set direct argument count does not match its function",
+        )?;
+        self.require(
+            order_by.order == turso_parser::ast::SortOrder::Asc && order_by.nulls.is_none(),
+            "ordered-set ordering uses unsupported direction or NULLS placement",
+        )
     }
 
     fn visit_subquery(&self, subquery: &SubqueryExpr) -> ValidationResult {

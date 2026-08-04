@@ -194,7 +194,6 @@ pub struct FunctionCall {
     /// need to match expression trees to identify shared function state.
     pub evaluation: FunctionEvaluation,
     pub arguments: FunctionArguments,
-    pub within_group: Vec<OrderTerm>,
     pub window: Option<WindowSpec>,
     pub result_type: TypeFact,
     pub custom_type_operation: Option<CustomTypeOperation>,
@@ -211,6 +210,10 @@ pub enum FunctionArguments {
         distinctness: Option<Distinctness>,
         order_by: Vec<OrderTerm>,
     },
+    OrderedSet {
+        direct: Vec<Expr>,
+        order_by: Box<OrderTerm>,
+    },
 }
 
 impl FunctionArguments {
@@ -218,13 +221,15 @@ impl FunctionArguments {
         match self {
             Self::Star => &[],
             Self::Expressions { values, .. } => values,
+            Self::OrderedSet { direct, .. } => direct,
         }
     }
 
-    pub fn order_by(&self) -> &[OrderTerm] {
+    pub fn order_terms(&self) -> &[OrderTerm] {
         match self {
             Self::Star => &[],
             Self::Expressions { order_by, .. } => order_by,
+            Self::OrderedSet { order_by, .. } => std::slice::from_ref(order_by.as_ref()),
         }
     }
 
@@ -232,6 +237,7 @@ impl FunctionArguments {
         match self {
             Self::Star => None,
             Self::Expressions { distinctness, .. } => *distinctness,
+            Self::OrderedSet { .. } => None,
         }
     }
 }
@@ -465,8 +471,7 @@ impl Expr {
             }
             Self::Function(call) => {
                 walk_exprs(call.arguments.expressions(), visitor);
-                walk_order_terms(call.arguments.order_by(), visitor);
-                walk_order_terms(&call.within_group, visitor);
+                walk_order_terms(call.arguments.order_terms(), visitor);
                 walk_optional_expr(call.evaluation.filter(), visitor);
                 if let Some(window) = &call.window {
                     walk_window_spec(window, visitor);

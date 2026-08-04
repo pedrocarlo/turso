@@ -124,6 +124,11 @@ enum FunctionInput {
         values: ExprChildren,
         order_by: Vec<FunctionOrderTerm>,
     },
+    OrderedSet {
+        function: AggFunc,
+        direct: ExprChildren,
+        order_by: FunctionOrderTerm,
+    },
 }
 
 impl FunctionInput {
@@ -131,6 +136,7 @@ impl FunctionInput {
         match self {
             Self::Star => 0,
             Self::Expressions { values, .. } => values.len(),
+            Self::OrderedSet { direct, .. } => direct.len() + 1,
         }
     }
 
@@ -138,6 +144,7 @@ impl FunctionInput {
         match self {
             Self::Star => &[],
             Self::Expressions { values, .. } => values,
+            Self::OrderedSet { direct, .. } => direct,
         }
     }
 
@@ -145,6 +152,7 @@ impl FunctionInput {
         match self {
             Self::Star => None,
             Self::Expressions { distinctness, .. } => *distinctness,
+            Self::OrderedSet { .. } => None,
         }
     }
 
@@ -152,6 +160,14 @@ impl FunctionInput {
         match self {
             Self::Star => &[],
             Self::Expressions { order_by, .. } => order_by,
+            Self::OrderedSet { order_by, .. } => std::slice::from_ref(order_by),
+        }
+    }
+
+    fn result_facts(&self) -> &[ResolvedScopeExpr] {
+        match self {
+            Self::OrderedSet { order_by, .. } => std::slice::from_ref(&order_by.value),
+            _ => self.facts(),
         }
     }
 
@@ -169,6 +185,12 @@ impl FunctionInput {
                     .into_iter()
                     .map(FunctionOrderTerm::into_hir)
                     .collect(),
+            },
+            Self::OrderedSet {
+                direct, order_by, ..
+            } => hir::FunctionArguments::OrderedSet {
+                direct: direct.into_iter().map(|value| value.expr).collect(),
+                order_by: Box::new(order_by.into_hir()),
             },
         }
     }
@@ -253,17 +275,23 @@ impl<'a> ExprFrame<'a> {
             ast::Expr::FunctionCall {
                 args,
                 order_by,
+                within_group,
                 filter_over,
                 ..
             } => {
-                let argument_children = args.len() + order_by.len();
+                let argument_order_end = args.len() + order_by.len();
+                let within_group_end = argument_order_end + within_group.len();
                 if self.next_child < args.len() {
                     args.get(self.next_child).map(Box::as_ref)
-                } else if self.next_child < argument_children {
+                } else if self.next_child < argument_order_end {
                     order_by
                         .get(self.next_child - args.len())
                         .map(|term| term.expr.as_ref())
-                } else if self.next_child == argument_children {
+                } else if self.next_child < within_group_end {
+                    within_group
+                        .get(self.next_child - argument_order_end)
+                        .map(|term| term.expr.as_ref())
+                } else if self.next_child == within_group_end {
                     filter_over.filter_clause.as_deref()
                 } else {
                     None
@@ -644,11 +672,30 @@ impl Analyzer<'_, '_> {
                 within_group,
                 filter_over,
             } => {
-                if !within_group.is_empty() || filter_over.over_clause.is_some() {
-                    return super::analyze::unsupported_select();
-                }
-                let expected_children =
-                    args.len() + order_by.len() + usize::from(filter_over.filter_clause.is_some());
+                let ordered_set = if within_group.is_empty() {
+                    if normalize_ident(name.as_str()) == "mode" {
+                        crate::bail_parse_error!(
+                            "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
+                        );
+                    }
+                    if filter_over.over_clause.is_some() {
+                        return super::analyze::unsupported_select();
+                    }
+                    None
+                } else {
+                    Some(resolve_ordered_set_function(
+                        name,
+                        args,
+                        distinctness.as_ref(),
+                        order_by,
+                        within_group,
+                        filter_over,
+                    )?)
+                };
+                let expected_children = args.len()
+                    + order_by.len()
+                    + within_group.len()
+                    + usize::from(filter_over.filter_clause.is_some());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
@@ -658,7 +705,7 @@ impl Analyzer<'_, '_> {
                 }
                 let mut children = children.into_iter();
                 let values = children.by_ref().take(args.len()).collect();
-                let order_by = order_by
+                let argument_order = order_by
                     .iter()
                     .zip(children.by_ref())
                     .map(|(syntax, value)| FunctionOrderTerm {
@@ -666,22 +713,37 @@ impl Analyzer<'_, '_> {
                         order: syntax.order.unwrap_or(ast::SortOrder::Asc),
                         nulls: syntax.nulls,
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let within_group = within_group
+                    .iter()
+                    .zip(children.by_ref())
+                    .map(|(syntax, value)| FunctionOrderTerm {
+                        value,
+                        order: syntax.order.unwrap_or(ast::SortOrder::Asc),
+                        nulls: syntax.nulls,
+                    })
+                    .collect::<Vec<_>>();
                 let filter = filter_over.filter_clause.as_ref().map(|_| {
                     children
                         .next()
                         .expect("function child count includes FILTER")
                 });
-                self.build_function_call(
-                    name,
-                    FunctionInput::Expressions {
+                let input = match ordered_set {
+                    Some(function) => FunctionInput::OrderedSet {
+                        function,
+                        direct: values,
+                        order_by: within_group
+                            .into_iter()
+                            .next()
+                            .expect("ordered-set syntax requires one ordering expression"),
+                    },
+                    None => FunctionInput::Expressions {
                         distinctness: *distinctness,
                         values,
-                        order_by,
+                        order_by: argument_order,
                     },
-                    filter,
-                    functions,
-                )
+                };
+                self.build_function_call(name, input, filter, functions)
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 if filter_over.over_clause.is_some() {
@@ -755,11 +817,17 @@ impl Analyzer<'_, '_> {
     ) -> Result<ResolvedScopeExpr> {
         let argument_count = input.argument_count();
         let function_name = normalize_ident(name.as_str());
-        let Some(function) = self
-            .context()
-            .resolve_function(&function_name, argument_count)?
-        else {
-            crate::bail_parse_error!("no such function: {function_name}");
+        let function = match &input {
+            FunctionInput::OrderedSet { function, .. } => Func::Agg(function.clone()),
+            _ => {
+                let Some(function) = self
+                    .context()
+                    .resolve_function(&function_name, argument_count)?
+                else {
+                    crate::bail_parse_error!("no such function: {function_name}");
+                };
+                function
+            }
         };
         let binding = bind_function(&function, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
@@ -785,7 +853,7 @@ impl Analyzer<'_, '_> {
                 crate::bail_parse_error!("misuse of aggregate function {nested}()");
             }
         }
-        let result_type = function_result_type(&function, input.facts());
+        let result_type = function_result_type(&function, input.result_facts());
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function { argument_count },
@@ -807,7 +875,6 @@ impl Analyzer<'_, '_> {
                 function,
                 evaluation,
                 arguments,
-                within_group: Vec::new(),
                 window: None,
                 result_type: result_type.clone(),
                 custom_type_operation: None,
@@ -1101,6 +1168,66 @@ fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<
             id: state.allocate_aggregate(),
         })),
     }
+}
+
+fn resolve_ordered_set_function(
+    name: &ast::Name,
+    args: &[Box<ast::Expr>],
+    distinctness: Option<&ast::Distinctness>,
+    argument_order: &[ast::SortedColumn],
+    within_group: &[ast::SortedColumn],
+    tail: &ast::FunctionTail,
+) -> Result<AggFunc> {
+    let function = match normalize_ident(name.as_str()).as_str() {
+        "mode" => AggFunc::Mode,
+        "percentile_cont" => AggFunc::PercentileCont,
+        "percentile_disc" => AggFunc::PercentileDisc,
+        _ => {
+            crate::bail_parse_error!(
+                "WITHIN GROUP is not supported for function {}()",
+                name.as_str()
+            )
+        }
+    };
+    if tail.over_clause.is_some() {
+        crate::bail_parse_error!(
+            "ordered-set aggregate {}() may not be used as a window function",
+            name.as_str()
+        );
+    }
+    if distinctness.is_some() {
+        crate::bail_parse_error!(
+            "DISTINCT is not supported for ordered-set aggregate {}()",
+            name.as_str()
+        );
+    }
+    if !argument_order.is_empty() {
+        crate::bail_parse_error!(
+            "{}() does not accept an argument ORDER BY together with WITHIN GROUP",
+            name.as_str()
+        );
+    }
+    if within_group.len() != 1 {
+        crate::bail_parse_error!(
+            "WITHIN GROUP for {}() must specify exactly one ORDER BY expression",
+            name.as_str()
+        );
+    }
+    let order_by = &within_group[0];
+    if matches!(order_by.order, Some(ast::SortOrder::Desc)) || order_by.nulls.is_some() {
+        crate::bail_parse_error!(
+            "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
+        );
+    }
+    let expected_direct = match function {
+        AggFunc::Mode => 0,
+        AggFunc::PercentileCont | AggFunc::PercentileDisc => 1,
+        _ => unreachable!("ordered-set function list is exhaustive"),
+    };
+    if args.len() != expected_direct {
+        crate::bail_parse_error!("wrong number of arguments to function {}()", name.as_str());
+    }
+    Ok(function)
 }
 
 fn nested_aggregate(arguments: &[ResolvedScopeExpr]) -> Option<String> {
