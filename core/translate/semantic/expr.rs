@@ -10,7 +10,7 @@ use super::{
     scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope},
 };
 use crate::{
-    function::{Func, ScalarFunc},
+    function::{AggFunc, Func, ScalarFunc},
     schema::Type,
     sync::Arc,
     translate::collate::CollationSeq,
@@ -57,6 +57,47 @@ impl ExprPolicy {
 }
 
 type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
+
+pub(super) struct QueryFunctionState {
+    block: hir::QueryBlockId,
+    aggregate_count: usize,
+}
+
+impl QueryFunctionState {
+    pub(super) const fn new(block: hir::QueryBlockId) -> Self {
+        Self {
+            block,
+            aggregate_count: 0,
+        }
+    }
+
+    fn allocate_aggregate(&mut self) -> hir::AggregateId {
+        let id = hir::AggregateId::new(self.block, self.aggregate_count);
+        self.aggregate_count += 1;
+        id
+    }
+
+    pub(super) const fn aggregate_count(&self) -> usize {
+        self.aggregate_count
+    }
+}
+
+enum FunctionContext<'state> {
+    ScalarOnly,
+    Query(&'state mut QueryFunctionState),
+}
+
+enum FunctionBinding {
+    Scalar,
+    Aggregate(AggregateBinding),
+    Window(WindowBinding),
+}
+
+struct AggregateBinding {
+    id: hir::AggregateId,
+}
+
+struct WindowBinding;
 
 struct ExprFrame<'a> {
     syntax: &'a ast::Expr,
@@ -163,6 +204,36 @@ impl Analyzer<'_, '_> {
         scope: &Scope,
         policy: ExprPolicy,
     ) -> Result<ResolvedScopeExpr> {
+        self.analyze_resolved_expr_with_functions(
+            syntax,
+            scope,
+            policy,
+            &mut FunctionContext::ScalarOnly,
+        )
+    }
+
+    pub(super) fn analyze_query_expr(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        functions: &mut QueryFunctionState,
+    ) -> Result<ResolvedScopeExpr> {
+        self.analyze_resolved_expr_with_functions(
+            syntax,
+            scope,
+            policy,
+            &mut FunctionContext::Query(functions),
+        )
+    }
+
+    fn analyze_resolved_expr_with_functions(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        functions: &mut FunctionContext<'_>,
+    ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax)];
         loop {
             if let Some(child) = frames
@@ -175,7 +246,13 @@ impl Analyzer<'_, '_> {
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
-            let resolved = self.build_expr(frame.syntax, frame.resolved_children, scope, policy)?;
+            let resolved = self.build_expr(
+                frame.syntax,
+                frame.resolved_children,
+                scope,
+                policy,
+                functions,
+            )?;
             match frames.last_mut() {
                 Some(parent) => parent.resolved_children.push(resolved),
                 None => return Ok(resolved),
@@ -189,6 +266,7 @@ impl Analyzer<'_, '_> {
         children: ExprChildren,
         scope: &Scope,
         policy: ExprPolicy,
+        functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
             ast::Expr::Literal(literal) => {
@@ -492,10 +570,13 @@ impl Analyzer<'_, '_> {
                 else {
                     crate::bail_parse_error!("no such function: {function_name}");
                 };
-                if !is_scalar_function(&function) {
-                    return super::analyze::unsupported_select();
+                let binding = bind_function(&function, functions)?;
+                if matches!(binding, FunctionBinding::Aggregate(_)) {
+                    if let Some(nested) = nested_aggregate(&children) {
+                        crate::bail_parse_error!("misuse of aggregate function {nested}()");
+                    }
                 }
-                let result_type = scalar_function_result_type(&function, &children);
+                let result_type = function_result_type(&function, &children);
                 let id = self.catalog_object_id(
                     None,
                     CatalogObjectKind::Function {
@@ -509,10 +590,17 @@ impl Analyzer<'_, '_> {
                     None,
                     Arc::new(function),
                 );
+                let evaluation = match binding {
+                    FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
+                    FunctionBinding::Aggregate(binding) => {
+                        hir::FunctionEvaluation::Aggregate(binding.id)
+                    }
+                    FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
+                };
                 Ok(computed_expr(
                     hir::Expr::Function(hir::FunctionCall {
                         function,
-                        evaluation: hir::FunctionEvaluation::Scalar,
+                        evaluation,
                         star: false,
                         arguments: children.into_iter().map(|child| child.expr).collect(),
                         distinctness: None,
@@ -837,11 +925,45 @@ fn computed_expr(
     }
 }
 
-fn is_scalar_function(function: &Func) -> bool {
-    !matches!(
-        function,
-        Func::Agg(_) | Func::Window(_) | Func::AlterTable(_)
-    )
+fn bind_function(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+    match function {
+        Func::Agg(_) => bind_aggregate(function, context),
+        Func::External(external) if external.func.is_aggregate() => {
+            bind_aggregate(function, context)
+        }
+        Func::Window(_) => Ok(FunctionBinding::Window(WindowBinding)),
+        Func::AlterTable(_) => super::analyze::unsupported_select(),
+        _ => Ok(FunctionBinding::Scalar),
+    }
+}
+
+fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+    match context {
+        FunctionContext::ScalarOnly => {
+            crate::bail_parse_error!("misuse of aggregate function {}()", function)
+        }
+        FunctionContext::Query(state) => Ok(FunctionBinding::Aggregate(AggregateBinding {
+            id: state.allocate_aggregate(),
+        })),
+    }
+}
+
+fn nested_aggregate(arguments: &[ResolvedScopeExpr]) -> Option<String> {
+    let mut name = None;
+    for argument in arguments {
+        argument.expr.walk(&mut |expression| {
+            if name.is_some() {
+                return;
+            }
+            let hir::Expr::Function(call) = expression else {
+                return;
+            };
+            if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate(_)) {
+                name = Some(call.function.value().to_string());
+            }
+        });
+    }
+    name
 }
 
 fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
@@ -853,7 +975,7 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
     }
 }
 
-fn scalar_function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
+fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
     match function {
         Func::Scalar(ScalarFunc::Length) => hir::TypeFact::known(Type::Integer),
         Func::Scalar(ScalarFunc::Abs) => {
@@ -871,6 +993,23 @@ fn scalar_function_result_type(function: &Func, arguments: &[ResolvedScopeExpr])
                     }
                 })
         }
+        Func::Agg(AggFunc::Count | AggFunc::Count0) => hir::TypeFact::known(Type::Integer),
+        Func::Agg(AggFunc::Avg | AggFunc::Total | AggFunc::PercentileCont) => {
+            hir::TypeFact::known(Type::Real)
+        }
+        Func::Agg(AggFunc::Sum) => hir::TypeFact::known(Type::Numeric),
+        Func::Agg(AggFunc::Min | AggFunc::Max | AggFunc::Mode | AggFunc::PercentileDisc) => {
+            arguments
+                .first()
+                .map_or_else(hir::TypeFact::dynamic, |argument| {
+                    argument.type_fact.clone()
+                })
+        }
+        Func::Agg(AggFunc::GroupConcat | AggFunc::StringAgg) => hir::TypeFact::known(Type::Text),
+        Func::Agg(AggFunc::ArrayAgg) => arguments.first().map_or_else(
+            || hir::TypeFact::known_array(1),
+            |argument| hir::TypeFact::array_literal_result([argument.type_fact.clone()]),
+        ),
         _ => hir::TypeFact::dynamic(),
     }
 }
@@ -1166,6 +1305,20 @@ mod tests {
         )
         .expect_err("clause policy disables DQS");
         assert_eq!(error.to_string(), "Parse error: no such column: missing");
+    }
+
+    #[test]
+    fn scalar_only_context_rejects_aggregate_functions() {
+        let error = analyze_expression(
+            &expression("SELECT sum(1)"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect_err("schema-style expression context rejects aggregates");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: misuse of aggregate function sum()"
+        );
     }
 
     #[test]
