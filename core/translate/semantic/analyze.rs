@@ -1230,7 +1230,7 @@ mod tests {
             let Expr::Function(call) = &output.expr else {
                 panic!("function call becomes resolved HIR");
             };
-            assert_eq!(call.evaluation, FunctionEvaluation::Scalar);
+            assert!(matches!(call.evaluation, FunctionEvaluation::Scalar));
             assert!(matches!(
                 &call.arguments,
                 crate::translate::semantic::hir::FunctionArguments::Expressions {
@@ -1240,7 +1240,6 @@ mod tests {
                 } if values.len() == 1 && order_by.is_empty()
             ));
             assert!(call.within_group.is_empty());
-            assert!(call.filter.is_none());
             assert!(call.window.is_none());
         }
         let Expr::Function(length) = &outputs[0].expr else {
@@ -1286,12 +1285,11 @@ mod tests {
             let Expr::Function(call) = &output.expr else {
                 panic!("aggregate output becomes a function call");
             };
-            assert_eq!(
-                call.evaluation,
-                FunctionEvaluation::Aggregate(crate::translate::semantic::hir::AggregateId::new(
-                    block.id, index,
-                ))
-            );
+            assert!(matches!(
+                &call.evaluation,
+                FunctionEvaluation::Aggregate { id, filter: None }
+                    if *id == crate::translate::semantic::hir::AggregateId::new(block.id, index)
+            ));
         }
         assert!(block.outputs[..3].iter().all(|output| {
             matches!(
@@ -1356,12 +1354,69 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_filters_are_bound_into_evaluation() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT sum(score) FILTER (WHERE id > 0), \
+             count(*) FILTER (WHERE value IS NOT NULL) FROM items",
+        )
+        .expect("aggregate FILTER clauses bind");
+        document
+            .validate()
+            .expect("aggregate filters produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 2);
+
+        let Expr::Function(sum) = &block.outputs[0].expr else {
+            panic!("filtered aggregate becomes a function call");
+        };
+        assert!(matches!(
+            &sum.evaluation,
+            FunctionEvaluation::Aggregate {
+                id,
+                filter: Some(filter),
+            } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 0)
+                && matches!(filter.as_ref(), Expr::Binary { .. })
+        ));
+
+        let Expr::Function(count) = &block.outputs[1].expr else {
+            panic!("filtered COUNT becomes a function call");
+        };
+        assert!(matches!(
+            count.arguments,
+            crate::translate::semantic::hir::FunctionArguments::Star
+        ));
+        assert!(matches!(
+            &count.evaluation,
+            FunctionEvaluation::Aggregate {
+                id,
+                filter: Some(filter),
+            } if *id == crate::translate::semantic::hir::AggregateId::new(block.id, 1)
+                && matches!(filter.as_ref(), Expr::NotNull(_))
+        ));
+    }
+
+    #[test]
     fn aggregate_checkpoint_rejects_nested_and_modified_calls() {
         let schema = schema_with_items();
         let nested = analyze_sql_with_schema(&schema, "SELECT sum(max(score)) FROM items")
             .expect_err("aggregate calls cannot be nested");
         assert_eq!(
             nested.to_string(),
+            "Parse error: misuse of aggregate function max()"
+        );
+        let nested_filter = analyze_sql_with_schema(
+            &schema,
+            "SELECT sum(score) FILTER (WHERE max(id) > 0) FROM items",
+        )
+        .expect_err("aggregate filters cannot contain aggregates");
+        assert_eq!(
+            nested_filter.to_string(),
             "Parse error: misuse of aggregate function max()"
         );
 
@@ -1371,7 +1426,7 @@ mod tests {
             "SELECT length(value) FILTER (WHERE id > 0) FROM items",
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
-                .expect_err("function modifiers remain outside this checkpoint");
+                .expect_err("scalar functions reject aggregate modifiers");
             assert_eq!(
                 error.to_string(),
                 "Parse error: semantic analysis accepts source-free literal SELECT statements"
@@ -1418,7 +1473,7 @@ mod tests {
             length.function.value(),
             crate::function::Func::Scalar(crate::function::ScalarFunc::Length)
         ));
-        assert_eq!(length.evaluation, FunctionEvaluation::Scalar);
+        assert!(matches!(length.evaluation, FunctionEvaluation::Scalar));
         assert_eq!(length.result_type.storage, Some(Type::Integer));
         assert!(matches!(
             length.arguments.expressions(),

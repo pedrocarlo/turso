@@ -1474,7 +1474,7 @@ impl<'document> HirValidator<'document> {
                 self.visit_exprs(function.arguments.expressions())?;
                 self.visit_order_terms(function.arguments.order_by())?;
                 self.visit_order_terms(&function.within_group)?;
-                self.visit_optional_expr(function.filter.as_deref())?;
+                self.visit_optional_expr(function.evaluation.filter())?;
                 if let Some(window) = &function.window {
                     self.visit_window_spec(window)?;
                 }
@@ -1544,12 +1544,12 @@ impl<'document> HirValidator<'document> {
             call.arguments.order_by().is_empty() || aggregate,
             "argument ORDER BY belongs to a non-aggregate call",
         )?;
-        match call.evaluation {
+        match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(
                 !aggregate && !window,
                 "aggregate or window function has scalar evaluation identity",
             ),
-            FunctionEvaluation::Aggregate(id) => {
+            FunctionEvaluation::Aggregate { id, .. } => {
                 let block = self.query_block(id.block)?;
                 self.require(
                     aggregate && !window,

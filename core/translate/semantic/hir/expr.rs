@@ -195,7 +195,6 @@ pub struct FunctionCall {
     pub evaluation: FunctionEvaluation,
     pub arguments: FunctionArguments,
     pub within_group: Vec<OrderTerm>,
-    pub filter: Option<Box<Expr>>,
     pub window: Option<WindowSpec>,
     pub result_type: TypeFact,
     pub custom_type_operation: Option<CustomTypeOperation>,
@@ -237,11 +236,23 @@ impl FunctionArguments {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
 pub enum FunctionEvaluation {
     Scalar,
-    Aggregate(AggregateId),
+    Aggregate {
+        id: AggregateId,
+        filter: Option<Box<Expr>>,
+    },
     Window(WindowFunctionId),
+}
+
+impl FunctionEvaluation {
+    pub fn filter(&self) -> Option<&Expr> {
+        match self {
+            Self::Aggregate { filter, .. } => filter.as_deref(),
+            Self::Scalar | Self::Window(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -456,7 +467,7 @@ impl Expr {
                 walk_exprs(call.arguments.expressions(), visitor);
                 walk_order_terms(call.arguments.order_by(), visitor);
                 walk_order_terms(&call.within_group, visitor);
-                walk_optional_expr(call.filter.as_deref(), visitor);
+                walk_optional_expr(call.evaluation.filter(), visitor);
                 if let Some(window) = &call.window {
                     walk_window_spec(window, visitor);
                 }
