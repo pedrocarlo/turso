@@ -1024,14 +1024,6 @@ mod tests {
             &crate::translate::collate::CollationSeq::Rtrim
         );
         assert!(outputs[4].collation_is_explicit);
-
-        let custom =
-            analyze_sql_with_schema(&schema, "SELECT CAST(value AS VARCHAR(3)) FROM items")
-                .expect_err("custom CAST waits for resolved schema programs");
-        assert_eq!(
-            custom.to_string(),
-            "Parse error: semantic analysis accepts source-free literal SELECT statements"
-        );
     }
 
     #[test]
@@ -1260,6 +1252,64 @@ mod tests {
             [Expr::Column(column)]
                 if column.source == program.input_source && column.column == 0
         ));
+    }
+
+    #[test]
+    fn varchar_encoder_keeps_abort_raise_in_hir() {
+        let schema = schema_with_items();
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT CAST(value AS VARCHAR(3)) FROM items")
+                .expect("built-in VARCHAR encoder binds");
+        document
+            .validate()
+            .expect("VARCHAR encoder produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("VARCHAR CAST becomes resolved HIR");
+        };
+        assert_eq!(target.programs.encode.len(), 1);
+        let program = document
+            .schema_program(target.programs.encode[0].program)
+            .expect("VARCHAR encoder program exists");
+        let Expr::Case {
+            else_expr: Some(else_expr),
+            ..
+        } = &program.body
+        else {
+            panic!("VARCHAR encoder keeps failure branch");
+        };
+        let Expr::Raise {
+            action: ast::ResolveType::Abort,
+            message: Some(message),
+        } = else_expr.as_ref()
+        else {
+            panic!("VARCHAR failure branch becomes RAISE(ABORT)");
+        };
+        assert!(matches!(
+            message.as_ref(),
+            Expr::Literal(ast::Literal::String(value))
+                if value == "'value too long for varchar'"
+        ));
+    }
+
+    #[test]
+    fn non_trigger_raise_only_allows_abort() {
+        let document = analyze_sql("SELECT RAISE(ABORT, 'stop')")
+            .expect("Turso allows RAISE(ABORT) outside triggers");
+        document
+            .validate()
+            .expect("standalone abort produces closed HIR");
+
+        let error = analyze_sql("SELECT RAISE(FAIL, 'stop')")
+            .expect_err("other RAISE actions require a trigger");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: RAISE() may only be used within a trigger-program"
+        );
     }
 
     #[test]

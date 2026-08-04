@@ -57,10 +57,12 @@ Completed:
 - Domain `NOT NULL` and `CHECK` rules frozen into custom `CAST` targets.
 - Scalar function calls with resolved catalog identity, including calls inside
   custom `CAST` encoders.
+- `RAISE(ABORT, ...)` expressions, including built-in custom-type encoders such
+  as `VARCHAR`.
 
 Remaining expression checkpoints, in agreed order:
 
-1. Finish resolved custom `CAST` programs: `RAISE` in encoders and arrays.
+1. Finish resolved custom `CAST` programs for arrays.
 2. Finish function forms: aggregates, windows, argument ordering, filters, and
    special custom-type or sequence calls.
 
