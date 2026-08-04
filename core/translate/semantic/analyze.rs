@@ -59,6 +59,7 @@ pub(super) enum CatalogObjectKind {
     Table,
     Collation,
     Type,
+    Function { argument_count: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -429,7 +430,7 @@ mod tests {
     use super::*;
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
-        hir::{HirRoot, OutputNameKind, SourceKind, SourceOwner},
+        hir::{FunctionEvaluation, HirRoot, OutputNameKind, SourceKind, SourceOwner},
     };
 
     fn parse_statement(sql: &str) -> ast::Stmt {
@@ -1144,6 +1145,119 @@ mod tests {
         assert!(matches!(
             &when_then[0].1,
             Expr::Column(column)
+                if column.source == program.input_source && column.column == 0
+        ));
+    }
+
+    #[test]
+    fn scalar_functions_keep_resolved_identity_and_result_type() {
+        let schema = schema_with_items();
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT length(value), abs(score) FROM items")
+                .expect("scalar functions bind");
+        document
+            .validate()
+            .expect("scalar functions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 2);
+        for output in outputs {
+            let Expr::Function(call) = &output.expr else {
+                panic!("function call becomes resolved HIR");
+            };
+            assert_eq!(call.evaluation, FunctionEvaluation::Scalar);
+            assert_eq!(call.arguments.len(), 1);
+            assert!(!call.star);
+            assert!(call.distinctness.is_none());
+            assert!(call.argument_order.is_empty());
+            assert!(call.within_group.is_empty());
+            assert!(call.filter.is_none());
+            assert!(call.window.is_none());
+        }
+        let Expr::Function(length) = &outputs[0].expr else {
+            unreachable!();
+        };
+        assert!(matches!(
+            length.function.value(),
+            crate::function::Func::Scalar(crate::function::ScalarFunc::Length)
+        ));
+        assert_eq!(length.result_type.storage, Some(Type::Integer));
+        assert_eq!(outputs[0].type_fact, length.result_type);
+        let Expr::Function(abs) = &outputs[1].expr else {
+            unreachable!();
+        };
+        assert!(matches!(
+            abs.function.value(),
+            crate::function::Func::Scalar(crate::function::ScalarFunc::Abs)
+        ));
+        assert_eq!(abs.result_type.storage, Some(Type::Real));
+        assert_eq!(outputs[1].type_fact, abs.result_type);
+    }
+
+    #[test]
+    fn scalar_function_checkpoint_rejects_aggregate_syntax() {
+        let schema = schema_with_items();
+        for sql in [
+            "SELECT sum(score) FROM items",
+            "SELECT length(DISTINCT value) FROM items",
+            "SELECT length(value) FILTER (WHERE id > 0) FROM items",
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("aggregate-only function forms remain outside this checkpoint");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: semantic analysis accepts source-free literal SELECT statements"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_cast_encoder_can_call_scalar_functions() {
+        let mut schema = schema_with_items();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE short_text(value TEXT, maximum INTEGER) BASE TEXT \
+                 ENCODE CASE WHEN length(value) <= maximum THEN value ELSE NULL END",
+            )
+            .expect("custom type definition parses");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT CAST(value AS short_text(3)) FROM items")
+                .expect("function call in custom encoder binds");
+        document
+            .validate()
+            .expect("function encoder produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("custom CAST becomes resolved HIR");
+        };
+        let program = document
+            .schema_program(target.programs.encode[0].program)
+            .expect("encoder program exists");
+        let Expr::Case { when_then, .. } = &program.body else {
+            panic!("encoder keeps CASE body");
+        };
+        let Expr::Binary { lhs, .. } = &when_then[0].0 else {
+            panic!("encoder condition is a comparison");
+        };
+        let Expr::Function(length) = lhs.as_ref() else {
+            panic!("comparison contains resolved function");
+        };
+        assert!(matches!(
+            length.function.value(),
+            crate::function::Func::Scalar(crate::function::ScalarFunc::Length)
+        ));
+        assert_eq!(length.evaluation, FunctionEvaluation::Scalar);
+        assert_eq!(length.result_type.storage, Some(Type::Integer));
+        assert!(matches!(
+            length.arguments.as_slice(),
+            [Expr::Column(column)]
                 if column.source == program.input_source && column.column == 0
         ));
     }

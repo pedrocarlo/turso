@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     dialect::Dialect,
+    function::Func,
     schema::{Schema, Table},
     sync::Arc,
     util::normalize_ident,
@@ -80,6 +81,16 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) fn dialect(&self) -> &Arc<dyn Dialect> {
         &self.dialect
+    }
+
+    pub(crate) fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        match self.dialect.resolve_function(name, arg_count)? {
+            Some(function) => Ok(Some(function)),
+            None => Ok(self
+                .symbols
+                .resolve_function(name, arg_count)
+                .map(Func::External)),
+        }
     }
 
     pub(crate) fn database(&self, name: &str) -> Option<DatabaseId> {

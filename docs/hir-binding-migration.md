@@ -55,12 +55,14 @@ Completed:
 - Catalog-resolved custom `CAST` targets that need no stored program.
 - Simple custom `CAST` encoders bound against document-owned synthetic inputs.
 - Domain `NOT NULL` and `CHECK` rules frozen into custom `CAST` targets.
+- Scalar function calls with resolved catalog identity, including calls inside
+  custom `CAST` encoders.
 
 Remaining expression checkpoints, in agreed order:
 
-1. Finish resolved custom `CAST` programs: functions and `RAISE` in encoders,
-   and arrays.
-2. Functions.
+1. Finish resolved custom `CAST` programs: `RAISE` in encoders and arrays.
+2. Finish function forms: aggregates, windows, argument ordering, filters, and
+   special custom-type or sequence calls.
 
 After expression work, resume the original SELECT order at joins. Basic outputs
 were implemented early; join-aware output behavior must still be checked after
