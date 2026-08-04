@@ -78,6 +78,22 @@ impl<'a> ExprFrame<'a> {
                 0 => Some(lhs.as_ref()),
                 index => rhs.get(index - 1).map(Box::as_ref),
             },
+            ast::Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => match (base.as_deref(), self.next_child) {
+                (Some(base), 0) => Some(base),
+                _ => {
+                    let index = self.next_child - usize::from(base.is_some());
+                    match when_then_pairs.get(index / 2) {
+                        Some((when, _)) if index % 2 == 0 => Some(when.as_ref()),
+                        Some((_, then)) => Some(then.as_ref()),
+                        None if index == when_then_pairs.len() * 2 => else_expr.as_deref(),
+                        None => None,
+                    }
+                }
+            },
             _ => None,
         };
         if child.is_some() {
@@ -301,6 +317,71 @@ impl Analyzer<'_, '_> {
                         comparisons,
                     },
                     hir::TypeFact::known(Type::Integer),
+                    collation,
+                ))
+            }
+            ast::Expr::Case {
+                base: base_syntax,
+                when_then_pairs,
+                else_expr: else_syntax,
+            } => {
+                let expected_children = usize::from(base_syntax.is_some())
+                    + when_then_pairs.len() * 2
+                    + usize::from(else_syntax.is_some());
+                if children.len() != expected_children {
+                    return Err(LimboError::InternalError(format!(
+                        "CASE expression expected {expected_children} child values, got {}",
+                        children.len()
+                    )));
+                }
+                let collation = children
+                    .iter()
+                    .fold(ExprCollation::Absent, |current, child| {
+                        expression_collation(&current, &child.collation)
+                    });
+                let mut children = children.into_iter();
+                let base = base_syntax.as_ref().map(|_| {
+                    children
+                        .next()
+                        .expect("CASE child count includes base expression")
+                });
+                let when_then = when_then_pairs
+                    .iter()
+                    .map(|_| {
+                        (
+                            children.next().expect("CASE child count includes WHEN"),
+                            children.next().expect("CASE child count includes THEN"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let else_expr = else_syntax.as_ref().map(|_| {
+                    children
+                        .next()
+                        .expect("CASE child count includes ELSE expression")
+                });
+                let base_comparisons = base.as_ref().map_or_else(Vec::new, |base| {
+                    when_then
+                        .iter()
+                        .map(|(when, _)| comparison_semantics(base, when))
+                        .collect()
+                });
+                let type_fact = hir::TypeFact::selected_value_result(
+                    when_then
+                        .iter()
+                        .map(|(_, then)| &then.type_fact)
+                        .chain(else_expr.iter().map(|value| &value.type_fact)),
+                );
+                Ok(computed_expr(
+                    hir::Expr::Case {
+                        base: base.map(|value| Box::new(value.expr)),
+                        when_then: when_then
+                            .into_iter()
+                            .map(|(when, then)| (when.expr, then.expr))
+                            .collect(),
+                        else_expr: else_expr.map(|value| Box::new(value.expr)),
+                        base_comparisons,
+                    },
+                    type_fact,
                     collation,
                 ))
             }
