@@ -99,6 +99,46 @@ struct AggregateBinding {
 
 struct WindowBinding;
 
+enum FunctionInput {
+    Star,
+    Expressions {
+        distinctness: Option<ast::Distinctness>,
+        values: ExprChildren,
+    },
+}
+
+impl FunctionInput {
+    fn argument_count(&self) -> usize {
+        match self {
+            Self::Star => 0,
+            Self::Expressions { values, .. } => values.len(),
+        }
+    }
+
+    fn facts(&self) -> &[ResolvedScopeExpr] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions { values, .. } => values,
+        }
+    }
+
+    fn distinctness(&self) -> Option<ast::Distinctness> {
+        match self {
+            Self::Star => None,
+            Self::Expressions { distinctness, .. } => *distinctness,
+        }
+    }
+
+    fn into_hir(self) -> hir::FunctionArguments {
+        match self {
+            Self::Star => hir::FunctionArguments::Star,
+            Self::Expressions { values, .. } => hir::FunctionArguments::Expressions(
+                values.into_iter().map(|value| value.expr).collect(),
+            ),
+        }
+    }
+}
+
 struct ExprFrame<'a> {
     syntax: &'a ast::Expr,
     next_child: usize,
@@ -548,8 +588,7 @@ impl Analyzer<'_, '_> {
                 within_group,
                 filter_over,
             } => {
-                if distinctness.is_some()
-                    || !order_by.is_empty()
+                if !order_by.is_empty()
                     || !within_group.is_empty()
                     || filter_over.filter_clause.is_some()
                     || filter_over.over_clause.is_some()
@@ -563,58 +602,21 @@ impl Analyzer<'_, '_> {
                         children.len()
                     )));
                 }
-                let function_name = normalize_ident(name.as_str());
-                let Some(function) = self
-                    .context()
-                    .resolve_function(&function_name, args.len())?
-                else {
-                    crate::bail_parse_error!("no such function: {function_name}");
-                };
-                let binding = bind_function(&function, functions)?;
-                if matches!(binding, FunctionBinding::Aggregate(_)) {
-                    if let Some(nested) = nested_aggregate(&children) {
-                        crate::bail_parse_error!("misuse of aggregate function {nested}()");
-                    }
-                }
-                let result_type = function_result_type(&function, &children);
-                let id = self.catalog_object_id(
-                    None,
-                    CatalogObjectKind::Function {
-                        argument_count: args.len(),
+                self.build_function_call(
+                    name,
+                    FunctionInput::Expressions {
+                        distinctness: *distinctness,
+                        values: children,
                     },
-                    function_name,
-                );
-                let function = hir::CatalogObject::new(
-                    id,
-                    self.context().snapshot(),
-                    None,
-                    Arc::new(function),
-                );
-                let evaluation = match binding {
-                    FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
-                    FunctionBinding::Aggregate(binding) => {
-                        hir::FunctionEvaluation::Aggregate(binding.id)
-                    }
-                    FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
-                };
-                Ok(computed_expr(
-                    hir::Expr::Function(hir::FunctionCall {
-                        function,
-                        evaluation,
-                        star: false,
-                        arguments: children.into_iter().map(|child| child.expr).collect(),
-                        distinctness: None,
-                        argument_order: Vec::new(),
-                        within_group: Vec::new(),
-                        filter: None,
-                        window: None,
-                        result_type: result_type.clone(),
-                        custom_type_operation: None,
-                        sequence_operation: None,
-                    }),
-                    result_type,
-                    ExprCollation::Absent,
-                ))
+                    functions,
+                )
+            }
+            ast::Expr::FunctionCallStar { name, filter_over } => {
+                expect_no_expr_children(children)?;
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+                    return super::analyze::unsupported_select();
+                }
+                self.build_function_call(name, FunctionInput::Star, functions)
             }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
@@ -661,6 +663,64 @@ impl Analyzer<'_, '_> {
             }
             _ => super::analyze::unsupported_select(),
         }
+    }
+
+    fn build_function_call(
+        &mut self,
+        name: &ast::Name,
+        input: FunctionInput,
+        functions: &mut FunctionContext<'_>,
+    ) -> Result<ResolvedScopeExpr> {
+        let argument_count = input.argument_count();
+        let function_name = normalize_ident(name.as_str());
+        let Some(function) = self
+            .context()
+            .resolve_function(&function_name, argument_count)?
+        else {
+            crate::bail_parse_error!("no such function: {function_name}");
+        };
+        let binding = bind_function(&function, functions)?;
+        let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
+        if (input.distinctness().is_some() || matches!(&input, FunctionInput::Star)) && !aggregate {
+            return super::analyze::unsupported_select();
+        }
+        if aggregate {
+            if let Some(nested) = nested_aggregate(input.facts()) {
+                crate::bail_parse_error!("misuse of aggregate function {nested}()");
+            }
+        }
+        let result_type = function_result_type(&function, input.facts());
+        let id = self.catalog_object_id(
+            None,
+            CatalogObjectKind::Function { argument_count },
+            function_name,
+        );
+        let function =
+            hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
+        let evaluation = match binding {
+            FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
+            FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate(binding.id),
+            FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
+        };
+        let distinctness = input.distinctness();
+        let arguments = input.into_hir();
+        Ok(computed_expr(
+            hir::Expr::Function(hir::FunctionCall {
+                function,
+                evaluation,
+                arguments,
+                distinctness,
+                argument_order: Vec::new(),
+                within_group: Vec::new(),
+                filter: None,
+                window: None,
+                result_type: result_type.clone(),
+                custom_type_operation: None,
+                sequence_operation: None,
+            }),
+            result_type,
+            ExprCollation::Absent,
+        ))
     }
 
     pub(super) fn resolve_atomic_expr(

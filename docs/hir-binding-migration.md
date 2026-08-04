@@ -58,7 +58,8 @@ Completed:
 - Scalar function calls with resolved catalog identity, including calls inside
   custom `CAST` encoders.
 - Plain aggregate calls with stable query-block identities and frozen result
-  type facts. Nested aggregates are rejected during analysis.
+  type facts. `COUNT(*)` and `DISTINCT` argument forms are explicit in HIR;
+  nested aggregates are rejected during analysis.
 - `RAISE(ABORT, ...)` expressions, including built-in custom-type encoders such
   as `VARCHAR`.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
@@ -66,8 +67,8 @@ Completed:
 
 Remaining expression checkpoints, in agreed order:
 
-1. Finish function forms: aggregate modifiers, windows, argument ordering,
-   filters, and special custom-type or sequence calls.
+1. Finish function forms: aggregate argument ordering, filters, ordered-set
+   forms, windows, and special custom-type or sequence calls.
 
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.
