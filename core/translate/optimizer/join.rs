@@ -3,7 +3,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
-use turso_parser::ast::{Operator, TableInternalId};
+use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use super::{
     access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
@@ -19,7 +19,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::expr_references_subquery_id,
+        expr::{expr_references_subquery_id, walk_expr, WalkControl},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -87,6 +87,9 @@ struct JoinSearch<'query, 'arena> {
     access_methods: &'arena mut Vec<AccessMethod>,
     /// Per-term info (table masks, WHERE work, equality tables) computed once per query.
     where_terms: Vec<WhereTermInfo>,
+    /// Joined tables directly referenced by each WHERE term's columns, used to
+    /// skip multi-index OR analysis for terms that never touch the candidate table.
+    where_term_table_masks: crate::alloc::Vec<TableMask>,
     btree_access_methods: HashMap<BTreeAccessMethodKey, Option<AccessMethod>>,
 }
 
@@ -110,10 +113,13 @@ impl<'query, 'arena> JoinSearch<'query, 'arena> {
             context.table_references,
             context.subqueries,
         )?;
+        let where_term_table_masks =
+            build_where_term_table_masks(context.where_clause, context.joined_tables)?;
         Ok(Self {
             context,
             access_methods,
             where_terms,
+            where_term_table_masks,
             btree_access_methods: HashMap::default(),
         })
     }
@@ -497,6 +503,7 @@ impl JoinSearch<'_, '_> {
                     planning_context,
                     where_clause,
                     &ready_where,
+                    &self.where_term_table_masks,
                     available_indexes,
                     table_references,
                     subqueries,
@@ -518,6 +525,7 @@ impl JoinSearch<'_, '_> {
                 planning_context,
                 where_clause,
                 &ready_where,
+                &self.where_term_table_masks,
                 available_indexes,
                 table_references,
                 subqueries,
@@ -2139,6 +2147,46 @@ fn build_where_term_info(
             })
         })
         .collect()
+}
+
+/// Precompute joined tables directly referenced by each WHERE term's columns.
+///
+/// Unlike [build_where_term_info]'s masks, these ignore tables referenced only
+/// through subqueries: multi-index OR analysis needs a direct column reference
+/// on the candidate table to build an index seek branch from a term.
+pub(crate) fn build_where_term_table_masks(
+    where_clause: &[WhereTerm],
+    joined_tables: &[JoinedTable],
+) -> Result<crate::alloc::Vec<TableMask>> {
+    let table_numbers: HashMap<TableInternalId, usize> = joined_tables
+        .iter()
+        .enumerate()
+        .map(|(table_number, table)| (table.internal_id, table_number))
+        .try_collect()?;
+    where_clause
+        .iter()
+        .map(|term| expr_table_mask(&term.expr, &table_numbers))
+        .try_collect::<Result<crate::alloc::Vec<_>>>()?
+}
+
+/// Collect joined tables referenced by an expression.
+fn expr_table_mask(
+    expr: &Expr,
+    table_numbers: &HashMap<TableInternalId, usize>,
+) -> Result<TableMask> {
+    let mut tables = TableMask::default();
+    walk_expr(expr, &mut |node| {
+        match node {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if let Some(table_number) = table_numbers.get(table) {
+                    tables.set(*table_number)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(tables)
 }
 
 /// Return the extra `WHERE` work that can run after this table.
@@ -4104,7 +4152,7 @@ mod tests {
                 table_id_counter.next(),
             ),
         ];
-        let mut where_clause = vec![_create_binary_expr(
+        let where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, false),
             Operator::Equals,
             _create_column_expr(joined_tables[1].internal_id, 0, false),
@@ -4127,7 +4175,7 @@ mod tests {
             1,
             &constraints[0],
             &constraints[1],
-            &mut where_clause,
+            &where_clause,
             std::iter::once((
                 0,
                 table_references.joined_tables()[0].internal_id,
