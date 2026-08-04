@@ -810,6 +810,93 @@ mod tests {
     }
 
     #[test]
+    fn case_expressions_freeze_result_and_comparison_rules_in_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT CASE value \
+                 WHEN 'a' THEN 1 \
+                 WHEN ('b' COLLATE RTRIM) THEN 2.5 \
+                 ELSE NULL END, \
+             CASE WHEN id > 0 THEN value ELSE 'none' END, \
+             CASE WHEN 0 THEN 1 END \
+             FROM items",
+        )
+        .expect("simple and searched CASE expressions have valid SQL meaning");
+        document
+            .validate()
+            .expect("CASE expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|output| !output.has_affinity));
+
+        let Expr::Case {
+            base: Some(_),
+            when_then,
+            else_expr: Some(_),
+            base_comparisons,
+        } = &outputs[0].expr
+        else {
+            panic!("simple CASE keeps base, branches, and ELSE");
+        };
+        assert_eq!(when_then.len(), 2);
+        assert_eq!(base_comparisons.len(), 2);
+        assert_eq!(outputs[0].type_fact.storage, Some(Type::Numeric));
+        for comparison in base_comparisons {
+            assert_eq!(
+                comparison.components[0].affinity,
+                crate::vdbe::affinity::Affinity::Text
+            );
+        }
+        assert_eq!(
+            base_comparisons[0].components[0]
+                .collation
+                .as_ref()
+                .expect("base column supplies first comparison collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert_eq!(
+            base_comparisons[1].components[0]
+                .collation
+                .as_ref()
+                .expect("explicit WHEN collation wins")
+                .value(),
+            &crate::translate::collate::CollationSeq::Rtrim
+        );
+
+        let Expr::Case {
+            base: None,
+            when_then,
+            else_expr: Some(_),
+            base_comparisons,
+        } = &outputs[1].expr
+        else {
+            panic!("searched CASE has branches and ELSE without base");
+        };
+        assert_eq!(when_then.len(), 1);
+        assert!(base_comparisons.is_empty());
+        assert_eq!(outputs[1].type_fact.storage, Some(Type::Text));
+
+        let Expr::Case {
+            base: None,
+            when_then,
+            else_expr: None,
+            base_comparisons,
+        } = &outputs[2].expr
+        else {
+            panic!("searched CASE can omit ELSE");
+        };
+        assert_eq!(when_then.len(), 1);
+        assert!(base_comparisons.is_empty());
+        assert_eq!(outputs[2].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
     fn explicit_collations_override_inherited_collations() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
