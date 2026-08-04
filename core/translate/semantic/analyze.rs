@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     context::SemanticContext,
-    expr::ExprPolicy,
+    expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument,
         HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId,
@@ -262,7 +262,8 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             }
             None => (None, Scope::default()),
         };
-        let outputs = self.analyze_outputs(block_id, columns, &scope)?;
+        let mut functions = QueryFunctionState::new(block_id);
+        let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
         let output_ids = outputs.iter().map(|output| output.id).collect();
 
         self.insert_query(
@@ -276,7 +277,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                     id: block_id,
                     from,
                     outputs,
-                    aggregate_count: 0,
+                    aggregate_count: functions.aggregate_count(),
                     window_function_count: 0,
                     body: QueryBlockBody::Select {
                         distinctness: *distinctness,
@@ -301,12 +302,19 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         block: QueryBlockId,
         columns: &[ast::ResultColumn],
         scope: &Scope,
+        functions: &mut QueryFunctionState,
     ) -> Result<Vec<Output>> {
         let mut outputs = Vec::with_capacity(columns.len());
         for column in columns {
             match column {
                 ast::ResultColumn::Expr(_, _) => {
-                    outputs.push(self.analyze_output(block, outputs.len(), column, scope)?);
+                    outputs.push(self.analyze_output(
+                        block,
+                        outputs.len(),
+                        column,
+                        scope,
+                        functions,
+                    )?);
                 }
                 ast::ResultColumn::Star => {
                     let expanded = scope.expand_star()?;
@@ -353,13 +361,14 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         index: usize,
         column: &ast::ResultColumn,
         scope: &Scope,
+        functions: &mut QueryFunctionState,
     ) -> Result<Output> {
         let ast::ResultColumn::Expr(expression, alias) = column else {
             return unsupported_select();
         };
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
-        let resolved = self.analyze_resolved_expr(syntax, scope, policy)?;
+        let resolved = self.analyze_query_expr(syntax, scope, policy, functions)?;
         let (collation, collation_is_explicit) = resolved.collation.into_output();
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
@@ -1251,15 +1260,56 @@ mod tests {
     }
 
     #[test]
-    fn scalar_function_checkpoint_rejects_aggregate_syntax() {
+    fn aggregate_functions_get_stable_block_local_identities() {
         let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT sum(score), count(id), max(value) FROM items",
+        )
+        .expect("plain aggregate calls bind");
+        document
+            .validate()
+            .expect("aggregate calls produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 3);
+        for (index, output) in block.outputs.iter().enumerate() {
+            let Expr::Function(call) = &output.expr else {
+                panic!("aggregate output becomes a function call");
+            };
+            assert_eq!(
+                call.evaluation,
+                FunctionEvaluation::Aggregate(crate::translate::semantic::hir::AggregateId::new(
+                    block.id, index,
+                ))
+            );
+            assert_eq!(call.arguments.len(), 1);
+            assert!(!call.star);
+        }
+        assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Numeric));
+        assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Integer));
+        assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
+    }
+
+    #[test]
+    fn aggregate_checkpoint_rejects_nested_and_modified_calls() {
+        let schema = schema_with_items();
+        let nested = analyze_sql_with_schema(&schema, "SELECT sum(max(score)) FROM items")
+            .expect_err("aggregate calls cannot be nested");
+        assert_eq!(
+            nested.to_string(),
+            "Parse error: misuse of aggregate function max()"
+        );
+
         for sql in [
-            "SELECT sum(score) FROM items",
             "SELECT length(DISTINCT value) FROM items",
             "SELECT length(value) FILTER (WHERE id > 0) FROM items",
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
-                .expect_err("aggregate-only function forms remain outside this checkpoint");
+                .expect_err("function modifiers remain outside this checkpoint");
             assert_eq!(
                 error.to_string(),
                 "Parse error: semantic analysis accepts source-free literal SELECT statements"
