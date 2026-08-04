@@ -54,11 +54,12 @@ Completed:
 - `BETWEEN`, list `IN`, `CASE`, and built-in `CAST` expressions.
 - Catalog-resolved custom `CAST` targets that need no stored program.
 - Simple custom `CAST` encoders bound against document-owned synthetic inputs.
+- Domain `NOT NULL` and `CHECK` rules frozen into custom `CAST` targets.
 
 Remaining expression checkpoints, in agreed order:
 
 1. Finish resolved custom `CAST` programs: functions and `RAISE` in encoders,
-   domains, and arrays.
+   and arrays.
 2. Functions.
 
 After expression work, resume the original SELECT order at joins. Basic outputs

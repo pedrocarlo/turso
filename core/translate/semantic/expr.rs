@@ -596,9 +596,6 @@ impl Analyzer<'_, '_> {
             {
                 if syntax.array_dimensions > 0
                     || resolved.leaf().user_params().count() != parameters.len()
-                    || resolved.chain.iter().any(|definition| {
-                        definition.not_null || !definition.domain_checks.is_empty()
-                    })
                 {
                     return super::analyze::unsupported_select();
                 }
@@ -628,9 +625,14 @@ impl Analyzer<'_, '_> {
                 let type_fact = hir::TypeFact::declared(hir::DeclaredType {
                     name: syntax.name.clone(),
                     storage,
-                    custom_chain,
+                    custom_chain: custom_chain.clone(),
                     array_dimensions: 0,
                 });
+                let domain = custom_chain
+                    .first()
+                    .filter(|definition| definition.value().is_domain)
+                    .map(|_| self.bind_domain_constraints(&type_fact, &custom_chain))
+                    .transpose()?;
                 return Ok(hir::TypeName {
                     name: syntax.name.clone(),
                     parameters: parameter_expressions,
@@ -639,7 +641,7 @@ impl Analyzer<'_, '_> {
                     affinity,
                     programs: hir::BoundCastPrograms {
                         encode,
-                        domain: None,
+                        domain,
                         apply_builtin_affinity: false,
                     },
                 });
