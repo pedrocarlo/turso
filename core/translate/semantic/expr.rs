@@ -753,14 +753,9 @@ impl Analyzer<'_, '_> {
             }
         }
         let affinity = Affinity::affinity(&syntax.name);
-        let storage = if syntax.array_dimensions > 0 {
-            Type::Blob
-        } else {
-            affinity.to_type()
-        };
         let type_fact = hir::TypeFact::declared(hir::DeclaredType {
             name: syntax.name.clone(),
-            storage,
+            storage: affinity.to_type(),
             custom_chain: Vec::new(),
             array_dimensions: syntax.array_dimensions,
         });

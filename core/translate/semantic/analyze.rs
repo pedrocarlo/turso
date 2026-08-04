@@ -628,6 +628,67 @@ mod tests {
     }
 
     #[test]
+    fn array_columns_keep_element_facts_without_program_metadata() {
+        let mut schema = Schema::new();
+        let table = Arc::new(
+            BTreeTable::from_sql(
+                "CREATE TABLE arrays(\
+                    vals INTEGER[], matrix TEXT[][], anything ANY[]\
+                 ) STRICT",
+                2,
+            )
+            .expect("array table schema parses"),
+        );
+        schema
+            .add_btree_table(table)
+            .expect("array table name is unique");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT vals, matrix, anything FROM arrays")
+                .expect("built-in array columns bind");
+        document
+            .validate()
+            .expect("array type facts produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source_id = block.from.as_ref().expect("array query has source").first;
+        let source = document.source(source_id).expect("array source exists");
+        assert!(source.column_type_programs.iter().all(Option::is_none));
+
+        let values = &source.columns[0].type_fact;
+        assert_eq!(values.storage, Some(Type::Blob));
+        assert_eq!(values.array_dimensions, 1);
+        let value = values.array_element().expect("INTEGER[] has an element");
+        assert_eq!(value.storage, Some(Type::Integer));
+        assert_eq!(value.array_dimensions, 0);
+
+        let matrix = &source.columns[1].type_fact;
+        assert_eq!(matrix.storage, Some(Type::Blob));
+        assert_eq!(matrix.array_dimensions, 2);
+        let row = matrix.array_element().expect("TEXT[][] has array elements");
+        assert_eq!(row.storage, Some(Type::Blob));
+        assert_eq!(row.array_dimensions, 1);
+        let value = row.array_element().expect("TEXT[] has scalar elements");
+        assert_eq!(value.storage, Some(Type::Text));
+
+        let anything = &source.columns[2].type_fact;
+        assert!(anything
+            .array_element()
+            .expect("ANY[] has an element fact")
+            .storage
+            .is_none());
+        assert!(block.outputs.iter().enumerate().all(|(column, output)| {
+            matches!(
+                output.expr,
+                Expr::Column(reference)
+                    if reference.source == source_id && reference.column == column
+            )
+        }));
+    }
+
+    #[test]
     fn stars_become_ordered_hir_outputs() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(&schema, "SELECT *, score FROM items")
