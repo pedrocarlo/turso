@@ -194,7 +194,6 @@ pub struct FunctionCall {
     /// need to match expression trees to identify shared function state.
     pub evaluation: FunctionEvaluation,
     pub arguments: FunctionArguments,
-    pub window: Option<WindowSpec>,
     pub result_type: TypeFact,
     pub custom_type_operation: Option<CustomTypeOperation>,
     pub sequence_operation: Option<SequenceOperation>,
@@ -249,14 +248,25 @@ pub enum FunctionEvaluation {
         id: AggregateId,
         filter: Option<Box<Expr>>,
     },
-    Window(WindowFunctionId),
+    Window {
+        id: WindowFunctionId,
+        filter: Option<Box<Expr>>,
+        spec: WindowSpec,
+    },
 }
 
 impl FunctionEvaluation {
     pub fn filter(&self) -> Option<&Expr> {
         match self {
-            Self::Aggregate { filter, .. } => filter.as_deref(),
-            Self::Scalar | Self::Window(_) => None,
+            Self::Aggregate { filter, .. } | Self::Window { filter, .. } => filter.as_deref(),
+            Self::Scalar => None,
+        }
+    }
+
+    pub fn window_spec(&self) -> Option<&WindowSpec> {
+        match self {
+            Self::Window { spec, .. } => Some(spec),
+            Self::Scalar | Self::Aggregate { .. } => None,
         }
     }
 }
@@ -473,7 +483,7 @@ impl Expr {
                 walk_exprs(call.arguments.expressions(), visitor);
                 walk_order_terms(call.arguments.order_terms(), visitor);
                 walk_optional_expr(call.evaluation.filter(), visitor);
-                if let Some(window) = &call.window {
+                if let Some(window) = call.evaluation.window_spec() {
                     walk_window_spec(window, visitor);
                 }
             }

@@ -10,7 +10,7 @@ use super::{
     scope::{ExprCollation, NamePrecedence, ResolvedScopeExpr, Scope},
 };
 use crate::{
-    function::{AggFunc, Func, ScalarFunc},
+    function::{AggFunc, Func, ScalarFunc, WindowFunc},
     schema::Type,
     sync::Arc,
     translate::collate::CollationSeq,
@@ -61,6 +61,7 @@ type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
 pub(super) struct QueryFunctionState {
     block: hir::QueryBlockId,
     aggregate_count: usize,
+    window_function_count: usize,
 }
 
 impl QueryFunctionState {
@@ -68,6 +69,7 @@ impl QueryFunctionState {
         Self {
             block,
             aggregate_count: 0,
+            window_function_count: 0,
         }
     }
 
@@ -79,6 +81,16 @@ impl QueryFunctionState {
 
     pub(super) const fn aggregate_count(&self) -> usize {
         self.aggregate_count
+    }
+
+    fn allocate_window(&mut self) -> hir::WindowFunctionId {
+        let id = hir::WindowFunctionId::new(self.block, self.window_function_count);
+        self.window_function_count += 1;
+        id
+    }
+
+    pub(super) const fn window_function_count(&self) -> usize {
+        self.window_function_count
     }
 }
 
@@ -97,12 +109,67 @@ struct AggregateBinding {
     id: hir::AggregateId,
 }
 
-struct WindowBinding;
+struct WindowBinding {
+    id: hir::WindowFunctionId,
+}
 
 struct FunctionOrderTerm {
     value: ResolvedScopeExpr,
     order: ast::SortOrder,
     nulls: Option<ast::NullsOrder>,
+}
+
+struct FunctionWindow {
+    partition_by: ExprChildren,
+    order_by: Vec<FunctionOrderTerm>,
+    frame: Option<FunctionWindowFrame>,
+}
+
+struct FunctionWindowFrame {
+    mode: ast::FrameMode,
+    start: hir::WindowFrameBound,
+    end: Option<hir::WindowFrameBound>,
+    exclude: Option<ast::FrameExclude>,
+}
+
+enum NestedFunction {
+    Aggregate(String),
+    Window(String),
+}
+
+impl FunctionWindow {
+    fn into_hir(self, function: &Func) -> Result<hir::WindowSpec> {
+        let frame = match function {
+            Func::Window(window) => match coerced_window_frame(window) {
+                Some(frame) => frame,
+                None => effective_window_frame(self.frame, self.order_by.len(), function)?,
+            },
+            _ => effective_window_frame(self.frame, self.order_by.len(), function)?,
+        };
+        Ok(hir::WindowSpec {
+            partition_by: self
+                .partition_by
+                .into_iter()
+                .map(|value| value.expr)
+                .collect(),
+            order_by: self
+                .order_by
+                .into_iter()
+                .map(FunctionOrderTerm::into_hir)
+                .collect(),
+            frame: Some(frame),
+        })
+    }
+
+    fn nested_function(&self) -> Option<NestedFunction> {
+        nested_function_iter(&self.partition_by)
+            .or_else(|| nested_function_iter(self.order_by.iter().map(|term| &term.value)))
+            .or_else(|| {
+                let frame = self.frame.as_ref()?;
+                nested_function_in_window_bound(&frame.start)
+                    .or_else(|| frame.end.as_ref().and_then(nested_function_in_window_bound))
+            })
+    }
 }
 
 impl FunctionOrderTerm {
@@ -273,6 +340,7 @@ impl<'a> ExprFrame<'a> {
                 }
             }
             ast::Expr::FunctionCall {
+                name,
                 args,
                 order_by,
                 within_group,
@@ -281,6 +349,8 @@ impl<'a> ExprFrame<'a> {
             } => {
                 let argument_order_end = args.len() + order_by.len();
                 let within_group_end = argument_order_end + within_group.len();
+                let filter_end =
+                    within_group_end + usize::from(filter_over.filter_clause.is_some());
                 if self.next_child < args.len() {
                     args.get(self.next_child).map(Box::as_ref)
                 } else if self.next_child < argument_order_end {
@@ -291,15 +361,31 @@ impl<'a> ExprFrame<'a> {
                     within_group
                         .get(self.next_child - argument_order_end)
                         .map(|term| term.expr.as_ref())
-                } else if self.next_child == within_group_end {
+                } else if self.next_child == within_group_end && filter_over.filter_clause.is_some()
+                {
                     filter_over.filter_clause.as_deref()
                 } else {
-                    None
+                    window_child(
+                        name,
+                        args.len(),
+                        filter_over.over_clause.as_ref(),
+                        self.next_child - filter_end,
+                    )
                 }
             }
-            ast::Expr::FunctionCallStar { filter_over, .. } => (self.next_child == 0)
-                .then(|| filter_over.filter_clause.as_deref())
-                .flatten(),
+            ast::Expr::FunctionCallStar { name, filter_over } => {
+                let filter_end = usize::from(filter_over.filter_clause.is_some());
+                if self.next_child == 0 && filter_end == 1 {
+                    filter_over.filter_clause.as_deref()
+                } else {
+                    window_child(
+                        name,
+                        0,
+                        filter_over.over_clause.as_ref(),
+                        self.next_child - filter_end,
+                    )
+                }
+            }
             ast::Expr::Raise(_, message) => {
                 (self.next_child == 0).then(|| message.as_deref()).flatten()
             }
@@ -309,6 +395,156 @@ impl<'a> ExprFrame<'a> {
             self.next_child += 1;
         }
         child
+    }
+}
+
+fn window_child<'a>(
+    name: &ast::Name,
+    argument_count: usize,
+    over: Option<&'a ast::Over>,
+    index: usize,
+) -> Option<&'a ast::Expr> {
+    let ast::Over::Window(window) = over? else {
+        return None;
+    };
+    if let Some(expression) = window.partition_by.get(index) {
+        return Some(expression.as_ref());
+    }
+    let index = index - window.partition_by.len();
+    if let Some(term) = window.order_by.get(index) {
+        return Some(term.expr.as_ref());
+    }
+    if window_function_ignores_frame(name, argument_count) {
+        return None;
+    }
+    let index = index - window.order_by.len();
+    let frame = window.frame_clause.as_ref()?;
+    [
+        frame_bound_expr(&frame.start),
+        frame.end.as_ref().and_then(frame_bound_expr),
+    ]
+    .into_iter()
+    .flatten()
+    .nth(index)
+}
+
+fn frame_bound_expr(bound: &ast::FrameBound) -> Option<&ast::Expr> {
+    match bound {
+        ast::FrameBound::Following(expression) | ast::FrameBound::Preceding(expression) => {
+            Some(expression.as_ref())
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => None,
+    }
+}
+
+fn window_function_ignores_frame(name: &ast::Name, argument_count: usize) -> bool {
+    match (normalize_ident(name.as_str()).as_str(), argument_count) {
+        ("row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist", 0)
+        | ("ntile", 1)
+        | ("lag" | "lead", 1..=3) => true,
+        _ => false,
+    }
+}
+
+fn window_expression_count(
+    name: &ast::Name,
+    argument_count: usize,
+    over: Option<&ast::Over>,
+) -> usize {
+    let Some(ast::Over::Window(window)) = over else {
+        return 0;
+    };
+    let frame_offsets = if window_function_ignores_frame(name, argument_count) {
+        0
+    } else {
+        window.frame_clause.as_ref().map_or(0, |frame| {
+            usize::from(frame_bound_expr(&frame.start).is_some())
+                + usize::from(frame.end.as_ref().and_then(frame_bound_expr).is_some())
+        })
+    };
+    window.partition_by.len() + window.order_by.len() + frame_offsets
+}
+
+fn take_function_window(
+    name: &ast::Name,
+    argument_count: usize,
+    over: Option<&ast::Over>,
+    children: &mut impl Iterator<Item = ResolvedScopeExpr>,
+) -> Result<Option<FunctionWindow>> {
+    let Some(over) = over else {
+        return Ok(None);
+    };
+    let ast::Over::Window(window) = over else {
+        return super::analyze::unsupported_select();
+    };
+    if window.base.is_some() {
+        return super::analyze::unsupported_select();
+    }
+    let partition_by = children.take(window.partition_by.len()).collect();
+    let order_by = window
+        .order_by
+        .iter()
+        .map(|syntax| FunctionOrderTerm {
+            value: children
+                .next()
+                .expect("window child count includes ORDER BY expression"),
+            order: syntax.order.unwrap_or(ast::SortOrder::Asc),
+            nulls: syntax.nulls,
+        })
+        .collect();
+    let frame = if window_function_ignores_frame(name, argument_count) {
+        None
+    } else {
+        window
+            .frame_clause
+            .as_ref()
+            .map(|frame| take_function_window_frame(frame, children))
+            .transpose()?
+    };
+    Ok(Some(FunctionWindow {
+        partition_by,
+        order_by,
+        frame,
+    }))
+}
+
+fn take_function_window_frame(
+    frame: &ast::FrameClause,
+    children: &mut impl Iterator<Item = ResolvedScopeExpr>,
+) -> Result<FunctionWindowFrame> {
+    Ok(FunctionWindowFrame {
+        mode: frame.mode,
+        start: take_window_frame_bound(&frame.start, children),
+        end: frame
+            .end
+            .as_ref()
+            .map(|bound| take_window_frame_bound(bound, children)),
+        exclude: frame.exclude.clone(),
+    })
+}
+
+fn take_window_frame_bound(
+    bound: &ast::FrameBound,
+    children: &mut impl Iterator<Item = ResolvedScopeExpr>,
+) -> hir::WindowFrameBound {
+    match bound {
+        ast::FrameBound::CurrentRow => hir::WindowFrameBound::CurrentRow,
+        ast::FrameBound::Following(_) => hir::WindowFrameBound::Following(Box::new(
+            children
+                .next()
+                .expect("window child count includes FOLLOWING offset")
+                .expr,
+        )),
+        ast::FrameBound::Preceding(_) => hir::WindowFrameBound::Preceding(Box::new(
+            children
+                .next()
+                .expect("window child count includes PRECEDING offset")
+                .expr,
+        )),
+        ast::FrameBound::UnboundedFollowing => hir::WindowFrameBound::UnboundedFollowing,
+        ast::FrameBound::UnboundedPreceding => hir::WindowFrameBound::UnboundedPreceding,
     }
 }
 
@@ -678,9 +914,6 @@ impl Analyzer<'_, '_> {
                             "mode() requires a WITHIN GROUP (ORDER BY ...) clause"
                         );
                     }
-                    if filter_over.over_clause.is_some() {
-                        return super::analyze::unsupported_select();
-                    }
                     None
                 } else {
                     Some(resolve_ordered_set_function(
@@ -695,7 +928,8 @@ impl Analyzer<'_, '_> {
                 let expected_children = args.len()
                     + order_by.len()
                     + within_group.len()
-                    + usize::from(filter_over.filter_clause.is_some());
+                    + usize::from(filter_over.filter_clause.is_some())
+                    + window_expression_count(name, args.len(), filter_over.over_clause.as_ref());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
@@ -728,6 +962,12 @@ impl Analyzer<'_, '_> {
                         .next()
                         .expect("function child count includes FILTER")
                 });
+                let window = take_function_window(
+                    name,
+                    args.len(),
+                    filter_over.over_clause.as_ref(),
+                    &mut children,
+                )?;
                 let input = match ordered_set {
                     Some(function) => FunctionInput::OrderedSet {
                         function,
@@ -743,23 +983,26 @@ impl Analyzer<'_, '_> {
                         order_by: argument_order,
                     },
                 };
-                self.build_function_call(name, input, filter, functions)
+                self.build_function_call(name, input, filter, window, functions)
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
-                if filter_over.over_clause.is_some() {
-                    return super::analyze::unsupported_select();
+                let expected_children = usize::from(filter_over.filter_clause.is_some())
+                    + window_expression_count(name, 0, filter_over.over_clause.as_ref());
+                if children.len() != expected_children {
+                    return Err(LimboError::InternalError(format!(
+                        "star function expression expected {expected_children} child values, got {}",
+                        children.len()
+                    )));
                 }
-                let filter = match filter_over.filter_clause {
-                    Some(_) => {
-                        let [filter] = expect_expr_children(children)?;
-                        Some(filter)
-                    }
-                    None => {
-                        expect_no_expr_children(children)?;
-                        None
-                    }
-                };
-                self.build_function_call(name, FunctionInput::Star, filter, functions)
+                let mut children = children.into_iter();
+                let filter = filter_over.filter_clause.as_ref().map(|_| {
+                    children
+                        .next()
+                        .expect("star function child count includes FILTER")
+                });
+                let window =
+                    take_function_window(name, 0, filter_over.over_clause.as_ref(), &mut children)?;
+                self.build_function_call(name, FunctionInput::Star, filter, window, functions)
             }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
@@ -813,6 +1056,7 @@ impl Analyzer<'_, '_> {
         name: &ast::Name,
         input: FunctionInput,
         filter: Option<ResolvedScopeExpr>,
+        window: Option<FunctionWindow>,
         functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
         let argument_count = input.argument_count();
@@ -829,28 +1073,49 @@ impl Analyzer<'_, '_> {
                 function
             }
         };
-        let binding = bind_function(&function, functions)?;
+        let binding = bind_function(&function, window.is_some(), name, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
+        let window_evaluation = matches!(binding, FunctionBinding::Window(_));
+        if window_evaluation && input.distinctness().is_some() {
+            crate::bail_parse_error!("DISTINCT is not supported for window functions");
+        }
+        if window_evaluation && !input.order_terms().is_empty() {
+            crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
+        }
+        if window_evaluation && filter.is_some() && matches!(&function, Func::Window(_)) {
+            crate::bail_parse_error!(
+                "FILTER clause may only be used with aggregate window functions"
+            );
+        }
         if (input.distinctness().is_some()
             || !input.order_terms().is_empty()
             || filter.is_some()
             || matches!(&input, FunctionInput::Star))
             && !aggregate
+            && !window_evaluation
         {
             return super::analyze::unsupported_select();
         }
-        if aggregate {
-            if let Some(nested) = nested_aggregate(input.facts())
+        if aggregate || window_evaluation {
+            if let Some(nested) = nested_function_iter(input.facts())
                 .or_else(|| {
-                    nested_aggregate_iter(input.order_terms().iter().map(|term| &term.value))
+                    nested_function_iter(input.order_terms().iter().map(|term| &term.value))
                 })
                 .or_else(|| {
                     filter
                         .as_ref()
-                        .and_then(|filter| nested_aggregate_iter([filter]))
+                        .and_then(|filter| nested_function_iter([filter]))
                 })
+                .or_else(|| window.as_ref().and_then(FunctionWindow::nested_function))
             {
-                crate::bail_parse_error!("misuse of aggregate function {nested}()");
+                match nested {
+                    NestedFunction::Aggregate(name) => {
+                        crate::bail_parse_error!("misuse of aggregate function {name}()")
+                    }
+                    NestedFunction::Window(name) => {
+                        crate::bail_parse_error!("misuse of window function: {name}()")
+                    }
+                }
             }
         }
         let result_type = function_result_type(&function, input.result_facts());
@@ -867,7 +1132,13 @@ impl Analyzer<'_, '_> {
                 id: binding.id,
                 filter: filter.map(|filter| Box::new(filter.expr)),
             },
-            FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
+            FunctionBinding::Window(binding) => hir::FunctionEvaluation::Window {
+                id: binding.id,
+                filter: filter.map(|filter| Box::new(filter.expr)),
+                spec: window
+                    .expect("window binding requires an OVER clause")
+                    .into_hir(function.value())?,
+            },
         };
         let arguments = input.into_hir();
         Ok(computed_expr(
@@ -875,7 +1146,6 @@ impl Analyzer<'_, '_> {
                 function,
                 evaluation,
                 arguments,
-                window: None,
                 result_type: result_type.clone(),
                 custom_type_operation: None,
                 sequence_operation: None,
@@ -1147,15 +1417,162 @@ fn computed_expr(
     }
 }
 
-fn bind_function(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+fn effective_window_frame(
+    frame: Option<FunctionWindowFrame>,
+    order_by_len: usize,
+    function: &Func,
+) -> Result<hir::WindowFrame> {
+    let Some(frame) = frame else {
+        return Ok(hir::WindowFrame {
+            mode: ast::FrameMode::Range,
+            start: hir::WindowFrameBound::UnboundedPreceding,
+            end: Some(hir::WindowFrameBound::CurrentRow),
+            exclude: None,
+        });
+    };
+    let end = frame.end.unwrap_or(hir::WindowFrameBound::CurrentRow);
+    let illegal = matches!(
+        (&frame.start, &end),
+        (hir::WindowFrameBound::UnboundedFollowing, _)
+            | (_, hir::WindowFrameBound::UnboundedPreceding)
+            | (
+                hir::WindowFrameBound::CurrentRow,
+                hir::WindowFrameBound::Preceding(_)
+            )
+            | (
+                hir::WindowFrameBound::Following(_),
+                hir::WindowFrameBound::Preceding(_) | hir::WindowFrameBound::CurrentRow
+            )
+    );
+    if illegal {
+        crate::bail_parse_error!("unsupported frame specification");
+    }
+    if frame.mode == ast::FrameMode::Range
+        && (matches!(
+            &frame.start,
+            hir::WindowFrameBound::Preceding(_) | hir::WindowFrameBound::Following(_)
+        ) || matches!(
+            &end,
+            hir::WindowFrameBound::Preceding(_) | hir::WindowFrameBound::Following(_)
+        ))
+        && order_by_len != 1
+    {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
+        );
+    }
+    let moving_start = !matches!(&frame.start, hir::WindowFrameBound::UnboundedPreceding);
+    if moving_start && frame.exclude.is_none() && !function_supports_sliding_frame(function) {
+        crate::bail_parse_error!(
+            "{}() does not yet support window frames with a moving start; use a frame with UNBOUNDED PRECEDING start",
+            function
+        );
+    }
+    Ok(hir::WindowFrame {
+        mode: frame.mode,
+        start: frame.start,
+        end: Some(end),
+        exclude: frame.exclude,
+    })
+}
+
+fn function_supports_sliding_frame(function: &Func) -> bool {
+    let supported = matches!(
+        function,
+        Func::Agg(
+            AggFunc::Sum
+                | AggFunc::Total
+                | AggFunc::Count
+                | AggFunc::Count0
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max
+                | AggFunc::GroupConcat
+                | AggFunc::StringAgg
+        ) | Func::Window(WindowFunc::FirstValue | WindowFunc::NthValue | WindowFunc::LastValue)
+    );
+    #[cfg(feature = "json")]
+    let supported = supported
+        || matches!(
+            function,
+            Func::Agg(
+                AggFunc::JsonGroupObject
+                    | AggFunc::JsonbGroupObject
+                    | AggFunc::JsonGroupArray
+                    | AggFunc::JsonbGroupArray
+            )
+        );
+    supported
+}
+
+fn coerced_window_frame(function: &WindowFunc) -> Option<hir::WindowFrame> {
+    use hir::WindowFrameBound::{CurrentRow, Following, UnboundedFollowing, UnboundedPreceding};
+    let (mode, start, end) = match function {
+        WindowFunc::RowNumber | WindowFunc::Lag => {
+            (ast::FrameMode::Rows, UnboundedPreceding, CurrentRow)
+        }
+        WindowFunc::Rank | WindowFunc::DenseRank => {
+            (ast::FrameMode::Range, UnboundedPreceding, CurrentRow)
+        }
+        WindowFunc::PercentRank => (ast::FrameMode::Groups, CurrentRow, UnboundedFollowing),
+        WindowFunc::CumeDist => (
+            ast::FrameMode::Groups,
+            Following(Box::new(hir::Expr::Literal(ast::Literal::Numeric(
+                "1".to_string(),
+            )))),
+            UnboundedFollowing,
+        ),
+        WindowFunc::Ntile => (ast::FrameMode::Rows, CurrentRow, UnboundedFollowing),
+        WindowFunc::Lead => (ast::FrameMode::Rows, UnboundedPreceding, UnboundedFollowing),
+        WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue => return None,
+        WindowFunc::External(_) => {
+            unreachable!("WindowFunc::External is not constructible: ExtFunc has no Window variant")
+        }
+    };
+    Some(hir::WindowFrame {
+        mode,
+        start,
+        end: Some(end),
+        exclude: None,
+    })
+}
+
+fn bind_function(
+    function: &Func,
+    has_over: bool,
+    name: &ast::Name,
+    context: &mut FunctionContext<'_>,
+) -> Result<FunctionBinding> {
     match function {
+        Func::Agg(_) if has_over => bind_window(function, context),
         Func::Agg(_) => bind_aggregate(function, context),
         Func::External(external) if external.func.is_aggregate() => {
-            bind_aggregate(function, context)
+            if has_over {
+                bind_window(function, context)
+            } else {
+                bind_aggregate(function, context)
+            }
         }
-        Func::Window(_) => Ok(FunctionBinding::Window(WindowBinding)),
+        Func::Window(_) if has_over => bind_window(function, context),
+        Func::Window(window) => {
+            crate::bail_parse_error!("misuse of window function: {}()", window)
+        }
+        _ if has_over => {
+            crate::bail_parse_error!("{} may not be used as a window function", name.as_str())
+        }
         Func::AlterTable(_) => super::analyze::unsupported_select(),
         _ => Ok(FunctionBinding::Scalar),
+    }
+}
+
+fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+    match context {
+        FunctionContext::ScalarOnly => {
+            crate::bail_parse_error!("misuse of window function: {}()", function)
+        }
+        FunctionContext::Query(state) => Ok(FunctionBinding::Window(WindowBinding {
+            id: state.allocate_window(),
+        })),
     }
 }
 
@@ -1230,28 +1647,44 @@ fn resolve_ordered_set_function(
     Ok(function)
 }
 
-fn nested_aggregate(arguments: &[ResolvedScopeExpr]) -> Option<String> {
-    nested_aggregate_iter(arguments)
+fn nested_function_iter<'a>(
+    arguments: impl IntoIterator<Item = &'a ResolvedScopeExpr>,
+) -> Option<NestedFunction> {
+    arguments
+        .into_iter()
+        .find_map(|argument| nested_function_in_expr(&argument.expr))
 }
 
-fn nested_aggregate_iter<'a>(
-    arguments: impl IntoIterator<Item = &'a ResolvedScopeExpr>,
-) -> Option<String> {
-    let mut name = None;
-    for argument in arguments {
-        argument.expr.walk(&mut |expression| {
-            if name.is_some() {
-                return;
+fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
+    let mut nested = None;
+    expression.walk(&mut |expression| {
+        if nested.is_some() {
+            return;
+        }
+        let hir::Expr::Function(call) = expression else {
+            return;
+        };
+        nested = match call.evaluation {
+            hir::FunctionEvaluation::Aggregate { .. } => {
+                Some(NestedFunction::Aggregate(call.function.value().to_string()))
             }
-            let hir::Expr::Function(call) = expression else {
-                return;
-            };
-            if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) {
-                name = Some(call.function.value().to_string());
+            hir::FunctionEvaluation::Window { .. } => {
+                Some(NestedFunction::Window(call.function.value().to_string()))
             }
-        });
+            hir::FunctionEvaluation::Scalar => None,
+        };
+    });
+    nested
+}
+
+fn nested_function_in_window_bound(bound: &hir::WindowFrameBound) -> Option<NestedFunction> {
+    match bound {
+        hir::WindowFrameBound::Following(expression)
+        | hir::WindowFrameBound::Preceding(expression) => nested_function_in_expr(expression),
+        hir::WindowFrameBound::CurrentRow
+        | hir::WindowFrameBound::UnboundedFollowing
+        | hir::WindowFrameBound::UnboundedPreceding => None,
     }
-    name
 }
 
 fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
@@ -1298,6 +1731,23 @@ fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir
             || hir::TypeFact::known_array(1),
             |argument| hir::TypeFact::array_literal_result([argument.type_fact.clone()]),
         ),
+        Func::Window(
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank | WindowFunc::Ntile,
+        ) => hir::TypeFact::known(Type::Integer),
+        Func::Window(WindowFunc::PercentRank | WindowFunc::CumeDist) => {
+            hir::TypeFact::known(Type::Real)
+        }
+        Func::Window(
+            WindowFunc::Lag
+            | WindowFunc::Lead
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue,
+        ) => arguments
+            .first()
+            .map_or_else(hir::TypeFact::dynamic, |argument| {
+                argument.type_fact.clone()
+            }),
         _ => hir::TypeFact::dynamic(),
     }
 }
