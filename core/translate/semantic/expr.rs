@@ -116,6 +116,19 @@ impl Analyzer<'_, '_> {
                     ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                         tasks.push(ExprTask::Visit(&expressions[0]));
                     }
+                    ast::Expr::Variable(variable) => {
+                        if variable.col_type.is_some() {
+                            return super::analyze::unsupported_select();
+                        }
+                        values.push(self.resolve_atomic_expr(
+                            hir::Expr::Parameter(hir::Parameter {
+                                index: variable.index,
+                                name: variable.name.as_deref().map(str::to_owned),
+                                type_fact: hir::TypeFact::dynamic(),
+                            }),
+                            scope,
+                        )?);
+                    }
                     ast::Expr::Unary(operator, expression) => {
                         tasks.push(ExprTask::BuildUnary(*operator));
                         tasks.push(ExprTask::Visit(expression));
@@ -256,6 +269,13 @@ impl Analyzer<'_, '_> {
             hir::Expr::Literal(literal) => Ok(ResolvedScopeExpr {
                 type_fact: super::analyze::literal_type_fact(&literal)?,
                 expr: hir::Expr::Literal(literal),
+                affinity: Affinity::Blob,
+                has_affinity: false,
+                collation: ExprCollation::Absent,
+            }),
+            hir::Expr::Parameter(parameter) => Ok(ResolvedScopeExpr {
+                type_fact: parameter.type_fact.clone(),
+                expr: hir::Expr::Parameter(parameter),
                 affinity: Affinity::Blob,
                 has_affinity: false,
                 collation: ExprCollation::Absent,
