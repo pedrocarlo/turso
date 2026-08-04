@@ -99,11 +99,30 @@ struct AggregateBinding {
 
 struct WindowBinding;
 
+struct FunctionOrderTerm {
+    value: ResolvedScopeExpr,
+    order: ast::SortOrder,
+    nulls: Option<ast::NullsOrder>,
+}
+
+impl FunctionOrderTerm {
+    fn into_hir(self) -> hir::OrderTerm {
+        hir::OrderTerm {
+            collation: self.value.collation.value().cloned(),
+            type_fact: self.value.type_fact,
+            expr: self.value.expr,
+            order: self.order,
+            nulls: self.nulls,
+        }
+    }
+}
+
 enum FunctionInput {
     Star,
     Expressions {
         distinctness: Option<ast::Distinctness>,
         values: ExprChildren,
+        order_by: Vec<FunctionOrderTerm>,
     },
 }
 
@@ -129,12 +148,28 @@ impl FunctionInput {
         }
     }
 
+    fn order_terms(&self) -> &[FunctionOrderTerm] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions { order_by, .. } => order_by,
+        }
+    }
+
     fn into_hir(self) -> hir::FunctionArguments {
         match self {
             Self::Star => hir::FunctionArguments::Star,
-            Self::Expressions { values, .. } => hir::FunctionArguments::Expressions(
-                values.into_iter().map(|value| value.expr).collect(),
-            ),
+            Self::Expressions {
+                distinctness,
+                values,
+                order_by,
+            } => hir::FunctionArguments::Expressions {
+                values: values.into_iter().map(|value| value.expr).collect(),
+                distinctness,
+                order_by: order_by
+                    .into_iter()
+                    .map(FunctionOrderTerm::into_hir)
+                    .collect(),
+            },
         }
     }
 }
@@ -215,7 +250,15 @@ impl<'a> ExprFrame<'a> {
                     None => (self.next_child == 0).then(|| expr.as_ref()),
                 }
             }
-            ast::Expr::FunctionCall { args, .. } => args.get(self.next_child).map(Box::as_ref),
+            ast::Expr::FunctionCall { args, order_by, .. } => {
+                if self.next_child < args.len() {
+                    args.get(self.next_child).map(Box::as_ref)
+                } else {
+                    order_by
+                        .get(self.next_child - args.len())
+                        .map(|term| term.expr.as_ref())
+                }
+            }
             ast::Expr::Raise(_, message) => {
                 (self.next_child == 0).then(|| message.as_deref()).flatten()
             }
@@ -588,25 +631,37 @@ impl Analyzer<'_, '_> {
                 within_group,
                 filter_over,
             } => {
-                if !order_by.is_empty()
-                    || !within_group.is_empty()
+                if !within_group.is_empty()
                     || filter_over.filter_clause.is_some()
                     || filter_over.over_clause.is_some()
                 {
                     return super::analyze::unsupported_select();
                 }
-                if children.len() != args.len() {
+                let expected_children = args.len() + order_by.len();
+                if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
-                        args.len(),
+                        expected_children,
                         children.len()
                     )));
                 }
+                let mut children = children.into_iter();
+                let values = children.by_ref().take(args.len()).collect();
+                let order_by = order_by
+                    .iter()
+                    .zip(children)
+                    .map(|(syntax, value)| FunctionOrderTerm {
+                        value,
+                        order: syntax.order.unwrap_or(ast::SortOrder::Asc),
+                        nulls: syntax.nulls,
+                    })
+                    .collect();
                 self.build_function_call(
                     name,
                     FunctionInput::Expressions {
                         distinctness: *distinctness,
-                        values: children,
+                        values,
+                        order_by,
                     },
                     functions,
                 )
@@ -681,11 +736,17 @@ impl Analyzer<'_, '_> {
         };
         let binding = bind_function(&function, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
-        if (input.distinctness().is_some() || matches!(&input, FunctionInput::Star)) && !aggregate {
+        if (input.distinctness().is_some()
+            || !input.order_terms().is_empty()
+            || matches!(&input, FunctionInput::Star))
+            && !aggregate
+        {
             return super::analyze::unsupported_select();
         }
         if aggregate {
-            if let Some(nested) = nested_aggregate(input.facts()) {
+            if let Some(nested) = nested_aggregate(input.facts()).or_else(|| {
+                nested_aggregate_iter(input.order_terms().iter().map(|term| &term.value))
+            }) {
                 crate::bail_parse_error!("misuse of aggregate function {nested}()");
             }
         }
@@ -702,15 +763,12 @@ impl Analyzer<'_, '_> {
             FunctionBinding::Aggregate(binding) => hir::FunctionEvaluation::Aggregate(binding.id),
             FunctionBinding::Window(_) => return super::analyze::unsupported_select(),
         };
-        let distinctness = input.distinctness();
         let arguments = input.into_hir();
         Ok(computed_expr(
             hir::Expr::Function(hir::FunctionCall {
                 function,
                 evaluation,
                 arguments,
-                distinctness,
-                argument_order: Vec::new(),
                 within_group: Vec::new(),
                 filter: None,
                 window: None,
@@ -1009,6 +1067,12 @@ fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<
 }
 
 fn nested_aggregate(arguments: &[ResolvedScopeExpr]) -> Option<String> {
+    nested_aggregate_iter(arguments)
+}
+
+fn nested_aggregate_iter<'a>(
+    arguments: impl IntoIterator<Item = &'a ResolvedScopeExpr>,
+) -> Option<String> {
     let mut name = None;
     for argument in arguments {
         argument.expr.walk(&mut |expression| {

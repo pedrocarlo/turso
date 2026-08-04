@@ -194,8 +194,6 @@ pub struct FunctionCall {
     /// need to match expression trees to identify shared function state.
     pub evaluation: FunctionEvaluation,
     pub arguments: FunctionArguments,
-    pub distinctness: Option<Distinctness>,
-    pub argument_order: Vec<OrderTerm>,
     pub within_group: Vec<OrderTerm>,
     pub filter: Option<Box<Expr>>,
     pub window: Option<WindowSpec>,
@@ -209,14 +207,32 @@ pub struct FunctionCall {
 #[derive(Clone, Debug)]
 pub enum FunctionArguments {
     Star,
-    Expressions(Vec<Expr>),
+    Expressions {
+        values: Vec<Expr>,
+        distinctness: Option<Distinctness>,
+        order_by: Vec<OrderTerm>,
+    },
 }
 
 impl FunctionArguments {
     pub fn expressions(&self) -> &[Expr] {
         match self {
             Self::Star => &[],
-            Self::Expressions(expressions) => expressions,
+            Self::Expressions { values, .. } => values,
+        }
+    }
+
+    pub fn order_by(&self) -> &[OrderTerm] {
+        match self {
+            Self::Star => &[],
+            Self::Expressions { order_by, .. } => order_by,
+        }
+    }
+
+    pub fn distinctness(&self) -> Option<Distinctness> {
+        match self {
+            Self::Star => None,
+            Self::Expressions { distinctness, .. } => *distinctness,
         }
     }
 }
@@ -438,7 +454,7 @@ impl Expr {
             }
             Self::Function(call) => {
                 walk_exprs(call.arguments.expressions(), visitor);
-                walk_order_terms(&call.argument_order, visitor);
+                walk_order_terms(call.arguments.order_by(), visitor);
                 walk_order_terms(&call.within_group, visitor);
                 walk_optional_expr(call.filter.as_deref(), visitor);
                 if let Some(window) = &call.window {
