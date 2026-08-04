@@ -1233,11 +1233,12 @@ mod tests {
             assert_eq!(call.evaluation, FunctionEvaluation::Scalar);
             assert!(matches!(
                 &call.arguments,
-                crate::translate::semantic::hir::FunctionArguments::Expressions(arguments)
-                    if arguments.len() == 1
+                crate::translate::semantic::hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } if values.len() == 1 && order_by.is_empty()
             ));
-            assert!(call.distinctness.is_none());
-            assert!(call.argument_order.is_empty());
             assert!(call.within_group.is_empty());
             assert!(call.filter.is_none());
             assert!(call.window.is_none());
@@ -1268,7 +1269,8 @@ mod tests {
         let document = analyze_sql_with_schema(
             &schema,
             "SELECT sum(score), count(id), max(value), count(*), \
-             sum(DISTINCT score) FROM items",
+             sum(DISTINCT score), \
+             group_concat(value ORDER BY score DESC NULLS LAST) FROM items",
         )
         .expect("plain aggregate calls bind");
         document
@@ -1279,7 +1281,7 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let block = &document.query(root.query).expect("query exists").blocks[0];
-        assert_eq!(block.aggregate_count, 5);
+        assert_eq!(block.aggregate_count, 6);
         for (index, output) in block.outputs.iter().enumerate() {
             let Expr::Function(call) = &output.expr else {
                 panic!("aggregate output becomes a function call");
@@ -1297,8 +1299,11 @@ mod tests {
                 Expr::Function(call)
                     if matches!(
                         &call.arguments,
-                        crate::translate::semantic::hir::FunctionArguments::Expressions(arguments)
-                            if arguments.len() == 1
+                        crate::translate::semantic::hir::FunctionArguments::Expressions {
+                            values,
+                            distinctness: None,
+                            order_by,
+                        } if values.len() == 1 && order_by.is_empty()
                     )
             )
         }));
@@ -1312,26 +1317,42 @@ mod tests {
         let Expr::Function(distinct_sum) = &block.outputs[4].expr else {
             unreachable!();
         };
-        assert_eq!(distinct_sum.distinctness, Some(ast::Distinctness::Distinct));
         assert!(matches!(
             &distinct_sum.arguments,
-            crate::translate::semantic::hir::FunctionArguments::Expressions(arguments)
-                if arguments.len() == 1
+            crate::translate::semantic::hir::FunctionArguments::Expressions {
+                values,
+                distinctness: Some(ast::Distinctness::Distinct),
+                order_by,
+            } if values.len() == 1 && order_by.is_empty()
         ));
+        let Expr::Function(ordered_concat) = &block.outputs[5].expr else {
+            unreachable!();
+        };
+        let crate::translate::semantic::hir::FunctionArguments::Expressions {
+            values,
+            distinctness,
+            order_by,
+        } = &ordered_concat.arguments
+        else {
+            panic!("ordered aggregate has expression arguments");
+        };
+        assert_eq!(values.len(), 1);
+        assert!(distinctness.is_none());
+        assert_eq!(order_by.len(), 1);
+        assert!(matches!(
+            order_by[0].expr,
+            Expr::Column(crate::translate::semantic::hir::ColumnRef { column: 2, .. })
+        ));
+        assert_eq!(order_by[0].order, ast::SortOrder::Desc);
+        assert_eq!(order_by[0].nulls, Some(ast::NullsOrder::Last));
+        assert_eq!(order_by[0].type_fact.storage, Some(Type::Real));
+        assert!(order_by[0].collation.is_none());
         assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Numeric));
         assert_eq!(block.outputs[1].type_fact.storage, Some(Type::Integer));
         assert_eq!(block.outputs[2].type_fact.storage, Some(Type::Text));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
         assert_eq!(block.outputs[4].type_fact.storage, Some(Type::Numeric));
-
-        let mut invalid = document.clone();
-        let Expr::Function(count_star) =
-            &mut invalid.queries[root.query.index()].blocks[0].outputs[3].expr
-        else {
-            unreachable!();
-        };
-        count_star.distinctness = Some(ast::Distinctness::Distinct);
-        assert!(invalid.validate().is_err());
+        assert_eq!(block.outputs[5].type_fact.storage, Some(Type::Text));
     }
 
     #[test]
@@ -1346,6 +1367,7 @@ mod tests {
 
         for sql in [
             "SELECT length(DISTINCT value) FROM items",
+            "SELECT length(value ORDER BY score) FROM items",
             "SELECT length(value) FILTER (WHERE id > 0) FROM items",
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
