@@ -2393,15 +2393,26 @@ pub(super) fn build_using_column(
     };
     let right_reference = *right_reference;
     let comparison = comparison_semantics(&left, &right);
-    let visible = match value {
-        hir::MergedColumnValue::Left => &left,
-        hir::MergedColumnValue::Right => &right,
-        hir::MergedColumnValue::Coalesce => return super::analyze::unsupported_select(),
+    let (type_fact, affinity, has_affinity, collation) = match value {
+        hir::MergedColumnValue::Left => (
+            left.type_fact.clone(),
+            left.affinity,
+            left.has_affinity,
+            left.collation.value().cloned(),
+        ),
+        hir::MergedColumnValue::Right => (
+            right.type_fact.clone(),
+            right.affinity,
+            right.has_affinity,
+            right.collation.value().cloned(),
+        ),
+        hir::MergedColumnValue::Coalesce => (
+            hir::TypeFact::selected_value_result([&left.type_fact, &right.type_fact]),
+            Affinity::Blob,
+            false,
+            None,
+        ),
     };
-    let type_fact = visible.type_fact.clone();
-    let affinity = visible.affinity;
-    let has_affinity = visible.has_affinity;
-    let collation = visible.collation.value().cloned();
 
     Ok(hir::UsingColumn {
         name,
