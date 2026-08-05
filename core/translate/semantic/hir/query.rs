@@ -46,6 +46,20 @@ pub struct QueryBlock {
     pub body: QueryBlockBody,
 }
 
+impl QueryBlock {
+    pub(crate) fn new(id: QueryBlockId, body: QueryBlockBody) -> Self {
+        Self {
+            id,
+            from: None,
+            outputs: Vec::new(),
+            aggregate_count: 0,
+            window_function_count: 0,
+            windows: Vec::new(),
+            body,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum QueryBlockBody {
     Select {
