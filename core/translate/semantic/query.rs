@@ -4,9 +4,9 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
-    expr::ExprPolicy,
+    expr::{build_using_column, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
-    scope::Scope,
+    scope::{resolve_source_column, Scope},
 };
 use crate::{schema::Table, sync::Arc, Result};
 
@@ -26,18 +26,52 @@ impl Analyzer<'_, '_> {
         let mut joins = Vec::with_capacity(syntax.joins.len());
         for syntax_join in &syntax.joins {
             let kind = basic_join_kind(syntax_join.operator)?;
-            if matches!(syntax_join.constraint, Some(ast::JoinConstraint::Using(_))) {
-                return super::analyze::unsupported_select();
+            let natural = is_natural_join(syntax_join.operator);
+            if natural && syntax_join.constraint.is_some() {
+                crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
             let right = self.analyze_table_source(&syntax_join.table, owner)?;
             let definition = self.source(right).ok_or_else(|| {
                 crate::LimboError::InternalError(format!("missing semantic source {right}"))
             })?;
+
+            let using_names = if natural {
+                Some(scope.natural_common_columns(definition))
+            } else if let Some(ast::JoinConstraint::Using(names)) = &syntax_join.constraint {
+                Some(names.iter().map(|name| name.as_str().to_string()).collect())
+            } else {
+                None
+            };
+            let using_columns = using_names
+                .map(|names| {
+                    names
+                        .into_iter()
+                        .map(|name| {
+                            let left = if natural {
+                                scope.resolve_natural_left(&name)?
+                            } else {
+                                scope.resolve_using_left(&name)?
+                            };
+                            let right = resolve_source_column(definition, &name)?;
+                            build_using_column(name, left, right, hir::MergedColumnValue::Left)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
+
             scope.add_source(definition, true);
+            if let Some(columns) = &using_columns {
+                scope.apply_using(columns)?;
+            }
+            let constraint = match using_columns {
+                Some(columns) if natural => hir::JoinConstraint::Natural(columns),
+                Some(columns) => hir::JoinConstraint::Using(columns),
+                None => hir::JoinConstraint::None,
+            };
             joins.push(hir::Join {
                 right,
                 kind,
-                constraint: hir::JoinConstraint::None,
+                constraint,
             });
         }
 
@@ -188,12 +222,8 @@ fn basic_join_kind(operator: ast::JoinOperator) -> Result<hir::JoinKind> {
         ast::JoinOperator::Comma => Ok(hir::JoinKind::Comma),
         ast::JoinOperator::TypedJoin(None) => Ok(hir::JoinKind::Inner),
         ast::JoinOperator::TypedJoin(Some(kind))
-            if kind.intersects(
-                ast::JoinType::NATURAL
-                    | ast::JoinType::LEFT
-                    | ast::JoinType::RIGHT
-                    | ast::JoinType::OUTER,
-            ) =>
+            if kind
+                .intersects(ast::JoinType::LEFT | ast::JoinType::RIGHT | ast::JoinType::OUTER) =>
         {
             super::analyze::unsupported_select()
         }
@@ -202,6 +232,13 @@ fn basic_join_kind(operator: ast::JoinOperator) -> Result<hir::JoinKind> {
         }
         ast::JoinOperator::TypedJoin(Some(_)) => Ok(hir::JoinKind::Inner),
     }
+}
+
+fn is_natural_join(operator: ast::JoinOperator) -> bool {
+    matches!(
+        operator,
+        ast::JoinOperator::TypedJoin(Some(kind)) if kind.contains(ast::JoinType::NATURAL)
+    )
 }
 
 fn table_has_rowid(table: &Table) -> bool {

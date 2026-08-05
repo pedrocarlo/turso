@@ -110,6 +110,21 @@ impl ScopeColumn {
     }
 }
 
+pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<ResolvedScopeExpr> {
+    let normalized = crate::util::normalize_ident(name);
+    source
+        .columns
+        .iter()
+        .enumerate()
+        .find(|(_, column)| crate::util::normalize_ident(&column.name) == normalized)
+        .map(|(index, column)| ScopeColumn::from_source(source.id, index, column).resolved())
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!(
+                "cannot join using column {name} - column not present in both tables"
+            ))
+        })
+}
+
 #[derive(Clone, Debug)]
 struct ScopeSource {
     id: SourceId,

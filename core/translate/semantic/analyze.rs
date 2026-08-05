@@ -451,7 +451,7 @@ mod tests {
         context::DoubleQuotedDml,
         hir::{
             CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot, JoinConstraint,
-            JoinKind, OutputNameKind, SourceKind, SourceOwner,
+            JoinKind, MergedColumnValue, OutputNameKind, SourceKind, SourceOwner,
         },
     };
 
@@ -503,7 +503,11 @@ mod tests {
         for (sql, root_page) in [
             ("CREATE TABLE categories(id INTEGER, label TEXT)", 3),
             ("CREATE TABLE tags(item_id INTEGER, note TEXT)", 4),
-            ("CREATE TABLE extras(item_id INTEGER, flag INTEGER)", 5),
+            (
+                "CREATE TABLE extras(item_id INTEGER, flag INTEGER, id INTEGER)",
+                5,
+            ),
+            ("CREATE TABLE codes(value INTEGER, label TEXT)", 6),
         ] {
             let table = Arc::new(
                 BTreeTable::from_sql(sql, root_page).expect("fixed join table schema parses"),
@@ -770,6 +774,141 @@ mod tests {
             .as_ref()
             .expect("joined query has FROM");
         assert_eq!(from.joins[0].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn using_joins_build_one_visible_column_from_resolved_sides() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id, items.id, categories.id, * \
+             FROM items JOIN categories USING (id)",
+        )
+        .expect("USING join binds into HIR");
+        document.validate().expect("USING join produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("joined query has FROM");
+        let JoinConstraint::Using(columns) = &from.joins[0].constraint else {
+            panic!("USING remains explicit in HIR");
+        };
+        assert_eq!(columns.len(), 1);
+        let column = &columns[0];
+        assert_eq!(column.name, "id");
+        assert_eq!(column.value, MergedColumnValue::Left);
+        assert!(matches!(
+            column.left.as_ref(),
+            Expr::Column(reference) if reference.source == from.first && reference.column == 0
+        ));
+        assert_eq!(column.right.source, from.joins[0].right);
+        assert_eq!(column.right.column, 0);
+
+        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        assert!(matches!(
+            block.outputs[1].expr,
+            Expr::Column(reference) if reference.source == from.first && reference.column == 0
+        ));
+        assert!(matches!(
+            block.outputs[2].expr,
+            Expr::Column(reference)
+                if reference.source == from.joins[0].right && reference.column == 0
+        ));
+        assert_eq!(block.outputs.len(), 7);
+        assert!(matches!(block.outputs[3].expr, Expr::MergedColumn(_)));
+    }
+
+    #[test]
+    fn natural_joins_use_both_sides_for_comparison_and_left_for_visible_facts() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value, items.value, codes.value, * \
+             FROM items NATURAL JOIN codes",
+        )
+        .expect("NATURAL join binds into HIR");
+        document
+            .validate()
+            .expect("NATURAL join produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("joined query has FROM");
+        let JoinConstraint::Natural(columns) = &from.joins[0].constraint else {
+            panic!("NATURAL remains explicit in HIR");
+        };
+        assert_eq!(columns.len(), 1);
+        let column = &columns[0];
+        assert_eq!(column.name, "value");
+        assert_eq!(column.type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            column.affinity,
+            crate::vdbe::affinity::Affinity::Text,
+            "visible merged value keeps left affinity"
+        );
+        assert_eq!(
+            column.comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Numeric,
+            "comparison sees the right INTEGER affinity"
+        );
+        assert_eq!(
+            column
+                .collation
+                .as_ref()
+                .expect("visible merged value keeps left collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert_eq!(
+            column.comparison.components[0]
+                .collation
+                .as_ref()
+                .expect("comparison resolves collation from both sides")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        assert_eq!(block.outputs.len(), 7);
+        assert!(matches!(block.outputs[3].expr, Expr::Column(_)));
+        assert!(matches!(block.outputs[4].expr, Expr::MergedColumn(_)));
+    }
+
+    #[test]
+    fn using_and_natural_joins_keep_name_errors() {
+        let schema = schema_with_join_tables();
+        let missing = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items JOIN categories USING (missing)",
+        )
+        .expect_err("USING requires the name on both sides");
+        assert_eq!(
+            missing.to_string(),
+            "Parse error: cannot join using column missing - column not present in both tables"
+        );
+
+        let constrained = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items NATURAL JOIN categories ON items.id = categories.id",
+        )
+        .expect_err("NATURAL rejects an explicit constraint");
+        assert_eq!(
+            constrained.to_string(),
+            "Parse error: a NATURAL join may not have an ON or USING clause"
+        );
+
+        let ambiguous = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items JOIN categories ON TRUE NATURAL JOIN extras",
+        )
+        .expect_err("NATURAL common name must be unique on the left");
+        assert_eq!(
+            ambiguous.to_string(),
+            "Parse error: ambiguous column name: id"
+        );
     }
 
     #[test]

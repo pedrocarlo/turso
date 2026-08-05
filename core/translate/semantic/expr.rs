@@ -1663,6 +1663,13 @@ impl Analyzer<'_, '_> {
                     collation: ExprCollation::inherited(column.collation.clone()),
                 })
             }
+            hir::Expr::MergedColumn(merged) => Ok(ResolvedScopeExpr {
+                type_fact: merged.type_fact.clone(),
+                affinity: merged.affinity,
+                has_affinity: merged.has_affinity,
+                collation: ExprCollation::inherited(merged.collation.clone()),
+                expr: hir::Expr::MergedColumn(merged),
+            }),
             hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
                 expr: hir::Expr::RowId(source),
                 type_fact: hir::TypeFact::known(Type::Integer),
@@ -2371,6 +2378,42 @@ fn comparison_semantics(
             array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
         }],
     }
+}
+
+pub(super) fn build_using_column(
+    name: String,
+    left: ResolvedScopeExpr,
+    right: ResolvedScopeExpr,
+    value: hir::MergedColumnValue,
+) -> Result<hir::UsingColumn> {
+    let hir::Expr::Column(right_reference) = &right.expr else {
+        return Err(LimboError::InternalError(
+            "USING right side is not a source column".to_string(),
+        ));
+    };
+    let right_reference = *right_reference;
+    let comparison = comparison_semantics(&left, &right);
+    let visible = match value {
+        hir::MergedColumnValue::Left => &left,
+        hir::MergedColumnValue::Right => &right,
+        hir::MergedColumnValue::Coalesce => return super::analyze::unsupported_select(),
+    };
+    let type_fact = visible.type_fact.clone();
+    let affinity = visible.affinity;
+    let has_affinity = visible.has_affinity;
+    let collation = visible.collation.value().cloned();
+
+    Ok(hir::UsingColumn {
+        name,
+        left: Box::new(left.expr),
+        right: right_reference,
+        value,
+        type_fact,
+        affinity,
+        has_affinity,
+        collation,
+        comparison,
+    })
 }
 
 fn in_comparison_semantics(

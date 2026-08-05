@@ -76,6 +76,9 @@ Completed:
   ordinary scalar call because it only reads connection state.
 - Basic joins. Comma, plain, inner, and cross joins preserve source order and
   bind `ON` expressions against the complete FROM scope.
+- `USING` and `NATURAL` joins resolve both column expressions once, freeze
+  comparison rules in HIR, and expose one merged unqualified column while
+  keeping qualified columns available.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
