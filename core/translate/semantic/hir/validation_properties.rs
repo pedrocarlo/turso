@@ -79,20 +79,19 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
         .collect::<Vec<_>>();
     let query_outputs = outputs.iter().map(|output| output.id).collect();
     let block = QueryBlock {
-        id: block_id,
         from: Some(From {
             first: source_id,
             joins: Vec::new(),
         }),
         outputs,
-        aggregate_count: 0,
-        window_function_count: 0,
-        windows: Vec::new(),
-        body: QueryBlockBody::Select {
-            distinctness: None,
-            filter: None,
-            grouping: None,
-        },
+        ..QueryBlock::new(
+            block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        )
     };
 
     HirDocument {
@@ -208,20 +207,19 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                 captures: Vec::new(),
                 reachable_ctes: vec![cte_id],
                 blocks: vec![QueryBlock {
-                    id: root_block,
                     from: Some(From {
                         first: source_id,
                         joins: Vec::new(),
                     }),
                     outputs: root_outputs,
-                    aggregate_count: 0,
-                    window_function_count: 0,
-                    windows: Vec::new(),
-                    body: QueryBlockBody::Select {
-                        distinctness: None,
-                        filter: None,
-                        grouping: None,
-                    },
+                    ..QueryBlock::new(
+                        root_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
                 }],
                 first: root_block,
                 compounds: Vec::new(),
@@ -235,17 +233,15 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                 captures: Vec::new(),
                 reachable_ctes: Vec::new(),
                 blocks: vec![QueryBlock {
-                    id: body_block,
-                    from: None,
                     outputs: body_outputs,
-                    aggregate_count: 0,
-                    window_function_count: 0,
-                    windows: Vec::new(),
-                    body: QueryBlockBody::Select {
-                        distinctness: None,
-                        filter: None,
-                        grouping: None,
-                    },
+                    ..QueryBlock::new(
+                        body_block,
+                        QueryBlockBody::Select {
+                            distinctness: None,
+                            filter: None,
+                            grouping: None,
+                        },
+                    )
                 }],
                 first: body_block,
                 compounds: Vec::new(),
