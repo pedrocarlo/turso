@@ -1469,7 +1469,7 @@ impl<'document> HirValidator<'document> {
                 match &function.operation {
                     FunctionOperation::Ordinary => {}
                     FunctionOperation::CustomType(operation) => {
-                        self.visit_custom_type_operation(operation)?;
+                        self.visit_custom_type_operation(function, operation)?;
                     }
                     FunctionOperation::Sequence(operation) => {
                         self.visit_sequence_operation(operation)?;
@@ -1816,7 +1816,11 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_custom_type_operation(&self, operation: &CustomTypeOperation) -> ValidationResult {
+    fn visit_custom_type_operation(
+        &self,
+        call: &FunctionCall,
+        operation: &CustomTypeOperation,
+    ) -> ValidationResult {
         let resolved_type = match operation {
             CustomTypeOperation::UnionValue { union_type, .. }
             | CustomTypeOperation::UnionTag { union_type, .. }
@@ -1824,13 +1828,127 @@ impl<'document> HirValidator<'document> {
             CustomTypeOperation::StructExtract { struct_type, .. } => struct_type,
         };
         self.visit_catalog_object(resolved_type, "custom-type operation")?;
+        let result_name = call
+            .result_type
+            .declared
+            .as_ref()
+            .map(|declaration| declaration.name.as_str());
         match operation {
-            CustomTypeOperation::UnionValue { result_type, .. }
-            | CustomTypeOperation::UnionExtract { result_type, .. }
-            | CustomTypeOperation::StructExtract { result_type, .. } => {
-                self.visit_type_fact(result_type)
+            CustomTypeOperation::UnionValue {
+                union_type,
+                tag_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(crate::function::ScalarFunc::UnionValueFunc)
+                    ),
+                    "union-value operation belongs to the wrong function",
+                )?;
+                let union = union_type.value().union_def();
+                self.require(
+                    union.is_some(),
+                    "union-value operation names a non-union type",
+                )?;
+                self.require(
+                    union.is_some_and(|union| {
+                        union
+                            .variants
+                            .iter()
+                            .any(|variant| variant.tag_index == *tag_index)
+                    }),
+                    "union-value operation has an unknown tag index",
+                )?;
+                self.require(
+                    result_name
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&union_type.value().name)),
+                    "union-value result type disagrees with its union",
+                )
             }
-            CustomTypeOperation::UnionTag { .. } => Ok(()),
+            CustomTypeOperation::UnionTag {
+                union_type,
+                tag_names,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(crate::function::ScalarFunc::UnionTagFunc)
+                    ),
+                    "union-tag operation belongs to the wrong function",
+                )?;
+                let union = union_type.value().union_def();
+                self.require(
+                    union.is_some(),
+                    "union-tag operation names a non-union type",
+                )?;
+                self.require(
+                    union.is_some_and(|union| union.tag_names.as_ref() == tag_names.as_ref()),
+                    "union-tag names disagree with its union",
+                )?;
+                self.require(
+                    call.result_type == TypeFact::known(crate::schema::Type::Text),
+                    "union-tag result is not TEXT",
+                )
+            }
+            CustomTypeOperation::UnionExtract {
+                union_type,
+                tag_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(
+                            crate::function::ScalarFunc::UnionExtractFunc
+                        )
+                    ),
+                    "union-extract operation belongs to the wrong function",
+                )?;
+                let variant = union_type.value().union_def().and_then(|union| {
+                    union
+                        .variants
+                        .iter()
+                        .find(|variant| variant.tag_index == *tag_index)
+                });
+                self.require(
+                    variant.is_some(),
+                    "union-extract operation has an unknown tag index",
+                )?;
+                self.require(
+                    variant.is_some_and(|variant| {
+                        result_name
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
+                    }),
+                    "union-extract result type disagrees with its variant",
+                )
+            }
+            CustomTypeOperation::StructExtract {
+                struct_type,
+                field_index,
+            } => {
+                self.require(
+                    matches!(
+                        call.function.value(),
+                        crate::function::Func::Scalar(
+                            crate::function::ScalarFunc::StructExtractFunc
+                        )
+                    ),
+                    "struct-extract operation belongs to the wrong function",
+                )?;
+                let field = struct_type
+                    .value()
+                    .struct_def()
+                    .and_then(|structure| structure.fields.get(*field_index));
+                self.require(
+                    field.is_some(),
+                    "struct-extract operation has an unknown field index",
+                )?;
+                self.require(
+                    field.is_some_and(|field| {
+                        result_name.is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
+                    }),
+                    "struct-extract result type disagrees with its field",
+                )
+            }
         }
     }
 

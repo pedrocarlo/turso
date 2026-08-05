@@ -332,12 +332,13 @@ struct ExprFrame<'a> {
 }
 
 impl<'a> ExprFrame<'a> {
-    fn new(syntax: &'a ast::Expr) -> Self {
-        Self {
+    fn new(syntax: &'a ast::Expr) -> Result<Self> {
+        validate_custom_type_read_syntax(syntax)?;
+        Ok(Self {
             syntax,
             next_child: 0,
             resolved_children: SmallVec::new(),
-        }
+        })
     }
 
     fn next_child(&mut self) -> Option<&'a ast::Expr> {
@@ -804,14 +805,14 @@ impl Analyzer<'_, '_> {
         policy: ExprPolicy,
         functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax)];
+        let mut frames = vec![ExprFrame::new(syntax)?];
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
                 .next_child()
             {
-                frames.push(ExprFrame::new(child));
+                frames.push(ExprFrame::new(child)?);
                 continue;
             }
 
@@ -1293,6 +1294,7 @@ impl Analyzer<'_, '_> {
                 function
             }
         };
+        let custom_type_operation = self.resolve_custom_type_read(&function, &input)?;
         let binding = bind_function(&function, window.is_some(), name, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
@@ -1350,7 +1352,15 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        let result_type = function_result_type(&function, input.result_facts());
+        let (operation, result_type) = custom_type_operation.map_or_else(
+            || {
+                (
+                    hir::FunctionOperation::Ordinary,
+                    function_result_type(&function, input.result_facts()),
+                )
+            },
+            |(operation, result_type)| (hir::FunctionOperation::CustomType(operation), result_type),
+        );
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function { argument_count },
@@ -1385,11 +1395,134 @@ impl Analyzer<'_, '_> {
                 evaluation,
                 arguments,
                 result_type: result_type.clone(),
-                operation: hir::FunctionOperation::Ordinary,
+                operation,
             }),
             result_type,
             ExprCollation::Absent,
         ))
+    }
+
+    fn resolve_custom_type_read(
+        &mut self,
+        function: &Func,
+        input: &FunctionInput,
+    ) -> Result<Option<(hir::CustomTypeOperation, hir::TypeFact)>> {
+        let scalar = match function {
+            Func::Scalar(
+                scalar @ (ScalarFunc::UnionTagFunc
+                | ScalarFunc::UnionExtractFunc
+                | ScalarFunc::StructExtractFunc),
+            ) => scalar,
+            _ => return Ok(None),
+        };
+        let arguments = input.facts();
+        match scalar {
+            ScalarFunc::UnionTagFunc => {
+                let union_type =
+                    custom_argument_type(&arguments[0], |definition| definition.is_union())
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "union_tag() argument must have a known union type".to_string(),
+                            )
+                        })?;
+                let tag_names = Arc::clone(
+                    &union_type
+                        .value()
+                        .union_def()
+                        .expect("resolved union type has a union definition")
+                        .tag_names,
+                );
+                Ok(Some((
+                    hir::CustomTypeOperation::UnionTag {
+                        union_type,
+                        tag_names,
+                    },
+                    hir::TypeFact::known(Type::Text),
+                )))
+            }
+            ScalarFunc::UnionExtractFunc => {
+                let tag_name = custom_type_name_argument(
+                    &arguments[1],
+                    "union_extract() second argument must be a string literal",
+                )?;
+                let union_type =
+                    custom_argument_type(&arguments[0], |definition| definition.is_union())
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "union_extract() first argument must have a known union type"
+                                    .to_string(),
+                            )
+                        })?;
+                let (tag_index, result_name) = union_type
+                    .value()
+                    .find_union_variant(&tag_name)
+                    .map(|(index, variant)| (index, variant.type_name.clone()))
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "unknown variant '{}' in union type '{}'",
+                            tag_name,
+                            union_type.value().name
+                        ))
+                    })?;
+                let result_type = self.resolve_named_type_fact(&result_name)?;
+                Ok(Some((
+                    hir::CustomTypeOperation::UnionExtract {
+                        union_type,
+                        tag_index,
+                    },
+                    result_type,
+                )))
+            }
+            ScalarFunc::StructExtractFunc => {
+                let field_name = custom_type_name_argument(
+                    &arguments[1],
+                    "struct_extract() second argument must be a string literal",
+                )?;
+                let struct_type =
+                    custom_argument_type(&arguments[0], |definition| definition.is_struct())
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "struct_extract() first argument must have a known struct type"
+                                    .to_string(),
+                            )
+                        })?;
+                let (field_index, result_name) = struct_type
+                    .value()
+                    .find_struct_field(&field_name)
+                    .map(|(index, field)| (index, field.type_name.clone()))
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "unknown field '{}' in struct type '{}'",
+                            field_name,
+                            struct_type.value().name
+                        ))
+                    })?;
+                let result_type = self.resolve_named_type_fact(&result_name)?;
+                Ok(Some((
+                    hir::CustomTypeOperation::StructExtract {
+                        struct_type,
+                        field_index,
+                    },
+                    result_type,
+                )))
+            }
+            _ => unreachable!("custom-type read function match is exhaustive"),
+        }
+    }
+
+    fn resolve_named_type_fact(&mut self, name: &str) -> Result<hir::TypeFact> {
+        if self.context().custom_types_enabled() {
+            if let Some(resolved) = self.context().main_schema().resolve_type_unchecked(name)? {
+                return Ok(self.freeze_type_fact(name, resolved).0);
+            }
+        }
+        let affinity = Affinity::affinity(name);
+        Ok(hir::TypeFact::declared(hir::DeclaredType {
+            name: name.to_string(),
+            storage: affinity.to_type(),
+            custom_chain: Vec::new(),
+            array_dimensions: 0,
+        }))
     }
 
     pub(super) fn resolve_atomic_expr(
@@ -1521,35 +1654,19 @@ impl Analyzer<'_, '_> {
                 {
                     return super::analyze::unsupported_select();
                 }
-                let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
-                let storage = Affinity::affinity(&resolved.primitive).to_type();
-                let affinity = Affinity::affinity(&resolved.primitive);
-                let mut custom_chain = Vec::with_capacity(resolved.chain.len());
-                for definition in resolved.chain {
-                    let id = self.catalog_object_id(
-                        Some(database),
-                        CatalogObjectKind::Type,
-                        crate::util::normalize_ident(&definition.name),
-                    );
-                    custom_chain.push(hir::CatalogObject::new(
-                        id,
-                        self.context().snapshot(),
-                        Some(database),
-                        definition,
-                    ));
-                }
+                let (type_fact, affinity) = self.freeze_type_fact(&syntax.name, resolved);
+                let custom_chain = type_fact
+                    .declared
+                    .as_ref()
+                    .expect("resolved custom type has a declaration")
+                    .custom_chain
+                    .clone();
                 let mut encode = Vec::new();
                 for definition in &custom_chain {
                     if let Some(call) = self.bind_type_encoder(definition, &parameters)? {
                         encode.push(call);
                     }
                 }
-                let type_fact = hir::TypeFact::declared(hir::DeclaredType {
-                    name: syntax.name.clone(),
-                    storage,
-                    custom_chain: custom_chain.clone(),
-                    array_dimensions: 0,
-                });
                 let domain = custom_chain
                     .first()
                     .filter(|definition| definition.value().is_domain)
@@ -1585,6 +1702,102 @@ impl Analyzer<'_, '_> {
             programs: builtin_cast_programs(),
         })
     }
+
+    fn freeze_type_fact(
+        &mut self,
+        name: &str,
+        resolved: crate::schema::ResolvedType,
+    ) -> (hir::TypeFact, Affinity) {
+        let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
+        let affinity = Affinity::affinity(&resolved.primitive);
+        let custom_chain = resolved
+            .chain
+            .into_iter()
+            .map(|definition| {
+                let id = self.catalog_object_id(
+                    Some(database),
+                    CatalogObjectKind::Type,
+                    crate::util::normalize_ident(&definition.name),
+                );
+                hir::CatalogObject::new(id, self.context().snapshot(), Some(database), definition)
+            })
+            .collect();
+        (
+            hir::TypeFact::declared(hir::DeclaredType {
+                name: name.to_string(),
+                storage: affinity.to_type(),
+                custom_chain,
+                array_dimensions: 0,
+            }),
+            affinity,
+        )
+    }
+}
+
+fn custom_argument_type(
+    argument: &ResolvedScopeExpr,
+    expected: impl FnOnce(&crate::schema::TypeDef) -> bool,
+) -> Option<hir::ResolvedType> {
+    argument
+        .type_fact
+        .declared
+        .as_ref()?
+        .custom()
+        .filter(|definition| expected(definition.value()))
+        .cloned()
+}
+
+fn custom_type_name_argument(argument: &ResolvedScopeExpr, error: &str) -> Result<String> {
+    match &argument.expr {
+        hir::Expr::Literal(ast::Literal::String(value)) => Ok(value.trim_matches('\'').to_string()),
+        _ => Err(LimboError::ParseError(error.to_string())),
+    }
+}
+
+fn validate_custom_type_read_syntax(syntax: &ast::Expr) -> Result<()> {
+    let ast::Expr::FunctionCall {
+        name,
+        args,
+        order_by,
+        within_group,
+        filter_over,
+        ..
+    } = syntax
+    else {
+        return Ok(());
+    };
+    let function = normalize_ident(name.as_str());
+    let expected_arguments = match function.as_str() {
+        "union_tag" => 1,
+        "union_extract" | "struct_extract" => 2,
+        _ => return Ok(()),
+    };
+    if args.len() != expected_arguments {
+        crate::bail_parse_error!(
+            "{}() requires exactly {} argument{}",
+            function,
+            expected_arguments,
+            if expected_arguments == 1 { "" } else { "s" }
+        );
+    }
+    if !order_by.is_empty() || !within_group.is_empty() {
+        crate::bail_parse_error!("ORDER BY is not allowed for scalar function {}()", function);
+    }
+    if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() {
+        crate::bail_parse_error!(
+            "{}() may not be used as an aggregate or window function",
+            function
+        );
+    }
+    if matches!(function.as_str(), "union_extract" | "struct_extract")
+        && !matches!(
+            args[1].as_ref(),
+            ast::Expr::Literal(ast::Literal::String(_))
+        )
+    {
+        crate::bail_parse_error!("{}() second argument must be a string literal", function);
+    }
+    Ok(())
 }
 
 fn cast_parameter_count(type_name: Option<&ast::Type>) -> usize {
