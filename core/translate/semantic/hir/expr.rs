@@ -8,11 +8,10 @@ use turso_parser::ast::{
 };
 
 use super::{
-    BoundCastPrograms, BoundSchemaCall, DatabaseId, MergedColumnValue, OutputId, QueryBlockId,
-    QueryId, ResolvedCollation, ResolvedFunction, ResolvedTable, ResolvedType, SourceId, TypeFact,
-    WindowId,
+    BoundCastPrograms, BoundSchemaCall, MergedColumnValue, OutputId, QueryBlockId, QueryId,
+    ResolvedCollation, ResolvedFunction, ResolvedSequence, ResolvedTable, ResolvedType, SourceId,
+    TypeFact, WindowId,
 };
-use crate::schema::Sequence;
 use crate::sync::Arc;
 use crate::vdbe::affinity::Affinity;
 
@@ -171,18 +170,16 @@ pub enum SequenceOperationKind {
 #[derive(Clone, Debug)]
 pub struct SequenceOperation {
     pub kind: SequenceOperationKind,
-    pub database: DatabaseId,
     /// The string supplied by SQL, without its outer quotes. Runtime currval
     /// tracking uses this spelling, including an optional schema prefix.
     pub user_name: String,
     pub normalized_name: String,
+    pub sequence: ResolvedSequence,
     pub backing_table: ResolvedTable,
     /// Present only for the internal sequence behind an AUTOINCREMENT table.
     /// Physical lowering uses this frozen object to keep sqlite_sequence in
     /// sync without reopening the catalog.
     pub sqlite_sequence: Option<ResolvedTable>,
-    pub sequence: Arc<Sequence>,
-    pub schema_cookie: u32,
 }
 
 #[derive(Clone, Debug)]

@@ -57,6 +57,7 @@ pub(super) struct Analyzer<'context, 'catalog> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CatalogObjectKind {
     Table,
+    Sequence,
     Collation,
     Type,
     Function { argument_count: usize },
@@ -440,7 +441,7 @@ mod tests {
 
     use crate::{
         dialect::SqliteDialect,
-        schema::{BTreeTable, Schema, Type},
+        schema::{BTreeTable, Schema, Sequence, Type},
         sync::Arc,
         SymbolTable,
     };
@@ -494,6 +495,25 @@ mod tests {
         schema
             .add_btree_table(table)
             .expect("fixed table name is unique");
+        schema
+    }
+
+    fn schema_with_sequence(name: &str) -> Schema {
+        let mut schema = Schema::new();
+        let normalized = crate::util::normalize_ident(name);
+        let sequence = Sequence::new(normalized.clone(), None, None, None, None, false)
+            .expect("fixed sequence descriptor is valid");
+        schema
+            .sequences
+            .insert(normalized.clone(), Arc::new(sequence));
+        let table = BTreeTable::from_sql(
+            &crate::translate::sequence::sequence_backing_table_sql(&normalized),
+            2,
+        )
+        .expect("sequence backing table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("sequence backing table name is unique");
         schema
     }
 
@@ -1388,6 +1408,134 @@ mod tests {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid read must fail");
             assert_eq!(error.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn sequence_writes_freeze_catalog_objects_and_names() {
+        let schema = schema_with_sequence("orders");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT nextval('orders'), \
+                    setval('main.orders', 7), \
+                    setval('orders', 8, TRUE), \
+                    currval('orders')",
+        )
+        .expect("sequence functions bind");
+        document
+            .validate()
+            .expect("sequence functions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        for (index, expected_kind, expected_user_name) in [
+            (
+                0,
+                crate::translate::semantic::hir::SequenceOperationKind::NextValue,
+                "orders",
+            ),
+            (
+                1,
+                crate::translate::semantic::hir::SequenceOperationKind::SetValue,
+                "main.orders",
+            ),
+            (
+                2,
+                crate::translate::semantic::hir::SequenceOperationKind::SetValue,
+                "orders",
+            ),
+        ] {
+            let Expr::Function(call) = &outputs[index].expr else {
+                panic!("sequence call becomes a function expression");
+            };
+            let FunctionOperation::Sequence(operation) = &call.operation else {
+                panic!("sequence write keeps its resolved operation");
+            };
+            assert_eq!(operation.kind, expected_kind);
+            assert_eq!(operation.user_name, expected_user_name);
+            assert_eq!(operation.normalized_name, "orders");
+            assert_eq!(operation.sequence.value().name, "orders");
+            assert_eq!(
+                operation.backing_table.value().get_name(),
+                "__turso_internal_seq_orders"
+            );
+            assert_eq!(
+                operation.sequence.database(),
+                Some(DatabaseId::new(crate::MAIN_DB_ID))
+            );
+            assert_eq!(operation.sequence.snapshot(), document.snapshot);
+            assert!(operation.sqlite_sequence.is_none());
+            assert_eq!(call.result_type, TypeFact::known(Type::Integer));
+        }
+
+        let Expr::Function(currval) = &outputs[3].expr else {
+            panic!("currval becomes a function expression");
+        };
+        assert!(matches!(currval.operation, FunctionOperation::Ordinary));
+        assert_eq!(currval.result_type, TypeFact::known(Type::Integer));
+    }
+
+    #[test]
+    fn sequence_writes_keep_name_errors() {
+        let schema = schema_with_sequence("orders");
+        for (sql, expected) in [
+            (
+                "SELECT nextval(orders)",
+                "Parse error: expected a string literal argument",
+            ),
+            (
+                "SELECT nextval(\"orders\")",
+                "Parse error: expected a string literal argument",
+            ),
+            (
+                "SELECT nextval('missing')",
+                "Parse error: sequence \"missing\" does not exist",
+            ),
+            (
+                "SELECT setval('aux.orders', 1)",
+                "Invalid argument supplied: no such database: aux",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call must fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn autoincrement_sequence_writes_resolve_sqlite_sequence() {
+        let sequence_name = crate::schema::autoincrement_sequence_name("items");
+        let mut schema = schema_with_sequence(&sequence_name);
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name, seq)", 3)
+                    .expect("sqlite_sequence schema parses"),
+            ))
+            .expect("sqlite_sequence name is unique");
+        let document =
+            analyze_sql_with_schema(&schema, &format!("SELECT nextval('{sequence_name}')"))
+                .expect("internal sequence binds");
+        document
+            .validate()
+            .expect("internal sequence produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let Expr::Function(call) =
+            &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
+        else {
+            panic!("nextval becomes a function expression");
+        };
+        let FunctionOperation::Sequence(operation) = &call.operation else {
+            panic!("nextval keeps its resolved sequence operation");
+        };
+        let sqlite_sequence = operation
+            .sqlite_sequence
+            .as_ref()
+            .expect("AUTOINCREMENT sequence resolves sqlite_sequence");
+        assert_eq!(sqlite_sequence.value().get_name(), "sqlite_sequence");
+        assert_eq!(sqlite_sequence.database(), operation.sequence.database());
     }
 
     #[test]
