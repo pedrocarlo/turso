@@ -64,6 +64,9 @@ Completed:
 - Inline window calls with stable query-block identities, resolved partition
   and ordering expressions, and frozen effective frames. Aggregate window
   filters and built-in frame coercion keep their existing rules.
+- Named and inherited windows resolve during analysis. Functions reference
+  block-owned `WindowId` values; parser window names and inheritance links do
+  not enter HIR.
 - `RAISE(ABORT, ...)` expressions, including built-in custom-type encoders such
   as `VARCHAR`.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
@@ -71,8 +74,7 @@ Completed:
 
 Remaining expression checkpoints, in agreed order:
 
-1. Finish function forms: named and inherited windows, then special custom-type
-   or sequence calls.
+1. Finish function forms: special custom-type or sequence calls.
 
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.

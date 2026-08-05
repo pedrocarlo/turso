@@ -866,10 +866,7 @@ impl<'document> HirValidator<'document> {
         }
         match &block.body {
             QueryBlockBody::Select {
-                filter,
-                grouping,
-                windows,
-                ..
+                filter, grouping, ..
             } => {
                 self.visit_optional_expr(filter.as_ref())?;
                 if let Some(grouping) = grouping {
@@ -893,9 +890,6 @@ impl<'document> HirValidator<'document> {
                     }
                     self.visit_optional_expr(grouping.having.as_ref())?;
                 }
-                for window in windows {
-                    self.visit_window_spec(&window.spec)?;
-                }
             }
             QueryBlockBody::Values { rows } => {
                 for row in rows {
@@ -911,6 +905,13 @@ impl<'document> HirValidator<'document> {
                     self.visit_exprs(row)?;
                 }
             }
+        }
+        for (index, window) in block.windows.iter().enumerate() {
+            self.require(
+                window.id == WindowId::new(block.id, index),
+                format!("window {:?} is stored at the wrong block index", window.id),
+            )?;
+            self.visit_resolved_window(window)?;
         }
         Ok(())
     }
@@ -1474,9 +1475,6 @@ impl<'document> HirValidator<'document> {
                 self.visit_exprs(function.arguments.expressions())?;
                 self.visit_order_terms(function.arguments.order_terms())?;
                 self.visit_optional_expr(function.evaluation.filter())?;
-                if let Some(window) = function.evaluation.window_spec() {
-                    self.visit_window_spec(window)?;
-                }
                 Ok(())
             }
             Expr::InList {
@@ -1560,7 +1558,7 @@ impl<'document> HirValidator<'document> {
                     format!("aggregate identity {id:?} is outside its block"),
                 )
             }
-            FunctionEvaluation::Window { id, filter, .. } => {
+            FunctionEvaluation::Window { id, window, filter } => {
                 let block = self.query_block(id.block)?;
                 self.require(
                     aggregate || window_function,
@@ -1573,6 +1571,10 @@ impl<'document> HirValidator<'document> {
                 self.require(
                     id.index < block.window_function_count,
                     format!("window identity {id:?} is outside its block"),
+                )?;
+                self.require(
+                    window.block == id.block && window.index < block.windows.len(),
+                    format!("resolved window {window:?} is outside its block"),
                 )
             }
         }
@@ -1671,12 +1673,10 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_window_spec(&self, window: &WindowSpec) -> ValidationResult {
+    fn visit_resolved_window(&self, window: &ResolvedWindow) -> ValidationResult {
         self.visit_exprs(&window.partition_by)?;
         self.visit_order_terms(&window.order_by)?;
-        let Some(frame) = &window.frame else {
-            return self.invalid("window evaluation has no effective frame");
-        };
+        let frame = &window.frame;
         self.visit_window_bound(&frame.start)?;
         let Some(end) = &frame.end else {
             return self.invalid("window effective frame has no end bound");

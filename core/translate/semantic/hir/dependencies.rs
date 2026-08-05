@@ -21,18 +21,12 @@ impl HirDocument {
             }
             match &block.body {
                 QueryBlockBody::Select {
-                    filter,
-                    grouping,
-                    windows,
-                    ..
+                    filter, grouping, ..
                 } => {
                     collect_optional_expr_references(filter.as_ref(), &mut references);
                     if let Some(grouping) = grouping {
                         collect_exprs_references(&grouping.keys, &mut references);
                         collect_optional_expr_references(grouping.having.as_ref(), &mut references);
-                    }
-                    for window in windows {
-                        collect_window_references(&window.spec, &mut references);
                     }
                 }
                 QueryBlockBody::Values { rows } => {
@@ -40,6 +34,9 @@ impl HirDocument {
                         collect_exprs_references(row, &mut references);
                     }
                 }
+            }
+            for window in &block.windows {
+                collect_window_references(window, &mut references);
             }
         }
         collect_order_references(&query.order_by, &mut references);
@@ -156,9 +153,6 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
             collect_exprs_references(function.arguments.expressions(), references);
             collect_order_references(function.arguments.order_terms(), references);
             collect_optional_expr_references(function.evaluation.filter(), references);
-            if let Some(window) = function.evaluation.window_spec() {
-                collect_window_references(window, references);
-            }
         }
         Expr::InList { lhs, values, .. } => {
             collect_expr_references(lhs, references);
@@ -207,12 +201,10 @@ fn collect_order_references(terms: &[OrderTerm], references: &mut HashSet<Source
     }
 }
 
-fn collect_window_references(window: &WindowSpec, references: &mut HashSet<SourceId>) {
+fn collect_window_references(window: &ResolvedWindow, references: &mut HashSet<SourceId>) {
     collect_exprs_references(&window.partition_by, references);
     collect_order_references(&window.order_by, references);
-    let Some(frame) = &window.frame else {
-        return;
-    };
+    let frame = &window.frame;
     collect_window_bound_references(&frame.start, references);
     if let Some(end) = &frame.end {
         collect_window_bound_references(end, references);
