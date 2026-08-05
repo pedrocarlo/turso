@@ -449,7 +449,8 @@ mod tests {
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            FunctionEvaluation, FunctionOperation, HirRoot, OutputNameKind, SourceKind, SourceOwner,
+            CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot, OutputNameKind,
+            SourceKind, SourceOwner,
         },
     };
 
@@ -1270,6 +1271,123 @@ mod tests {
         ));
         assert_eq!(abs.result_type.storage, Some(Type::Real));
         assert_eq!(outputs[1].type_fact, abs.result_type);
+    }
+
+    #[test]
+    fn custom_type_reads_freeze_types_and_member_indexes() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT)")
+            .expect("struct type parses");
+        schema
+            .add_type_from_sql("CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT)")
+            .expect("union type parses");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT union_tag(CAST(NULL AS platform)), \
+                    struct_extract(\
+                        union_extract(CAST(NULL AS platform), 'telegram'), \
+                        'chat_id'\
+                    )",
+        )
+        .expect("custom-type read functions bind");
+        document
+            .validate()
+            .expect("custom-type reads produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+
+        let Expr::Function(tag) = &outputs[0].expr else {
+            panic!("union_tag becomes a function call");
+        };
+        let FunctionOperation::CustomType(CustomTypeOperation::UnionTag {
+            union_type,
+            tag_names,
+        }) = &tag.operation
+        else {
+            panic!("union_tag keeps its resolved union operation");
+        };
+        assert_eq!(union_type.value().name, "platform");
+        assert_eq!(tag_names.as_ref(), ["telegram", "slack"]);
+        assert_eq!(tag.result_type.storage, Some(Type::Text));
+
+        let Expr::Function(field) = &outputs[1].expr else {
+            panic!("struct_extract becomes a function call");
+        };
+        let FunctionOperation::CustomType(CustomTypeOperation::StructExtract {
+            struct_type,
+            field_index,
+        }) = &field.operation
+        else {
+            panic!("struct_extract keeps its resolved field operation");
+        };
+        assert_eq!(struct_type.value().name, "telegram_msg");
+        assert_eq!(*field_index, 0);
+        assert_eq!(field.result_type.storage, Some(Type::Integer));
+
+        let [union, Expr::Literal(ast::Literal::String(field_name))] =
+            field.arguments.expressions()
+        else {
+            panic!("struct_extract keeps its input and member name");
+        };
+        assert_eq!(field_name, "'chat_id'");
+        let Expr::Function(union) = union else {
+            panic!("struct input comes from union_extract");
+        };
+        let FunctionOperation::CustomType(CustomTypeOperation::UnionExtract {
+            union_type,
+            tag_index,
+        }) = &union.operation
+        else {
+            panic!("union_extract keeps its resolved variant operation");
+        };
+        assert_eq!(union_type.value().name, "platform");
+        assert_eq!(*tag_index, 0);
+        assert_eq!(
+            union
+                .result_type
+                .declared
+                .as_ref()
+                .map(|declaration| declaration.name.as_str()),
+            Some("telegram_msg")
+        );
+    }
+
+    #[test]
+    fn custom_type_reads_keep_bind_time_errors() {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE platform AS UNION(telegram TEXT, slack TEXT)")
+            .expect("union type parses");
+
+        for (sql, expected) in [
+            (
+                "SELECT union_tag(1)",
+                "Parse error: union_tag() argument must have a known union type",
+            ),
+            (
+                "SELECT union_extract(CAST(NULL AS platform), 1)",
+                "Parse error: union_extract() second argument must be a string literal",
+            ),
+            (
+                "SELECT union_extract(CAST(NULL AS platform), \"telegram\")",
+                "Parse error: union_extract() second argument must be a string literal",
+            ),
+            (
+                "SELECT union_extract(CAST(NULL AS platform), 'discord')",
+                "Parse error: unknown variant 'discord' in union type 'platform'",
+            ),
+            (
+                "SELECT union_tag(CAST(NULL AS platform)) FILTER (WHERE TRUE)",
+                "Parse error: union_tag() may not be used as an aggregate or window function",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid read must fail");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

@@ -101,7 +101,6 @@ pub enum CustomTypeOperation {
     UnionValue {
         union_type: ResolvedType,
         tag_index: u8,
-        result_type: TypeFact,
     },
     UnionTag {
         union_type: ResolvedType,
@@ -110,12 +109,10 @@ pub enum CustomTypeOperation {
     UnionExtract {
         union_type: ResolvedType,
         tag_index: u8,
-        result_type: TypeFact,
     },
     StructExtract {
         struct_type: ResolvedType,
         field_index: usize,
-        result_type: TypeFact,
     },
 }
 
