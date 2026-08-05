@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
+    expr::ExprPolicy,
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     scope::Scope,
 };
@@ -15,26 +16,57 @@ impl Analyzer<'_, '_> {
         syntax: &ast::FromClause,
         owner: SourceOwner,
     ) -> Result<(hir::From, Scope)> {
-        if !syntax.joins.is_empty() {
-            return super::analyze::unsupported_select();
-        }
-        let ast::SelectTable::Table(name, alias, indexed) = syntax.select.as_ref() else {
-            return super::analyze::unsupported_select();
-        };
-        let source =
-            self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?;
+        let source = self.analyze_table_source(&syntax.select, owner)?;
         let mut scope = Scope::default();
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
         scope.add_source(definition, true);
+
+        let mut joins = Vec::with_capacity(syntax.joins.len());
+        for syntax_join in &syntax.joins {
+            let kind = basic_join_kind(syntax_join.operator)?;
+            if matches!(syntax_join.constraint, Some(ast::JoinConstraint::Using(_))) {
+                return super::analyze::unsupported_select();
+            }
+            let right = self.analyze_table_source(&syntax_join.table, owner)?;
+            let definition = self.source(right).ok_or_else(|| {
+                crate::LimboError::InternalError(format!("missing semantic source {right}"))
+            })?;
+            scope.add_source(definition, true);
+            joins.push(hir::Join {
+                right,
+                kind,
+                constraint: hir::JoinConstraint::None,
+            });
+        }
+
+        let policy = ExprPolicy::select(self.context().dqs_dml());
+        for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
+            if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
+                join.constraint =
+                    hir::JoinConstraint::On(self.analyze_expr(expression, &scope, policy)?);
+            }
+        }
+
         Ok((
             hir::From {
                 first: source,
-                joins: Vec::new(),
+                joins,
             },
             scope,
         ))
+    }
+
+    fn analyze_table_source(
+        &mut self,
+        syntax: &ast::SelectTable,
+        owner: SourceOwner,
+    ) -> Result<hir::SourceId> {
+        let ast::SelectTable::Table(name, alias, indexed) = syntax else {
+            return super::analyze::unsupported_select();
+        };
+        self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)
     }
 
     fn analyze_base_table_source(
@@ -148,6 +180,27 @@ impl Analyzer<'_, '_> {
             });
         }
         Ok(columns)
+    }
+}
+
+fn basic_join_kind(operator: ast::JoinOperator) -> Result<hir::JoinKind> {
+    match operator {
+        ast::JoinOperator::Comma => Ok(hir::JoinKind::Comma),
+        ast::JoinOperator::TypedJoin(None) => Ok(hir::JoinKind::Inner),
+        ast::JoinOperator::TypedJoin(Some(kind))
+            if kind.intersects(
+                ast::JoinType::NATURAL
+                    | ast::JoinType::LEFT
+                    | ast::JoinType::RIGHT
+                    | ast::JoinType::OUTER,
+            ) =>
+        {
+            super::analyze::unsupported_select()
+        }
+        ast::JoinOperator::TypedJoin(Some(kind)) if kind.contains(ast::JoinType::CROSS) => {
+            Ok(hir::JoinKind::Cross)
+        }
+        ast::JoinOperator::TypedJoin(Some(_)) => Ok(hir::JoinKind::Inner),
     }
 }
 
