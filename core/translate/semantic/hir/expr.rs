@@ -189,6 +189,13 @@ pub struct SequenceOperation {
 }
 
 #[derive(Clone, Debug)]
+pub enum FunctionOperation {
+    Ordinary,
+    CustomType(CustomTypeOperation),
+    Sequence(SequenceOperation),
+}
+
+#[derive(Clone, Debug)]
 pub struct FunctionCall {
     pub function: ResolvedFunction,
     /// How this call is evaluated after semantic analysis. Aggregate and
@@ -197,8 +204,7 @@ pub struct FunctionCall {
     pub evaluation: FunctionEvaluation,
     pub arguments: FunctionArguments,
     pub result_type: TypeFact,
-    pub custom_type_operation: Option<CustomTypeOperation>,
-    pub sequence_operation: Option<SequenceOperation>,
+    pub operation: FunctionOperation,
 }
 
 /// Resolved function argument shape. Star cannot coexist with expression

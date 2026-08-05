@@ -1466,11 +1466,14 @@ impl<'document> HirValidator<'document> {
                 self.visit_catalog_object(&function.function, "function call")?;
                 self.visit_type_fact(&function.result_type)?;
                 self.visit_function_evaluation(function)?;
-                if let Some(operation) = &function.custom_type_operation {
-                    self.visit_custom_type_operation(operation)?;
-                }
-                if let Some(operation) = &function.sequence_operation {
-                    self.visit_sequence_operation(operation)?;
+                match &function.operation {
+                    FunctionOperation::Ordinary => {}
+                    FunctionOperation::CustomType(operation) => {
+                        self.visit_custom_type_operation(operation)?;
+                    }
+                    FunctionOperation::Sequence(operation) => {
+                        self.visit_sequence_operation(operation)?;
+                    }
                 }
                 self.visit_exprs(function.arguments.expressions())?;
                 self.visit_order_terms(function.arguments.order_terms())?;
