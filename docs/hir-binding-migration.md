@@ -82,6 +82,10 @@ Completed:
 - Left, right, and full joins remain in lexical source order. Merged columns
   select the left value, right value, or a fact-aware coalesced value according
   to the preserved join kind; no planner-era right-join swap enters HIR.
+- Compound SELECT arms become ordered query blocks with separate source scopes,
+  aggregate identities, and window identities. `UNION`, `UNION ALL`, `EXCEPT`,
+  and `INTERSECT` are preserved in HIR, while outward output identity stays with
+  the first arm and width errors keep the existing diagnostic.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -91,10 +95,9 @@ DML because it needs the destination column type.
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.
 
-After expression work, resume the original SELECT order at joins. Basic outputs
-were implemented early; join-aware output behavior must still be checked after
-joins. Clause work such as WHERE must not jump ahead of this sequence without
-an explicit plan change.
+The supported SELECT path now reaches compounds. `VALUES`, WHERE, GROUP BY,
+ORDER BY, LIMIT, derived sources, and CTEs remain separate checkpoints. Continue
+with lazy CTE handling and correlation calculation before starting DML.
 
 ## Working rules
 
