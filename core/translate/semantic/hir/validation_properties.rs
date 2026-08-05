@@ -87,11 +87,11 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
         outputs,
         aggregate_count: 0,
         window_function_count: 0,
+        windows: Vec::new(),
         body: QueryBlockBody::Select {
             distinctness: None,
             filter: None,
             grouping: None,
-            windows: Vec::new(),
         },
     };
 
@@ -216,11 +216,11 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                     outputs: root_outputs,
                     aggregate_count: 0,
                     window_function_count: 0,
+                    windows: Vec::new(),
                     body: QueryBlockBody::Select {
                         distinctness: None,
                         filter: None,
                         grouping: None,
-                        windows: Vec::new(),
                     },
                 }],
                 first: root_block,
@@ -240,11 +240,11 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
                     outputs: body_outputs,
                     aggregate_count: 0,
                     window_function_count: 0,
+                    windows: Vec::new(),
                     body: QueryBlockBody::Select {
                         distinctness: None,
                         filter: None,
                         grouping: None,
-                        windows: Vec::new(),
                     },
                 }],
                 first: body_block,

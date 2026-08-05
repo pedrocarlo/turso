@@ -76,6 +76,19 @@ impl QueryBlockId {
     }
 }
 
+/// Identifies one effective window owned by a query block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId {
+    pub block: QueryBlockId,
+    pub index: usize,
+}
+
+impl WindowId {
+    pub const fn new(block: QueryBlockId, index: usize) -> Self {
+        Self { block, index }
+    }
+}
+
 /// The object that owns an output expression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OutputOwner {

@@ -10,6 +10,7 @@ use turso_parser::ast::{
 use super::{
     BoundCastPrograms, BoundSchemaCall, DatabaseId, MergedColumnValue, OutputId, QueryBlockId,
     QueryId, ResolvedCollation, ResolvedFunction, ResolvedTable, ResolvedType, SourceId, TypeFact,
+    WindowId,
 };
 use crate::schema::Sequence;
 use crate::sync::Arc;
@@ -69,10 +70,11 @@ pub struct OrderTerm {
 }
 
 #[derive(Clone, Debug)]
-pub struct WindowSpec {
+pub struct ResolvedWindow {
+    pub id: WindowId,
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<OrderTerm>,
-    pub frame: Option<WindowFrame>,
+    pub frame: WindowFrame,
 }
 
 #[derive(Clone, Debug)]
@@ -250,8 +252,8 @@ pub enum FunctionEvaluation {
     },
     Window {
         id: WindowFunctionId,
+        window: WindowId,
         filter: Option<Box<Expr>>,
-        spec: WindowSpec,
     },
 }
 
@@ -260,13 +262,6 @@ impl FunctionEvaluation {
         match self {
             Self::Aggregate { filter, .. } | Self::Window { filter, .. } => filter.as_deref(),
             Self::Scalar => None,
-        }
-    }
-
-    pub fn window_spec(&self) -> Option<&WindowSpec> {
-        match self {
-            Self::Window { spec, .. } => Some(spec),
-            Self::Scalar | Self::Aggregate { .. } => None,
         }
     }
 }
@@ -483,9 +478,6 @@ impl Expr {
                 walk_exprs(call.arguments.expressions(), visitor);
                 walk_order_terms(call.arguments.order_terms(), visitor);
                 walk_optional_expr(call.evaluation.filter(), visitor);
-                if let Some(window) = call.evaluation.window_spec() {
-                    walk_window_spec(window, visitor);
-                }
             }
             Self::InList { lhs, values, .. } => {
                 lhs.walk(visitor);
@@ -535,23 +527,4 @@ fn walk_order_terms<'expr>(terms: &'expr [OrderTerm], visitor: &mut impl FnMut(&
 
 fn walk_schema_call<'expr>(call: &'expr BoundSchemaCall, visitor: &mut impl FnMut(&'expr Expr)) {
     walk_exprs(&call.arguments, visitor);
-}
-
-fn walk_window_spec<'expr>(window: &'expr WindowSpec, visitor: &mut impl FnMut(&'expr Expr)) {
-    walk_exprs(&window.partition_by, visitor);
-    walk_order_terms(&window.order_by, visitor);
-    let Some(frame) = &window.frame else {
-        return;
-    };
-    walk_window_bound(&frame.start, visitor);
-    if let Some(end) = &frame.end {
-        walk_window_bound(end, visitor);
-    }
-}
-
-fn walk_window_bound<'expr>(bound: &'expr WindowFrameBound, visitor: &mut impl FnMut(&'expr Expr)) {
-    if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
-    {
-        expression.walk(visitor);
-    }
 }

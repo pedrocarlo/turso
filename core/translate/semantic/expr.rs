@@ -62,6 +62,8 @@ pub(super) struct QueryFunctionState {
     block: hir::QueryBlockId,
     aggregate_count: usize,
     window_function_count: usize,
+    named_windows: Vec<NamedFunctionWindow>,
+    windows: Vec<hir::ResolvedWindow>,
 }
 
 impl QueryFunctionState {
@@ -70,6 +72,8 @@ impl QueryFunctionState {
             block,
             aggregate_count: 0,
             window_function_count: 0,
+            named_windows: Vec::new(),
+            windows: Vec::new(),
         }
     }
 
@@ -92,6 +96,20 @@ impl QueryFunctionState {
     pub(super) const fn window_function_count(&self) -> usize {
         self.window_function_count
     }
+
+    pub(super) fn take_windows(&mut self) -> Vec<hir::ResolvedWindow> {
+        std::mem::take(&mut self.windows)
+    }
+
+    fn allocate_resolved_window(
+        &mut self,
+        window: FunctionWindow,
+        function: &Func,
+    ) -> Result<hir::WindowId> {
+        let id = hir::WindowId::new(self.block, self.windows.len());
+        self.windows.push(window.into_hir(id, function)?);
+        Ok(id)
+    }
 }
 
 enum FunctionContext<'state> {
@@ -113,23 +131,41 @@ struct WindowBinding {
     id: hir::WindowFunctionId,
 }
 
+#[derive(Clone)]
 struct FunctionOrderTerm {
     value: ResolvedScopeExpr,
     order: ast::SortOrder,
     nulls: Option<ast::NullsOrder>,
 }
 
+#[derive(Clone)]
 struct FunctionWindow {
     partition_by: ExprChildren,
     order_by: Vec<FunctionOrderTerm>,
     frame: Option<FunctionWindowFrame>,
 }
 
+#[derive(Clone)]
 struct FunctionWindowFrame {
     mode: ast::FrameMode,
     start: hir::WindowFrameBound,
     end: Option<hir::WindowFrameBound>,
     exclude: Option<ast::FrameExclude>,
+}
+
+#[derive(Clone)]
+struct NamedFunctionWindow {
+    name: String,
+    window: FunctionWindow,
+    frame: Option<ast::FrameClause>,
+}
+
+enum FunctionOver {
+    Named(String),
+    Inline {
+        base: Option<String>,
+        window: FunctionWindow,
+    },
 }
 
 enum NestedFunction {
@@ -138,7 +174,7 @@ enum NestedFunction {
 }
 
 impl FunctionWindow {
-    fn into_hir(self, function: &Func) -> Result<hir::WindowSpec> {
+    fn into_hir(self, id: hir::WindowId, function: &Func) -> Result<hir::ResolvedWindow> {
         let frame = match function {
             Func::Window(window) => match coerced_window_frame(window) {
                 Some(frame) => frame,
@@ -146,7 +182,8 @@ impl FunctionWindow {
             },
             _ => effective_window_frame(self.frame, self.order_by.len(), function)?,
         };
-        Ok(hir::WindowSpec {
+        Ok(hir::ResolvedWindow {
+            id,
             partition_by: self
                 .partition_by
                 .into_iter()
@@ -157,7 +194,7 @@ impl FunctionWindow {
                 .into_iter()
                 .map(FunctionOrderTerm::into_hir)
                 .collect(),
-            frame: Some(frame),
+            frame,
         })
     }
 
@@ -170,6 +207,31 @@ impl FunctionWindow {
                     .or_else(|| frame.end.as_ref().and_then(nested_function_in_window_bound))
             })
     }
+}
+
+fn chain_function_window(
+    mut window: FunctionWindow,
+    base: &FunctionWindow,
+    base_has_frame: bool,
+    base_name: &str,
+) -> Result<FunctionWindow> {
+    if !window.partition_by.is_empty() {
+        crate::bail_parse_error!("cannot override PARTITION clause of window: {}", base_name);
+    }
+    if !base.order_by.is_empty() && !window.order_by.is_empty() {
+        crate::bail_parse_error!("cannot override ORDER BY clause of window: {}", base_name);
+    }
+    if base_has_frame {
+        crate::bail_parse_error!(
+            "cannot override frame specification of window: {}",
+            base_name
+        );
+    }
+    window.partition_by.clone_from(&base.partition_by);
+    if window.order_by.is_empty() {
+        window.order_by.clone_from(&base.order_by);
+    }
+    Ok(window)
 }
 
 impl FunctionOrderTerm {
@@ -448,6 +510,10 @@ fn window_function_ignores_frame(name: &ast::Name, argument_count: usize) -> boo
     }
 }
 
+fn function_ignores_user_frame(function: &Func) -> bool {
+    matches!(function, Func::Window(window) if coerced_window_frame(window).is_some())
+}
+
 fn window_expression_count(
     name: &ast::Name,
     argument_count: usize,
@@ -472,16 +538,16 @@ fn take_function_window(
     argument_count: usize,
     over: Option<&ast::Over>,
     children: &mut impl Iterator<Item = ResolvedScopeExpr>,
-) -> Result<Option<FunctionWindow>> {
+) -> Result<Option<FunctionOver>> {
     let Some(over) = over else {
         return Ok(None);
     };
     let ast::Over::Window(window) = over else {
-        return super::analyze::unsupported_select();
+        let ast::Over::Name(name) = over else {
+            unreachable!("OVER has only named and inline forms")
+        };
+        return Ok(Some(FunctionOver::Named(normalize_ident(name.as_str()))));
     };
-    if window.base.is_some() {
-        return super::analyze::unsupported_select();
-    }
     let partition_by = children.take(window.partition_by.len()).collect();
     let order_by = window
         .order_by
@@ -503,10 +569,16 @@ fn take_function_window(
             .map(|frame| take_function_window_frame(frame, children))
             .transpose()?
     };
-    Ok(Some(FunctionWindow {
-        partition_by,
-        order_by,
-        frame,
+    Ok(Some(FunctionOver::Inline {
+        base: window
+            .base
+            .as_ref()
+            .map(|name| normalize_ident(name.as_str())),
+        window: FunctionWindow {
+            partition_by,
+            order_by,
+            frame,
+        },
     }))
 }
 
@@ -585,6 +657,144 @@ impl Analyzer<'_, '_> {
             policy,
             &mut FunctionContext::Query(functions),
         )
+    }
+
+    pub(super) fn analyze_named_windows(
+        &mut self,
+        definitions: &[ast::WindowDef],
+        scope: &Scope,
+        policy: ExprPolicy,
+        functions: &mut QueryFunctionState,
+    ) -> Result<()> {
+        for definition in definitions {
+            let name = normalize_ident(definition.name.as_str());
+            let mut window = self.analyze_window_definition(&definition.window, scope, policy)?;
+            if let Some(base) = &definition.window.base {
+                // SQLite ignores the base on the first WINDOW definition.
+                if !functions.named_windows.is_empty() {
+                    let base = normalize_ident(base.as_str());
+                    let inherited = functions
+                        .named_windows
+                        .iter()
+                        .rfind(|window| window.name == base)
+                        .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
+                    window = chain_function_window(
+                        window,
+                        &inherited.window,
+                        inherited.frame.is_some(),
+                        &base,
+                    )?;
+                }
+            }
+            functions.named_windows.push(NamedFunctionWindow {
+                name,
+                window,
+                frame: definition.window.frame_clause.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn analyze_window_definition(
+        &mut self,
+        window: &ast::Window,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<FunctionWindow> {
+        let mut partition_by = ExprChildren::new();
+        for expression in &window.partition_by {
+            partition_by.push(self.analyze_resolved_expr(expression, scope, policy)?);
+        }
+        let mut order_by = Vec::with_capacity(window.order_by.len());
+        for term in &window.order_by {
+            order_by.push(FunctionOrderTerm {
+                value: self.analyze_resolved_expr(&term.expr, scope, policy)?,
+                order: term.order.unwrap_or(ast::SortOrder::Asc),
+                nulls: term.nulls,
+            });
+        }
+        Ok(FunctionWindow {
+            partition_by,
+            order_by,
+            frame: None,
+        })
+    }
+
+    fn analyze_window_frame(
+        &mut self,
+        frame: &ast::FrameClause,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<FunctionWindowFrame> {
+        Ok(FunctionWindowFrame {
+            mode: frame.mode,
+            start: self.analyze_window_bound(&frame.start, scope, policy)?,
+            end: frame
+                .end
+                .as_ref()
+                .map(|bound| self.analyze_window_bound(bound, scope, policy))
+                .transpose()?,
+            exclude: frame.exclude.clone(),
+        })
+    }
+
+    fn analyze_window_bound(
+        &mut self,
+        bound: &ast::FrameBound,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<hir::WindowFrameBound> {
+        Ok(match bound {
+            ast::FrameBound::CurrentRow => hir::WindowFrameBound::CurrentRow,
+            ast::FrameBound::Following(expression) => hir::WindowFrameBound::Following(Box::new(
+                self.analyze_resolved_expr(expression, scope, policy)?.expr,
+            )),
+            ast::FrameBound::Preceding(expression) => hir::WindowFrameBound::Preceding(Box::new(
+                self.analyze_resolved_expr(expression, scope, policy)?.expr,
+            )),
+            ast::FrameBound::UnboundedFollowing => hir::WindowFrameBound::UnboundedFollowing,
+            ast::FrameBound::UnboundedPreceding => hir::WindowFrameBound::UnboundedPreceding,
+        })
+    }
+
+    fn resolve_function_over(
+        &mut self,
+        over: FunctionOver,
+        function: &Func,
+        scope: &Scope,
+        policy: ExprPolicy,
+        functions: &QueryFunctionState,
+    ) -> Result<FunctionWindow> {
+        match over {
+            FunctionOver::Named(name) => {
+                let named = functions
+                    .named_windows
+                    .iter()
+                    .rfind(|window| window.name == name)
+                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
+                let mut window = named.window.clone();
+                if !function_ignores_user_frame(function) {
+                    window.frame = named
+                        .frame
+                        .as_ref()
+                        .map(|frame| self.analyze_window_frame(frame, scope, policy))
+                        .transpose()?;
+                }
+                Ok(window)
+            }
+            FunctionOver::Inline { base: None, window } => Ok(window),
+            FunctionOver::Inline {
+                base: Some(base),
+                window,
+            } => {
+                let named = functions
+                    .named_windows
+                    .iter()
+                    .rfind(|window| window.name == base)
+                    .ok_or_else(|| LimboError::ParseError(format!("no such window: {base}")))?;
+                chain_function_window(window, &named.window, named.frame.is_some(), &base)
+            }
+        }
     }
 
     fn analyze_resolved_expr_with_functions(
@@ -983,7 +1193,7 @@ impl Analyzer<'_, '_> {
                         order_by: argument_order,
                     },
                 };
-                self.build_function_call(name, input, filter, window, functions)
+                self.build_function_call(name, input, filter, window, scope, policy, functions)
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 let expected_children = usize::from(filter_over.filter_clause.is_some())
@@ -1002,7 +1212,15 @@ impl Analyzer<'_, '_> {
                 });
                 let window =
                     take_function_window(name, 0, filter_over.over_clause.as_ref(), &mut children)?;
-                self.build_function_call(name, FunctionInput::Star, filter, window, functions)
+                self.build_function_call(
+                    name,
+                    FunctionInput::Star,
+                    filter,
+                    window,
+                    scope,
+                    policy,
+                    functions,
+                )
             }
             ast::Expr::Collate(_, name) => {
                 let [inner] = expect_expr_children(children)?;
@@ -1056,7 +1274,9 @@ impl Analyzer<'_, '_> {
         name: &ast::Name,
         input: FunctionInput,
         filter: Option<ResolvedScopeExpr>,
-        window: Option<FunctionWindow>,
+        window: Option<FunctionOver>,
+        scope: &Scope,
+        policy: ExprPolicy,
         functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
         let argument_count = input.argument_count();
@@ -1076,6 +1296,18 @@ impl Analyzer<'_, '_> {
         let binding = bind_function(&function, window.is_some(), name, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
+        let window = match (window_evaluation, window) {
+            (true, Some(over)) => Some(match functions {
+                FunctionContext::Query(state) => {
+                    self.resolve_function_over(over, &function, scope, policy, state)?
+                }
+                FunctionContext::ScalarOnly => {
+                    unreachable!("window binding rejects scalar-only expression contexts")
+                }
+            }),
+            (false, None) => None,
+            _ => unreachable!("window binding and OVER clause must agree"),
+        };
         if window_evaluation && input.distinctness().is_some() {
             crate::bail_parse_error!("DISTINCT is not supported for window functions");
         }
@@ -1134,10 +1366,16 @@ impl Analyzer<'_, '_> {
             },
             FunctionBinding::Window(binding) => hir::FunctionEvaluation::Window {
                 id: binding.id,
+                window: match functions {
+                    FunctionContext::Query(state) => state.allocate_resolved_window(
+                        window.expect("window binding requires an OVER clause"),
+                        function.value(),
+                    )?,
+                    FunctionContext::ScalarOnly => {
+                        unreachable!("window binding rejects scalar-only expression contexts")
+                    }
+                },
                 filter: filter.map(|filter| Box::new(filter.expr)),
-                spec: window
-                    .expect("window binding requires an OVER clause")
-                    .into_hir(function.value())?,
             },
         };
         let arguments = input.into_hir();

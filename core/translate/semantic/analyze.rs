@@ -241,7 +241,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         else {
             return unsupported_select();
         };
-        if where_clause.is_some() || group_by.is_some() || !window_clause.is_empty() {
+        if where_clause.is_some() || group_by.is_some() {
             return unsupported_select();
         }
         if from.is_none()
@@ -263,8 +263,17 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             None => (None, Scope::default()),
         };
         let mut functions = QueryFunctionState::new(block_id);
+        self.analyze_named_windows(
+            window_clause,
+            &scope,
+            ExprPolicy::select(self.context.dqs_dml()),
+            &mut functions,
+        )?;
         let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
         let output_ids = outputs.iter().map(|output| output.id).collect();
+        let aggregate_count = functions.aggregate_count();
+        let window_function_count = functions.window_function_count();
+        let windows = functions.take_windows();
 
         self.insert_query(
             query_id,
@@ -277,13 +286,13 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                     id: block_id,
                     from,
                     outputs,
-                    aggregate_count: functions.aggregate_count(),
-                    window_function_count: functions.window_function_count(),
+                    aggregate_count,
+                    window_function_count,
+                    windows,
                     body: QueryBlockBody::Select {
                         distinctness: *distinctness,
                         filter: None,
                         grouping: None,
-                        windows: Vec::new(),
                     },
                 }],
                 first: block_id,
@@ -1432,8 +1441,8 @@ mod tests {
         };
         let FunctionEvaluation::Window {
             id,
+            window,
             filter: None,
-            spec,
         } = &row_number.evaluation
         else {
             panic!("row_number has window evaluation");
@@ -1442,11 +1451,12 @@ mod tests {
             *id,
             crate::translate::semantic::hir::WindowFunctionId::new(block.id, 0)
         );
-        assert_eq!(spec.partition_by.len(), 1);
-        assert_eq!(spec.order_by.len(), 1);
-        assert_eq!(spec.order_by[0].order, ast::SortOrder::Desc);
-        assert_eq!(spec.order_by[0].nulls, Some(ast::NullsOrder::Last));
-        let frame = spec.frame.as_ref().expect("effective frame is frozen");
+        let window = &block.windows[window.index];
+        assert_eq!(window.partition_by.len(), 1);
+        assert_eq!(window.order_by.len(), 1);
+        assert_eq!(window.order_by[0].order, ast::SortOrder::Desc);
+        assert_eq!(window.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        let frame = &window.frame;
         assert_eq!(frame.mode, ast::FrameMode::Rows);
         assert!(matches!(frame.start, WindowFrameBound::UnboundedPreceding));
         assert!(matches!(frame.end, Some(WindowFrameBound::CurrentRow)));
@@ -1457,8 +1467,8 @@ mod tests {
         };
         let FunctionEvaluation::Window {
             id,
+            window,
             filter: Some(filter),
-            spec,
         } = &sum.evaluation
         else {
             panic!("sum has window evaluation and filter");
@@ -1468,7 +1478,7 @@ mod tests {
             crate::translate::semantic::hir::WindowFunctionId::new(block.id, 1)
         );
         assert!(matches!(filter.as_ref(), Expr::Binary { .. }));
-        let frame = spec.frame.as_ref().expect("effective frame is frozen");
+        let frame = &block.windows[window.index].frame;
         assert_eq!(frame.mode, ast::FrameMode::Rows);
         assert!(matches!(frame.start, WindowFrameBound::Preceding(_)));
         assert!(matches!(frame.end, Some(WindowFrameBound::Following(_))));
@@ -1477,10 +1487,10 @@ mod tests {
         let Expr::Function(first_value) = &block.outputs[2].expr else {
             panic!("first_value becomes a function call");
         };
-        let FunctionEvaluation::Window { spec, .. } = &first_value.evaluation else {
+        let FunctionEvaluation::Window { window, .. } = &first_value.evaluation else {
             panic!("first_value has window evaluation");
         };
-        let frame = spec.frame.as_ref().expect("default frame is frozen");
+        let frame = &block.windows[window.index].frame;
         assert_eq!(frame.mode, ast::FrameMode::Range);
         assert!(matches!(frame.start, WindowFrameBound::UnboundedPreceding));
         assert!(matches!(frame.end, Some(WindowFrameBound::CurrentRow)));
@@ -1531,6 +1541,89 @@ mod tests {
             let error = analyze_sql_with_schema(&schema, sql)
                 .expect_err("unsupported inline window form is rejected");
             assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn named_windows_resolve_inheritance_into_block_owned_windows() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT rank() OVER ranked, sum(score) OVER base, \
+                    row_number() OVER (later ORDER BY score) \
+             FROM items \
+             WINDOW base AS (PARTITION BY value), \
+                    ranked AS (base ORDER BY score), \
+                    later AS (PARTITION BY value)",
+        )
+        .expect("named and inline inheritance bind");
+        document
+            .validate()
+            .expect("resolved windows produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.window_function_count, 3);
+        assert_eq!(block.windows.len(), 3);
+        for (index, output) in block.outputs.iter().enumerate() {
+            let Expr::Function(function) = &output.expr else {
+                panic!("window output becomes a function call");
+            };
+            let FunctionEvaluation::Window { window, .. } = function.evaluation else {
+                panic!("function has window evaluation");
+            };
+            assert_eq!(window.index, index);
+            assert_eq!(block.windows[index].id, window);
+        }
+        assert_eq!(block.windows[0].partition_by.len(), 1);
+        assert_eq!(block.windows[0].order_by.len(), 1);
+        assert_eq!(block.windows[1].partition_by.len(), 1);
+        assert!(block.windows[1].order_by.is_empty());
+        assert_eq!(block.windows[2].partition_by.len(), 1);
+        assert_eq!(block.windows[2].order_by.len(), 1);
+    }
+
+    #[test]
+    fn named_windows_keep_sqlite_chaining_rules() {
+        let schema = schema_with_items();
+
+        analyze_sql_with_schema(
+            &schema,
+            "SELECT row_number() OVER framed FROM items \
+             WINDOW framed AS (ORDER BY score ROWS BETWEEN missing PRECEDING AND CURRENT ROW)",
+        )
+        .expect("coerced window functions ignore named user frames");
+
+        for (sql, expected) in [
+            (
+                "SELECT sum(score) OVER absent FROM items",
+                "Parse error: no such window: absent",
+            ),
+            (
+                "SELECT sum(score) OVER (base PARTITION BY id) FROM items \
+                 WINDOW base AS (PARTITION BY value)",
+                "Parse error: cannot override PARTITION clause of window: base",
+            ),
+            (
+                "SELECT sum(score) OVER (base ORDER BY id) FROM items \
+                 WINDOW base AS (ORDER BY score)",
+                "Parse error: cannot override ORDER BY clause of window: base",
+            ),
+            (
+                "SELECT sum(score) OVER child FROM items \
+                 WINDOW base AS (ROWS CURRENT ROW), child AS (base)",
+                "Parse error: cannot override frame specification of window: base",
+            ),
+            (
+                "SELECT sum(score) OVER second FROM items \
+                 WINDOW first AS (), second AS (later), later AS ()",
+                "Parse error: no such window: later",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid chain fails");
+            assert_eq!(error.to_string(), expected, "SQL: {sql}");
         }
     }
 
