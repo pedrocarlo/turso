@@ -79,6 +79,9 @@ Completed:
 - `USING` and `NATURAL` joins resolve both column expressions once, freeze
   comparison rules in HIR, and expose one merged unqualified column while
   keeping qualified columns available.
+- Left, right, and full joins remain in lexical source order. Merged columns
+  select the left value, right value, or a fact-aware coalesced value according
+  to the preserved join kind; no planner-era right-join swap enters HIR.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 

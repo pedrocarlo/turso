@@ -25,7 +25,13 @@ impl Analyzer<'_, '_> {
 
         let mut joins = Vec::with_capacity(syntax.joins.len());
         for syntax_join in &syntax.joins {
-            let kind = basic_join_kind(syntax_join.operator)?;
+            let kind = join_kind(syntax_join.operator);
+            if kind == hir::JoinKind::Right && !joins.is_empty() {
+                crate::bail_parse_error!(
+                    "RIGHT JOIN following another join is not yet supported. \
+                     Try rewriting as LEFT JOIN or using a subquery."
+                );
+            }
             let natural = is_natural_join(syntax_join.operator);
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
@@ -53,7 +59,7 @@ impl Analyzer<'_, '_> {
                                 scope.resolve_using_left(&name)?
                             };
                             let right = resolve_source_column(definition, &name)?;
-                            build_using_column(name, left, right, hir::MergedColumnValue::Left)
+                            build_using_column(name, left, right, merged_column_value(kind))
                         })
                         .collect::<Result<Vec<_>>>()
                 })
@@ -217,20 +223,39 @@ impl Analyzer<'_, '_> {
     }
 }
 
-fn basic_join_kind(operator: ast::JoinOperator) -> Result<hir::JoinKind> {
+fn join_kind(operator: ast::JoinOperator) -> hir::JoinKind {
     match operator {
-        ast::JoinOperator::Comma => Ok(hir::JoinKind::Comma),
-        ast::JoinOperator::TypedJoin(None) => Ok(hir::JoinKind::Inner),
-        ast::JoinOperator::TypedJoin(Some(kind))
-            if kind
-                .intersects(ast::JoinType::LEFT | ast::JoinType::RIGHT | ast::JoinType::OUTER) =>
-        {
-            super::analyze::unsupported_select()
+        ast::JoinOperator::Comma => hir::JoinKind::Comma,
+        ast::JoinOperator::TypedJoin(None) => hir::JoinKind::Inner,
+        ast::JoinOperator::TypedJoin(Some(kind)) if is_full_join(kind) => hir::JoinKind::Full,
+        ast::JoinOperator::TypedJoin(Some(kind)) if kind.contains(ast::JoinType::RIGHT) => {
+            hir::JoinKind::Right
+        }
+        ast::JoinOperator::TypedJoin(Some(kind)) if kind.contains(ast::JoinType::LEFT) => {
+            hir::JoinKind::Left
         }
         ast::JoinOperator::TypedJoin(Some(kind)) if kind.contains(ast::JoinType::CROSS) => {
-            Ok(hir::JoinKind::Cross)
+            hir::JoinKind::Cross
         }
-        ast::JoinOperator::TypedJoin(Some(_)) => Ok(hir::JoinKind::Inner),
+        ast::JoinOperator::TypedJoin(Some(_)) => hir::JoinKind::Inner,
+    }
+}
+
+fn is_full_join(kind: ast::JoinType) -> bool {
+    let left = kind.contains(ast::JoinType::LEFT);
+    let right = kind.contains(ast::JoinType::RIGHT);
+    let outer = kind.contains(ast::JoinType::OUTER);
+    (left && right) || (outer && !left && !right)
+}
+
+fn merged_column_value(kind: hir::JoinKind) -> hir::MergedColumnValue {
+    match kind {
+        hir::JoinKind::Right => hir::MergedColumnValue::Right,
+        hir::JoinKind::Full => hir::MergedColumnValue::Coalesce,
+        hir::JoinKind::Comma
+        | hir::JoinKind::Inner
+        | hir::JoinKind::Cross
+        | hir::JoinKind::Left => hir::MergedColumnValue::Left,
     }
 }
 

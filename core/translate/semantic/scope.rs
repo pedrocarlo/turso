@@ -530,26 +530,13 @@ impl Scope {
                 collation: using.collation.clone(),
             });
 
-            match using.value {
-                hir::MergedColumnValue::Left | hir::MergedColumnValue::Coalesce => {
-                    let left = &mut self.visible_columns[left_position];
-                    left.expr = merged;
-                    left.type_fact = using.type_fact.clone();
-                    left.affinity = using.affinity;
-                    left.has_affinity = using.has_affinity;
-                    left.collation = using.collation.clone();
-                    self.visible_columns.remove(right_position);
-                }
-                hir::MergedColumnValue::Right => {
-                    let right = &mut self.visible_columns[right_position];
-                    right.expr = merged;
-                    right.type_fact = using.type_fact.clone();
-                    right.affinity = using.affinity;
-                    right.has_affinity = using.has_affinity;
-                    right.collation = using.collation.clone();
-                    self.visible_columns.remove(left_position);
-                }
-            }
+            let left = &mut self.visible_columns[left_position];
+            left.expr = merged;
+            left.type_fact = using.type_fact.clone();
+            left.affinity = using.affinity;
+            left.has_affinity = using.has_affinity;
+            left.collation = using.collation.clone();
+            self.visible_columns.remove(right_position);
         }
         Ok(())
     }

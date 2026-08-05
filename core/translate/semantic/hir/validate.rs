@@ -924,7 +924,21 @@ impl<'document> HirValidator<'document> {
                 JoinConstraint::None => {}
                 JoinConstraint::On(expression) => self.visit_expr(expression)?,
                 JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                    let expected_value = match join.kind {
+                        JoinKind::Right => MergedColumnValue::Right,
+                        JoinKind::Full => MergedColumnValue::Coalesce,
+                        JoinKind::Comma | JoinKind::Inner | JoinKind::Cross | JoinKind::Left => {
+                            MergedColumnValue::Left
+                        }
+                    };
                     for column in columns {
+                        self.require(
+                            column.value == expected_value,
+                            format!(
+                                "join source {} has {:?} merged value for {:?} join",
+                                join.right, column.value, join.kind
+                            ),
+                        )?;
                         self.require(
                             column.right.source == join.right,
                             format!(

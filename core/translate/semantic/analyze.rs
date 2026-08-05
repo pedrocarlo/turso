@@ -912,6 +912,105 @@ mod tests {
     }
 
     #[test]
+    fn outer_using_joins_keep_kind_value_facts_and_star_order() {
+        let schema = schema_with_join_tables();
+        for (operator, kind, value) in [
+            ("LEFT JOIN", JoinKind::Left, MergedColumnValue::Left),
+            ("RIGHT JOIN", JoinKind::Right, MergedColumnValue::Right),
+            ("FULL JOIN", JoinKind::Full, MergedColumnValue::Coalesce),
+        ] {
+            let sql = format!("SELECT * FROM items {operator} codes USING (value)");
+            let document =
+                analyze_sql_with_schema(&schema, &sql).expect("outer USING join binds into HIR");
+            document
+                .validate()
+                .expect("outer USING join produces closed HIR");
+
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let block = &document.query(root.query).expect("query exists").blocks[0];
+            let from = block.from.as_ref().expect("joined query has FROM");
+            let join = &from.joins[0];
+            assert_eq!(join.kind, kind);
+            let JoinConstraint::Using(columns) = &join.constraint else {
+                panic!("outer USING remains explicit in HIR");
+            };
+            let column = &columns[0];
+            assert_eq!(column.value, value);
+            let Expr::MergedColumn(merged) = &block.outputs[1].expr else {
+                panic!("star emits one merged USING column");
+            };
+            assert_eq!(merged.value, value);
+            assert_eq!(
+                block
+                    .outputs
+                    .iter()
+                    .map(|output| output.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["id", "value", "score", "label"],
+                "RIGHT JOIN does not reorder lexical star columns"
+            );
+
+            match value {
+                MergedColumnValue::Left => {
+                    assert_eq!(column.type_fact.storage, Some(Type::Text));
+                    assert_eq!(column.affinity, crate::vdbe::affinity::Affinity::Text);
+                    assert!(column.has_affinity);
+                    assert!(column.collation.is_some());
+                }
+                MergedColumnValue::Right => {
+                    assert_eq!(column.type_fact.storage, Some(Type::Integer));
+                    assert_eq!(column.affinity, crate::vdbe::affinity::Affinity::Integer);
+                    assert!(column.has_affinity);
+                    assert!(column.collation.is_none());
+                }
+                MergedColumnValue::Coalesce => {
+                    assert!(column.type_fact.storage.is_none());
+                    assert_eq!(column.affinity, crate::vdbe::affinity::Affinity::Blob);
+                    assert!(!column.has_affinity);
+                    assert!(column.collation.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn natural_outer_joins_use_the_same_merge_direction() {
+        let schema = schema_with_join_tables();
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT value FROM items NATURAL RIGHT JOIN codes")
+                .expect("NATURAL RIGHT JOIN binds into HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let join = &block.from.as_ref().expect("joined query has FROM").joins[0];
+        assert_eq!(join.kind, JoinKind::Right);
+        let JoinConstraint::Natural(columns) = &join.constraint else {
+            panic!("NATURAL RIGHT JOIN remains explicit in HIR");
+        };
+        assert_eq!(columns[0].value, MergedColumnValue::Right);
+        assert_eq!(block.outputs[0].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn right_join_after_another_join_keeps_existing_error() {
+        let schema = schema_with_join_tables();
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items JOIN categories ON TRUE \
+             RIGHT JOIN extras ON TRUE",
+        )
+        .expect_err("chained RIGHT JOIN remains unsupported");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: RIGHT JOIN following another join is not yet supported. \
+             Try rewriting as LEFT JOIN or using a subquery."
+        );
+    }
+
+    #[test]
     fn array_columns_keep_element_facts_without_program_metadata() {
         let mut schema = Schema::new();
         let table = Arc::new(
