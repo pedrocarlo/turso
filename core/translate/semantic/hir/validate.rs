@@ -110,7 +110,7 @@ impl<'document> HirValidator<'document> {
         if let Some(sequence) = &cdc.sequence {
             self.visit_sequence_operation(sequence)?;
             self.require(
-                sequence.database.index() == crate::MAIN_DB_ID,
+                sequence.sequence.database().map(DatabaseId::index) == Some(crate::MAIN_DB_ID),
                 "CDC sequence must belong to the main database",
             )?;
         }
@@ -1472,7 +1472,7 @@ impl<'document> HirValidator<'document> {
                         self.visit_custom_type_operation(function, operation)?;
                     }
                     FunctionOperation::Sequence(operation) => {
-                        self.visit_sequence_operation(operation)?;
+                        self.visit_sequence_function(function, operation)?;
                     }
                 }
                 self.visit_exprs(function.arguments.expressions())?;
@@ -1953,29 +1953,77 @@ impl<'document> HirValidator<'document> {
     }
 
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {
-        self.require_database(operation.database)?;
+        self.visit_catalog_object(&operation.sequence, "sequence")?;
         self.visit_catalog_object(&operation.backing_table, "sequence backing table")?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
             self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
         }
-        let expected = self
-            .document
-            .databases
-            .iter()
-            .find(|snapshot| snapshot.database == operation.database)
-            .map(|snapshot| snapshot.schema_version)
-            .ok_or_else(|| {
-                HirValidationError::new(format!(
-                    "sequence database {} is absent from the catalog snapshot",
-                    operation.database.index()
-                ))
-            })?;
+        let database = operation
+            .sequence
+            .database()
+            .ok_or_else(|| HirValidationError::new("sequence has no owning database"))?;
         self.require(
-            operation.schema_cookie == expected,
-            format!(
-                "sequence schema cookie {} does not match snapshot version {expected}",
-                operation.schema_cookie
+            operation.backing_table.database() == Some(database),
+            "sequence and backing table belong to different databases",
+        )?;
+        self.require(
+            operation
+                .sequence
+                .value()
+                .name
+                .eq_ignore_ascii_case(&operation.normalized_name),
+            "sequence descriptor name disagrees with resolved name",
+        )?;
+        let expected_backing =
+            crate::translate::sequence::sequence_backing_table_name(&operation.normalized_name);
+        self.require(
+            operation
+                .backing_table
+                .value()
+                .get_name()
+                .eq_ignore_ascii_case(&expected_backing),
+            "sequence backing table name disagrees with resolved name",
+        )?;
+        if let Some(sqlite_sequence) = &operation.sqlite_sequence {
+            self.require(
+                sqlite_sequence.database() == Some(database),
+                "sequence and sqlite_sequence belong to different databases",
+            )?;
+            self.require(
+                sqlite_sequence
+                    .value()
+                    .get_name()
+                    .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+                "sequence operation carries the wrong sqlite_sequence table",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn visit_sequence_function(
+        &self,
+        call: &FunctionCall,
+        operation: &SequenceOperation,
+    ) -> ValidationResult {
+        self.visit_sequence_operation(operation)?;
+        let expected = match operation.kind {
+            SequenceOperationKind::NextValue => crate::function::ScalarFunc::NextVal,
+            SequenceOperationKind::SetValue => crate::function::ScalarFunc::SetVal,
+        };
+        self.require(
+            matches!(
+                call.function.value(),
+                crate::function::Func::Scalar(function) if function == &expected
             ),
+            "sequence operation belongs to the wrong function",
+        )?;
+        self.require(
+            matches!(call.evaluation, FunctionEvaluation::Scalar),
+            "sequence operation is not scalar",
+        )?;
+        self.require(
+            call.result_type == TypeFact::known(crate::schema::Type::Integer),
+            "sequence function result is not INTEGER",
         )
     }
 

@@ -69,12 +69,16 @@ Completed:
   not enter HIR.
 - `RAISE(ABORT, ...)` expressions, including built-in custom-type encoders such
   as `VARCHAR`.
+- Custom-type read functions. `union_tag`, `union_extract`, and
+  `struct_extract` carry resolved types and stable member indexes in HIR.
+- Sequence writes. `nextval` and `setval` carry the resolved sequence,
+  backing table, and optional `sqlite_sequence` table. `currval` stays an
+  ordinary scalar call because it only reads connection state.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
-Remaining expression checkpoints, in agreed order:
-
-1. Finish function forms: special custom-type or sequence calls.
+The SELECT expression checkpoints are complete. `union_value` remains with
+DML because it needs the destination column type.
 
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     function::{AggFunc, Func, ScalarFunc, WindowFunc},
-    schema::Type,
+    schema::{Type, AUTOINCREMENT_SEQ_PREFIX, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
     translate::collate::CollationSeq,
     util::normalize_ident,
@@ -333,7 +333,7 @@ struct ExprFrame<'a> {
 
 impl<'a> ExprFrame<'a> {
     fn new(syntax: &'a ast::Expr) -> Result<Self> {
-        validate_custom_type_read_syntax(syntax)?;
+        validate_special_function_syntax(syntax)?;
         Ok(Self {
             syntax,
             next_child: 0,
@@ -1294,7 +1294,12 @@ impl Analyzer<'_, '_> {
                 function
             }
         };
-        let custom_type_operation = self.resolve_custom_type_read(&function, &input)?;
+        let special_operation = match self.resolve_custom_type_read(&function, &input)? {
+            Some((operation, result_type)) => {
+                Some((hir::FunctionOperation::CustomType(operation), result_type))
+            }
+            None => self.resolve_sequence_operation(&function, &input)?,
+        };
         let binding = bind_function(&function, window.is_some(), name, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
@@ -1352,14 +1357,14 @@ impl Analyzer<'_, '_> {
                 }
             }
         }
-        let (operation, result_type) = custom_type_operation.map_or_else(
+        let (operation, result_type) = special_operation.map_or_else(
             || {
                 (
                     hir::FunctionOperation::Ordinary,
                     function_result_type(&function, input.result_facts()),
                 )
             },
-            |(operation, result_type)| (hir::FunctionOperation::CustomType(operation), result_type),
+            |resolved| resolved,
         );
         let id = self.catalog_object_id(
             None,
@@ -1441,7 +1446,7 @@ impl Analyzer<'_, '_> {
                 )))
             }
             ScalarFunc::UnionExtractFunc => {
-                let tag_name = custom_type_name_argument(
+                let tag_name = string_literal_argument(
                     &arguments[1],
                     "union_extract() second argument must be a string literal",
                 )?;
@@ -1474,7 +1479,7 @@ impl Analyzer<'_, '_> {
                 )))
             }
             ScalarFunc::StructExtractFunc => {
-                let field_name = custom_type_name_argument(
+                let field_name = string_literal_argument(
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
                 )?;
@@ -1508,6 +1513,90 @@ impl Analyzer<'_, '_> {
             }
             _ => unreachable!("custom-type read function match is exhaustive"),
         }
+    }
+
+    fn resolve_sequence_operation(
+        &mut self,
+        function: &Func,
+        input: &FunctionInput,
+    ) -> Result<Option<(hir::FunctionOperation, hir::TypeFact)>> {
+        let kind = match function {
+            Func::Scalar(ScalarFunc::NextVal) => hir::SequenceOperationKind::NextValue,
+            Func::Scalar(ScalarFunc::SetVal) => hir::SequenceOperationKind::SetValue,
+            _ => return Ok(None),
+        };
+        let user_name =
+            string_literal_argument(&input.facts()[0], "expected a string literal argument")?;
+        let (database, normalized_name) = match user_name.split_once('.') {
+            Some((schema, name)) => {
+                let schema = normalize_ident(schema);
+                let database = self.context().database(&schema).ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {schema}"))
+                })?;
+                (database, normalize_ident(name))
+            }
+            None => (
+                hir::DatabaseId::new(crate::MAIN_DB_ID),
+                normalize_ident(&user_name),
+            ),
+        };
+        let backing_table_name =
+            crate::translate::sequence::sequence_backing_table_name(&normalized_name);
+        let (backing_table, sequence, sqlite_sequence) = {
+            let schema = self.context().main_schema();
+            let backing_table = schema.get_table(&backing_table_name).ok_or_else(|| {
+                LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
+            })?;
+            let sequence = schema
+                .get_sequence(&normalized_name)
+                .cloned()
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
+                })?;
+            let sqlite_sequence = normalized_name
+                .starts_with(AUTOINCREMENT_SEQ_PREFIX)
+                .then(|| schema.get_table(SQLITE_SEQUENCE_TABLE_NAME))
+                .flatten();
+            (backing_table, sequence, sqlite_sequence)
+        };
+        let backing_table_id =
+            self.catalog_object_id(Some(database), CatalogObjectKind::Table, backing_table_name);
+        let backing_table = hir::CatalogObject::new(
+            backing_table_id,
+            self.context().snapshot(),
+            Some(database),
+            backing_table,
+        );
+        let sequence_id = self.catalog_object_id(
+            Some(database),
+            CatalogObjectKind::Sequence,
+            normalized_name.clone(),
+        );
+        let sequence = hir::CatalogObject::new(
+            sequence_id,
+            self.context().snapshot(),
+            Some(database),
+            sequence,
+        );
+        let sqlite_sequence = sqlite_sequence.map(|table| {
+            let id = self.catalog_object_id(
+                Some(database),
+                CatalogObjectKind::Table,
+                SQLITE_SEQUENCE_TABLE_NAME,
+            );
+            hir::CatalogObject::new(id, self.context().snapshot(), Some(database), table)
+        });
+        Ok(Some((
+            hir::FunctionOperation::Sequence(hir::SequenceOperation {
+                kind,
+                user_name,
+                normalized_name,
+                sequence,
+                backing_table,
+                sqlite_sequence,
+            }),
+            hir::TypeFact::known(Type::Integer),
+        )))
     }
 
     fn resolve_named_type_fact(&mut self, name: &str) -> Result<hir::TypeFact> {
@@ -1747,14 +1836,14 @@ fn custom_argument_type(
         .cloned()
 }
 
-fn custom_type_name_argument(argument: &ResolvedScopeExpr, error: &str) -> Result<String> {
+fn string_literal_argument(argument: &ResolvedScopeExpr, error: &str) -> Result<String> {
     match &argument.expr {
         hir::Expr::Literal(ast::Literal::String(value)) => Ok(value.trim_matches('\'').to_string()),
         _ => Err(LimboError::ParseError(error.to_string())),
     }
 }
 
-fn validate_custom_type_read_syntax(syntax: &ast::Expr) -> Result<()> {
+fn validate_special_function_syntax(syntax: &ast::Expr) -> Result<()> {
     let ast::Expr::FunctionCall {
         name,
         args,
@@ -1767,6 +1856,20 @@ fn validate_custom_type_read_syntax(syntax: &ast::Expr) -> Result<()> {
         return Ok(());
     };
     let function = normalize_ident(name.as_str());
+    let valid_sequence_arity = match function.as_str() {
+        "nextval" => args.len() == 1,
+        "setval" => matches!(args.len(), 2 | 3),
+        _ => false,
+    };
+    if valid_sequence_arity {
+        if !matches!(
+            args[0].as_ref(),
+            ast::Expr::Literal(ast::Literal::String(_))
+        ) {
+            crate::bail_parse_error!("expected a string literal argument");
+        }
+        return Ok(());
+    }
     let expected_arguments = match function.as_str() {
         "union_tag" => 1,
         "union_extract" | "struct_extract" => 2,
@@ -2148,7 +2251,9 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
 
 fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
     match function {
-        Func::Scalar(ScalarFunc::Length) => hir::TypeFact::known(Type::Integer),
+        Func::Scalar(
+            ScalarFunc::Length | ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal,
+        ) => hir::TypeFact::known(Type::Integer),
         Func::Scalar(ScalarFunc::Abs) => {
             arguments
                 .first()

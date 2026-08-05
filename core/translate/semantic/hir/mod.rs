@@ -18,7 +18,7 @@ use std::fmt;
 
 use crate::{
     function::Func,
-    schema::{Index, Table, Trigger, Type, TypeDef},
+    schema::{Index, Sequence, Table, Trigger, Type, TypeDef},
     sync::Arc,
     translate::collate::CollationSeq,
 };
@@ -241,6 +241,7 @@ pub type ResolvedFunction = CatalogObject<Func>;
 pub type ResolvedCollation = CatalogObject<CollationSeq>;
 pub type ResolvedType = CatalogObject<TypeDef>;
 pub type ResolvedTrigger = CatalogObject<Trigger>;
+pub type ResolvedSequence = CatalogObject<Sequence>;
 
 /// A declared SQL type whose meaning was resolved during analysis.
 #[derive(Clone, Debug, PartialEq)]
