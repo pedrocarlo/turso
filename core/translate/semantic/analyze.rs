@@ -448,7 +448,9 @@ mod tests {
     use super::*;
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
-        hir::{FunctionEvaluation, HirRoot, OutputNameKind, SourceKind, SourceOwner},
+        hir::{
+            FunctionEvaluation, FunctionOperation, HirRoot, OutputNameKind, SourceKind, SourceOwner,
+        },
     };
 
     fn parse_statement(sql: &str) -> ast::Stmt {
@@ -1240,6 +1242,7 @@ mod tests {
                 panic!("function call becomes resolved HIR");
             };
             assert!(matches!(call.evaluation, FunctionEvaluation::Scalar));
+            assert!(matches!(call.operation, FunctionOperation::Ordinary));
             assert!(matches!(
                 &call.arguments,
                 crate::translate::semantic::hir::FunctionArguments::Expressions {
