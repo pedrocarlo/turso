@@ -10,9 +10,9 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, Cte, DatabaseId, DatabaseSnapshot, Expr, HirDocument,
-        HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody, QueryBlockId,
-        QueryId, QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
+        BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, DatabaseId, DatabaseSnapshot, Expr,
+        HirDocument, HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody,
+        QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
     },
     scope::{ExpandedColumn, Scope},
     AnalyzeInput,
@@ -223,14 +223,69 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
     }
 
     fn analyze_select(&mut self, select: &ast::Select) -> Result<QueryId> {
-        if select.with.is_some()
-            || !select.body.compounds.is_empty()
-            || !select.order_by.is_empty()
-            || select.limit.is_some()
-        {
+        if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
             return unsupported_select();
         }
 
+        let query_id = self.reserve_query();
+        let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
+        blocks.push(self.analyze_select_block(&select.body.select, query_id, 0)?);
+        for (index, compound) in select.body.compounds.iter().enumerate() {
+            blocks.push(self.analyze_select_block(&compound.select, query_id, index + 1)?);
+        }
+
+        if let Some(rightmost) = blocks.last() {
+            let rightmost_width = rightmost.outputs.len();
+            if let Some((_, compound)) = blocks[..blocks.len() - 1]
+                .iter()
+                .zip(&select.body.compounds)
+                .find(|(block, _)| block.outputs.len() != rightmost_width)
+            {
+                crate::bail_parse_error!(
+                    "SELECTs to the left and right of {} do not have the same number of result columns",
+                    compound.operator
+                );
+            }
+        }
+
+        let first = blocks[0].id;
+        let output = blocks[0].outputs.iter().map(|output| output.id).collect();
+        let compounds = select
+            .body
+            .compounds
+            .iter()
+            .zip(blocks.iter().skip(1))
+            .map(|(compound, block)| CompoundArm {
+                operator: compound.operator,
+                block: block.id,
+            })
+            .collect();
+
+        self.insert_query(
+            query_id,
+            Query {
+                id: query_id,
+                parent: None,
+                captures: Vec::new(),
+                reachable_ctes: Vec::new(),
+                blocks,
+                first,
+                compounds,
+                order_by: Vec::new(),
+                limit: None,
+                output,
+            },
+        )?;
+
+        Ok(query_id)
+    }
+
+    fn analyze_select_block(
+        &mut self,
+        select: &ast::OneSelect,
+        query: QueryId,
+        index: usize,
+    ) -> Result<QueryBlock> {
         let ast::OneSelect::Select {
             distinctness,
             columns,
@@ -238,7 +293,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             where_clause,
             group_by,
             window_clause,
-        } = &select.body.select
+        } = select
         else {
             return unsupported_select();
         };
@@ -253,8 +308,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             crate::bail_parse_error!("no tables specified");
         }
 
-        let query_id = self.reserve_query();
-        let block_id = QueryBlockId::new(query_id, 0);
+        let block_id = QueryBlockId::new(query, index);
         let (from, scope) = match from {
             Some(from) => {
                 let (from, scope) =
@@ -271,40 +325,23 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             &mut functions,
         )?;
         let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
-        let output_ids = outputs.iter().map(|output| output.id).collect();
         let aggregate_count = functions.aggregate_count();
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
-        self.insert_query(
-            query_id,
-            Query {
-                id: query_id,
-                parent: None,
-                captures: Vec::new(),
-                reachable_ctes: Vec::new(),
-                blocks: vec![QueryBlock {
-                    id: block_id,
-                    from,
-                    outputs,
-                    aggregate_count,
-                    window_function_count,
-                    windows,
-                    body: QueryBlockBody::Select {
-                        distinctness: *distinctness,
-                        filter: None,
-                        grouping: None,
-                    },
-                }],
-                first: block_id,
-                compounds: Vec::new(),
-                order_by: Vec::new(),
-                limit: None,
-                output: output_ids,
+        Ok(QueryBlock {
+            id: block_id,
+            from,
+            outputs,
+            aggregate_count,
+            window_function_count,
+            windows,
+            body: QueryBlockBody::Select {
+                distinctness: *distinctness,
+                filter: None,
+                grouping: None,
             },
-        )?;
-
-        Ok(query_id)
+        })
     }
 
     fn analyze_outputs(
@@ -687,6 +724,93 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn compound_selects_become_ordered_query_blocks() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items \
+             UNION ALL SELECT id FROM categories \
+             UNION SELECT item_id FROM tags \
+             INTERSECT SELECT flag FROM extras \
+             EXCEPT SELECT value FROM codes",
+        )
+        .expect("compound SELECT binds into HIR");
+        document
+            .validate()
+            .expect("compound SELECT produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        assert_eq!(query.blocks.len(), 5);
+        assert_eq!(query.first, query.blocks[0].id);
+        assert_eq!(query.output, vec![query.blocks[0].outputs[0].id]);
+
+        let expected_operators = [
+            ast::CompoundOperator::UnionAll,
+            ast::CompoundOperator::Union,
+            ast::CompoundOperator::Intersect,
+            ast::CompoundOperator::Except,
+        ];
+        for ((arm, block), operator) in query
+            .compounds
+            .iter()
+            .zip(query.blocks.iter().skip(1))
+            .zip(expected_operators)
+        {
+            assert_eq!(arm.operator, operator);
+            assert_eq!(arm.block, block.id);
+        }
+
+        let expected_tables = ["items", "categories", "tags", "extras", "codes"];
+        for (block, table) in query.blocks.iter().zip(expected_tables) {
+            let source = document
+                .source(block.from.as_ref().expect("arm has FROM").first)
+                .expect("arm source exists");
+            assert_eq!(source.name, table);
+            assert_eq!(source.owner, SourceOwner::QueryBlock(block.id));
+            assert_eq!(block.outputs.len(), 1);
+        }
+    }
+
+    #[test]
+    fn compound_aggregate_identities_belong_to_each_arm() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT count(*) FROM items UNION ALL SELECT count(*) FROM categories",
+        )
+        .expect("aggregate compound SELECT binds into HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        for block in &query.blocks {
+            assert_eq!(block.aggregate_count, 1);
+            let Expr::Function(function) = &block.outputs[0].expr else {
+                panic!("count becomes a resolved function");
+            };
+            assert!(matches!(
+                function.evaluation,
+                FunctionEvaluation::Aggregate { id, .. }
+                    if id == crate::translate::semantic::hir::AggregateId::new(block.id, 0)
+            ));
+        }
+    }
+
+    #[test]
+    fn compound_selects_keep_width_diagnostics() {
+        let error = analyze_sql("SELECT 1, 2 UNION ALL SELECT 3 UNION SELECT 4, 5")
+            .expect_err("different compound widths fail semantic analysis");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: SELECTs to the left and right of UNION do not have the same number of result columns"
+        );
     }
 
     #[test]
