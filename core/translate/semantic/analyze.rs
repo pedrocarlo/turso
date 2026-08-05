@@ -450,8 +450,8 @@ mod tests {
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot, OutputNameKind,
-            SourceKind, SourceOwner,
+            CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot, JoinConstraint,
+            JoinKind, OutputNameKind, SourceKind, SourceOwner,
         },
     };
 
@@ -495,6 +495,23 @@ mod tests {
         schema
             .add_btree_table(table)
             .expect("fixed table name is unique");
+        schema
+    }
+
+    fn schema_with_join_tables() -> Schema {
+        let mut schema = schema_with_items();
+        for (sql, root_page) in [
+            ("CREATE TABLE categories(id INTEGER, label TEXT)", 3),
+            ("CREATE TABLE tags(item_id INTEGER, note TEXT)", 4),
+            ("CREATE TABLE extras(item_id INTEGER, flag INTEGER)", 5),
+        ] {
+            let table = Arc::new(
+                BTreeTable::from_sql(sql, root_page).expect("fixed join table schema parses"),
+            );
+            schema
+                .add_btree_table(table)
+                .expect("fixed join table name is unique");
+        }
         schema
     }
 
@@ -666,6 +683,93 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn basic_joins_keep_source_order_kinds_and_closed_on_expressions() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT i.value, c.label, t.note, e.flag \
+             FROM items AS i, categories AS c \
+             JOIN tags AS t ON e.item_id = i.id \
+             CROSS JOIN extras AS e",
+        )
+        .expect("basic joins bind into HIR");
+        document.validate().expect("basic joins produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("joined query has FROM");
+        assert_eq!(from.joins.len(), 3);
+        assert_eq!(from.joins[0].kind, JoinKind::Comma);
+        assert_eq!(from.joins[1].kind, JoinKind::Inner);
+        assert_eq!(from.joins[2].kind, JoinKind::Cross);
+
+        let sources = [
+            from.first,
+            from.joins[0].right,
+            from.joins[1].right,
+            from.joins[2].right,
+        ];
+        let aliases: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                document
+                    .source(*source)
+                    .expect("join source exists")
+                    .alias
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(aliases, [Some("i"), Some("c"), Some("t"), Some("e")]);
+
+        let JoinConstraint::On(Expr::Binary { lhs, rhs, .. }) = &from.joins[1].constraint else {
+            panic!("JOIN ON becomes a resolved HIR expression");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Column(reference) if reference.source == sources[3] && reference.column == 0
+        ));
+        assert!(matches!(
+            rhs.as_ref(),
+            Expr::Column(reference) if reference.source == sources[0] && reference.column == 0
+        ));
+
+        for (output, source) in block.outputs.iter().zip(sources) {
+            assert!(matches!(
+                output.expr,
+                Expr::Column(reference) if reference.source == source && reference.column == 1
+            ));
+        }
+    }
+
+    #[test]
+    fn joined_sources_keep_column_ambiguity_errors() {
+        let schema = schema_with_join_tables();
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items JOIN categories ON items.id = categories.id",
+        )
+        .expect_err("unqualified duplicate join column is ambiguous");
+        assert_eq!(error.to_string(), "Parse error: ambiguous column name: id");
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT items.id FROM items \
+             INNER JOIN categories ON items.id = categories.id",
+        )
+        .expect("explicit INNER JOIN binds");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let from = document.query(root.query).expect("query exists").blocks[0]
+            .from
+            .as_ref()
+            .expect("joined query has FROM");
+        assert_eq!(from.joins[0].kind, JoinKind::Inner);
     }
 
     #[test]

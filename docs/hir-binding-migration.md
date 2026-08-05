@@ -74,6 +74,8 @@ Completed:
 - Sequence writes. `nextval` and `setval` carry the resolved sequence,
   backing table, and optional `sqlite_sequence` table. `currval` stays an
   ordinary scalar call because it only reads connection state.
+- Basic joins. Comma, plain, inner, and cross joins preserve source order and
+  bind `ON` expressions against the complete FROM scope.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
