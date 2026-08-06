@@ -294,37 +294,45 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
     ) -> Result<QueryId> {
-        let rightmost = select
-            .body
-            .compounds
+        self.analyze_select_parts(
+            &select.body.select,
+            &select.body.compounds,
+            &select.order_by,
+            select.limit.as_ref(),
+            parent,
+            outer_scope,
+        )
+    }
+
+    pub(super) fn analyze_select_parts(
+        &mut self,
+        first_select: &'ast ast::OneSelect,
+        compounds: &'ast [ast::CompoundSelect],
+        order_by_syntax: &'ast [ast::SortedColumn],
+        limit_syntax: Option<&'ast ast::Limit>,
+        parent: Option<QueryId>,
+        outer_scope: Option<&Scope>,
+    ) -> Result<QueryId> {
+        let rightmost = compounds
             .last()
             .map(|compound| &compound.select)
-            .unwrap_or(&select.body.select);
+            .unwrap_or(first_select);
         if matches!(rightmost, ast::OneSelect::Values(_)) {
-            if !select.order_by.is_empty() {
+            if !order_by_syntax.is_empty() {
                 crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
             }
-            if select.limit.is_some() {
+            if limit_syntax.is_some() {
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
         }
 
         let query_id = self.reserve_query();
-        let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
-        let ordinary_order_by = select
-            .body
-            .compounds
-            .is_empty()
-            .then_some(select.order_by.as_slice());
-        let (first_block, mut order_by) = self.analyze_select_block(
-            &select.body.select,
-            query_id,
-            0,
-            outer_scope,
-            ordinary_order_by,
-        )?;
+        let mut blocks = Vec::with_capacity(compounds.len() + 1);
+        let ordinary_order_by = compounds.is_empty().then_some(order_by_syntax);
+        let (first_block, mut order_by) =
+            self.analyze_select_block(first_select, query_id, 0, outer_scope, ordinary_order_by)?;
         blocks.push(first_block);
-        for (index, compound) in select.body.compounds.iter().enumerate() {
+        for (index, compound) in compounds.iter().enumerate() {
             let (block, block_order_by) = self.analyze_select_block(
                 &compound.select,
                 query_id,
@@ -340,7 +348,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             let rightmost_width = rightmost.outputs.len();
             if let Some((_, compound)) = blocks[..blocks.len() - 1]
                 .iter()
-                .zip(&select.body.compounds)
+                .zip(compounds)
                 .find(|(block, _)| block.outputs.len() != rightmost_width)
             {
                 crate::bail_parse_error!(
@@ -350,20 +358,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
 
-        if !select.body.compounds.is_empty() {
-            order_by = self.analyze_compound_order_by(&select.order_by, &blocks)?;
+        if !compounds.is_empty() {
+            order_by = self.analyze_compound_order_by(order_by_syntax, &blocks)?;
         }
-        let limit = select
-            .limit
-            .as_ref()
+        let limit = limit_syntax
             .map(|limit| self.analyze_limit(limit, query_id))
             .transpose()?;
 
         let first = blocks[0].id;
         let output = blocks[0].outputs.iter().map(|output| output.id).collect();
-        let compounds = select
-            .body
-            .compounds
+        let compounds = compounds
             .iter()
             .zip(blocks.iter().skip(1))
             .map(|(compound, block)| CompoundArm {
@@ -403,7 +407,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let definition = self.source(source).ok_or_else(|| {
                     LimboError::InternalError(format!("missing semantic source {source}"))
                 })?;
-                if let super::hir::SourceKind::Cte(cte) = definition.kind {
+                if let super::hir::SourceKind::Cte(cte)
+                | super::hir::SourceKind::RecursiveInput(cte) = definition.kind
+                {
                     if !ctes.contains(&cte) {
                         ctes.push(cte);
                     }
@@ -2688,6 +2694,124 @@ mod tests {
             root_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
         ));
+    }
+
+    #[test]
+    fn recursive_ctes_split_seed_arms_and_input_occurrences() {
+        let document = analyze_sql(
+            "WITH RECURSIVE seq(x) AS (\
+                 VALUES(1), (10) \
+                 UNION ALL SELECT 100 \
+                 UNION ALL SELECT x + 1 FROM seq AS first WHERE x < 3 \
+                 UNION ALL SELECT x + 10 FROM seq AS second WHERE x < 20\
+             ) SELECT x FROM seq",
+        )
+        .expect("recursive CTE binds into HIR");
+        document
+            .validate()
+            .expect("recursive CTE produces closed HIR");
+
+        assert_eq!(document.ctes.len(), 1);
+        let cte = &document.ctes[0];
+        assert_eq!(cte.columns.len(), 1);
+        assert_eq!(cte.columns[0].name, "x");
+        assert_eq!(cte.columns[0].type_fact.storage, Some(Type::Integer));
+        let CteBody::Recursive(recursive) = &cte.body else {
+            panic!("self-reference produces recursive CTE body");
+        };
+        let seed = document.query(recursive.seed).expect("seed query exists");
+        assert_eq!(seed.blocks.len(), 2);
+        let QueryBlockBody::Values { rows } = &seed.blocks[0].body else {
+            panic!("VALUES seed remains explicit");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(recursive.arms.len(), 2);
+        assert!(recursive
+            .arms
+            .iter()
+            .all(|arm| arm.operator == ast::CompoundOperator::UnionAll));
+        assert_eq!(recursive.input_sources.len(), 2);
+        assert_eq!(recursive.comparison_collations.len(), 1);
+        assert!(recursive.queue_order.is_empty());
+        assert!(recursive.limit.is_none());
+
+        let sources = recursive
+            .input_sources
+            .iter()
+            .map(|source| document.source(*source).expect("recursive input exists"))
+            .collect::<Vec<_>>();
+        assert!(sources
+            .iter()
+            .all(|source| matches!(source.kind, SourceKind::RecursiveInput(id) if id == cte.id)));
+        assert_eq!(sources[0].alias.as_deref(), Some("first"));
+        assert_eq!(sources[1].alias.as_deref(), Some("second"));
+        assert_ne!(sources[0].id, sources[1].id);
+        for (arm, source) in recursive.arms.iter().zip(sources) {
+            let query = document.query(arm.query).expect("recursive arm exists");
+            assert_eq!(query.blocks.len(), 1);
+            assert_eq!(
+                query.blocks[0]
+                    .from
+                    .as_ref()
+                    .expect("arm reads input")
+                    .first,
+                source.id
+            );
+        }
+
+        let union = analyze_sql(
+            "WITH seq(x) AS (\
+                 VALUES('a') UNION SELECT upper(x) COLLATE NOCASE FROM seq\
+             ) SELECT x FROM seq",
+        )
+        .expect("recursive UNION binds comparison metadata");
+        let CteBody::Recursive(recursive) = &union.ctes[0].body else {
+            panic!("UNION self-reference produces recursive CTE");
+        };
+        assert_eq!(recursive.arms[0].operator, ast::CompoundOperator::Union);
+        assert_eq!(
+            recursive.comparison_collations[0]
+                .as_ref()
+                .expect("recursive arm supplies comparison collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn recursive_ctes_keep_structure_and_function_errors() {
+        for (sql, message) in [
+            (
+                "WITH seq(x) AS (SELECT x FROM seq UNION ALL SELECT 1) SELECT x FROM seq",
+                "Parse error: circular reference: seq",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT a.x FROM seq a, seq b) SELECT x FROM seq",
+                "Parse error: multiple references to recursive table: seq",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq UNION SELECT x + 2 FROM seq) SELECT x FROM seq",
+                "Parse error: recursive CTE queries must use the same UNION operator",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT x, x + 1 FROM seq) SELECT x FROM seq",
+                "Parse error: SELECTs to the left and right of UNION ALL do not have the same number of result columns",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT sum(x) FROM seq) SELECT x FROM seq",
+                "Parse error: recursive aggregate queries not supported",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT row_number() OVER () FROM seq) SELECT x FROM seq",
+                "Parse error: cannot use window functions in recursive queries",
+            ),
+        ] {
+            let error = analyze_sql(sql).expect_err("invalid recursive CTE fails analysis");
+            assert_eq!(error.to_string(), message);
+        }
+
+        analyze_sql("WITH unused(x) AS (SELECT x FROM unused UNION ALL SELECT 1) SELECT 1")
+            .expect("unused invalid recursive CTE remains lazy");
     }
 
     #[test]
