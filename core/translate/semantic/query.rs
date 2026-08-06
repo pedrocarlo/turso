@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
+    cte::CteResolution,
     expr::{build_using_column, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     scope::{resolve_source_column, Scope},
@@ -136,16 +137,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     fn analyze_cte_source(
         &mut self,
-        cte: hir::CteId,
+        resolution: CteResolution,
         name: &str,
         alias: Option<&str>,
         owner: SourceOwner,
     ) -> Result<hir::SourceId> {
-        let cte_definition = self.cte(cte).ok_or_else(|| {
-            crate::LimboError::InternalError(format!("missing semantic CTE {cte}"))
-        })?;
-        let columns = cte_definition
-            .columns
+        let (cte, recursive, cte_columns) = match resolution {
+            CteResolution::Cte(cte) => {
+                let definition = self.cte(cte).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("missing semantic CTE {cte}"))
+                })?;
+                (cte, false, definition.columns.clone())
+            }
+            CteResolution::RecursiveInput { cte, columns } => (cte, true, columns),
+        };
+        let columns = cte_columns
             .iter()
             .map(|column| hir::SourceColumn {
                 name: column.name.clone(),
@@ -167,7 +173,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 database: None,
                 name: crate::util::normalize_ident(name),
                 alias: alias.map(crate::util::normalize_ident),
-                kind: hir::SourceKind::Cte(cte),
+                kind: if recursive {
+                    hir::SourceKind::RecursiveInput(cte)
+                } else {
+                    hir::SourceKind::Cte(cte)
+                },
                 columns,
                 generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
                 default_expressions: vec![hir::ColumnReadExpression::Absent; width],
@@ -180,6 +190,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 index_method_patterns: Vec::new(),
             },
         )?;
+        if recursive {
+            self.record_recursive_input(cte, source)?;
+        }
         Ok(source)
     }
 
