@@ -94,37 +94,32 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     fn bind_cte(&mut self, syntax: &'ast ast::CommonTableExpr) -> Result<CteId> {
         let query = self.analyze_select(&syntax.select)?;
-        let query = self
-            .query(query)
-            .ok_or_else(|| LimboError::InternalError("missing bound CTE query".to_string()))?;
-        let first = &query.blocks[0];
+        let source_columns = self.query_source_columns(query)?;
 
-        if !syntax.columns.is_empty() && syntax.columns.len() != first.outputs.len() {
+        if !syntax.columns.is_empty() && syntax.columns.len() != source_columns.len() {
             crate::bail_parse_error!(
                 "table {} has {} values for {} columns",
                 syntax.tbl_name.as_str(),
-                first.outputs.len(),
+                source_columns.len(),
                 syntax.columns.len()
             );
         }
 
-        let columns = first
-            .outputs
-            .iter()
+        let columns = source_columns
+            .into_iter()
             .enumerate()
-            .map(|(index, output)| CteColumn {
+            .map(|(index, column)| CteColumn {
                 name: syntax
                     .columns
                     .get(index)
                     .map(|column| crate::util::normalize_ident(column.col_name.as_str()))
-                    .unwrap_or_else(|| output.name.clone()),
-                type_fact: output.type_fact.clone(),
-                affinity: output.schema_affinity,
-                has_affinity: output.has_affinity,
-                collation: output.collation.clone(),
+                    .unwrap_or(column.name),
+                type_fact: column.type_fact,
+                affinity: column.affinity,
+                has_affinity: column.has_affinity,
+                collation: column.collation,
             })
             .collect();
-        let query = query.id;
         // Allocate only referenced definitions. Closed HIR rejects arena
         // entries that cannot be reached from the statement root.
         let id = self.reserve_cte();

@@ -250,10 +250,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
+        self.analyze_select_with_parent(select, None)
+    }
+
+    pub(super) fn analyze_select_with_parent(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+    ) -> Result<QueryId> {
         if let Some(with) = &select.with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select_body(select);
+        let result = self.analyze_select_body(select, parent);
         if select.with.is_some() {
             self.cte_scopes
                 .pop()
@@ -262,7 +270,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         result
     }
 
-    fn analyze_select_body(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
+    fn analyze_select_body(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+    ) -> Result<QueryId> {
         if !select.order_by.is_empty() || select.limit.is_some() {
             return unsupported_select();
         }
@@ -306,7 +318,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             query_id,
             Query {
                 id: query_id,
-                parent: None,
+                parent,
                 captures: Vec::new(),
                 reachable_ctes,
                 blocks,
@@ -345,7 +357,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     fn analyze_select_block(
         &mut self,
-        select: &ast::OneSelect,
+        select: &'ast ast::OneSelect,
         query: QueryId,
         index: usize,
     ) -> Result<QueryBlock> {
@@ -787,6 +799,112 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn derived_from_sources_keep_query_ownership_and_output_facts() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT derived.item_text, derived.item_key \
+             FROM (\
+                 SELECT value AS item_text, id AS item_key FROM items \
+                 UNION ALL \
+                 SELECT label, id FROM categories\
+             ) AS derived",
+        )
+        .expect("derived FROM source binds into HIR");
+        document
+            .validate()
+            .expect("derived source produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_block = &outer.blocks[0];
+        let source = document
+            .source(
+                outer_block
+                    .from
+                    .as_ref()
+                    .expect("outer query has FROM")
+                    .first,
+            )
+            .expect("derived source exists");
+        let SourceKind::Derived(inner_id) = source.kind else {
+            panic!("FROM subquery becomes derived source");
+        };
+        let inner = document.query(inner_id).expect("inner query exists");
+
+        assert_eq!(inner.parent, Some(outer.id));
+        assert!(inner.captures.is_empty());
+        assert_eq!(inner.blocks.len(), 2);
+        assert_eq!(source.owner, SourceOwner::QueryBlock(outer_block.id));
+        assert_eq!(source.name, "(subquery-0)");
+        assert_eq!(source.alias.as_deref(), Some("derived"));
+        assert!(!source.rowid_available);
+        assert_eq!(source.columns.len(), 2);
+        assert_eq!(source.columns[0].name, "item_text");
+        assert_eq!(source.columns[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            source.columns[0]
+                .collation
+                .as_ref()
+                .expect("first compound arm supplies source collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert_eq!(source.columns[1].name, "item_key");
+        assert!(matches!(
+            outer_block.outputs[0].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 0
+        ));
+        assert!(matches!(
+            outer_block.outputs[1].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 1
+        ));
+    }
+
+    #[test]
+    fn derived_sources_keep_positions_and_do_not_see_outer_scope() {
+        let document = analyze_sql(
+            "SELECT * FROM (SELECT 1 AS one) AS left_side \
+             JOIN (SELECT 2 AS two) AS right_side",
+        )
+        .expect("multiple derived sources bind into HIR");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let from = outer.blocks[0].from.as_ref().expect("outer query has FROM");
+        let sources = [
+            document.source(from.first).expect("left source exists"),
+            document
+                .source(from.joins[0].right)
+                .expect("right source exists"),
+        ];
+        assert_eq!(sources[0].name, "(subquery-0)");
+        assert_eq!(sources[1].name, "(subquery-1)");
+        for source in sources {
+            let SourceKind::Derived(query) = source.kind else {
+                panic!("FROM subquery becomes derived source");
+            };
+            assert_eq!(
+                document.query(query).expect("derived query exists").parent,
+                Some(outer.id)
+            );
+        }
+        assert_eq!(outer.blocks[0].outputs.len(), 2);
+
+        let schema = schema_with_items();
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items AS outer_items \
+             JOIN (SELECT outer_items.id AS captured) AS derived",
+        )
+        .expect_err("FROM subquery cannot capture the outer source scope");
+        assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
     }
 
     #[test]

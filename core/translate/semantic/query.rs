@@ -10,13 +10,13 @@ use super::{
 };
 use crate::{schema::Table, sync::Arc, Result};
 
-impl Analyzer<'_, '_, '_> {
+impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_from_clause(
         &mut self,
-        syntax: &ast::FromClause,
+        syntax: &'ast ast::FromClause,
         owner: SourceOwner,
     ) -> Result<(hir::From, Scope)> {
-        let source = self.analyze_table_source(&syntax.select, owner)?;
+        let source = self.analyze_table_source(&syntax.select, owner, 0)?;
         let mut scope = Scope::default();
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
@@ -36,7 +36,7 @@ impl Analyzer<'_, '_, '_> {
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
-            let right = self.analyze_table_source(&syntax_join.table, owner)?;
+            let right = self.analyze_table_source(&syntax_join.table, owner, joins.len() + 1)?;
             let definition = self.source(right).ok_or_else(|| {
                 crate::LimboError::InternalError(format!("missing semantic source {right}"))
             })?;
@@ -100,27 +100,33 @@ impl Analyzer<'_, '_, '_> {
 
     fn analyze_table_source(
         &mut self,
-        syntax: &ast::SelectTable,
+        syntax: &'ast ast::SelectTable,
         owner: SourceOwner,
+        position: usize,
     ) -> Result<hir::SourceId> {
-        let ast::SelectTable::Table(name, alias, indexed) = syntax else {
-            return super::analyze::unsupported_select();
-        };
-        if name.db_name.is_none() {
-            if let Some(cte) = self.resolve_cte(name.name.as_str())? {
-                return self.analyze_cte_source(
-                    cte,
-                    name.name.as_str(),
-                    alias
-                        .as_ref()
-                        .map(ast::As::name)
-                        .or(name.alias.as_ref())
-                        .map(ast::Name::as_str),
-                    owner,
-                );
+        match syntax {
+            ast::SelectTable::Table(name, alias, indexed) => {
+                if name.db_name.is_none() {
+                    if let Some(cte) = self.resolve_cte(name.name.as_str())? {
+                        return self.analyze_cte_source(
+                            cte,
+                            name.name.as_str(),
+                            alias
+                                .as_ref()
+                                .map(ast::As::name)
+                                .or(name.alias.as_ref())
+                                .map(ast::Name::as_str),
+                            owner,
+                        );
+                    }
+                }
+                self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)
             }
+            ast::SelectTable::Select(select, alias) => {
+                self.analyze_derived_source(select, alias.as_ref(), owner, position)
+            }
+            _ => super::analyze::unsupported_select(),
         }
-        self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)
     }
 
     fn analyze_cte_source(
@@ -170,6 +176,74 @@ impl Analyzer<'_, '_, '_> {
             },
         )?;
         Ok(source)
+    }
+
+    fn analyze_derived_source(
+        &mut self,
+        select: &'ast ast::Select,
+        alias: Option<&ast::As>,
+        owner: SourceOwner,
+        position: usize,
+    ) -> Result<hir::SourceId> {
+        let SourceOwner::QueryBlock(owner_block) = owner else {
+            return Err(crate::LimboError::InternalError(
+                "derived source must belong to a query block".to_string(),
+            ));
+        };
+        let query = self.analyze_select_with_parent(select, Some(owner_block.query))?;
+        let columns = self.query_source_columns(query)?;
+        let width = columns.len();
+        let source = self.reserve_source();
+        self.insert_source(
+            source,
+            hir::Source {
+                id: source,
+                owner,
+                database: None,
+                name: format!("(subquery-{position})"),
+                alias: alias
+                    .map(ast::As::name)
+                    .map(ast::Name::as_str)
+                    .map(crate::util::normalize_ident),
+                kind: hir::SourceKind::Derived(query),
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available: false,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(source)
+    }
+
+    pub(super) fn query_source_columns(
+        &self,
+        query: hir::QueryId,
+    ) -> Result<Vec<hir::SourceColumn>> {
+        let query = self.query(query).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("missing semantic query {query}"))
+        })?;
+        let first = query.blocks.first().ok_or_else(|| {
+            crate::LimboError::InternalError(format!("semantic query {} has no blocks", query.id))
+        })?;
+        Ok(first
+            .outputs
+            .iter()
+            .map(|output| hir::SourceColumn {
+                name: output.name.clone(),
+                type_fact: output.type_fact.clone(),
+                affinity: output.schema_affinity,
+                has_affinity: output.has_affinity,
+                collation: output.collation.clone(),
+                hidden: false,
+                rowid_alias: false,
+            })
+            .collect())
     }
 
     fn analyze_base_table_source(
