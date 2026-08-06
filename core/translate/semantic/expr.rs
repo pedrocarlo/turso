@@ -621,7 +621,7 @@ fn take_window_frame_bound(
     }
 }
 
-impl Analyzer<'_, '_> {
+impl Analyzer<'_, '_, '_> {
     pub(crate) fn analyze_expr(
         &mut self,
         syntax: &ast::Expr,

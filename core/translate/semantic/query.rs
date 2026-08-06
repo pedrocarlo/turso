@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{schema::Table, sync::Arc, Result};
 
-impl Analyzer<'_, '_> {
+impl Analyzer<'_, '_, '_> {
     pub(super) fn analyze_from_clause(
         &mut self,
         syntax: &ast::FromClause,
@@ -106,7 +106,70 @@ impl Analyzer<'_, '_> {
         let ast::SelectTable::Table(name, alias, indexed) = syntax else {
             return super::analyze::unsupported_select();
         };
+        if name.db_name.is_none() {
+            if let Some(cte) = self.resolve_cte(name.name.as_str())? {
+                return self.analyze_cte_source(
+                    cte,
+                    name.name.as_str(),
+                    alias
+                        .as_ref()
+                        .map(ast::As::name)
+                        .or(name.alias.as_ref())
+                        .map(ast::Name::as_str),
+                    owner,
+                );
+            }
+        }
         self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)
+    }
+
+    fn analyze_cte_source(
+        &mut self,
+        cte: hir::CteId,
+        name: &str,
+        alias: Option<&str>,
+        owner: SourceOwner,
+    ) -> Result<hir::SourceId> {
+        let cte_definition = self.cte(cte).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("missing semantic CTE {cte}"))
+        })?;
+        let columns = cte_definition
+            .columns
+            .iter()
+            .map(|column| hir::SourceColumn {
+                name: column.name.clone(),
+                type_fact: column.type_fact.clone(),
+                affinity: column.affinity,
+                has_affinity: column.has_affinity,
+                collation: column.collation.clone(),
+                hidden: false,
+                rowid_alias: false,
+            })
+            .collect::<Vec<_>>();
+        let width = columns.len();
+        let source = self.reserve_source();
+        self.insert_source(
+            source,
+            hir::Source {
+                id: source,
+                owner,
+                database: None,
+                name: crate::util::normalize_ident(name),
+                alias: alias.map(crate::util::normalize_ident),
+                kind: hir::SourceKind::Cte(cte),
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available: false,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(source)
     }
 
     fn analyze_base_table_source(

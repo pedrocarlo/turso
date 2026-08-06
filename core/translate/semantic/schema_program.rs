@@ -17,7 +17,7 @@ struct SchemaInput {
     type_fact: TypeFact,
 }
 
-impl Analyzer<'_, '_> {
+impl Analyzer<'_, '_, '_> {
     pub(super) fn bind_type_encoder(
         &mut self,
         definition: &ResolvedType,
