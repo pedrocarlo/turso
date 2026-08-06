@@ -11,7 +11,7 @@ use super::{
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, CteId, DatabaseId, DatabaseSnapshot,
-        Expr, FunctionEvaluation, HirDocument, HirRoot, OrderTerm, Output, OutputId,
+        Expr, FunctionEvaluation, HirDocument, HirRoot, Limit, OrderTerm, Output, OutputId,
         OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
         QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
     },
@@ -294,10 +294,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
     ) -> Result<QueryId> {
-        if select.limit.is_some() {
-            return unsupported_select();
-        }
-
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
         let ordinary_order_by = select
@@ -342,6 +338,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         if !select.body.compounds.is_empty() {
             order_by = self.analyze_compound_order_by(&select.order_by, &blocks)?;
         }
+        let limit = select
+            .limit
+            .as_ref()
+            .map(|limit| self.analyze_limit(limit, query_id))
+            .transpose()?;
 
         let first = blocks[0].id;
         let output = blocks[0].outputs.iter().map(|output| output.id).collect();
@@ -366,7 +367,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             first,
             compounds,
             order_by,
-            limit: None,
+            limit,
             output,
         };
         query.captures = query.direct_captures(|source| self.source(source));
@@ -583,6 +584,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Ok(order_term(syntax, resolved))
             })
             .collect()
+    }
+
+    fn analyze_limit(&mut self, syntax: &'ast ast::Limit, parent: QueryId) -> Result<Limit> {
+        let scope = Scope::default();
+        let policy = ExprPolicy::limit(self.context.dqs_dml());
+        let limit = self.analyze_query_scalar_expr(&syntax.expr, &scope, policy, parent)?;
+        let offset = syntax
+            .offset
+            .as_deref()
+            .map(|offset| self.analyze_query_scalar_expr(offset, &scope, policy, parent))
+            .transpose()?;
+        Ok(Limit {
+            limit: limit.expr,
+            offset: offset.map(|offset| offset.expr),
+        })
     }
 
     fn analyze_compound_order_by(
@@ -2015,6 +2031,114 @@ mod tests {
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
                 .expect_err("compound ORDER BY only accepts result-column references");
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn limit_and_offset_become_query_level_hir() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items ORDER BY id \
+             LIMIT abs(?1) + 2 OFFSET \"3\"",
+        )
+        .expect("LIMIT and OFFSET accept standalone scalar expressions");
+        document
+            .validate()
+            .expect("LIMIT and OFFSET produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let limit = query.limit.as_ref().expect("LIMIT is preserved");
+        assert!(matches!(
+            &limit.limit,
+            Expr::Binary {
+                lhs,
+                operator: ast::Operator::Add,
+                rhs,
+                ..
+            } if matches!(lhs.as_ref(), Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Scalar))
+                && matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Numeric(value))
+                    if value == "2")
+        ));
+        assert!(matches!(
+            limit.offset.as_ref(),
+            Some(Expr::Literal(ast::Literal::String(value))) if value == "'3'"
+        ));
+
+        let comma = analyze_sql("SELECT 1 UNION ALL SELECT 2 LIMIT 4, 2")
+            .expect("comma LIMIT syntax binds");
+        let HirRoot::Query(root) = &comma.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = comma.query(root.query).expect("query exists");
+        assert_eq!(query.blocks.len(), 2);
+        let limit = query.limit.as_ref().expect("compound LIMIT is preserved");
+        assert!(matches!(
+            &limit.limit,
+            Expr::Literal(ast::Literal::Numeric(value)) if value == "2"
+        ));
+        assert!(matches!(
+            limit.offset.as_ref(),
+            Some(Expr::Literal(ast::Literal::Numeric(value))) if value == "4"
+        ));
+    }
+
+    #[test]
+    fn limit_subqueries_are_independent_children() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH limit_value AS (SELECT 2 AS n) \
+             SELECT id FROM items LIMIT (SELECT n FROM limit_value)",
+        )
+        .expect("LIMIT accepts an independent scalar subquery");
+        document
+            .validate()
+            .expect("LIMIT subquery and its CTE are reachable HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) =
+            &outer.limit.as_ref().expect("LIMIT is preserved").limit
+        else {
+            panic!("LIMIT keeps its scalar subquery");
+        };
+        let inner = document.query(*inner).expect("LIMIT child query exists");
+        assert_eq!(inner.parent, Some(outer.id));
+        assert!(inner.captures.is_empty());
+        assert_eq!(inner.reachable_ctes.len(), 1);
+    }
+
+    #[test]
+    fn limit_has_no_query_or_function_scope() {
+        let schema = schema_with_items();
+        for (sql, message) in [
+            (
+                "SELECT id AS chosen FROM items LIMIT chosen",
+                "Parse error: no such column: chosen",
+            ),
+            (
+                "SELECT (SELECT 1 LIMIT outer_items.id) FROM items AS outer_items",
+                "Parse error: no such table: outer_items",
+            ),
+            (
+                "SELECT id FROM items LIMIT sum(1)",
+                "Parse error: misuse of aggregate function sum()",
+            ),
+            (
+                "SELECT id FROM items LIMIT row_number() OVER ()",
+                "Parse error: misuse of window function: row_number()",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("LIMIT cannot see query names or query functions");
             assert_eq!(error.to_string(), message);
         }
     }
