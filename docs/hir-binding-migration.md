@@ -116,6 +116,10 @@ Completed:
   output ordinals, correlated subqueries, and ORDER-BY-only function identities.
   Compound queries resolve ordinals and names from any arm to the first arm's
   stable `OutputId` values and keep their restricted-expression diagnostics.
+- Query-level LIMIT and OFFSET expressions bind in an empty scalar scope. They
+  keep parameters, scalar functions, DQS literals, and independent child
+  queries while rejecting query names, correlation, aggregates, and windows.
+  Both OFFSET spellings share the same normalized HIR shape.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -127,9 +131,9 @@ separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
-WHERE filters, GROUP BY keys, HAVING predicates, and query-level ORDER BY terms
-are also bound. `VALUES`, LIMIT, and recursive CTEs remain separate checkpoints.
-Continue with LIMIT before starting the remaining SELECT forms.
+WHERE filters, GROUP BY keys, HAVING predicates, query-level ORDER BY terms, and
+LIMIT/OFFSET are also bound. `VALUES` and recursive CTEs remain separate
+checkpoints. Continue with VALUES before recursive CTEs.
 
 ## Working rules
 
