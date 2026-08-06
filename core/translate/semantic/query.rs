@@ -14,10 +14,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_from_clause(
         &mut self,
         syntax: &'ast ast::FromClause,
-        owner: SourceOwner,
+        owner: hir::QueryBlockId,
+        outer_scope: Option<Scope>,
     ) -> Result<(hir::From, Scope)> {
-        let source = self.analyze_table_source(&syntax.select, owner, 0)?;
-        let mut scope = Scope::default();
+        let source_owner = SourceOwner::QueryBlock(owner);
+        let source = self.analyze_table_source(&syntax.select, source_owner, 0)?;
+        let mut scope = Scope::new(outer_scope);
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
@@ -36,7 +38,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
-            let right = self.analyze_table_source(&syntax_join.table, owner, joins.len() + 1)?;
+            let right =
+                self.analyze_table_source(&syntax_join.table, source_owner, joins.len() + 1)?;
             let definition = self.source(right).ok_or_else(|| {
                 crate::LimboError::InternalError(format!("missing semantic source {right}"))
             })?;
@@ -84,8 +87,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let policy = ExprPolicy::select(self.context().dqs_dml());
         for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
             if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
-                join.constraint =
-                    hir::JoinConstraint::On(self.analyze_expr(expression, &scope, policy)?);
+                join.constraint = hir::JoinConstraint::On(
+                    self.analyze_query_scalar_expr(expression, &scope, policy, owner.query)?
+                        .expr,
+                );
             }
         }
 

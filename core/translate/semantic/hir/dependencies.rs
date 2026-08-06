@@ -11,10 +11,21 @@ impl HirDocument {
         let Some(query) = self.query(id) else {
             return Vec::new();
         };
+        query.direct_captures(|source| self.source(source))
+    }
+}
+
+impl Query {
+    /// Derive the external sources read directly by this query from resolved
+    /// HIR. Nested queries own their own capture summaries.
+    pub(crate) fn direct_captures<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+    ) -> Vec<SourceId> {
         let mut references = HashSet::default();
-        for block in &query.blocks {
+        for block in &self.blocks {
             if let Some(from) = &block.from {
-                self.collect_from_references(from, &mut references);
+                collect_from_references(from, &mut references, source_by_id);
             }
             for output in &block.outputs {
                 collect_expr_references(&output.expr, &mut references);
@@ -39,8 +50,8 @@ impl HirDocument {
                 collect_window_references(window, &mut references);
             }
         }
-        collect_order_references(&query.order_by, &mut references);
-        if let Some(limit) = &query.limit {
+        collect_order_references(&self.order_by, &mut references);
+        if let Some(limit) = &self.limit {
             collect_expr_references(&limit.limit, &mut references);
             collect_optional_expr_references(limit.offset.as_ref(), &mut references);
         }
@@ -49,41 +60,49 @@ impl HirDocument {
             .into_iter()
             .filter(|source| {
                 !matches!(
-                    self.source(*source).map(|source| source.owner),
-                    Some(SourceOwner::QueryBlock(block)) if block.query == id
+                    source_by_id(*source).map(|source| source.owner),
+                    Some(SourceOwner::QueryBlock(block)) if block.query == self.id
                 )
             })
             .collect::<Vec<_>>();
         captures.sort_unstable();
         captures
     }
+}
 
-    fn collect_from_references(&self, from: &From, references: &mut HashSet<SourceId>) {
-        self.collect_source_arguments(from.first, references);
-        for join in &from.joins {
-            self.collect_source_arguments(join.right, references);
-            match &join.constraint {
-                JoinConstraint::None => {}
-                JoinConstraint::On(expression) => {
-                    collect_expr_references(expression, references);
-                }
-                JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
-                    for column in columns {
-                        collect_expr_references(&column.left, references);
-                        references.insert(column.right.source);
-                    }
+fn collect_from_references<'source>(
+    from: &From,
+    references: &mut HashSet<SourceId>,
+    source: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+) {
+    collect_source_arguments(from.first, references, source);
+    for join in &from.joins {
+        collect_source_arguments(join.right, references, source);
+        match &join.constraint {
+            JoinConstraint::None => {}
+            JoinConstraint::On(expression) => {
+                collect_expr_references(expression, references);
+            }
+            JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                for column in columns {
+                    collect_expr_references(&column.left, references);
+                    references.insert(column.right.source);
                 }
             }
         }
     }
+}
 
-    fn collect_source_arguments(&self, source: SourceId, references: &mut HashSet<SourceId>) {
-        let Some(source) = self.source(source) else {
-            return;
-        };
-        if let SourceKind::TableFunction { arguments, .. } = &source.kind {
-            collect_exprs_references(arguments, references);
-        }
+fn collect_source_arguments<'source>(
+    id: SourceId,
+    references: &mut HashSet<SourceId>,
+    source: impl Fn(SourceId) -> Option<&'source Source>,
+) {
+    let Some(source) = source(id) else {
+        return;
+    };
+    if let SourceKind::TableFunction { arguments, .. } = &source.kind {
+        collect_exprs_references(arguments, references);
     }
 }
 

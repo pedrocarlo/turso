@@ -43,7 +43,7 @@ impl ExprCollation {
         }
     }
 
-    fn output(collation: Option<hir::ResolvedCollation>, explicit: bool) -> Self {
+    pub(crate) fn output(collation: Option<hir::ResolvedCollation>, explicit: bool) -> Self {
         match (collation, explicit) {
             (None, false) => Self::Absent,
             (Some(collation), true) => Self::Explicit(collation),
