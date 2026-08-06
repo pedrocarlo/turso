@@ -42,6 +42,14 @@ impl ExprPolicy {
         }
     }
 
+    pub(crate) const fn where_clause(dqs_dml: DoubleQuotedDml) -> Self {
+        Self {
+            precedence: NamePrecedence::SourceThenOutput,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
+            raise: RaisePolicy::AbortOnly,
+        }
+    }
+
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
         self

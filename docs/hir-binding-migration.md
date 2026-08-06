@@ -103,6 +103,10 @@ Completed:
   negation, child query, and one frozen comparison rule per column in HIR.
   Correlated right sides capture outer sources, and row-width errors keep the
   existing diagnostic.
+- WHERE expressions become query-block filters. Source columns win over result
+  aliases, aliases remain stable `OutputId` references, correlated subqueries
+  keep their captures, and aggregate or window calls retain their existing
+  errors.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -114,8 +118,9 @@ separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
-`VALUES`, WHERE, GROUP BY, ORDER BY, LIMIT, and recursive CTEs remain separate
-checkpoints. Continue with WHERE before starting the remaining SELECT clauses.
+WHERE filters are also bound. `VALUES`, GROUP BY, ORDER BY, LIMIT, and recursive
+CTEs remain separate checkpoints. Continue with GROUP BY and HAVING before
+starting the remaining SELECT clauses.
 
 ## Working rules
 

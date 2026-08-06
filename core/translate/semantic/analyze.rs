@@ -11,9 +11,9 @@ use super::{
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, CteId, DatabaseId, DatabaseSnapshot,
-        Expr, HirDocument, HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock,
-        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId,
-        TypeFact,
+        Expr, FunctionEvaluation, HirDocument, HirRoot, Output, OutputId, OutputNameKind,
+        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
+        SchemaProgramId, Source, SourceId, TypeFact,
     },
     scope::{ExpandedColumn, Scope},
     AnalyzeInput,
@@ -396,7 +396,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         else {
             return unsupported_select();
         };
-        if where_clause.is_some() || group_by.is_some() {
+        if group_by.is_some() {
             return unsupported_select();
         }
         if from.is_none()
@@ -424,6 +424,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             &mut functions,
         )?;
         let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
+        let filter = match where_clause.as_deref() {
+            Some(syntax) => {
+                let mut clause_scope = scope.clone();
+                clause_scope.set_outputs(&outputs);
+                let resolved = self.analyze_query_scalar_expr(
+                    syntax,
+                    &clause_scope,
+                    ExprPolicy::where_clause(self.context.dqs_dml()),
+                    query,
+                )?;
+                reject_where_alias_functions(&resolved.expr, block_id, &outputs)?;
+                Some(resolved.expr)
+            }
+            None => None,
+        };
         let aggregate_count = functions.aggregate_count();
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
@@ -437,7 +452,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             windows,
             body: QueryBlockBody::Select {
                 distinctness: *distinctness,
-                filter: None,
+                filter,
                 grouping: None,
             },
         })
@@ -540,6 +555,55 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             name_kind,
         })
     }
+}
+
+fn reject_where_alias_functions(
+    filter: &Expr,
+    block: QueryBlockId,
+    outputs: &[Output],
+) -> Result<()> {
+    let mut error = None;
+    filter.walk(&mut |expression| {
+        if error.is_some() {
+            return;
+        }
+        let Expr::Output(id) = expression else {
+            return;
+        };
+        let OutputOwner::QueryBlock(owner) = id.owner else {
+            return;
+        };
+        if owner != block {
+            return;
+        }
+        let Some(output) = outputs.get(id.index) else {
+            error = Some(LimboError::InternalError(format!(
+                "WHERE refers to missing output {}",
+                id.index
+            )));
+            return;
+        };
+        output.expr.walk(&mut |expression| {
+            if error.is_some() {
+                return;
+            }
+            let Expr::Function(call) = expression else {
+                return;
+            };
+            error = match call.evaluation {
+                FunctionEvaluation::Aggregate { .. } => Some(LimboError::ParseError(format!(
+                    "misuse of aggregate: {}()",
+                    call.function.value()
+                ))),
+                FunctionEvaluation::Window { .. } => Some(LimboError::ParseError(format!(
+                    "misuse of aliased window function {}",
+                    output.name
+                ))),
+                FunctionEvaluation::Scalar => None,
+            };
+        });
+    });
+    error.map_or(Ok(()), Err)
 }
 
 pub(super) fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
@@ -1070,6 +1134,121 @@ mod tests {
         let inner = document.query(*inner_id).expect("inner query exists");
         assert_eq!(inner.parent, Some(outer.id));
         assert_eq!(inner.captures, vec![from.first]);
+    }
+
+    #[test]
+    fn where_prefers_source_columns_and_falls_back_to_outputs() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value AS score, id + 1 AS next_id \
+             FROM items \
+             WHERE score > 1 AND next_id > 2",
+        )
+        .expect("WHERE resolves source columns before output aliases");
+        document
+            .validate()
+            .expect("WHERE output references produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let block = &query.blocks[0];
+        let QueryBlockBody::Select {
+            filter: Some(filter),
+            ..
+        } = &block.body
+        else {
+            panic!("WHERE becomes the query block filter");
+        };
+        let source = block.from.as_ref().expect("query has FROM").first;
+        let mut columns = Vec::new();
+        let mut outputs = Vec::new();
+        filter.walk(&mut |expression| match expression {
+            Expr::Column(reference) => columns.push(*reference),
+            Expr::Output(output) => outputs.push(*output),
+            _ => {}
+        });
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].source, source);
+        assert_eq!(columns[0].column, 2);
+        assert_eq!(outputs, vec![OutputId::query(block.id, 1)]);
+    }
+
+    #[test]
+    fn where_subqueries_capture_outer_sources() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT outer_items.id \
+             FROM items AS outer_items \
+             WHERE EXISTS (SELECT 1 WHERE outer_items.id > 0)",
+        )
+        .expect("WHERE accepts a correlated expression subquery");
+        document
+            .validate()
+            .expect("correlated WHERE subquery produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let QueryBlockBody::Select {
+            filter: Some(Expr::Subquery(SubqueryExpr::Exists(inner))),
+            ..
+        } = &outer.blocks[0].body
+        else {
+            panic!("WHERE keeps its EXISTS subquery");
+        };
+        let inner = document.query(*inner).expect("inner query exists");
+        assert_eq!(inner.parent, Some(outer.id));
+        assert_eq!(inner.captures, vec![outer_source]);
+        let QueryBlockBody::Select {
+            filter: Some(filter),
+            ..
+        } = &inner.blocks[0].body
+        else {
+            panic!("inner WHERE becomes a filter");
+        };
+        assert!(matches!(
+            filter,
+            Expr::Binary { lhs, .. }
+                if matches!(lhs.as_ref(), Expr::Column(reference)
+                    if reference.source == outer_source && reference.column == 0)
+        ));
+    }
+
+    #[test]
+    fn where_rejects_aggregate_and_window_functions() {
+        let schema = schema_with_items();
+        for (sql, message) in [
+            (
+                "SELECT id FROM items WHERE sum(score) > 1",
+                "Parse error: misuse of aggregate function sum()",
+            ),
+            (
+                "SELECT id FROM items WHERE row_number() OVER () > 1",
+                "Parse error: misuse of window function: row_number()",
+            ),
+            (
+                "SELECT sum(score) AS total FROM items WHERE total > 1",
+                "Parse error: misuse of aggregate: sum()",
+            ),
+            (
+                "SELECT row_number() OVER () AS position FROM items WHERE position > 1",
+                "Parse error: misuse of aliased window function position",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("WHERE only accepts scalar functions");
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     #[test]
