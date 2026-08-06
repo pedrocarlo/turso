@@ -157,6 +157,7 @@ pub(crate) struct Scope {
     visible_columns: Vec<ScopeColumn>,
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
+    outer_resolution_blocked: bool,
 }
 
 impl Scope {
@@ -165,6 +166,11 @@ impl Scope {
             outer: outer.map(Arc::new),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn without_outer_resolution(mut self) -> Self {
+        self.outer_resolution_blocked = true;
+        self
     }
 
     pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
@@ -281,6 +287,9 @@ impl Scope {
         if current.is_some() {
             return Ok(current);
         }
+        if self.outer_resolution_blocked {
+            return Ok(None);
+        }
         self.outer.as_deref().map_or(Ok(None), |outer| {
             outer.resolve_unqualified(name, NamePrecedence::SourceThenOutput)
         })
@@ -300,6 +309,16 @@ impl Scope {
             .collect();
 
         if matching_sources.is_empty() {
+            if self.outer_resolution_blocked {
+                if self
+                    .outer
+                    .as_deref()
+                    .is_some_and(|outer| outer.has_qualifier(&normalized_qualifier))
+                {
+                    crate::bail_parse_error!("no such column: {qualifier}.{column}");
+                }
+                return Ok(None);
+            }
             return self
                 .outer
                 .as_deref()
@@ -350,6 +369,9 @@ impl Scope {
             .collect();
 
         if matching_sources.is_empty() {
+            if self.outer_resolution_blocked {
+                return Ok(None);
+            }
             return self.outer.as_deref().map_or(Ok(None), |outer| {
                 outer.resolve_database_qualified(database, table, column)
             });
@@ -585,6 +607,16 @@ impl Scope {
 
     fn output(&self, id: OutputId) -> Option<&ScopeOutput> {
         self.outputs.iter().find(|output| output.id == id)
+    }
+
+    fn has_qualifier(&self, qualifier: &str) -> bool {
+        self.sources
+            .iter()
+            .any(|source| source.qualifier == qualifier)
+            || self
+                .outer
+                .as_deref()
+                .is_some_and(|outer| outer.has_qualifier(qualifier))
     }
 }
 

@@ -107,6 +107,10 @@ Completed:
   aliases, aliases remain stable `OutputId` references, correlated subqueries
   keep their captures, and aggregate or window calls retain their existing
   errors.
+- GROUP BY keys keep resolved expressions, type facts, and collations. Source
+  columns win over aliases, positive integer terms become `OutputId` references,
+  and grouping expressions cannot capture an enclosing query. HAVING prefers
+  aliases, allows aggregates with block-local identities, and rejects windows.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -118,9 +122,9 @@ separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
-WHERE filters are also bound. `VALUES`, GROUP BY, ORDER BY, LIMIT, and recursive
-CTEs remain separate checkpoints. Continue with GROUP BY and HAVING before
-starting the remaining SELECT clauses.
+WHERE filters, GROUP BY keys, and HAVING predicates are also bound. `VALUES`,
+ORDER BY, LIMIT, and recursive CTEs remain separate checkpoints. Continue with
+ORDER BY before starting the remaining SELECT clauses.
 
 ## Working rules
 

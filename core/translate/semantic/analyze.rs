@@ -396,9 +396,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         else {
             return unsupported_select();
         };
-        if group_by.is_some() {
-            return unsupported_select();
-        }
         if from.is_none()
             && columns
                 .iter()
@@ -428,17 +425,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
                 clause_scope.set_outputs(&outputs);
-                let resolved = self.analyze_query_scalar_expr(
+                let resolved = self.analyze_query_expr(
                     syntax,
                     &clause_scope,
                     ExprPolicy::where_clause(self.context.dqs_dml()),
-                    query,
+                    &mut functions,
                 )?;
-                reject_where_alias_functions(&resolved.expr, block_id, &outputs)?;
+                reject_clause_alias_functions(&resolved.expr, block_id, &outputs, false)?;
                 Some(resolved.expr)
             }
             None => None,
         };
+        let grouping = group_by
+            .as_ref()
+            .map(|group_by| {
+                self.analyze_grouping(group_by, &scope, &outputs, block_id, &mut functions)
+            })
+            .transpose()?;
         let aggregate_count = functions.aggregate_count();
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
@@ -453,8 +456,66 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             body: QueryBlockBody::Select {
                 distinctness: *distinctness,
                 filter,
-                grouping: None,
+                grouping,
             },
+        })
+    }
+
+    fn analyze_grouping(
+        &mut self,
+        syntax: &'ast ast::GroupBy,
+        scope: &Scope,
+        outputs: &[Output],
+        block: QueryBlockId,
+        functions: &mut QueryFunctionState,
+    ) -> Result<super::hir::Grouping> {
+        let mut grouping_scope = scope.clone().without_outer_resolution();
+        grouping_scope.set_outputs(outputs);
+        let mut keys = Vec::with_capacity(syntax.exprs.len());
+        let mut key_type_facts = Vec::with_capacity(syntax.exprs.len());
+        let mut key_collations = Vec::with_capacity(syntax.exprs.len());
+        for syntax in &syntax.exprs {
+            let resolved = match output_ordinal(syntax) {
+                Some(OutputOrdinal::Index(index)) => {
+                    grouping_scope.resolve_output_ordinal(index, "1st GROUP BY")?
+                }
+                Some(OutputOrdinal::OutOfRange) => {
+                    grouping_scope.resolve_output_ordinal(0, "1st GROUP BY")?
+                }
+                None => self.analyze_query_expr(
+                    syntax,
+                    &grouping_scope,
+                    ExprPolicy::group_by(self.context.dqs_dml()),
+                    functions,
+                )?,
+            };
+            reject_clause_alias_functions(&resolved.expr, block, outputs, false)?;
+            key_type_facts.push(resolved.type_fact.clone());
+            key_collations.push(resolved.collation.value().cloned());
+            keys.push(resolved.expr);
+        }
+
+        let having = match syntax.having.as_deref() {
+            Some(syntax) => {
+                let mut having_scope = scope.clone();
+                having_scope.set_outputs(outputs);
+                let resolved = self.analyze_query_expr(
+                    syntax,
+                    &having_scope,
+                    ExprPolicy::having(self.context.dqs_dml()),
+                    functions,
+                )?;
+                reject_clause_alias_functions(&resolved.expr, block, outputs, true)?;
+                reject_having_aliased_aggregates(&resolved.expr, block, outputs)?;
+                Some(resolved.expr)
+            }
+            None => None,
+        };
+        Ok(super::hir::Grouping {
+            keys,
+            key_type_facts,
+            key_collations,
+            having,
         })
     }
 
@@ -557,13 +618,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 }
 
-fn reject_where_alias_functions(
-    filter: &Expr,
+fn reject_clause_alias_functions(
+    expression: &Expr,
     block: QueryBlockId,
     outputs: &[Output],
+    allow_aggregates: bool,
 ) -> Result<()> {
     let mut error = None;
-    filter.walk(&mut |expression| {
+    expression.walk(&mut |expression| {
         if error.is_some() {
             return;
         }
@@ -591,19 +653,116 @@ fn reject_where_alias_functions(
                 return;
             };
             error = match call.evaluation {
-                FunctionEvaluation::Aggregate { .. } => Some(LimboError::ParseError(format!(
-                    "misuse of aggregate: {}()",
-                    call.function.value()
-                ))),
+                FunctionEvaluation::Aggregate { .. } if !allow_aggregates => {
+                    Some(LimboError::ParseError(format!(
+                        "misuse of aggregate: {}()",
+                        call.function.value()
+                    )))
+                }
                 FunctionEvaluation::Window { .. } => Some(LimboError::ParseError(format!(
                     "misuse of aliased window function {}",
                     output.name
                 ))),
-                FunctionEvaluation::Scalar => None,
+                FunctionEvaluation::Aggregate { .. } | FunctionEvaluation::Scalar => None,
             };
         });
     });
     error.map_or(Ok(()), Err)
+}
+
+fn reject_having_aliased_aggregates(
+    having: &Expr,
+    block: QueryBlockId,
+    outputs: &[Output],
+) -> Result<()> {
+    let mut error = None;
+    having.walk(&mut |expression| {
+        if error.is_some() {
+            return;
+        }
+        let Expr::Function(call) = expression else {
+            return;
+        };
+        if !matches!(call.evaluation, FunctionEvaluation::Aggregate { .. }) {
+            return;
+        }
+        for argument in call.arguments.expressions() {
+            argument.walk(&mut |expression| {
+                if error.is_some() {
+                    return;
+                }
+                let Expr::Output(id) = expression else {
+                    return;
+                };
+                let OutputOwner::QueryBlock(owner) = id.owner else {
+                    return;
+                };
+                if owner != block {
+                    return;
+                }
+                let Some(output) = outputs.get(id.index) else {
+                    error = Some(LimboError::InternalError(format!(
+                        "HAVING refers to missing output {}",
+                        id.index
+                    )));
+                    return;
+                };
+                if expression_contains_aggregate(&output.expr) {
+                    error = Some(LimboError::ParseError(format!(
+                        "misuse of aliased aggregate {}",
+                        crate::util::normalize_ident(&output.name)
+                    )));
+                }
+            });
+        }
+    });
+    error.map_or(Ok(()), Err)
+}
+
+fn expression_contains_aggregate(expression: &Expr) -> bool {
+    let mut found = false;
+    expression.walk(&mut |expression| {
+        if let Expr::Function(call) = expression {
+            found |= matches!(call.evaluation, FunctionEvaluation::Aggregate { .. });
+        }
+    });
+    found
+}
+
+enum OutputOrdinal {
+    Index(usize),
+    OutOfRange,
+}
+
+fn output_ordinal(expression: &ast::Expr) -> Option<OutputOrdinal> {
+    match expression {
+        ast::Expr::Collate(inner, _) => output_ordinal(inner),
+        ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            output_ordinal(&expressions[0])
+        }
+        ast::Expr::Literal(ast::Literal::Numeric(value)) => parsed_output_ordinal(value),
+        ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => match inner.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(value)) => parsed_output_ordinal(value),
+            _ => None,
+        },
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => match inner.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(value)) if value.parse::<i32>().is_ok() => {
+                Some(OutputOrdinal::OutOfRange)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parsed_output_ordinal(value: &str) -> Option<OutputOrdinal> {
+    value.parse::<i32>().ok().map(|value| {
+        if value > 0 {
+            OutputOrdinal::Index(value as usize)
+        } else {
+            OutputOrdinal::OutOfRange
+        }
+    })
 }
 
 pub(super) fn literal_type_fact(literal: &ast::Literal) -> Result<TypeFact> {
@@ -1249,6 +1408,177 @@ mod tests {
                 .expect_err("WHERE only accepts scalar functions");
             assert_eq!(error.to_string(), message);
         }
+    }
+
+    #[test]
+    fn group_by_keeps_precedence_ordinals_and_key_facts() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value AS score, id + 1 AS next_id \
+             FROM items \
+             GROUP BY score, next_id, 1",
+        )
+        .expect("GROUP BY resolves columns, aliases, and ordinals");
+        document.validate().expect("GROUP BY produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } = &block.body
+        else {
+            panic!("GROUP BY becomes block grouping");
+        };
+        let source = block.from.as_ref().expect("query has FROM").first;
+        assert_eq!(grouping.keys.len(), 3);
+        assert!(matches!(
+            grouping.keys[0],
+            Expr::Column(reference) if reference.source == source && reference.column == 2
+        ));
+        assert!(matches!(
+            grouping.keys[1],
+            Expr::Output(id) if id == OutputId::query(block.id, 1)
+        ));
+        assert!(matches!(
+            grouping.keys[2],
+            Expr::Output(id) if id == OutputId::query(block.id, 0)
+        ));
+        assert_eq!(grouping.key_type_facts[0].storage, Some(Type::Real));
+        assert_eq!(grouping.key_type_facts[2].storage, Some(Type::Text));
+        assert!(grouping.key_collations[0].is_none());
+        assert_eq!(
+            grouping.key_collations[2]
+                .as_ref()
+                .expect("ordinal keeps output collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn having_prefers_outputs_and_allocates_aggregate_ids() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT sum(id) AS score \
+             FROM items \
+             GROUP BY value \
+             HAVING max(id) > score",
+        )
+        .expect("HAVING accepts aggregates and output aliases");
+        document.validate().expect("HAVING produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 2);
+        let QueryBlockBody::Select {
+            grouping:
+                Some(super::super::hir::Grouping {
+                    having:
+                        Some(Expr::Binary {
+                            lhs,
+                            rhs,
+                            operator: ast::Operator::Greater,
+                            ..
+                        }),
+                    ..
+                }),
+            ..
+        } = &block.body
+        else {
+            panic!("HAVING becomes grouping predicate");
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Aggregate { id, .. }
+                    if id.index == 1 && id.block == block.id)
+        ));
+        assert!(matches!(
+            rhs.as_ref(),
+            Expr::Output(id) if *id == OutputId::query(block.id, 0)
+        ));
+    }
+
+    #[test]
+    fn grouping_keeps_function_and_ordinal_errors() {
+        let schema = schema_with_items();
+        for (sql, message) in [
+            (
+                "SELECT id FROM items GROUP BY sum(score)",
+                "Parse error: misuse of aggregate function sum()",
+            ),
+            (
+                "SELECT id FROM items GROUP BY row_number() OVER ()",
+                "Parse error: misuse of window function: row_number()",
+            ),
+            (
+                "SELECT sum(id) AS total FROM items GROUP BY total",
+                "Parse error: misuse of aggregate: sum()",
+            ),
+            (
+                "SELECT row_number() OVER () AS position FROM items GROUP BY position",
+                "Parse error: misuse of aliased window function position",
+            ),
+            (
+                "SELECT id FROM items GROUP BY id HAVING row_number() OVER () > 1",
+                "Parse error: misuse of window function: row_number()",
+            ),
+            (
+                "SELECT row_number() OVER () AS position FROM items \
+                 GROUP BY value HAVING position > 1",
+                "Parse error: misuse of aliased window function position",
+            ),
+            (
+                "SELECT min(id) AS m FROM items \
+                 GROUP BY value HAVING max(m + 5) < 10",
+                "Parse error: misuse of aliased aggregate m",
+            ),
+            (
+                "SELECT id FROM items GROUP BY 0",
+                "Parse error: 1st GROUP BY term out of range - should be between 1 and 1",
+            ),
+            (
+                "SELECT id FROM items GROUP BY 2",
+                "Parse error: 1st GROUP BY term out of range - should be between 1 and 1",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("grouping expression keeps its clause rules");
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn correlated_group_by_does_not_capture_outer_columns() {
+        let schema = schema_with_join_tables();
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT (\
+                 SELECT categories.id FROM categories GROUP BY outer_items.id\
+             ) FROM items AS outer_items",
+        )
+        .expect_err("GROUP BY cannot capture an outer query column");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: no such column: outer_items.id"
+        );
+
+        analyze_sql_with_schema(
+            &schema,
+            "SELECT (\
+                 SELECT categories.id \
+                 FROM categories \
+                 GROUP BY (SELECT categories.id)\
+             ) FROM items AS outer_items",
+        )
+        .expect("a GROUP BY subquery can capture the current query source");
     }
 
     #[test]

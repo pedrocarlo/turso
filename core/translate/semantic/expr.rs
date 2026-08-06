@@ -24,6 +24,8 @@ use crate::{
 pub(crate) struct ExprPolicy {
     precedence: NamePrecedence,
     allow_dqs_fallback: bool,
+    allow_aggregates: bool,
+    allow_windows: bool,
     raise: RaisePolicy,
 }
 
@@ -38,6 +40,8 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: dqs_dml.is_enabled(),
+            allow_aggregates: true,
+            allow_windows: true,
             raise: RaisePolicy::AbortOnly,
         }
     }
@@ -46,6 +50,28 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourceThenOutput,
             allow_dqs_fallback: dqs_dml.is_enabled(),
+            allow_aggregates: false,
+            allow_windows: false,
+            raise: RaisePolicy::AbortOnly,
+        }
+    }
+
+    pub(crate) const fn group_by(dqs_dml: DoubleQuotedDml) -> Self {
+        Self {
+            precedence: NamePrecedence::SourceThenOutput,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
+            allow_aggregates: false,
+            allow_windows: false,
+            raise: RaisePolicy::AbortOnly,
+        }
+    }
+
+    pub(crate) const fn having(dqs_dml: DoubleQuotedDml) -> Self {
+        Self {
+            precedence: NamePrecedence::OutputThenSource,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
+            allow_aggregates: true,
+            allow_windows: false,
             raise: RaisePolicy::AbortOnly,
         }
     }
@@ -59,6 +85,8 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: false,
+            allow_aggregates: false,
+            allow_windows: false,
             raise: RaisePolicy::AbortOnly,
         }
     }
@@ -1504,7 +1532,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             None => self.resolve_sequence_operation(&function, &input)?,
         };
-        let binding = bind_function(&function, window.is_some(), name, functions)?;
+        let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
         let window = match (window_evaluation, window) {
@@ -2305,8 +2333,27 @@ fn bind_function(
     function: &Func,
     has_over: bool,
     name: &ast::Name,
+    policy: ExprPolicy,
     context: &mut FunctionContext<'_>,
 ) -> Result<FunctionBinding> {
+    let aggregate = matches!(function, Func::Agg(_))
+        || matches!(function, Func::External(external) if external.func.is_aggregate());
+    if aggregate && !has_over && !policy.allow_aggregates {
+        crate::bail_parse_error!("misuse of aggregate function {}()", function);
+    }
+    if has_over && !policy.allow_windows {
+        match function {
+            Func::Agg(_) | Func::Window(_) => {
+                crate::bail_parse_error!("misuse of window function: {}()", function)
+            }
+            Func::External(external) if external.func.is_aggregate() => {
+                crate::bail_parse_error!("misuse of window function: {}()", function)
+            }
+            _ => {
+                crate::bail_parse_error!("{} may not be used as a window function", name.as_str())
+            }
+        }
+    }
     match function {
         Func::Agg(_) if has_over => bind_window(function, context),
         Func::Agg(_) => bind_aggregate(function, context),
