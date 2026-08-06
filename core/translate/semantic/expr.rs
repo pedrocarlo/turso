@@ -621,7 +621,7 @@ fn take_window_frame_bound(
     }
 }
 
-impl Analyzer<'_, '_, '_> {
+impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(crate) fn analyze_expr(
         &mut self,
         syntax: &ast::Expr,
@@ -647,29 +647,140 @@ impl Analyzer<'_, '_, '_> {
 
     pub(super) fn analyze_query_expr(
         &mut self,
-        syntax: &ast::Expr,
+        syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
         functions: &mut QueryFunctionState,
     ) -> Result<ResolvedScopeExpr> {
-        self.analyze_resolved_expr_with_functions(
+        let parent = functions.block.query;
+        let mut functions = FunctionContext::Query(functions);
+        self.analyze_query_scoped_expr(syntax, scope, policy, parent, &mut functions)
+    }
+
+    pub(super) fn analyze_query_scalar_expr(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        parent: hir::QueryId,
+    ) -> Result<ResolvedScopeExpr> {
+        self.analyze_query_scoped_expr(
             syntax,
             scope,
             policy,
-            &mut FunctionContext::Query(functions),
+            parent,
+            &mut FunctionContext::ScalarOnly,
         )
+    }
+
+    fn analyze_query_scoped_expr(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        parent: hir::QueryId,
+        functions: &mut FunctionContext<'_>,
+    ) -> Result<ResolvedScopeExpr> {
+        let mut frames = vec![ExprFrame::new(syntax)?];
+        loop {
+            if let Some(child) = frames
+                .last_mut()
+                .expect("root expression frame exists")
+                .next_child()
+            {
+                frames.push(ExprFrame::new(child)?);
+                continue;
+            }
+
+            let frame = frames.pop().expect("completed expression frame exists");
+            let resolved = match frame.syntax {
+                ast::Expr::Subquery(_) | ast::Expr::Exists(_) => {
+                    expect_no_expr_children(frame.resolved_children)?;
+                    self.build_subquery_expr(frame.syntax, scope, parent)?
+                }
+                _ => self.build_expr(
+                    frame.syntax,
+                    frame.resolved_children,
+                    scope,
+                    policy,
+                    functions,
+                )?,
+            };
+            match frames.last_mut() {
+                Some(parent) => parent.resolved_children.push(resolved),
+                None => return Ok(resolved),
+            }
+        }
+    }
+
+    fn build_subquery_expr(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        parent: hir::QueryId,
+    ) -> Result<ResolvedScopeExpr> {
+        match syntax {
+            ast::Expr::Subquery(select) => {
+                let query = self.analyze_subquery(select, parent, scope)?;
+                self.resolve_query_output(query, 0)
+            }
+            ast::Expr::Exists(select) => {
+                let query = self.analyze_subquery(select, parent, scope)?;
+                Ok(computed_expr(
+                    hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
+                    hir::TypeFact::known(Type::Integer),
+                    ExprCollation::Absent,
+                ))
+            }
+            _ => Err(LimboError::InternalError(
+                "subquery expression builder received a non-subquery".to_string(),
+            )),
+        }
+    }
+
+    fn resolve_query_output(
+        &self,
+        query: hir::QueryId,
+        output: usize,
+    ) -> Result<ResolvedScopeExpr> {
+        let definition = self
+            .query(query)
+            .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?;
+        let width = definition.output.len();
+        if width != 1 {
+            crate::bail_parse_error!("sub-select returns {width} columns - expected 1");
+        }
+        let facts = definition
+            .blocks
+            .first()
+            .and_then(|block| block.outputs.get(output))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "semantic query {} has no output {output}",
+                    definition.id
+                ))
+            })?;
+        Ok(ResolvedScopeExpr {
+            expr: hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
+            type_fact: facts.type_fact.clone(),
+            affinity: facts.affinity,
+            has_affinity: facts.has_affinity,
+            collation: ExprCollation::output(facts.collation.clone(), facts.collation_is_explicit),
+        })
     }
 
     pub(super) fn analyze_named_windows(
         &mut self,
-        definitions: &[ast::WindowDef],
+        definitions: &'ast [ast::WindowDef],
         scope: &Scope,
         policy: ExprPolicy,
         functions: &mut QueryFunctionState,
     ) -> Result<()> {
+        let parent = functions.block.query;
         for definition in definitions {
             let name = normalize_ident(definition.name.as_str());
-            let mut window = self.analyze_window_definition(&definition.window, scope, policy)?;
+            let mut window =
+                self.analyze_window_definition(&definition.window, scope, policy, parent)?;
             if let Some(base) = &definition.window.base {
                 // SQLite ignores the base on the first WINDOW definition.
                 if !functions.named_windows.is_empty() {
@@ -698,18 +809,19 @@ impl Analyzer<'_, '_, '_> {
 
     fn analyze_window_definition(
         &mut self,
-        window: &ast::Window,
+        window: &'ast ast::Window,
         scope: &Scope,
         policy: ExprPolicy,
+        parent: hir::QueryId,
     ) -> Result<FunctionWindow> {
         let mut partition_by = ExprChildren::new();
         for expression in &window.partition_by {
-            partition_by.push(self.analyze_resolved_expr(expression, scope, policy)?);
+            partition_by.push(self.analyze_query_scalar_expr(expression, scope, policy, parent)?);
         }
         let mut order_by = Vec::with_capacity(window.order_by.len());
         for term in &window.order_by {
             order_by.push(FunctionOrderTerm {
-                value: self.analyze_resolved_expr(&term.expr, scope, policy)?,
+                value: self.analyze_query_scalar_expr(&term.expr, scope, policy, parent)?,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
             });

@@ -250,7 +250,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
-        self.analyze_select_with_parent(select, None)
+        self.analyze_select_with_scope(select, None, None)
     }
 
     pub(super) fn analyze_select_with_parent(
@@ -258,10 +258,28 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
     ) -> Result<QueryId> {
+        self.analyze_select_with_scope(select, parent, None)
+    }
+
+    pub(super) fn analyze_subquery(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: QueryId,
+        outer_scope: &Scope,
+    ) -> Result<QueryId> {
+        self.analyze_select_with_scope(select, Some(parent), Some(outer_scope))
+    }
+
+    fn analyze_select_with_scope(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+        outer_scope: Option<&Scope>,
+    ) -> Result<QueryId> {
         if let Some(with) = &select.with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select_body(select, parent);
+        let result = self.analyze_select_body(select, parent, outer_scope);
         if select.with.is_some() {
             self.cte_scopes
                 .pop()
@@ -274,6 +292,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         select: &'ast ast::Select,
         parent: Option<QueryId>,
+        outer_scope: Option<&Scope>,
     ) -> Result<QueryId> {
         if !select.order_by.is_empty() || select.limit.is_some() {
             return unsupported_select();
@@ -281,9 +300,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
-        blocks.push(self.analyze_select_block(&select.body.select, query_id, 0)?);
+        blocks.push(self.analyze_select_block(&select.body.select, query_id, 0, outer_scope)?);
         for (index, compound) in select.body.compounds.iter().enumerate() {
-            blocks.push(self.analyze_select_block(&compound.select, query_id, index + 1)?);
+            blocks.push(self.analyze_select_block(
+                &compound.select,
+                query_id,
+                index + 1,
+                outer_scope,
+            )?);
         }
 
         if let Some(rightmost) = blocks.last() {
@@ -314,21 +338,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .collect();
         let reachable_ctes = self.direct_ctes(&blocks)?;
 
-        self.insert_query(
-            query_id,
-            Query {
-                id: query_id,
-                parent,
-                captures: Vec::new(),
-                reachable_ctes,
-                blocks,
-                first,
-                compounds,
-                order_by: Vec::new(),
-                limit: None,
-                output,
-            },
-        )?;
+        let mut query = Query {
+            id: query_id,
+            parent,
+            captures: Vec::new(),
+            reachable_ctes,
+            blocks,
+            first,
+            compounds,
+            order_by: Vec::new(),
+            limit: None,
+            output,
+        };
+        query.captures = query.direct_captures(|source| self.source(source));
+        self.insert_query(query_id, query)?;
 
         Ok(query_id)
     }
@@ -360,6 +383,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::OneSelect,
         query: QueryId,
         index: usize,
+        outer_scope: Option<&Scope>,
     ) -> Result<QueryBlock> {
         let ast::OneSelect::Select {
             distinctness,
@@ -387,10 +411,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let (from, scope) = match from {
             Some(from) => {
                 let (from, scope) =
-                    self.analyze_from_clause(from, super::hir::SourceOwner::QueryBlock(block_id))?;
+                    self.analyze_from_clause(from, block_id, outer_scope.cloned())?;
                 (Some(from), scope)
             }
-            None => (None, Scope::default()),
+            None => (None, Scope::new(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
         self.analyze_named_windows(
@@ -422,7 +446,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn analyze_outputs(
         &mut self,
         block: QueryBlockId,
-        columns: &[ast::ResultColumn],
+        columns: &'ast [ast::ResultColumn],
         scope: &Scope,
         functions: &mut QueryFunctionState,
     ) -> Result<Vec<Output>> {
@@ -481,7 +505,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         block: QueryBlockId,
         index: usize,
-        column: &ast::ResultColumn,
+        column: &'ast ast::ResultColumn,
         scope: &Scope,
         functions: &mut QueryFunctionState,
     ) -> Result<Output> {
@@ -564,6 +588,7 @@ mod tests {
         hir::{
             CteBody, CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot,
             JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, SourceKind, SourceOwner,
+            SubqueryExpr,
         },
     };
 
@@ -905,6 +930,159 @@ mod tests {
         )
         .expect_err("FROM subquery cannot capture the outer source scope");
         assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
+    }
+
+    #[test]
+    fn expression_subqueries_capture_outer_sources_and_keep_result_facts() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (SELECT outer_items.value), \
+                    EXISTS (SELECT outer_items.id) \
+             FROM items AS outer_items",
+        )
+        .expect("correlated expression subqueries bind into HIR");
+        document
+            .validate()
+            .expect("correlated subqueries produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_block = &outer.blocks[0];
+        let outer_source = outer_block
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: scalar_id,
+            output,
+        }) = &outer_block.outputs[0].expr
+        else {
+            panic!("scalar subquery remains explicit in HIR");
+        };
+        assert_eq!(*output, 0);
+        let scalar = document.query(*scalar_id).expect("scalar query exists");
+        assert_eq!(scalar.parent, Some(outer.id));
+        assert_eq!(scalar.captures, vec![outer_source]);
+        assert!(matches!(
+            scalar.blocks[0].outputs[0].expr,
+            Expr::Column(reference)
+                if reference.source == outer_source && reference.column == 1
+        ));
+        assert_eq!(outer_block.outputs[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            outer_block.outputs[0].affinity,
+            crate::vdbe::affinity::Affinity::Text
+        );
+        assert!(outer_block.outputs[0].has_affinity);
+        assert_eq!(
+            outer_block.outputs[0]
+                .collation
+                .as_ref()
+                .expect("scalar output keeps selected collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+
+        let Expr::Subquery(SubqueryExpr::Exists(exists_id)) = &outer_block.outputs[1].expr else {
+            panic!("EXISTS subquery remains explicit in HIR");
+        };
+        let exists = document.query(*exists_id).expect("EXISTS query exists");
+        assert_eq!(exists.parent, Some(outer.id));
+        assert_eq!(exists.captures, vec![outer_source]);
+        assert_eq!(
+            outer_block.outputs[1].type_fact.storage,
+            Some(Type::Integer)
+        );
+        assert!(!outer_block.outputs[1].has_affinity);
+        assert!(outer_block.outputs[1].collation.is_none());
+    }
+
+    #[test]
+    fn nested_expression_subqueries_capture_any_ancestor_scope() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (SELECT (SELECT outer_items.id)) \
+             FROM items AS outer_items",
+        )
+        .expect("nested subquery resolves an ancestor source");
+        document
+            .validate()
+            .expect("ancestor capture follows the query parent chain");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: middle_id, ..
+        }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("outer expression contains middle query");
+        };
+        let middle = document.query(*middle_id).expect("middle query exists");
+        assert!(middle.captures.is_empty());
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: inner_id, ..
+        }) = &middle.blocks[0].outputs[0].expr
+        else {
+            panic!("middle expression contains inner query");
+        };
+        let inner = document.query(*inner_id).expect("inner query exists");
+        assert_eq!(inner.parent, Some(middle.id));
+        assert_eq!(inner.captures, vec![outer_source]);
+    }
+
+    #[test]
+    fn expression_subqueries_bind_in_join_constraints() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT outer_items.id \
+             FROM items AS outer_items \
+             JOIN categories ON EXISTS (SELECT outer_items.id)",
+        )
+        .expect("JOIN constraint accepts a correlated subquery");
+        document
+            .validate()
+            .expect("JOIN subquery produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let from = outer.blocks[0].from.as_ref().expect("query has FROM");
+        let JoinConstraint::On(Expr::Subquery(SubqueryExpr::Exists(inner_id))) =
+            &from.joins[0].constraint
+        else {
+            panic!("JOIN keeps its EXISTS subquery");
+        };
+        let inner = document.query(*inner_id).expect("inner query exists");
+        assert_eq!(inner.parent, Some(outer.id));
+        assert_eq!(inner.captures, vec![from.first]);
+    }
+
+    #[test]
+    fn scalar_subqueries_require_one_output() {
+        let error = analyze_sql("SELECT (SELECT 1, 2)")
+            .expect_err("multi-column scalar subquery is invalid");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: sub-select returns 2 columns - expected 1"
+        );
+
+        analyze_sql("SELECT EXISTS (SELECT 1, 2)")
+            .expect("EXISTS does not require a one-column query");
     }
 
     #[test]
