@@ -120,6 +120,10 @@ Completed:
   keep parameters, scalar functions, DQS literals, and independent child
   queries while rejecting query names, correlation, aggregates, and windows.
   Both OFFSET spellings share the same normalized HIR shape.
+- VALUES rows bind as block-owned HIR expressions. Generated `columnN` outputs
+  keep first-row type, affinity, and collation facts; row expressions remain
+  the only runtime values. VALUES subqueries keep outer captures, scalar DQS
+  rules, aggregate/window identities, and compound-arm ordering.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -132,8 +136,8 @@ separate from built-in array columns.
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
 WHERE filters, GROUP BY keys, HAVING predicates, query-level ORDER BY terms, and
-LIMIT/OFFSET are also bound. `VALUES` and recursive CTEs remain separate
-checkpoints. Continue with VALUES before recursive CTEs.
+LIMIT/OFFSET and VALUES rows are also bound. Recursive CTEs remain the next
+separate checkpoint.
 
 ## Working rules
 

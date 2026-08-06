@@ -294,6 +294,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
     ) -> Result<QueryId> {
+        let rightmost = select
+            .body
+            .compounds
+            .last()
+            .map(|compound| &compound.select)
+            .unwrap_or(&select.body.select);
+        if matches!(rightmost, ast::OneSelect::Values(_)) {
+            if !select.order_by.is_empty() {
+                crate::bail_parse_error!("ORDER BY clause is not allowed with VALUES clause");
+            }
+            if select.limit.is_some() {
+                crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
+            }
+        }
+
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
         let ordinary_order_by = select
@@ -406,17 +421,48 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
     ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
-        let ast::OneSelect::Select {
-            distinctness,
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-        } = select
-        else {
-            return unsupported_select();
-        };
+        match select {
+            ast::OneSelect::Select {
+                distinctness,
+                columns,
+                from,
+                where_clause,
+                group_by,
+                window_clause,
+            } => self.analyze_projection_block(
+                *distinctness,
+                columns,
+                from.as_ref(),
+                where_clause.as_deref(),
+                group_by.as_ref(),
+                window_clause,
+                query,
+                index,
+                outer_scope,
+                order_by,
+            ),
+            ast::OneSelect::Values(rows) => {
+                debug_assert!(order_by.is_none_or(<[_]>::is_empty));
+                self.analyze_values_block(rows, query, index, outer_scope)
+                    .map(|block| (block, Vec::new()))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_projection_block(
+        &mut self,
+        distinctness: Option<ast::Distinctness>,
+        columns: &'ast [ast::ResultColumn],
+        from: Option<&'ast ast::FromClause>,
+        where_clause: Option<&'ast ast::Expr>,
+        group_by: Option<&'ast ast::GroupBy>,
+        window_clause: &'ast [ast::WindowDef],
+        query: QueryId,
+        index: usize,
+        outer_scope: Option<&Scope>,
+        order_by: Option<&'ast [ast::SortedColumn]>,
+    ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         if from.is_none()
             && columns
                 .iter()
@@ -442,7 +488,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             &mut functions,
         )?;
         let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
-        let filter = match where_clause.as_deref() {
+        let filter = match where_clause {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
                 clause_scope.set_outputs(&outputs);
@@ -458,7 +504,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => None,
         };
         let grouping = group_by
-            .as_ref()
             .map(|group_by| {
                 self.analyze_grouping(group_by, &scope, &outputs, block_id, &mut functions)
             })
@@ -490,13 +535,76 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 window_function_count,
                 windows,
                 body: QueryBlockBody::Select {
-                    distinctness: *distinctness,
+                    distinctness,
                     filter,
                     grouping,
                 },
             },
             order_by,
         ))
+    }
+
+    fn analyze_values_block(
+        &mut self,
+        rows: &'ast [Vec<Box<ast::Expr>>],
+        query: QueryId,
+        index: usize,
+        outer_scope: Option<&Scope>,
+    ) -> Result<QueryBlock> {
+        let block = QueryBlockId::new(query, index);
+        let scope = Scope::new(outer_scope.cloned());
+        let policy = ExprPolicy::select(self.context.dqs_dml());
+        let mut functions = QueryFunctionState::new(block);
+        let mut resolved_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut resolved_row = Vec::with_capacity(row.len());
+            for expression in row {
+                resolved_row.push(self.analyze_query_expr(
+                    expression,
+                    &scope,
+                    policy,
+                    &mut functions,
+                )?);
+            }
+            resolved_rows.push(resolved_row);
+        }
+
+        let first = resolved_rows
+            .first()
+            .expect("parser guarantees one VALUES row");
+        let outputs = first
+            .iter()
+            .enumerate()
+            .map(|(index, resolved)| {
+                let mut descriptor = resolved.clone();
+                // VALUES rows own runtime expressions. This placeholder only
+                // identifies the result position, matching the old planner.
+                descriptor.expr = Expr::Literal(ast::Literal::Numeric(index.to_string()));
+                output_from_resolved(
+                    OutputId::query(block, index),
+                    format!("column{}", index + 1),
+                    OutputNameKind::Inferred,
+                    descriptor,
+                )
+            })
+            .collect();
+        let rows = resolved_rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|resolved| resolved.expr).collect())
+            .collect();
+        let aggregate_count = functions.aggregate_count();
+        let window_function_count = functions.window_function_count();
+        let windows = functions.take_windows();
+
+        Ok(QueryBlock {
+            id: block,
+            from: None,
+            outputs,
+            aggregate_count,
+            window_function_count,
+            windows,
+            body: QueryBlockBody::Values { rows },
+        })
     }
 
     fn analyze_grouping(
@@ -771,19 +879,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<()> {
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
-            let (collation, collation_is_explicit) = resolved.collation.into_output();
-            outputs.push(Output {
-                id: OutputId::query(block, outputs.len()),
-                name: column.name,
-                expr: resolved.expr,
-                type_fact: resolved.type_fact,
-                affinity: resolved.affinity,
-                schema_affinity: resolved.affinity,
-                has_affinity: resolved.has_affinity,
-                collation,
-                collation_is_explicit,
-                name_kind: OutputNameKind::StarExpansion,
-            });
+            outputs.push(output_from_resolved(
+                OutputId::query(block, outputs.len()),
+                column.name,
+                OutputNameKind::StarExpansion,
+                resolved,
+            ));
         }
         Ok(())
     }
@@ -802,7 +903,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
         let resolved = self.analyze_query_expr(syntax, scope, policy, functions)?;
-        let (collation, collation_is_explicit) = resolved.collation.into_output();
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),
@@ -814,18 +914,33 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => (syntax.to_string(), OutputNameKind::Inferred),
             Some(_) => unreachable!("all explicit aliases were handled"),
         };
-        Ok(Output {
-            id: OutputId::query(block, index),
+        Ok(output_from_resolved(
+            OutputId::query(block, index),
             name,
-            expr: resolved.expr,
-            type_fact: resolved.type_fact,
-            affinity: resolved.affinity,
-            schema_affinity: resolved.affinity,
-            has_affinity: resolved.has_affinity,
-            collation,
-            collation_is_explicit,
             name_kind,
-        })
+            resolved,
+        ))
+    }
+}
+
+fn output_from_resolved(
+    id: OutputId,
+    name: String,
+    name_kind: OutputNameKind,
+    resolved: ResolvedScopeExpr,
+) -> Output {
+    let (collation, collation_is_explicit) = resolved.collation.into_output();
+    Output {
+        id,
+        name,
+        expr: resolved.expr,
+        type_fact: resolved.type_fact,
+        affinity: resolved.affinity,
+        schema_affinity: resolved.affinity,
+        has_affinity: resolved.has_affinity,
+        collation,
+        collation_is_explicit,
+        name_kind,
     }
 }
 
@@ -2141,6 +2256,133 @@ mod tests {
                 .expect_err("LIMIT cannot see query names or query functions");
             assert_eq!(error.to_string(), message);
         }
+    }
+
+    #[test]
+    fn values_rows_become_block_owned_hir() {
+        let document = analyze_sql(
+            "VALUES(1 COLLATE NOCASE, 'left'), (2, 'right') UNION ALL SELECT 3, 'last'",
+        )
+        .expect("VALUES rows bind into HIR");
+        document.validate().expect("VALUES produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("VALUES produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        assert_eq!(query.blocks.len(), 2);
+        let values = &query.blocks[0];
+        assert!(values.from.is_none());
+        assert_eq!(
+            values
+                .outputs
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect::<Vec<_>>(),
+            ["column1", "column2"]
+        );
+        assert_eq!(values.outputs[0].type_fact.storage, Some(Type::Integer));
+        assert_eq!(values.outputs[1].type_fact.storage, Some(Type::Text));
+        assert!(values.outputs[0].collation_is_explicit);
+        assert_eq!(
+            values.outputs[0]
+                .collation
+                .as_ref()
+                .expect("first-row explicit collation becomes output metadata")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        let QueryBlockBody::Values { rows } = &values.body else {
+            panic!("first compound arm remains VALUES");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            &rows[0][0],
+            Expr::Collate { expr, .. }
+                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Numeric(value)) if value == "1")
+        ));
+        assert!(matches!(
+            &rows[1][1],
+            Expr::Literal(ast::Literal::String(value)) if value == "'right'"
+        ));
+    }
+
+    #[test]
+    fn values_subqueries_capture_outer_sources() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (VALUES(outer_items.value), (upper(outer_items.value))) \
+             FROM items AS outer_items",
+        )
+        .expect("VALUES subquery captures outer source");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("VALUES stays a scalar subquery");
+        };
+        let values = document.query(*query).expect("VALUES query exists");
+        assert_eq!(values.parent, Some(outer.id));
+        assert_eq!(values.captures, vec![outer_source]);
+        let QueryBlockBody::Values { rows } = &values.blocks[0].body else {
+            panic!("child query owns VALUES rows");
+        };
+        assert!(matches!(
+            rows[0][0],
+            Expr::Column(reference)
+                if reference.source == outer_source && reference.column == 1
+        ));
+    }
+
+    #[test]
+    fn values_keep_function_identities_and_name_rules() {
+        let document = analyze_sql("VALUES(sum(1), row_number() OVER ())")
+            .expect("VALUES allows query functions");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("VALUES produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 1);
+        assert_eq!(block.window_function_count, 1);
+        assert_eq!(block.windows.len(), 1);
+        let QueryBlockBody::Values { rows } = &block.body else {
+            panic!("query owns VALUES rows");
+        };
+        assert!(matches!(
+            &rows[0][0],
+            Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Aggregate { .. })
+        ));
+        assert!(matches!(
+            &rows[0][1],
+            Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Window { .. })
+        ));
+
+        let error = analyze_sql("VALUES(missing)").expect_err("VALUES has no local names");
+        assert_eq!(error.to_string(), "Parse error: no such column: missing");
+        let document = analyze_sql("VALUES(\"missing\")").expect("VALUES keeps DQS fallback");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("VALUES produces query root");
+        };
+        let QueryBlockBody::Values { rows } =
+            &document.query(root.query).expect("query exists").blocks[0].body
+        else {
+            panic!("query owns VALUES rows");
+        };
+        assert!(matches!(
+            &rows[0][0],
+            Expr::Literal(ast::Literal::String(value)) if value == "'missing'"
+        ));
     }
 
     #[test]
