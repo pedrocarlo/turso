@@ -86,6 +86,11 @@ Completed:
   aggregate identities, and window identities. `UNION`, `UNION ALL`, `EXCEPT`,
   and `INTERSECT` are preserved in HIR, while outward output identity stays with
   the first arm and width errors keep the existing diagnostic.
+- Ordinary CTEs bind lazily from immutable AST references. Referenced CTEs own
+  HIR queries and sources, forward sibling references and nested shadowing keep
+  their existing rules, and unused invalid definitions never enter the closed
+  document. Document-local `CteId` values are allocated on first use so the HIR
+  arena contains no unreachable definitions.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -95,9 +100,10 @@ DML because it needs the destination column type.
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.
 
-The supported SELECT path now reaches compounds. `VALUES`, WHERE, GROUP BY,
-ORDER BY, LIMIT, derived sources, and CTEs remain separate checkpoints. Continue
-with lazy CTE handling and correlation calculation before starting DML.
+The supported SELECT path now reaches ordinary non-recursive CTEs. `VALUES`,
+WHERE, GROUP BY, ORDER BY, LIMIT, derived sources, correlated queries, and
+recursive CTEs remain separate checkpoints. Continue with derived sources and
+correlation calculation before starting DML.
 
 ## Working rules
 

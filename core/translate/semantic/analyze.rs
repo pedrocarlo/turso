@@ -10,17 +10,18 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, DatabaseId, DatabaseSnapshot, Expr,
-        HirDocument, HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock, QueryBlockBody,
-        QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
+        BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, CteId, DatabaseId, DatabaseSnapshot,
+        Expr, HirDocument, HirRoot, Output, OutputId, OutputNameKind, Query, QueryBlock,
+        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId,
+        TypeFact,
     },
     scope::{ExpandedColumn, Scope},
     AnalyzeInput,
 };
 
-pub(crate) fn analyze(
-    context: &SemanticContext<'_>,
-    input: AnalyzeInput<'_>,
+pub(crate) fn analyze<'context, 'catalog, 'ast>(
+    context: &'context SemanticContext<'catalog>,
+    input: AnalyzeInput<'ast>,
 ) -> Result<HirDocument> {
     let mut analyzer = Analyzer::new(context);
     let root = match input {
@@ -44,7 +45,7 @@ pub(crate) fn analyze(
     Ok(document)
 }
 
-pub(super) struct Analyzer<'context, 'catalog> {
+pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     context: &'context SemanticContext<'catalog>,
     queries: Vec<Option<Query>>,
     sources: Vec<Option<Source>>,
@@ -52,6 +53,7 @@ pub(super) struct Analyzer<'context, 'catalog> {
     schema_programs: Vec<Option<BoundSchemaProgram>>,
     schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
+    pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -70,7 +72,7 @@ struct CatalogIdentity {
     name: String,
 }
 
-impl<'context, 'catalog> Analyzer<'context, 'catalog> {
+impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn new(context: &'context SemanticContext<'catalog>) -> Self {
         Self {
             context,
@@ -80,6 +82,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
             schema_programs: Vec::new(),
             schema_programs_in_progress: HashSet::default(),
             catalog_ids: HashMap::default(),
+            cte_scopes: Vec::new(),
         }
     }
 
@@ -91,6 +94,26 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         let id = QueryId::new(self.queries.len());
         self.queries.push(None);
         id
+    }
+
+    pub(super) fn reserve_cte(&mut self) -> CteId {
+        let id = CteId::new(self.ctes.len());
+        self.ctes.push(None);
+        id
+    }
+
+    pub(super) fn insert_cte(&mut self, id: CteId, cte: Cte) -> Result<()> {
+        if cte.id != id {
+            return Err(LimboError::InternalError(format!(
+                "CTE {} was inserted into slot {}",
+                cte.id, id
+            )));
+        }
+        Self::insert_reserved(&mut self.ctes, id.index(), cte, "CTE")
+    }
+
+    pub(super) fn cte(&self, id: CteId) -> Option<&Cte> {
+        self.ctes.get(id.index())?.as_ref()
     }
 
     pub(super) fn reserve_source(&mut self) -> SourceId {
@@ -172,6 +195,10 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         Self::insert_reserved(&mut self.queries, id.index(), query, "query")
     }
 
+    pub(super) fn query(&self, id: QueryId) -> Option<&Query> {
+        self.queries.get(id.index())?.as_ref()
+    }
+
     fn insert_reserved<T>(
         arena: &mut [Option<T>],
         index: usize,
@@ -222,8 +249,21 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         })
     }
 
-    fn analyze_select(&mut self, select: &ast::Select) -> Result<QueryId> {
-        if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
+    pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
+        if let Some(with) = &select.with {
+            self.push_cte_scope(with)?;
+        }
+        let result = self.analyze_select_body(select);
+        if select.with.is_some() {
+            self.cte_scopes
+                .pop()
+                .expect("a SELECT WITH clause must own one CTE scope");
+        }
+        result
+    }
+
+    fn analyze_select_body(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
+        if !select.order_by.is_empty() || select.limit.is_some() {
             return unsupported_select();
         }
 
@@ -260,6 +300,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                 block: block.id,
             })
             .collect();
+        let reachable_ctes = self.direct_ctes(&blocks)?;
 
         self.insert_query(
             query_id,
@@ -267,7 +308,7 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
                 id: query_id,
                 parent: None,
                 captures: Vec::new(),
-                reachable_ctes: Vec::new(),
+                reachable_ctes,
                 blocks,
                 first,
                 compounds,
@@ -278,6 +319,28 @@ impl<'context, 'catalog> Analyzer<'context, 'catalog> {
         )?;
 
         Ok(query_id)
+    }
+
+    fn direct_ctes(&self, blocks: &[QueryBlock]) -> Result<Vec<CteId>> {
+        let mut ctes = Vec::new();
+        for block in blocks {
+            let Some(from) = &block.from else {
+                continue;
+            };
+            for source in
+                std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
+            {
+                let definition = self.source(source).ok_or_else(|| {
+                    LimboError::InternalError(format!("missing semantic source {source}"))
+                })?;
+                if let super::hir::SourceKind::Cte(cte) = definition.kind {
+                    if !ctes.contains(&cte) {
+                        ctes.push(cte);
+                    }
+                }
+            }
+        }
+        Ok(ctes)
     }
 
     fn analyze_select_block(
@@ -487,8 +550,8 @@ mod tests {
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot, JoinConstraint,
-            JoinKind, MergedColumnValue, OutputNameKind, SourceKind, SourceOwner,
+            CteBody, CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot,
+            JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, SourceKind, SourceOwner,
         },
     };
 
@@ -811,6 +874,198 @@ mod tests {
             error.to_string(),
             "Parse error: SELECTs to the left and right of UNION do not have the same number of result columns"
         );
+    }
+
+    #[test]
+    fn referenced_ctes_become_document_owned_queries_and_sources() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH picked(item_key, item_text) AS MATERIALIZED (\
+                 SELECT id, value FROM items \
+                 UNION ALL SELECT id, label FROM categories\
+             ) \
+             SELECT p.item_text FROM picked AS p",
+        )
+        .expect("ordinary CTE binds into HIR");
+        document.validate().expect("CTE produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let root_query = document.query(root.query).expect("root query exists");
+        let cte = &document.ctes[0];
+        assert_eq!(root_query.reachable_ctes, vec![cte.id]);
+        assert_eq!(cte.name, "picked");
+        assert_eq!(cte.materialized, ast::Materialized::Yes);
+        assert_eq!(cte.columns.len(), 2);
+        assert_eq!(cte.columns[0].name, "item_key");
+        assert_eq!(cte.columns[1].name, "item_text");
+        assert_eq!(cte.columns[1].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            cte.columns[1]
+                .collation
+                .as_ref()
+                .expect("leftmost CTE output keeps collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+
+        let CteBody::Query(body_id) = cte.body else {
+            panic!("ordinary CTE owns a query body");
+        };
+        let body = document.query(body_id).expect("CTE body query exists");
+        assert_eq!(body.blocks.len(), 2);
+        assert_eq!(body.compounds[0].operator, ast::CompoundOperator::UnionAll);
+
+        let root_block = &root_query.blocks[0];
+        let source = document
+            .source(root_block.from.as_ref().expect("root reads CTE").first)
+            .expect("CTE source exists");
+        assert!(matches!(source.kind, SourceKind::Cte(id) if id == cte.id));
+        assert_eq!(source.owner, SourceOwner::QueryBlock(root_block.id));
+        assert_eq!(source.alias.as_deref(), Some("p"));
+        assert!(!source.rowid_available);
+        assert_eq!(source.columns[1].name, "item_text");
+        assert!(matches!(
+            root_block.outputs[0].expr,
+            Expr::Column(reference) if reference.source == source.id && reference.column == 1
+        ));
+    }
+
+    #[test]
+    fn ctes_bind_lazily_and_schema_qualification_bypasses_them() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH items(a, b) AS (SELECT missing) SELECT value FROM main.items",
+        )
+        .expect("unused invalid CTE stays unbound");
+        assert!(document.ctes.is_empty());
+        assert_eq!(document.queries.len(), 1);
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let source = document
+            .source(
+                document.query(root.query).expect("query exists").blocks[0]
+                    .from
+                    .as_ref()
+                    .expect("query reads schema table")
+                    .first,
+            )
+            .expect("schema source exists");
+        assert!(matches!(source.kind, SourceKind::Table(_)));
+    }
+
+    #[test]
+    fn ctes_can_reference_later_siblings() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH first AS (SELECT value FROM second), \
+                  second AS (SELECT value FROM items) \
+             SELECT value FROM first",
+        )
+        .expect("forward CTE dependency binds lazily");
+        document
+            .validate()
+            .expect("forward CTE dependency produces closed HIR");
+
+        assert_eq!(document.ctes.len(), 2);
+        assert_eq!(document.ctes[0].name, "second");
+        assert_eq!(document.ctes[1].name, "first");
+        let CteBody::Query(first_body) = document.ctes[1].body else {
+            panic!("ordinary CTE owns query body");
+        };
+        assert_eq!(
+            document
+                .query(first_body)
+                .expect("first body exists")
+                .reachable_ctes,
+            vec![document.ctes[0].id]
+        );
+    }
+
+    #[test]
+    fn repeated_cte_reads_share_one_definition() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH picked AS (SELECT id FROM items) \
+             SELECT left_pick.id, right_pick.id \
+             FROM picked AS left_pick JOIN picked AS right_pick",
+        )
+        .expect("repeated CTE reads bind into HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("root query exists");
+        assert_eq!(document.ctes.len(), 1);
+        assert_eq!(query.reachable_ctes, vec![document.ctes[0].id]);
+        let from = query.blocks[0].from.as_ref().expect("query reads CTE");
+        let left = document.source(from.first).expect("left source exists");
+        let right = document
+            .source(from.joins[0].right)
+            .expect("right source exists");
+        assert!(matches!(left.kind, SourceKind::Cte(id) if id == document.ctes[0].id));
+        assert!(matches!(right.kind, SourceKind::Cte(id) if id == document.ctes[0].id));
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn nested_with_clauses_shadow_outer_ctes() {
+        let document = analyze_sql(
+            "WITH picked AS (SELECT 1 AS value), \
+                  nested AS (\
+                      WITH picked AS (SELECT 2 AS value) \
+                      SELECT value FROM picked\
+                  ) \
+             SELECT value FROM nested",
+        )
+        .expect("nested WITH shadows outer CTE");
+        document
+            .validate()
+            .expect("nested CTE scopes produce closed HIR");
+
+        assert_eq!(document.ctes.len(), 2);
+        assert_eq!(document.ctes[0].name, "picked");
+        assert_eq!(document.ctes[1].name, "nested");
+        let CteBody::Query(shadow_body) = document.ctes[0].body else {
+            panic!("ordinary CTE owns query body");
+        };
+        assert!(matches!(
+            &document
+                .query(shadow_body)
+                .expect("shadow body exists")
+                .blocks[0]
+                .outputs[0]
+                .expr,
+            Expr::Literal(ast::Literal::Numeric(value)) if value == "2"
+        ));
+    }
+
+    #[test]
+    fn referenced_ctes_keep_lazy_structure_errors() {
+        for (sql, expected) in [
+            (
+                "WITH picked(a, b) AS (SELECT 1) SELECT * FROM picked",
+                "Parse error: table picked has 1 values for 2 columns",
+            ),
+            (
+                "WITH a AS (SELECT * FROM b), b AS (SELECT * FROM a) SELECT * FROM a",
+                "Parse error: circular reference: a",
+            ),
+        ] {
+            let error = analyze_sql(sql).expect_err("invalid referenced CTE fails analysis");
+            assert_eq!(error.to_string(), expected);
+        }
+
+        let document = analyze_sql("WITH picked(a, b) AS (SELECT 1) SELECT 1")
+            .expect("unused column-count mismatch stays deferred");
+        assert!(document.ctes.is_empty());
     }
 
     #[test]
