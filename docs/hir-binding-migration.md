@@ -111,6 +111,11 @@ Completed:
   columns win over aliases, positive integer terms become `OutputId` references,
   and grouping expressions cannot capture an enclosing query. HAVING prefers
   aliases, allows aggregates with block-local identities, and rejects windows.
+- Query-level ORDER BY terms keep resolved expressions, direction, null order,
+  type facts, and collations. Ordinary queries prefer output aliases, preserve
+  output ordinals, correlated subqueries, and ORDER-BY-only function identities.
+  Compound queries resolve ordinals and names from any arm to the first arm's
+  stable `OutputId` values and keep their restricted-expression diagnostics.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -122,9 +127,9 @@ separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
-WHERE filters, GROUP BY keys, and HAVING predicates are also bound. `VALUES`,
-ORDER BY, LIMIT, and recursive CTEs remain separate checkpoints. Continue with
-ORDER BY before starting the remaining SELECT clauses.
+WHERE filters, GROUP BY keys, HAVING predicates, and query-level ORDER BY terms
+are also bound. `VALUES`, LIMIT, and recursive CTEs remain separate checkpoints.
+Continue with LIMIT before starting the remaining SELECT forms.
 
 ## Working rules
 

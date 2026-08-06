@@ -11,11 +11,11 @@ use super::{
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, CteId, DatabaseId, DatabaseSnapshot,
-        Expr, FunctionEvaluation, HirDocument, HirRoot, Output, OutputId, OutputNameKind,
-        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-        SchemaProgramId, Source, SourceId, TypeFact,
+        Expr, FunctionEvaluation, HirDocument, HirRoot, OrderTerm, Output, OutputId,
+        OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
+        QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
     },
-    scope::{ExpandedColumn, Scope},
+    scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
     AnalyzeInput,
 };
 
@@ -294,20 +294,35 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
     ) -> Result<QueryId> {
-        if !select.order_by.is_empty() || select.limit.is_some() {
+        if select.limit.is_some() {
             return unsupported_select();
         }
 
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(select.body.compounds.len() + 1);
-        blocks.push(self.analyze_select_block(&select.body.select, query_id, 0, outer_scope)?);
+        let ordinary_order_by = select
+            .body
+            .compounds
+            .is_empty()
+            .then_some(select.order_by.as_slice());
+        let (first_block, mut order_by) = self.analyze_select_block(
+            &select.body.select,
+            query_id,
+            0,
+            outer_scope,
+            ordinary_order_by,
+        )?;
+        blocks.push(first_block);
         for (index, compound) in select.body.compounds.iter().enumerate() {
-            blocks.push(self.analyze_select_block(
+            let (block, block_order_by) = self.analyze_select_block(
                 &compound.select,
                 query_id,
                 index + 1,
                 outer_scope,
-            )?);
+                None,
+            )?;
+            debug_assert!(block_order_by.is_empty());
+            blocks.push(block);
         }
 
         if let Some(rightmost) = blocks.last() {
@@ -322,6 +337,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     compound.operator
                 );
             }
+        }
+
+        if !select.body.compounds.is_empty() {
+            order_by = self.analyze_compound_order_by(&select.order_by, &blocks)?;
         }
 
         let first = blocks[0].id;
@@ -346,7 +365,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             blocks,
             first,
             compounds,
-            order_by: Vec::new(),
+            order_by,
             limit: None,
             output,
         };
@@ -384,7 +403,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         query: QueryId,
         index: usize,
         outer_scope: Option<&Scope>,
-    ) -> Result<QueryBlock> {
+        order_by: Option<&'ast [ast::SortedColumn]>,
+    ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         let ast::OneSelect::Select {
             distinctness,
             columns,
@@ -442,23 +462,40 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 self.analyze_grouping(group_by, &scope, &outputs, block_id, &mut functions)
             })
             .transpose()?;
+        let aggregate_query = grouping.is_some() || functions.aggregate_count() > 0;
+        let order_by = order_by
+            .map(|order_by| {
+                self.analyze_order_by(
+                    order_by,
+                    &scope,
+                    &outputs,
+                    block_id,
+                    aggregate_query,
+                    &mut functions,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let aggregate_count = functions.aggregate_count();
         let window_function_count = functions.window_function_count();
         let windows = functions.take_windows();
 
-        Ok(QueryBlock {
-            id: block_id,
-            from,
-            outputs,
-            aggregate_count,
-            window_function_count,
-            windows,
-            body: QueryBlockBody::Select {
-                distinctness: *distinctness,
-                filter,
-                grouping,
+        Ok((
+            QueryBlock {
+                id: block_id,
+                from,
+                outputs,
+                aggregate_count,
+                window_function_count,
+                windows,
+                body: QueryBlockBody::Select {
+                    distinctness: *distinctness,
+                    filter,
+                    grouping,
+                },
             },
-        })
+            order_by,
+        ))
     }
 
     fn analyze_grouping(
@@ -475,20 +512,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut key_type_facts = Vec::with_capacity(syntax.exprs.len());
         let mut key_collations = Vec::with_capacity(syntax.exprs.len());
         for syntax in &syntax.exprs {
-            let resolved = match output_ordinal(syntax) {
-                Some(OutputOrdinal::Index(index)) => {
-                    grouping_scope.resolve_output_ordinal(index, "1st GROUP BY")?
-                }
-                Some(OutputOrdinal::OutOfRange) => {
-                    grouping_scope.resolve_output_ordinal(0, "1st GROUP BY")?
-                }
-                None => self.analyze_query_expr(
-                    syntax,
-                    &grouping_scope,
-                    ExprPolicy::group_by(self.context.dqs_dml()),
-                    functions,
-                )?,
-            };
+            let resolved =
+                match self.resolve_output_ordinal_expr(syntax, &grouping_scope, "1st GROUP BY")? {
+                    Some(resolved) => resolved,
+                    None => self.analyze_query_expr(
+                        syntax,
+                        &grouping_scope,
+                        ExprPolicy::group_by(self.context.dqs_dml()),
+                        functions,
+                    )?,
+                };
             reject_clause_alias_functions(&resolved.expr, block, outputs, false)?;
             key_type_facts.push(resolved.type_fact.clone());
             key_collations.push(resolved.collation.value().cloned());
@@ -506,7 +539,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     functions,
                 )?;
                 reject_clause_alias_functions(&resolved.expr, block, outputs, true)?;
-                reject_having_aliased_aggregates(&resolved.expr, block, outputs)?;
+                reject_aliased_aggregates(&resolved.expr, block, outputs)?;
                 Some(resolved.expr)
             }
             None => None,
@@ -517,6 +550,168 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             key_collations,
             having,
         })
+    }
+
+    fn analyze_order_by(
+        &mut self,
+        syntax: &'ast [ast::SortedColumn],
+        scope: &Scope,
+        outputs: &[Output],
+        block: QueryBlockId,
+        aggregate_query: bool,
+        functions: &mut QueryFunctionState,
+    ) -> Result<Vec<OrderTerm>> {
+        let mut order_scope = scope.clone();
+        order_scope.set_outputs(outputs);
+        syntax
+            .iter()
+            .map(|syntax| {
+                let resolved = match self.resolve_output_ordinal_expr(
+                    &syntax.expr,
+                    &order_scope,
+                    "1st ORDER BY",
+                )? {
+                    Some(resolved) => resolved,
+                    None => self.analyze_query_expr(
+                        &syntax.expr,
+                        &order_scope,
+                        ExprPolicy::order_by(self.context.dqs_dml(), aggregate_query),
+                        functions,
+                    )?,
+                };
+                reject_aliased_aggregates(&resolved.expr, block, outputs)?;
+                Ok(order_term(syntax, resolved))
+            })
+            .collect()
+    }
+
+    fn analyze_compound_order_by(
+        &mut self,
+        syntax: &'ast [ast::SortedColumn],
+        blocks: &[QueryBlock],
+    ) -> Result<Vec<OrderTerm>> {
+        syntax
+            .iter()
+            .enumerate()
+            .map(|(index, syntax)| {
+                let resolved =
+                    self.resolve_compound_order_by_expr(&syntax.expr, blocks, index + 1)?;
+                Ok(order_term(syntax, resolved))
+            })
+            .collect()
+    }
+
+    fn resolve_compound_order_by_expr(
+        &mut self,
+        syntax: &ast::Expr,
+        blocks: &[QueryBlock],
+        term_number: usize,
+    ) -> Result<ResolvedScopeExpr> {
+        let outputs = &blocks
+            .first()
+            .expect("compound SELECT must have a first block")
+            .outputs;
+        let mut collations = Vec::new();
+        let mut inner = syntax;
+        while let ast::Expr::Collate(expression, name) = inner {
+            collations.push(name);
+            inner = expression;
+        }
+        let mut resolved = match inner {
+            ast::Expr::Literal(ast::Literal::Numeric(value)) => {
+                let Ok(position) = value.parse::<i32>() else {
+                    return compound_order_by_no_match(term_number);
+                };
+                if position <= 0 || position as usize > outputs.len() {
+                    crate::bail_parse_error!(
+                        "{} ORDER BY term out of range - should be between 1 and {}",
+                        position,
+                        outputs.len()
+                    );
+                }
+                resolved_output(&outputs[position as usize - 1])
+            }
+            ast::Expr::Id(name) => {
+                let name = crate::util::normalize_ident(name.as_str());
+                let position = blocks.iter().find_map(|block| {
+                    block
+                        .outputs
+                        .iter()
+                        .position(|output| {
+                            output.name_kind == OutputNameKind::ExplicitAlias
+                                && crate::util::normalize_ident(&output.name) == name
+                        })
+                        .or_else(|| {
+                            block.outputs.iter().position(|output| {
+                                !output.name.is_empty()
+                                    && crate::util::normalize_ident(&output.name) == name
+                            })
+                        })
+                });
+                let Some(position) = position else {
+                    return compound_order_by_no_match(term_number);
+                };
+                resolved_output(&outputs[position])
+            }
+            _ => return compound_order_by_no_match(term_number),
+        };
+        for name in collations.into_iter().rev() {
+            let collation = self.resolve_collation(name)?;
+            resolved.expr = Expr::Collate {
+                expr: Box::new(resolved.expr),
+                collation: collation.clone(),
+            };
+            resolved.collation = ExprCollation::Explicit(collation);
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_output_ordinal_expr(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        clause: &str,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        enum Wrapper<'a> {
+            Collate(&'a ast::Name),
+        }
+
+        let mut wrappers = Vec::new();
+        let mut inner = syntax;
+        loop {
+            match inner {
+                ast::Expr::Collate(expression, name) => {
+                    wrappers.push(Wrapper::Collate(name));
+                    inner = expression;
+                }
+                ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+                    inner = &expressions[0];
+                }
+                _ => break,
+            }
+        }
+
+        let Some(ordinal) = output_ordinal(inner) else {
+            return Ok(None);
+        };
+        let position = match ordinal {
+            OutputOrdinal::Index(position) => position,
+            OutputOrdinal::OutOfRange => 0,
+        };
+        let mut resolved = scope.resolve_output_ordinal(position, clause)?;
+        for wrapper in wrappers.into_iter().rev() {
+            match wrapper {
+                Wrapper::Collate(name) => {
+                    let collation = self.resolve_collation(name)?;
+                    resolved.expr = Expr::Collate {
+                        expr: Box::new(resolved.expr),
+                        collation: collation.clone(),
+                    };
+                    resolved.collation = ExprCollation::Explicit(collation);
+                }
+            }
+        }
+        Ok(Some(resolved))
     }
 
     fn analyze_outputs(
@@ -670,11 +865,7 @@ fn reject_clause_alias_functions(
     error.map_or(Ok(()), Err)
 }
 
-fn reject_having_aliased_aggregates(
-    having: &Expr,
-    block: QueryBlockId,
-    outputs: &[Output],
-) -> Result<()> {
+fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Output]) -> Result<()> {
     let mut error = None;
     having.walk(&mut |expression| {
         if error.is_some() {
@@ -717,6 +908,44 @@ fn reject_having_aliased_aggregates(
         }
     });
     error.map_or(Ok(()), Err)
+}
+
+fn resolved_output(output: &Output) -> ResolvedScopeExpr {
+    ResolvedScopeExpr {
+        expr: Expr::Output(output.id),
+        type_fact: output.type_fact.clone(),
+        affinity: output.affinity,
+        has_affinity: output.has_affinity,
+        collation: ExprCollation::output(output.collation.clone(), output.collation_is_explicit),
+    }
+}
+
+fn order_term(syntax: &ast::SortedColumn, resolved: ResolvedScopeExpr) -> OrderTerm {
+    OrderTerm {
+        expr: resolved.expr,
+        order: syntax.order.unwrap_or(ast::SortOrder::Asc),
+        nulls: syntax.nulls,
+        type_fact: resolved.type_fact,
+        collation: resolved.collation.value().cloned(),
+    }
+}
+
+fn compound_order_by_no_match<T>(term_number: usize) -> Result<T> {
+    crate::bail_parse_error!(
+        "{} ORDER BY term does not match any column in the result set",
+        ordinal(term_number)
+    )
+}
+
+fn ordinal(number: usize) -> String {
+    let suffix = match (number % 10, number % 100) {
+        (1, 11) | (2, 12) | (3, 13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{number}{suffix}")
 }
 
 fn expression_contains_aggregate(expression: &Expr) -> bool {
@@ -1579,6 +1808,215 @@ mod tests {
              ) FROM items AS outer_items",
         )
         .expect("a GROUP BY subquery can capture the current query source");
+    }
+
+    #[test]
+    fn order_by_keeps_alias_precedence_ordinals_and_facts() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value AS score, id + 1 AS next_id \
+             FROM items \
+             ORDER BY score DESC NULLS LAST, next_id, 1 COLLATE BINARY",
+        )
+        .expect("ORDER BY resolves aliases and ordinals");
+        document.validate().expect("ORDER BY produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let block = &query.blocks[0];
+        assert_eq!(query.order_by.len(), 3);
+        assert!(matches!(
+            query.order_by[0].expr,
+            Expr::Output(id) if id == OutputId::query(block.id, 0)
+        ));
+        assert_eq!(query.order_by[0].order, ast::SortOrder::Desc);
+        assert_eq!(query.order_by[0].nulls, Some(ast::NullsOrder::Last));
+        assert_eq!(query.order_by[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            query.order_by[0]
+                .collation
+                .as_ref()
+                .expect("alias keeps output collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+        assert!(matches!(
+            query.order_by[1].expr,
+            Expr::Output(id) if id == OutputId::query(block.id, 1)
+        ));
+        assert!(matches!(
+            &query.order_by[2].expr,
+            Expr::Collate { expr, collation }
+                if matches!(expr.as_ref(), Expr::Output(id)
+                    if *id == OutputId::query(block.id, 0))
+                && collation.value() == &crate::translate::collate::CollationSeq::Binary
+        ));
+        assert_eq!(query.order_by[2].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            query.order_by[2]
+                .collation
+                .as_ref()
+                .expect("explicit ordinal collation is frozen")
+                .value(),
+            &crate::translate::collate::CollationSeq::Binary
+        );
+    }
+
+    #[test]
+    fn order_by_only_functions_get_first_block_identities() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT count(*) FROM items \
+             ORDER BY min(score), row_number() OVER (ORDER BY id)",
+        )
+        .expect("aggregate SELECT accepts ORDER-BY-only aggregate and window functions");
+        document
+            .validate()
+            .expect("ORDER-BY-only functions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let block = &query.blocks[0];
+        assert_eq!(block.aggregate_count, 2);
+        assert_eq!(block.window_function_count, 1);
+        assert_eq!(block.windows.len(), 1);
+        assert!(matches!(
+            &query.order_by[0].expr,
+            Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Aggregate { id, .. }
+                    if id.block == block.id && id.index == 1)
+        ));
+        assert!(matches!(
+            &query.order_by[1].expr,
+            Expr::Function(call)
+                if matches!(call.evaluation, FunctionEvaluation::Window { id, .. }
+                    if id.block == block.id && id.index == 0)
+        ));
+
+        let named = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items \
+             WINDOW ranked AS (ORDER BY score) \
+             ORDER BY row_number() OVER ranked",
+        )
+        .expect("ORDER-BY-only function can use the block's named window");
+        let HirRoot::Query(root) = &named.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = named.query(root.query).expect("query exists");
+        assert_eq!(query.blocks[0].window_function_count, 1);
+        assert_eq!(query.blocks[0].windows.len(), 1);
+    }
+
+    #[test]
+    fn order_by_subqueries_capture_the_current_query_scope() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id FROM items AS outer_items \
+             ORDER BY (SELECT outer_items.score)",
+        )
+        .expect("ORDER BY accepts a correlated scalar subquery");
+        document
+            .validate()
+            .expect("correlated ORDER BY produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) = &outer.order_by[0].expr
+        else {
+            panic!("ORDER BY keeps its scalar subquery");
+        };
+        let inner = document.query(*inner).expect("inner query exists");
+        assert_eq!(inner.parent, Some(outer.id));
+        assert_eq!(inner.captures, vec![source]);
+    }
+
+    #[test]
+    fn order_by_keeps_aggregate_and_ordinal_errors() {
+        let schema = schema_with_items();
+        for (sql, message) in [
+            (
+                "SELECT id FROM items ORDER BY min(score)",
+                "Parse error: misuse of aggregate: min()",
+            ),
+            (
+                "SELECT min(id) AS m FROM items ORDER BY max(m)",
+                "Parse error: misuse of aliased aggregate m",
+            ),
+            (
+                "SELECT id FROM items ORDER BY 0",
+                "Parse error: 1st ORDER BY term out of range - should be between 1 and 1",
+            ),
+            (
+                "SELECT id FROM items ORDER BY 2",
+                "Parse error: 1st ORDER BY term out of range - should be between 1 and 1",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("ORDER BY keeps its aggregate and ordinal rules");
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn compound_order_by_resolves_arm_names_to_first_outputs() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT id AS first_name FROM items \
+             UNION ALL \
+             SELECT score AS later_name FROM items \
+             ORDER BY later_name DESC NULLS FIRST, 1 COLLATE NOCASE",
+        )
+        .expect("compound ORDER BY searches output names from every arm");
+        document
+            .validate()
+            .expect("compound ORDER BY produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let first_output = OutputId::query(query.blocks[0].id, 0);
+        assert_eq!(query.order_by.len(), 2);
+        assert!(matches!(query.order_by[0].expr, Expr::Output(id) if id == first_output));
+        assert_eq!(query.order_by[0].order, ast::SortOrder::Desc);
+        assert_eq!(query.order_by[0].nulls, Some(ast::NullsOrder::First));
+        assert!(matches!(
+            &query.order_by[1].expr,
+            Expr::Collate { expr, collation }
+                if matches!(expr.as_ref(), Expr::Output(id) if *id == first_output)
+                    && collation.value() == &crate::translate::collate::CollationSeq::NoCase
+        ));
+
+        for (sql, message) in [
+            (
+                "SELECT id FROM items UNION SELECT score FROM items ORDER BY id + 1",
+                "Parse error: 1st ORDER BY term does not match any column in the result set",
+            ),
+            (
+                "SELECT id FROM items UNION SELECT score FROM items ORDER BY 2",
+                "Parse error: 2 ORDER BY term out of range - should be between 1 and 1",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("compound ORDER BY only accepts result-column references");
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     #[test]
