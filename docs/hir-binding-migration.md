@@ -91,6 +91,10 @@ Completed:
   their existing rules, and unused invalid definitions never enter the closed
   document. Document-local `CteId` values are allocated on first use so the HIR
   arena contains no unreachable definitions.
+- Derived `FROM` subqueries own child queries with lexical parents and become
+  `SourceKind::Derived` sources. Derived sources and CTEs share the same
+  first-arm output-to-column fact builder. Derived sources remain
+  non-correlated at this checkpoint.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -100,10 +104,10 @@ DML because it needs the destination column type.
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.
 
-The supported SELECT path now reaches ordinary non-recursive CTEs. `VALUES`,
-WHERE, GROUP BY, ORDER BY, LIMIT, derived sources, correlated queries, and
-recursive CTEs remain separate checkpoints. Continue with derived sources and
-correlation calculation before starting DML.
+The supported SELECT path now reaches ordinary non-recursive CTEs and derived
+`FROM` sources. `VALUES`, WHERE, GROUP BY, ORDER BY, LIMIT, correlated queries,
+and recursive CTEs remain separate checkpoints. Continue with correlated
+expression subqueries and capture calculation before starting DML.
 
 ## Working rules
 
