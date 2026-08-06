@@ -1086,6 +1086,154 @@ mod tests {
     }
 
     #[test]
+    fn in_query_expressions_keep_comparison_facts_and_captures() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT outer_items.value IN (\
+                        SELECT label COLLATE RTRIM FROM categories \
+                        UNION ALL SELECT outer_items.value\
+                    ), \
+                    outer_items.id NOT IN (SELECT outer_items.id) \
+             FROM items AS outer_items",
+        )
+        .expect("IN query expressions bind into HIR");
+        document
+            .validate()
+            .expect("IN query expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+
+        let Expr::Subquery(SubqueryExpr::In {
+            lhs,
+            query,
+            negated,
+            comparison,
+        }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("IN query remains explicit in HIR");
+        };
+        assert!(!negated);
+        assert!(matches!(
+            lhs.as_ref(),
+            Expr::Column(reference)
+                if reference.source == outer_source && reference.column == 1
+        ));
+        let query = document.query(*query).expect("IN query exists");
+        assert_eq!(query.parent, Some(outer.id));
+        assert_eq!(query.captures, vec![outer_source]);
+        assert_eq!(comparison.components.len(), 1);
+        assert_eq!(
+            comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Blob
+        );
+        assert_eq!(
+            comparison.components[0]
+                .collation
+                .as_ref()
+                .expect("right explicit collation wins")
+                .value(),
+            &crate::translate::collate::CollationSeq::Rtrim
+        );
+
+        let Expr::Subquery(SubqueryExpr::In {
+            query,
+            negated,
+            comparison,
+            ..
+        }) = &outer.blocks[0].outputs[1].expr
+        else {
+            panic!("NOT IN query remains explicit in HIR");
+        };
+        assert!(negated);
+        assert_eq!(comparison.components.len(), 1);
+        assert_eq!(
+            comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Numeric
+        );
+        assert_eq!(
+            document
+                .query(*query)
+                .expect("NOT IN query exists")
+                .captures,
+            vec![outer_source]
+        );
+    }
+
+    #[test]
+    fn row_in_query_has_one_comparison_component_per_column() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (outer_items.id, outer_items.value) IN (\
+                        SELECT categories.id, categories.label FROM categories\
+                    ) \
+             FROM items AS outer_items",
+        )
+        .expect("row IN query expression binds into HIR");
+        document
+            .validate()
+            .expect("row IN query expression produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let Expr::Subquery(SubqueryExpr::In {
+            lhs, comparison, ..
+        }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("row IN query remains explicit in HIR");
+        };
+        let Expr::Row(values) = lhs.as_ref() else {
+            panic!("row left side remains explicit in HIR");
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(comparison.components.len(), 2);
+        assert_eq!(
+            comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Numeric
+        );
+        assert_eq!(
+            comparison.components[1].affinity,
+            crate::vdbe::affinity::Affinity::Blob
+        );
+        assert_eq!(
+            comparison.components[1]
+                .collation
+                .as_ref()
+                .expect("left declared collation wins")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn in_queries_require_matching_row_widths() {
+        for (sql, message) in [
+            (
+                "SELECT 1 IN (SELECT 1, 2)",
+                "Parse error: sub-select returns 2 columns - expected 1",
+            ),
+            (
+                "SELECT (1, 2) IN (SELECT 1)",
+                "Parse error: sub-select returns 1 columns - expected 2",
+            ),
+        ] {
+            let error = analyze_sql(sql).expect_err("IN query widths must match");
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
     fn compound_selects_become_ordered_query_blocks() {
         let schema = schema_with_join_tables();
         let document = analyze_sql_with_schema(

@@ -99,21 +99,23 @@ Completed:
   parents. Outer names resolve through nested HIR scopes, scalar results keep
   the selected output facts, and each query derives its exact sorted capture
   set from completed HIR instead of mutable binding sidecars.
+- Scalar and row-value `IN` query expressions keep the left expressions,
+  negation, child query, and one frozen comparison rule per column in HIR.
+  Correlated right sides capture outer sources, and row-width errors keep the
+  existing diagnostic.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
-The standalone SELECT expression checkpoints are complete except for `IN`
-query expressions. `union_value` remains with DML because it needs the
-destination column type.
+The standalone SELECT expression checkpoints are complete. `union_value`
+remains with DML because it needs the destination column type.
 
 Custom-type table columns, including custom array element programs, remain
 separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
-`FROM` sources, plus correlated scalar and `EXISTS` expressions. `IN` query
-expressions, `VALUES`, WHERE, GROUP BY, ORDER BY, LIMIT, and recursive CTEs
-remain separate checkpoints. Continue with `IN` query expressions before
-starting the remaining SELECT clauses.
+`FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
+`VALUES`, WHERE, GROUP BY, ORDER BY, LIMIT, and recursive CTEs remain separate
+checkpoints. Continue with WHERE before starting the remaining SELECT clauses.
 
 ## Working rules
 

@@ -367,6 +367,12 @@ impl<'a> ExprFrame<'a> {
                 0 => Some(lhs.as_ref()),
                 index => rhs.get(index - 1).map(Box::as_ref),
             },
+            ast::Expr::InSelect { lhs, .. } => match lhs.as_ref() {
+                ast::Expr::Parenthesized(expressions) if expressions.len() > 1 => {
+                    expressions.get(self.next_child).map(Box::as_ref)
+                }
+                lhs => (self.next_child == 0).then_some(lhs),
+            },
             ast::Expr::Case {
                 base,
                 when_then_pairs,
@@ -694,9 +700,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
             let frame = frames.pop().expect("completed expression frame exists");
             let resolved = match frame.syntax {
-                ast::Expr::Subquery(_) | ast::Expr::Exists(_) => {
-                    expect_no_expr_children(frame.resolved_children)?;
-                    self.build_subquery_expr(frame.syntax, scope, parent)?
+                ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                    self.build_subquery_expr(frame.syntax, frame.resolved_children, scope, parent)?
                 }
                 _ => self.build_expr(
                     frame.syntax,
@@ -716,15 +721,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn build_subquery_expr(
         &mut self,
         syntax: &'ast ast::Expr,
+        children: ExprChildren,
         scope: &Scope,
         parent: hir::QueryId,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
             ast::Expr::Subquery(select) => {
+                expect_no_expr_children(children)?;
                 let query = self.analyze_subquery(select, parent, scope)?;
                 self.resolve_query_output(query, 0)
             }
             ast::Expr::Exists(select) => {
+                expect_no_expr_children(children)?;
                 let query = self.analyze_subquery(select, parent, scope)?;
                 Ok(computed_expr(
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
@@ -732,10 +740,77 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ExprCollation::Absent,
                 ))
             }
+            ast::Expr::InSelect {
+                not, rhs: select, ..
+            } => self.build_in_subquery(children, select, *not, scope, parent),
             _ => Err(LimboError::InternalError(
                 "subquery expression builder received a non-subquery".to_string(),
             )),
         }
+    }
+
+    fn build_in_subquery(
+        &mut self,
+        lhs: ExprChildren,
+        select: &'ast ast::Select,
+        negated: bool,
+        scope: &Scope,
+        parent: hir::QueryId,
+    ) -> Result<ResolvedScopeExpr> {
+        if lhs.is_empty() {
+            return Err(LimboError::InternalError(
+                "IN query expression has no left value".to_string(),
+            ));
+        }
+        let query = self.analyze_subquery(select, parent, scope)?;
+        let output_width = self
+            .query(query)
+            .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?
+            .output
+            .len();
+        if output_width != lhs.len() {
+            crate::bail_parse_error!(
+                "sub-select returns {output_width} columns - expected {}",
+                lhs.len()
+            );
+        }
+        let rhs = (0..output_width)
+            .map(|output| self.query_output_fact(query, output))
+            .collect::<Result<Vec<_>>>()?;
+        let comparison = hir::ComparisonSemantics {
+            components: lhs
+                .iter()
+                .zip(&rhs)
+                .map(|(lhs, rhs)| comparison_component(lhs, rhs))
+                .collect(),
+        };
+        let collation =
+            lhs.iter()
+                .zip(&rhs)
+                .fold(ExprCollation::Absent, |collation, (lhs, rhs)| {
+                    expression_collation(
+                        &expression_collation(&collation, &lhs.collation),
+                        &rhs.collation,
+                    )
+                });
+        let lhs = if lhs.len() == 1 {
+            lhs.into_iter()
+                .next()
+                .expect("IN query left side has one value")
+                .expr
+        } else {
+            hir::Expr::Row(lhs.into_iter().map(|value| value.expr).collect())
+        };
+        Ok(computed_expr(
+            hir::Expr::Subquery(hir::SubqueryExpr::In {
+                lhs: Box::new(lhs),
+                query,
+                negated,
+                comparison,
+            }),
+            hir::TypeFact::known(Type::Integer),
+            collation,
+        ))
     }
 
     fn resolve_query_output(
@@ -750,6 +825,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         if width != 1 {
             crate::bail_parse_error!("sub-select returns {width} columns - expected 1");
         }
+        let mut resolved = self.query_output_fact(query, output)?;
+        resolved.expr = hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output });
+        Ok(resolved)
+    }
+
+    fn query_output_fact(&self, query: hir::QueryId, output: usize) -> Result<ResolvedScopeExpr> {
+        let definition = self
+            .query(query)
+            .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?;
         let facts = definition
             .blocks
             .first()
@@ -761,7 +845,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ))
             })?;
         Ok(ResolvedScopeExpr {
-            expr: hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
+            expr: hir::Expr::Output(facts.id),
             type_fact: facts.type_fact.clone(),
             affinity: facts.affinity,
             has_affinity: facts.has_affinity,
@@ -2474,6 +2558,15 @@ fn comparison_semantics(
     lhs: &ResolvedScopeExpr,
     rhs: &ResolvedScopeExpr,
 ) -> hir::ComparisonSemantics {
+    hir::ComparisonSemantics {
+        components: vec![comparison_component(lhs, rhs)],
+    }
+}
+
+fn comparison_component(
+    lhs: &ResolvedScopeExpr,
+    rhs: &ResolvedScopeExpr,
+) -> hir::ComparisonComponent {
     let affinity = match (lhs.has_affinity, rhs.has_affinity) {
         (true, true) if lhs.affinity.is_numeric() || rhs.affinity.is_numeric() => Affinity::Numeric,
         (true, true) => Affinity::Blob,
@@ -2481,14 +2574,12 @@ fn comparison_semantics(
         (false, true) => rhs.affinity,
         (false, false) => Affinity::Blob,
     };
-    hir::ComparisonSemantics {
-        components: vec![hir::ComparisonComponent {
-            affinity,
-            collation: expression_collation(&lhs.collation, &rhs.collation)
-                .value()
-                .cloned(),
-            array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
-        }],
+    hir::ComparisonComponent {
+        affinity,
+        collation: expression_collation(&lhs.collation, &rhs.collation)
+            .value()
+            .cloned(),
+        array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
     }
 }
 
