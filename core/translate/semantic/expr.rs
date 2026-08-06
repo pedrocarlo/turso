@@ -24,9 +24,16 @@ use crate::{
 pub(crate) struct ExprPolicy {
     precedence: NamePrecedence,
     allow_dqs_fallback: bool,
-    allow_aggregates: bool,
+    aggregates: AggregatePolicy,
     allow_windows: bool,
     raise: RaisePolicy,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AggregatePolicy {
+    Allow,
+    RejectFunction,
+    RejectMisuse,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +47,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: dqs_dml.is_enabled(),
-            allow_aggregates: true,
+            aggregates: AggregatePolicy::Allow,
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
         }
@@ -50,7 +57,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourceThenOutput,
             allow_dqs_fallback: dqs_dml.is_enabled(),
-            allow_aggregates: false,
+            aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
         }
@@ -60,7 +67,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourceThenOutput,
             allow_dqs_fallback: dqs_dml.is_enabled(),
-            allow_aggregates: false,
+            aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
         }
@@ -70,8 +77,22 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::OutputThenSource,
             allow_dqs_fallback: dqs_dml.is_enabled(),
-            allow_aggregates: true,
+            aggregates: AggregatePolicy::Allow,
             allow_windows: false,
+            raise: RaisePolicy::AbortOnly,
+        }
+    }
+
+    pub(crate) const fn order_by(dqs_dml: DoubleQuotedDml, aggregate_query: bool) -> Self {
+        Self {
+            precedence: NamePrecedence::OutputThenSource,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
+            aggregates: if aggregate_query {
+                AggregatePolicy::Allow
+            } else {
+                AggregatePolicy::RejectMisuse
+            },
+            allow_windows: true,
             raise: RaisePolicy::AbortOnly,
         }
     }
@@ -85,7 +106,7 @@ impl ExprPolicy {
         Self {
             precedence: NamePrecedence::SourcesOnly,
             allow_dqs_fallback: false,
-            allow_aggregates: false,
+            aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
         }
@@ -1938,7 +1959,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
     }
 
-    fn resolve_collation(&mut self, name: &ast::Name) -> Result<hir::ResolvedCollation> {
+    pub(super) fn resolve_collation(&mut self, name: &ast::Name) -> Result<hir::ResolvedCollation> {
         let collation = match self.context().symbols().resolve_collation(name.as_str()) {
             Some(collation) => collation,
             None => CollationSeq::new(name.as_str())?,
@@ -2338,8 +2359,16 @@ fn bind_function(
 ) -> Result<FunctionBinding> {
     let aggregate = matches!(function, Func::Agg(_))
         || matches!(function, Func::External(external) if external.func.is_aggregate());
-    if aggregate && !has_over && !policy.allow_aggregates {
-        crate::bail_parse_error!("misuse of aggregate function {}()", function);
+    if aggregate && !has_over {
+        match policy.aggregates {
+            AggregatePolicy::Allow => {}
+            AggregatePolicy::RejectFunction => {
+                crate::bail_parse_error!("misuse of aggregate function {}()", function)
+            }
+            AggregatePolicy::RejectMisuse => {
+                crate::bail_parse_error!("misuse of aggregate: {}()", function)
+            }
+        }
     }
     if has_over && !policy.allow_windows {
         match function {
