@@ -700,7 +700,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .collect()
     }
 
-    fn analyze_limit(&mut self, syntax: &'ast ast::Limit, parent: QueryId) -> Result<Limit> {
+    pub(super) fn analyze_limit(
+        &mut self,
+        syntax: &'ast ast::Limit,
+        parent: QueryId,
+    ) -> Result<Limit> {
         let scope = Scope::default();
         let policy = ExprPolicy::limit(self.context.dqs_dml());
         let limit = self.analyze_query_scalar_expr(&syntax.expr, &scope, policy, parent)?;
@@ -720,12 +724,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast [ast::SortedColumn],
         blocks: &[QueryBlock],
     ) -> Result<Vec<OrderTerm>> {
+        let output_arms = blocks
+            .iter()
+            .map(|block| block.outputs.as_slice())
+            .collect::<Vec<_>>();
         syntax
             .iter()
             .enumerate()
             .map(|(index, syntax)| {
                 let resolved =
-                    self.resolve_compound_order_by_expr(&syntax.expr, blocks, index + 1)?;
+                    self.resolve_compound_order_by_expr(&syntax.expr, &output_arms, index + 1)?;
                 Ok(order_term(syntax, resolved))
             })
             .collect()
@@ -734,58 +742,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn resolve_compound_order_by_expr(
         &mut self,
         syntax: &ast::Expr,
-        blocks: &[QueryBlock],
+        output_arms: &[&[Output]],
         term_number: usize,
     ) -> Result<ResolvedScopeExpr> {
-        let outputs = &blocks
+        let (position, collations) = compound_order_by_position(syntax, output_arms, term_number)?;
+        let outputs = output_arms
             .first()
-            .expect("compound SELECT must have a first block")
-            .outputs;
-        let mut collations = Vec::new();
-        let mut inner = syntax;
-        while let ast::Expr::Collate(expression, name) = inner {
-            collations.push(name);
-            inner = expression;
-        }
-        let mut resolved = match inner {
-            ast::Expr::Literal(ast::Literal::Numeric(value)) => {
-                let Ok(position) = value.parse::<i32>() else {
-                    return compound_order_by_no_match(term_number);
-                };
-                if position <= 0 || position as usize > outputs.len() {
-                    crate::bail_parse_error!(
-                        "{} ORDER BY term out of range - should be between 1 and {}",
-                        position,
-                        outputs.len()
-                    );
-                }
-                resolved_output(&outputs[position as usize - 1])
-            }
-            ast::Expr::Id(name) => {
-                let name = crate::util::normalize_ident(name.as_str());
-                let position = blocks.iter().find_map(|block| {
-                    block
-                        .outputs
-                        .iter()
-                        .position(|output| {
-                            output.name_kind == OutputNameKind::ExplicitAlias
-                                && crate::util::normalize_ident(&output.name) == name
-                        })
-                        .or_else(|| {
-                            block.outputs.iter().position(|output| {
-                                !output.name.is_empty()
-                                    && crate::util::normalize_ident(&output.name) == name
-                            })
-                        })
-                });
-                let Some(position) = position else {
-                    return compound_order_by_no_match(term_number);
-                };
-                resolved_output(&outputs[position])
-            }
-            _ => return compound_order_by_no_match(term_number),
-        };
-        for name in collations.into_iter().rev() {
+            .expect("compound SELECT must have a first output arm");
+        let mut resolved = resolved_output(&outputs[position]);
+        for name in collations.iter().rev() {
             let collation = self.resolve_collation(name)?;
             resolved.expr = Expr::Collate {
                 expr: Box::new(resolved.expr),
@@ -1065,6 +1030,59 @@ fn order_term(syntax: &ast::SortedColumn, resolved: ResolvedScopeExpr) -> OrderT
         type_fact: resolved.type_fact,
         collation: resolved.collation.value().cloned(),
     }
+}
+
+pub(super) fn compound_order_by_position<'syntax>(
+    syntax: &'syntax ast::Expr,
+    output_arms: &[&[Output]],
+    term_number: usize,
+) -> Result<(usize, Vec<&'syntax ast::Name>)> {
+    let outputs = output_arms
+        .first()
+        .expect("compound SELECT must have a first output arm");
+    let mut collations = Vec::new();
+    let mut inner = syntax;
+    while let ast::Expr::Collate(expression, name) = inner {
+        collations.push(name);
+        inner = expression;
+    }
+    let position = match inner {
+        ast::Expr::Literal(ast::Literal::Numeric(value)) => {
+            let Ok(position) = value.parse::<i32>() else {
+                return compound_order_by_no_match(term_number);
+            };
+            if position <= 0 || position as usize > outputs.len() {
+                crate::bail_parse_error!(
+                    "{} ORDER BY term out of range - should be between 1 and {}",
+                    position,
+                    outputs.len()
+                );
+            }
+            position as usize - 1
+        }
+        ast::Expr::Id(name) => {
+            let name = crate::util::normalize_ident(name.as_str());
+            let Some(position) = output_arms.iter().find_map(|outputs| {
+                outputs
+                    .iter()
+                    .position(|output| {
+                        output.name_kind == OutputNameKind::ExplicitAlias
+                            && crate::util::normalize_ident(&output.name) == name
+                    })
+                    .or_else(|| {
+                        outputs.iter().position(|output| {
+                            !output.name.is_empty()
+                                && crate::util::normalize_ident(&output.name) == name
+                        })
+                    })
+            }) else {
+                return compound_order_by_no_match(term_number);
+            };
+            position
+        }
+        _ => return compound_order_by_no_match(term_number),
+    };
+    Ok((position, collations))
 }
 
 fn compound_order_by_no_match<T>(term_number: usize) -> Result<T> {
@@ -2779,6 +2797,52 @@ mod tests {
     }
 
     #[test]
+    fn recursive_ctes_bind_queue_order_and_limit() {
+        let document = analyze_sql(
+            "WITH RECURSIVE seq(value) AS (\
+                 SELECT 'a' AS key \
+                 UNION ALL SELECT value || 'x' AS next FROM seq WHERE length(value) < 3 \
+                 ORDER BY next COLLATE NOCASE DESC NULLS LAST \
+                 LIMIT (SELECT 4) OFFSET ?1\
+             ) SELECT value FROM seq",
+        )
+        .expect("recursive queue controls bind into HIR");
+        document
+            .validate()
+            .expect("recursive queue controls produce closed HIR");
+
+        let CteBody::Recursive(recursive) = &document.ctes[0].body else {
+            panic!("self-reference produces recursive CTE body");
+        };
+        assert_eq!(recursive.queue_order.len(), 1);
+        let order = &recursive.queue_order[0];
+        assert_eq!(order.output, 0);
+        assert_eq!(order.order, ast::SortOrder::Desc);
+        assert_eq!(order.nulls, Some(ast::NullsOrder::Last));
+        assert_eq!(
+            order
+                .explicit_collation
+                .as_ref()
+                .expect("COLLATE resolves for queue ordering")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+
+        let limit = recursive.limit.as_ref().expect("recursive LIMIT binds");
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &limit.limit else {
+            panic!("LIMIT subquery remains explicit HIR");
+        };
+        assert_eq!(
+            document.query(*query).expect("LIMIT query exists").parent,
+            Some(recursive.seed)
+        );
+        assert!(matches!(
+            limit.offset,
+            Some(Expr::Parameter(ref parameter)) if parameter.index.get() == 1
+        ));
+    }
+
+    #[test]
     fn recursive_ctes_keep_structure_and_function_errors() {
         for (sql, message) in [
             (
@@ -2804,6 +2868,14 @@ mod tests {
             (
                 "WITH seq(x) AS (VALUES(1) UNION ALL SELECT row_number() OVER () FROM seq) SELECT x FROM seq",
                 "Parse error: cannot use window functions in recursive queries",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq ORDER BY missing) SELECT x FROM seq",
+                "Parse error: 1st ORDER BY term does not match any column in the result set",
+            ),
+            (
+                "WITH seq(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM seq LIMIT x) SELECT x FROM seq",
+                "Parse error: no such column: x",
             ),
         ] {
             let error = analyze_sql(sql).expect_err("invalid recursive CTE fails analysis");

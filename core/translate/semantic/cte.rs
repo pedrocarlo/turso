@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
-    hir::{Cte, CteBody, CteColumn, CteId, RecursiveArm, RecursiveCte},
+    hir::{Cte, CteBody, CteColumn, CteId, RecursiveArm, RecursiveCte, RecursiveOrderTerm},
 };
 use crate::{
     translate::expr::{walk_expr, WalkControl},
@@ -450,10 +450,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         entry: usize,
         first_recursive_arm: usize,
     ) -> Result<CteId> {
-        if !syntax.select.order_by.is_empty() || syntax.select.limit.is_some() {
-            return super::analyze::unsupported_select();
-        }
-
         let seed_compounds = &syntax.select.body.compounds[..first_recursive_arm - 1];
         let seed = self.analyze_cte_query_parts(
             &syntax.select,
@@ -528,6 +524,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         };
         let comparison_collations = recursive_comparison_collations(self, seed, &arms)?;
+        let queue_order = self.analyze_recursive_order_by(&syntax.select.order_by, seed, &arms)?;
+        let limit = syntax
+            .select
+            .limit
+            .as_ref()
+            .map(|limit| self.analyze_limit(limit, seed))
+            .transpose()?;
         self.insert_cte(
             id,
             Cte {
@@ -540,12 +543,61 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     arms,
                     input_sources,
                     comparison_collations,
-                    queue_order: Vec::new(),
-                    limit: None,
+                    queue_order,
+                    limit,
                 }),
             },
         )?;
         Ok(id)
+    }
+
+    fn analyze_recursive_order_by(
+        &mut self,
+        syntax: &'ast [ast::SortedColumn],
+        seed: super::hir::QueryId,
+        arms: &[RecursiveArm],
+    ) -> Result<Vec<RecursiveOrderTerm>> {
+        let positions = {
+            let seed = self.query(seed).ok_or_else(|| {
+                LimboError::InternalError(format!("missing recursive seed {seed}"))
+            })?;
+            let arm_queries = arms
+                .iter()
+                .map(|arm| {
+                    self.query(arm.query).ok_or_else(|| {
+                        LimboError::InternalError(format!("missing recursive arm {}", arm.query))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let output_arms = std::iter::once(seed)
+                .chain(arm_queries)
+                .flat_map(|query| query.blocks.iter().map(|block| block.outputs.as_slice()))
+                .collect::<Vec<_>>();
+            syntax
+                .iter()
+                .enumerate()
+                .map(|(index, term)| {
+                    super::analyze::compound_order_by_position(&term.expr, &output_arms, index + 1)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        syntax
+            .iter()
+            .zip(positions)
+            .map(|(syntax, (output, collations))| {
+                let mut explicit_collation = None;
+                for name in collations.iter().rev() {
+                    explicit_collation = Some(self.resolve_collation(name)?);
+                }
+                Ok(RecursiveOrderTerm {
+                    output,
+                    order: syntax.order.unwrap_or(ast::SortOrder::Asc),
+                    nulls: syntax.nulls,
+                    explicit_collation,
+                })
+            })
+            .collect()
     }
 
     fn analyze_cte_query_parts(

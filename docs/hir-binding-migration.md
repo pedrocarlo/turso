@@ -127,7 +127,9 @@ Completed:
 - Recursive CTE seeds and recursive arms bind as separate HIR queries.
   Self-references become occurrence-local `RecursiveInput` sources, UNION
   operators and comparison collations stay explicit, and recursive
-  aggregate/window and structure errors remain binding-time errors.
+  aggregate/window and structure errors remain binding-time errors. Queue
+  ORDER BY terms resolve to output positions with explicit collations, while
+  LIMIT/OFFSET expressions use the same empty scalar scope as ordinary limits.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -140,9 +142,9 @@ separate from built-in array columns.
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
 WHERE filters, GROUP BY keys, HAVING predicates, query-level ORDER BY terms, and
-LIMIT/OFFSET and VALUES rows are also bound. Recursive CTE core identity and
-arms are bound; queue ORDER BY/LIMIT and correlated/nested cases remain the
-next recursive checkpoints.
+LIMIT/OFFSET and VALUES rows are also bound. Recursive CTE core identity, arms,
+queue ORDER BY, and LIMIT/OFFSET are bound; correlated and nested cases remain
+the next recursive checkpoint.
 
 ## Working rules
 
