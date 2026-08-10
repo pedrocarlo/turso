@@ -17,11 +17,14 @@ pub(super) struct CteScope<'ast> {
 
 fn recursive_arm_start(syntax: &ast::CommonTableExpr) -> Result<Option<usize>> {
     let name = crate::util::normalize_ident(syntax.tbl_name.as_str());
+    let counter = RecursiveRefCounter { cte_name: &name };
+    let mut scope = RecursiveRefScope::new();
+    counter.push_nested_ctes(syntax.select.with.as_ref(), &mut scope);
     let arms = std::iter::once(&syntax.select.body.select)
         .chain(syntax.select.body.compounds.iter().map(|arm| &arm.select));
     let mut first_recursive = None;
     for (index, arm) in arms.enumerate() {
-        let (direct, total) = recursive_references_in_arm(arm, &name);
+        let (direct, total) = counter.count_arm(arm, &mut scope);
         if total == 0 {
             if first_recursive.is_some() {
                 crate::bail_parse_error!("circular reference: {}", syntax.tbl_name.as_str());
@@ -67,155 +70,237 @@ fn recursive_arm_start(syntax: &ast::CommonTableExpr) -> Result<Option<usize>> {
     Ok(Some(first_recursive))
 }
 
-fn recursive_references_in_arm(one: &ast::OneSelect, name: &str) -> (usize, usize) {
-    fn direct(table: &ast::SelectTable, name: &str) -> usize {
-        match table {
-            ast::SelectTable::Table(table, _, _) | ast::SelectTable::TableCall(table, _, _) => {
-                usize::from(
-                    table.db_name.is_none()
-                        && crate::util::normalize_ident(table.name.as_str()) == name,
-                )
-            }
-            ast::SelectTable::Sub(from, _) => {
-                direct(&from.select, name)
-                    + from
-                        .joins
-                        .iter()
-                        .map(|join| direct(&join.table, name))
-                        .sum::<usize>()
-            }
-            ast::SelectTable::Select(_, _) => 0,
+struct RecursiveRefCounter<'a> {
+    cte_name: &'a str,
+}
+
+/// Names visible while counting recursive references, innermost last. Weight
+/// is zero for a shadowing definition, or the recursive-reference count
+/// contributed when another nested CTE is used.
+type RecursiveRefScope = Vec<(String, usize)>;
+
+impl RecursiveRefCounter<'_> {
+    fn name_weight(&self, name: &str, scope: &RecursiveRefScope) -> usize {
+        scope
+            .iter()
+            .rev()
+            .find_map(|(scope_name, weight)| (scope_name == name).then_some(*weight))
+            .unwrap_or_else(|| usize::from(name == self.cte_name))
+    }
+
+    fn push_nested_ctes(&self, with: Option<&ast::With>, scope: &mut RecursiveRefScope) {
+        let Some(with) = with else {
+            return;
+        };
+        for cte in &with.ctes {
+            let name = crate::util::normalize_ident(cte.tbl_name.as_str());
+            // Its own name must shadow the outer recursive table while its
+            // body is counted.
+            scope.push((name, 0));
+            let weight = self.count_select(&cte.select, scope);
+            scope
+                .last_mut()
+                .expect("nested CTE scope entry was pushed")
+                .1 = weight;
         }
     }
 
-    let ast::OneSelect::Select { from, .. } = one else {
-        return (0, count_one_select_references(one, name));
-    };
-    let direct_count = from.as_ref().map_or(0, |from| {
-        direct(&from.select, name)
-            + from
-                .joins
-                .iter()
-                .map(|join| direct(&join.table, name))
-                .sum::<usize>()
-    });
-    (direct_count, count_one_select_references(one, name))
-}
-
-fn count_select_references(select: &ast::Select, name: &str) -> usize {
-    count_one_select_references(&select.body.select, name)
-        + select
+    fn count_select(&self, select: &ast::Select, scope: &mut RecursiveRefScope) -> usize {
+        let scope_base = scope.len();
+        self.push_nested_ctes(select.with.as_ref(), scope);
+        let mut count = self.count_one_select(&select.body.select, scope);
+        count += select
             .body
             .compounds
             .iter()
-            .map(|arm| count_one_select_references(&arm.select, name))
-            .sum::<usize>()
-}
-
-fn count_one_select_references(one: &ast::OneSelect, name: &str) -> usize {
-    fn expression(expression: &ast::Expr, name: &str) -> usize {
-        let mut count = 0;
-        let _ = walk_expr(expression, &mut |node| -> Result<WalkControl> {
-            match node {
-                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
-                    count += count_select_references(select, name);
-                    Ok(WalkControl::SkipChildren)
-                }
-                ast::Expr::InSelect { rhs, .. } => {
-                    count += count_select_references(rhs, name);
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            }
-        });
+            .map(|arm| self.count_one_select(&arm.select, scope))
+            .sum::<usize>();
+        count += select
+            .order_by
+            .iter()
+            .map(|term| self.count_expr(&term.expr, scope))
+            .sum::<usize>();
+        if let Some(limit) = &select.limit {
+            count += self.count_expr(&limit.expr, scope);
+            count += limit
+                .offset
+                .as_deref()
+                .map_or(0, |offset| self.count_expr(offset, scope));
+        }
+        scope.truncate(scope_base);
         count
     }
 
-    fn table(table: &ast::SelectTable, name: &str) -> usize {
-        match table {
-            ast::SelectTable::Table(table, _, _) => usize::from(
-                table.db_name.is_none()
-                    && crate::util::normalize_ident(table.name.as_str()) == name,
-            ),
-            ast::SelectTable::TableCall(table_name, arguments, _) => {
-                usize::from(
-                    table_name.db_name.is_none()
-                        && crate::util::normalize_ident(table_name.name.as_str()) == name,
-                ) + arguments
-                    .iter()
-                    .map(|argument| expression(argument, name))
-                    .sum::<usize>()
+    fn count_one_select(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> usize {
+        match one {
+            ast::OneSelect::Values(rows) => rows
+                .iter()
+                .flatten()
+                .map(|value| self.count_expr(value, scope))
+                .sum(),
+            ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                window_clause,
+                ..
+            } => {
+                let mut count = from
+                    .as_ref()
+                    .map_or(0, |from| self.count_from_clause(from, scope));
+                for column in columns {
+                    if let ast::ResultColumn::Expr(value, _) = column {
+                        count += self.count_expr(value, scope);
+                    }
+                }
+                count += where_clause
+                    .as_deref()
+                    .map_or(0, |value| self.count_expr(value, scope));
+                if let Some(grouping) = group_by {
+                    count += grouping
+                        .exprs
+                        .iter()
+                        .map(|value| self.count_expr(value, scope))
+                        .sum::<usize>();
+                    count += grouping
+                        .having
+                        .as_deref()
+                        .map_or(0, |value| self.count_expr(value, scope));
+                }
+                for window in window_clause {
+                    count += self.count_window(&window.window, scope);
+                }
+                count
             }
-            ast::SelectTable::Select(select, _) => count_select_references(select, name),
-            ast::SelectTable::Sub(from, _) => from_clause(from, name),
         }
     }
 
-    fn from_clause(from: &ast::FromClause, name: &str) -> usize {
-        table(&from.select, name)
+    fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
+        match table {
+            ast::SelectTable::Table(name, _, _) => {
+                if name.db_name.is_some() {
+                    return 0;
+                }
+                self.name_weight(&crate::util::normalize_ident(name.name.as_str()), scope)
+            }
+            ast::SelectTable::TableCall(name, arguments, _) => {
+                let mut count = if name.db_name.is_none() {
+                    self.name_weight(&crate::util::normalize_ident(name.name.as_str()), scope)
+                } else {
+                    0
+                };
+                count += arguments
+                    .iter()
+                    .map(|argument| self.count_expr(argument, scope))
+                    .sum::<usize>();
+                count
+            }
+            ast::SelectTable::Select(select, _) => self.count_select(select, scope),
+            ast::SelectTable::Sub(from, _) => self.count_from_clause(from, scope),
+        }
+    }
+
+    fn count_from_clause(&self, from: &ast::FromClause, scope: &mut RecursiveRefScope) -> usize {
+        self.count_from_table(&from.select, scope)
             + from
                 .joins
                 .iter()
                 .map(|join| {
-                    table(&join.table, name)
+                    self.count_from_table(&join.table, scope)
                         + match &join.constraint {
-                            Some(ast::JoinConstraint::On(value)) => expression(value, name),
+                            Some(ast::JoinConstraint::On(value)) => self.count_expr(value, scope),
                             _ => 0,
                         }
                 })
                 .sum::<usize>()
     }
 
-    match one {
-        ast::OneSelect::Values(rows) => rows
+    fn count_window(&self, window: &ast::Window, scope: &mut RecursiveRefScope) -> usize {
+        let mut count = 0;
+        count += window
+            .partition_by
             .iter()
-            .flatten()
-            .map(|value| expression(value, name))
-            .sum(),
-        ast::OneSelect::Select {
-            columns,
-            from,
-            where_clause,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            let mut count = from.as_ref().map_or(0, |from| from_clause(from, name));
-            for column in columns {
-                if let ast::ResultColumn::Expr(value, _) = column {
-                    count += expression(value, name);
+            .map(|value| self.count_expr(value, scope))
+            .sum::<usize>();
+        count += window
+            .order_by
+            .iter()
+            .map(|term| self.count_expr(&term.expr, scope))
+            .sum::<usize>();
+        if let Some(frame) = &window.frame_clause {
+            for bound in std::iter::once(&frame.start).chain(frame.end.as_ref()) {
+                if let ast::FrameBound::Following(value) | ast::FrameBound::Preceding(value) = bound
+                {
+                    count += self.count_expr(value, scope);
                 }
             }
-            count += where_clause
-                .as_deref()
-                .map_or(0, |value| expression(value, name));
-            if let Some(grouping) = group_by {
-                count += grouping
-                    .exprs
-                    .iter()
-                    .map(|value| expression(value, name))
-                    .sum::<usize>();
-                count += grouping
-                    .having
-                    .as_deref()
-                    .map_or(0, |value| expression(value, name));
-            }
-            for window in window_clause {
-                count += window
-                    .window
-                    .partition_by
-                    .iter()
-                    .map(|value| expression(value, name))
-                    .sum::<usize>();
-                count += window
-                    .window
-                    .order_by
-                    .iter()
-                    .map(|term| expression(&term.expr, name))
-                    .sum::<usize>();
-            }
-            count
         }
+        count
+    }
+
+    fn count_expr(&self, expression: &ast::Expr, scope: &mut RecursiveRefScope) -> usize {
+        let mut count = 0;
+        walk_expr(expression, &mut |node| -> Result<WalkControl> {
+            match node {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    count += self.count_select(select, scope);
+                    Ok(WalkControl::SkipChildren)
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    count += self.count_select(rhs, scope);
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        })
+        .expect("recursive reference visitor cannot fail");
+        count
+    }
+
+    fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
+        fn direct(
+            counter: &RecursiveRefCounter<'_>,
+            table: &ast::SelectTable,
+            scope: &RecursiveRefScope,
+        ) -> usize {
+            match table {
+                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+                    if name.db_name.is_some() {
+                        return 0;
+                    }
+                    let name = crate::util::normalize_ident(name.name.as_str());
+                    usize::from(
+                        name == counter.cte_name
+                            && !scope.iter().any(|(scope_name, _)| *scope_name == name),
+                    )
+                }
+                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Sub(from, _) => {
+                    direct(counter, &from.select, scope)
+                        + from
+                            .joins
+                            .iter()
+                            .map(|join| direct(counter, &join.table, scope))
+                            .sum::<usize>()
+                }
+            }
+        }
+
+        let direct_count = if let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = one
+        {
+            direct(self, &from.select, scope)
+                + from
+                    .joins
+                    .iter()
+                    .map(|join| direct(self, &join.table, scope))
+                    .sum::<usize>()
+        } else {
+            0
+        };
+        (direct_count, self.count_one_select(one, scope))
     }
 }
 
