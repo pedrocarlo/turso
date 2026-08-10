@@ -130,6 +130,9 @@ Completed:
   aggregate/window and structure errors remain binding-time errors. Queue
   ORDER BY terms resolve to output positions with explicit collations, while
   LIMIT/OFFSET expressions use the same empty scalar scope as ordinary limits.
+  Recursive-reference counting follows nested CTE scopes: shadowing definitions
+  hide outer names, unused definitions contribute nothing, and referenced
+  definitions contribute their body's recursive references.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
 
@@ -143,8 +146,8 @@ The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
 WHERE filters, GROUP BY keys, HAVING predicates, query-level ORDER BY terms, and
 LIMIT/OFFSET and VALUES rows are also bound. Recursive CTE core identity, arms,
-queue ORDER BY, and LIMIT/OFFSET are bound; correlated and nested cases remain
-the next recursive checkpoint.
+queue ORDER BY, LIMIT/OFFSET, and nested CTE identity are bound. Correlation
+with enclosing queries remains the next recursive checkpoint.
 
 ## Working rules
 

@@ -2843,6 +2843,67 @@ mod tests {
     }
 
     #[test]
+    fn recursive_cte_reference_counting_respects_nested_cte_scopes() {
+        let shadowed = analyze_sql(
+            "WITH outer_seq(x) AS (\
+                 WITH outer_seq(y) AS (VALUES(2)) \
+                 SELECT y FROM outer_seq\
+             ) SELECT x FROM outer_seq",
+        )
+        .expect("nested CTE shadows outer name");
+        shadowed
+            .validate()
+            .expect("shadowed CTE produces closed HIR");
+        assert!(matches!(shadowed.ctes[1].body, CteBody::Query(_)));
+
+        let nested_subquery = analyze_sql(
+            "WITH seq(x) AS (\
+                 VALUES(1) \
+                 UNION ALL \
+                 SELECT x + 1 FROM seq \
+                 WHERE x < 2 AND EXISTS (\
+                     WITH seq(y) AS (VALUES(1)) SELECT 1 FROM seq\
+                 )\
+             ) SELECT x FROM seq",
+        )
+        .expect("nested subquery CTE shadows recursive input");
+        nested_subquery
+            .validate()
+            .expect("nested shadowing produces closed recursive HIR");
+        assert_eq!(
+            nested_subquery
+                .ctes
+                .iter()
+                .filter(|cte| matches!(cte.body, CteBody::Recursive(_)))
+                .count(),
+            1
+        );
+
+        let unused = analyze_sql(
+            "WITH seq(x) AS (\
+                 WITH unused AS (SELECT x FROM seq) \
+                 VALUES(1) UNION ALL SELECT x + 1 FROM seq WHERE x < 2\
+             ) SELECT x FROM seq",
+        )
+        .expect("unused nested CTE contributes no recursive reference");
+        unused
+            .validate()
+            .expect("unused nested CTE produces closed HIR");
+
+        let error = analyze_sql(
+            "WITH seq(x) AS (\
+                 WITH helper AS (SELECT x FROM seq) \
+                 VALUES(1) UNION ALL SELECT seq.x FROM seq, helper\
+             ) SELECT x FROM seq",
+        )
+        .expect_err("used nested CTE contributes its recursive references");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: multiple recursive references: seq"
+        );
+    }
+
+    #[test]
     fn recursive_ctes_keep_structure_and_function_errors() {
         for (sql, message) in [
             (
