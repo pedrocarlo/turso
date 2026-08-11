@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::{Analyzer, CatalogObjectKind},
+    analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
     cte::{CteBindingContext, CteResolution},
     expr::{build_using_column, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
@@ -23,6 +23,79 @@ enum CatalogSourceKind {
 }
 
 impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
+    pub(super) fn analyze_named_relation_query(
+        &mut self,
+        name: &ast::QualifiedName,
+        arguments: &'ast [Box<ast::Expr>],
+        parent: hir::QueryId,
+        outer_scope: &Scope,
+    ) -> Result<hir::QueryId> {
+        let query = self.reserve_query();
+        let block_id = hir::QueryBlockId::new(query, 0);
+        let analyzed = self.analyze_table_function_source(
+            name,
+            arguments,
+            None,
+            SourceOwner::QueryBlock(block_id),
+            CteBindingContext::new(query, Some(outer_scope)),
+        )?;
+        if let Some(arguments) = analyzed.function_arguments {
+            self.analyze_table_function_arguments(analyzed.id, arguments, outer_scope, query)?;
+        }
+
+        let source = self.source(analyzed.id).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing semantic relation source {}",
+                analyzed.id
+            ))
+        })?;
+        let mut scope = Scope::new(Some(outer_scope.clone()));
+        scope.add_source(source, true);
+        let expanded = scope.expand_star()?;
+        let mut outputs = Vec::with_capacity(expanded.len());
+        for column in expanded {
+            let resolved = self.resolve_atomic_expr(column.resolved.expr, &scope)?;
+            outputs.push(output_from_resolved(
+                hir::OutputId::query(block_id, outputs.len()),
+                column.name,
+                hir::OutputNameKind::StarExpansion,
+                resolved,
+            ));
+        }
+
+        let mut block = hir::QueryBlock::new(
+            block_id,
+            hir::QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: analyzed.id,
+            joins: Vec::new(),
+        });
+        block.outputs = outputs;
+        let output = block.outputs.iter().map(|output| output.id).collect();
+        let reachable_ctes = self.direct_ctes(std::slice::from_ref(&block))?;
+        let mut query = hir::Query {
+            id: query,
+            parent: Some(parent),
+            captures: Vec::new(),
+            reachable_ctes,
+            first: block_id,
+            blocks: vec![block],
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output,
+        };
+        query.captures = query.direct_captures(|source| self.source(source));
+        let id = query.id;
+        self.insert_query(id, query)?;
+        Ok(id)
+    }
+
     pub(super) fn analyze_from_clause(
         &mut self,
         syntax: &'ast ast::FromClause,

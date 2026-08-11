@@ -444,12 +444,14 @@ impl<'a> ExprFrame<'a> {
                 0 => Some(lhs.as_ref()),
                 index => rhs.get(index - 1).map(Box::as_ref),
             },
-            ast::Expr::InSelect { lhs, .. } => match lhs.as_ref() {
-                ast::Expr::Parenthesized(expressions) if expressions.len() > 1 => {
-                    expressions.get(self.next_child).map(Box::as_ref)
+            ast::Expr::InSelect { lhs, .. } | ast::Expr::InTable { lhs, .. } => {
+                match lhs.as_ref() {
+                    ast::Expr::Parenthesized(expressions) if expressions.len() > 1 => {
+                        expressions.get(self.next_child).map(Box::as_ref)
+                    }
+                    lhs => (self.next_child == 0).then_some(lhs),
                 }
-                lhs => (self.next_child == 0).then_some(lhs),
-            },
+            }
             ast::Expr::Like {
                 lhs, rhs, escape, ..
             } => {
@@ -796,7 +798,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
             let frame = frames.pop().expect("completed expression frame exists");
             let resolved = match frame.syntax {
-                ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                ast::Expr::Subquery(_)
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+                | ast::Expr::InTable { .. } => {
                     self.build_subquery_expr(frame.syntax, frame.resolved_children, scope, parent)?
                 }
                 _ => self.build_expr(
@@ -839,6 +844,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::InSelect {
                 not, rhs: select, ..
             } => self.build_in_subquery(children, select, *not, scope, parent),
+            ast::Expr::InTable { not, rhs, args, .. } => {
+                let query = self.analyze_named_relation_query(rhs, args, parent, scope)?;
+                self.build_in_query(children, query, *not)
+            }
             _ => Err(LimboError::InternalError(
                 "subquery expression builder received a non-subquery".to_string(),
             )),
@@ -853,12 +862,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         parent: hir::QueryId,
     ) -> Result<ResolvedScopeExpr> {
+        let query = self.analyze_subquery(select, parent, scope)?;
+        self.build_in_query(lhs, query, negated)
+    }
+
+    fn build_in_query(
+        &self,
+        lhs: ExprChildren,
+        query: hir::QueryId,
+        negated: bool,
+    ) -> Result<ResolvedScopeExpr> {
         if lhs.is_empty() {
             return Err(LimboError::InternalError(
                 "IN query expression has no left value".to_string(),
             ));
         }
-        let query = self.analyze_subquery(select, parent, scope)?;
         let output_width = self
             .query(query)
             .ok_or_else(|| LimboError::InternalError(format!("missing semantic query {query}")))?
