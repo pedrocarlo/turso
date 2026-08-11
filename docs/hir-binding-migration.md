@@ -148,6 +148,9 @@ Completed:
   remain invisible.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
+- `INDEXED BY` resolves to a snapshot-bound index identity on the source, while
+  `NOT INDEXED` remains an explicit source hint. Missing and wrong-table indexes
+  fail during analysis.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.

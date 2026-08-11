@@ -59,6 +59,7 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum CatalogObjectKind {
     Table,
+    Index,
     Sequence,
     Collation,
     Type,
@@ -1187,7 +1188,7 @@ mod tests {
 
     use crate::{
         dialect::SqliteDialect,
-        schema::{BTreeTable, Schema, Sequence, Type},
+        schema::{BTreeTable, Index, Schema, Sequence, Type},
         sync::Arc,
         SymbolTable,
     };
@@ -1262,6 +1263,29 @@ mod tests {
             schema
                 .add_btree_table(table)
                 .expect("fixed join table name is unique");
+        }
+        schema
+    }
+
+    fn schema_with_indexes() -> Schema {
+        let mut schema = schema_with_join_tables();
+        let symbols = SymbolTable::new();
+        for (table_name, sql, root_page) in [
+            ("items", "CREATE INDEX idx_items_value ON items(value)", 7),
+            (
+                "categories",
+                "CREATE INDEX idx_categories_label ON categories(label)",
+                8,
+            ),
+        ] {
+            let table = schema
+                .get_btree_table(table_name)
+                .expect("indexed table exists");
+            let index = Index::from_sql(&symbols, sql, root_page, &table)
+                .expect("fixed index schema parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("fixed index name is unique");
         }
         schema
     }
@@ -1434,6 +1458,74 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn table_index_hints_keep_resolved_index_identity() {
+        let schema = schema_with_indexes();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value FROM items INDEXED BY IDX_ITEMS_VALUE",
+        )
+        .expect("existing table index resolves");
+        document.validate().expect("index hint produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("source exists");
+        let SourceKind::Table(table) = &source.kind else {
+            panic!("indexed source remains a table");
+        };
+        let crate::translate::semantic::hir::IndexHint::Indexed(index) = &source.index_hint else {
+            panic!("INDEXED BY keeps a resolved index");
+        };
+        assert_eq!(index.value().name, "idx_items_value");
+        assert_eq!(index.value().table_name, "items");
+        assert_eq!(index.database(), source.database);
+        assert_eq!(index.snapshot(), table.snapshot());
+        assert_ne!(index.id(), table.id());
+
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM items NOT INDEXED")
+            .expect("NOT INDEXED binds");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("source exists");
+        assert!(matches!(
+            source.index_hint,
+            crate::translate::semantic::hir::IndexHint::NotIndexed
+        ));
+    }
+
+    #[test]
+    fn indexed_by_rejects_missing_or_other_table_indexes() {
+        let schema = schema_with_indexes();
+        for (sql, expected_name) in [
+            ("SELECT value FROM items INDEXED BY Missing", "Missing"),
+            (
+                "SELECT value FROM items INDEXED BY idx_categories_label",
+                "idx_categories_label",
+            ),
+            (
+                "WITH candidates AS (SELECT value FROM items) \
+                 SELECT * FROM candidates INDEXED BY idx_items_value",
+                "idx_items_value",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("INDEXED BY requires an index on the named table");
+            assert_eq!(
+                error.to_string(),
+                format!("Parse error: no such index: {expected_name}")
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap as HashMap;
 use crate::{
     dialect::Dialect,
     function::Func,
-    schema::{Schema, Table},
+    schema::{Index, Schema, Table},
     sync::Arc,
     util::normalize_ident,
     LimboError, Result, SymbolTable, MAIN_DB_ID,
@@ -116,6 +116,14 @@ impl<'catalog> SemanticContext<'catalog> {
             .get_table(&table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
         Ok((database, table))
+    }
+
+    pub(crate) fn resolve_index(&self, table_name: &str, index_name: &str) -> Result<Arc<Index>> {
+        let normalized_name = normalize_ident(index_name);
+        self.main_schema
+            .get_index(table_name, &normalized_name)
+            .cloned()
+            .ok_or_else(|| LimboError::ParseError(format!("no such index: {index_name}")))
     }
 
     pub(crate) const fn dqs_dml(&self) -> DoubleQuotedDml {
