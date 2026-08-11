@@ -1049,7 +1049,17 @@ impl<'document> HirValidator<'document> {
         }
         match &source.index_hint {
             IndexHint::None | IndexHint::NotIndexed => {}
-            IndexHint::Indexed(index) => self.visit_catalog_object(index, "index hint")?,
+            IndexHint::Indexed(index) => {
+                self.visit_catalog_object(index, "index hint")?;
+                self.require(
+                    index.database() == source.database,
+                    format!("source {id} index hint belongs to a different database"),
+                )?;
+                self.require(
+                    index.value().table_name == source.name,
+                    format!("source {id} index hint belongs to a different table"),
+                )?;
+            }
         }
 
         self.visit_column_read_expressions(&source.generated_expressions)?;

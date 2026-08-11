@@ -217,6 +217,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
                     if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
+                        if let Some(ast::Indexed::IndexedBy(index)) = indexed {
+                            crate::bail_parse_error!("no such index: {}", index.as_str());
+                        }
                         let id = self.analyze_cte_source(
                             cte,
                             name.name.as_str(),
@@ -549,7 +552,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let index_hint = match indexed {
             None => hir::IndexHint::None,
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
-            Some(ast::Indexed::IndexedBy(_)) => return super::analyze::unsupported_select(),
+            Some(ast::Indexed::IndexedBy(name)) => {
+                let index_name = crate::util::normalize_ident(name.as_str());
+                let index = self.context().resolve_index(&table_name, name.as_str())?;
+                let index_id =
+                    self.catalog_object_id(Some(database), CatalogObjectKind::Index, index_name);
+                hir::IndexHint::Indexed(CatalogObject::new(
+                    index_id,
+                    self.context().snapshot(),
+                    Some(database),
+                    index,
+                ))
+            }
         };
         let source = self.reserve_source();
         self.insert_source(
