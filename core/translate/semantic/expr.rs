@@ -2016,7 +2016,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn resolve_named_type_fact(&mut self, name: &str) -> Result<hir::TypeFact> {
         if self.context().custom_types_enabled() {
             if let Some(resolved) = self.context().main_schema().resolve_type_unchecked(name)? {
-                return Ok(self.freeze_type_fact(name, resolved).0);
+                return Ok(self.freeze_type_fact(name, resolved, 0).0);
             }
         }
         let affinity = Affinity::affinity(name);
@@ -2164,7 +2164,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 {
                     return super::analyze::unsupported_select();
                 }
-                let (type_fact, affinity) = self.freeze_type_fact(&syntax.name, resolved);
+                let (type_fact, affinity) = self.freeze_type_fact(&syntax.name, resolved, 0);
                 let custom_chain = type_fact
                     .declared
                     .as_ref()
@@ -2213,10 +2213,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
-    fn freeze_type_fact(
+    pub(super) fn freeze_type_fact(
         &mut self,
         name: &str,
         resolved: crate::schema::ResolvedType,
+        array_dimensions: u32,
     ) -> (hir::TypeFact, Affinity) {
         let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
         let affinity = Affinity::affinity(&resolved.primitive);
@@ -2237,7 +2238,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 name: name.to_string(),
                 storage: affinity.to_type(),
                 custom_chain,
-                array_dimensions: 0,
+                array_dimensions,
             }),
             affinity,
         )

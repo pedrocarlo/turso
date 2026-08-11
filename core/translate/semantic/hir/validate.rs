@@ -2189,10 +2189,15 @@ impl<'document> HirValidator<'document> {
             )?;
         }
         let type_fact = &source_definition.columns[column].type_fact;
-        let needs_type_programs = type_fact
-            .declared
-            .as_ref()
-            .is_some_and(|declared| !declared.custom_chain.is_empty());
+        let reads_catalog_storage = matches!(
+            &source_definition.kind,
+            SourceKind::Table(_) | SourceKind::TableFunction { .. }
+        );
+        let needs_type_programs = reads_catalog_storage
+            && type_fact
+                .declared
+                .as_ref()
+                .is_some_and(|declared| !declared.custom_chain.is_empty());
         self.require(
             source_definition.column_type_programs[column].is_some() == needs_type_programs,
             format!("source {source} column {column} has incomplete type programs"),

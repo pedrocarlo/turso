@@ -17,13 +17,40 @@ struct SchemaInput {
     type_fact: TypeFact,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum TypeTransform {
+    Encode,
+    Decode,
+}
+
 impl Analyzer<'_, '_, '_> {
     pub(super) fn bind_type_encoder(
         &mut self,
         definition: &ResolvedType,
         arguments: &[ResolvedScopeExpr],
     ) -> Result<Option<BoundSchemaCall>> {
-        let Some(expression) = definition.value().encode() else {
+        self.bind_type_transform(definition, arguments, TypeTransform::Encode)
+    }
+
+    pub(super) fn bind_type_transform(
+        &mut self,
+        definition: &ResolvedType,
+        arguments: &[ResolvedScopeExpr],
+        transform: TypeTransform,
+    ) -> Result<Option<BoundSchemaCall>> {
+        let (expression, value_type, description) = match transform {
+            TypeTransform::Encode => (
+                definition.value().encode(),
+                definition.value().value_input_type(),
+                "encode",
+            ),
+            TypeTransform::Decode => (
+                definition.value().decode(),
+                definition.value().base(),
+                "decode",
+            ),
+        };
+        let Some(expression) = expression else {
             return Ok(None);
         };
         let expected = definition.value().user_params().count();
@@ -38,7 +65,7 @@ impl Analyzer<'_, '_, '_> {
         let mut inputs = Vec::with_capacity(arguments.len() + 1);
         inputs.push(SchemaInput {
             name: "value".to_string(),
-            type_fact: declared_input_fact(definition.value().value_input_type()),
+            type_fact: declared_input_fact(value_type),
         });
         inputs.extend(definition.value().user_params().zip(arguments).map(
             |(parameter, argument)| SchemaInput {
@@ -49,7 +76,7 @@ impl Analyzer<'_, '_, '_> {
 
         if !self.enter_schema_program_binding(definition.id()) {
             crate::bail_parse_error!(
-                "recursive encode program for custom type '{}'",
+                "recursive {description} program for custom type '{}'",
                 definition.value().name
             );
         }
