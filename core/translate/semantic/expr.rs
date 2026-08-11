@@ -43,6 +43,12 @@ enum RaisePolicy {
     Trigger,
 }
 
+struct ResolvedCustomMember {
+    container_type: hir::ResolvedType,
+    result_type: hir::TypeFact,
+    kind: hir::FieldAccessKind,
+}
+
 impl ExprPolicy {
     pub(crate) const fn select(dqs_dml: DoubleQuotedDml) -> Self {
         Self {
@@ -440,7 +446,10 @@ impl<'a> ExprFrame<'a> {
             ast::Expr::Unary(_, expression)
             | ast::Expr::Collate(expression, _)
             | ast::Expr::IsNull(expression)
-            | ast::Expr::NotNull(expression) => (self.next_child == 0).then(|| expression.as_ref()),
+            | ast::Expr::NotNull(expression)
+            | ast::Expr::FieldAccess {
+                base: expression, ..
+            } => (self.next_child == 0).then(|| expression.as_ref()),
             ast::Expr::Binary(lhs, _, rhs) => match self.next_child {
                 0 => Some(lhs.as_ref()),
                 1 => Some(rhs.as_ref()),
@@ -1182,36 +1191,69 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::Qualified(table, column) => {
                 expect_no_expr_children(children)?;
-                let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())?
-                else {
-                    crate::bail_parse_error!("no such table: {}", table.as_str());
-                };
-                self.resolve_atomic_expr(resolved.expr, scope)
+                if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
+                    return self.resolve_atomic_expr(resolved.expr, scope);
+                }
+                if let Some(base) =
+                    scope.resolve_unqualified(table.as_str(), NamePrecedence::SourcesOnly)?
+                {
+                    if custom_argument_type(&base, |definition| {
+                        definition.is_struct() || definition.is_union()
+                    })
+                    .is_some()
+                    {
+                        return self.build_field_access(base, column.as_str());
+                    }
+                }
+                crate::bail_parse_error!("no such table: {}", table.as_str());
             }
             ast::Expr::DoublyQualified(database, table, column) => {
                 expect_no_expr_children(children)?;
-                let Some(database_id) = self.context().database(database.as_str()) else {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}.{}",
-                        database.as_str(),
+                if let Some(database_id) = self.context().database(database.as_str()) {
+                    if let Some(resolved) = scope.resolve_database_qualified(
+                        database_id,
                         table.as_str(),
-                        column.as_str()
+                        column.as_str(),
+                    )? {
+                        return self.resolve_atomic_expr(resolved.expr, scope);
+                    }
+                }
+
+                if let Some(base) = scope.resolve_qualified(database.as_str(), table.as_str())? {
+                    if custom_argument_type(&base, |definition| {
+                        definition.is_struct() || definition.is_union()
+                    })
+                    .is_some()
+                    {
+                        return self.build_field_access(base, column.as_str());
+                    }
+                    crate::bail_parse_error!(
+                        "column '{}' is not a STRUCT or UNION type; cannot access field '{}'",
+                        normalize_ident(table.as_str()),
+                        normalize_ident(column.as_str())
                     );
-                };
-                let Some(resolved) = scope.resolve_database_qualified(
-                    database_id,
+                }
+
+                if let Some(base) =
+                    scope.resolve_unqualified(database.as_str(), NamePrecedence::SourcesOnly)?
+                {
+                    if let Some(first) = self.try_build_field_access(base, table.as_str())? {
+                        if custom_argument_type(&first, |definition| {
+                            definition.is_struct() || definition.is_union()
+                        })
+                        .is_some()
+                        {
+                            return self.build_field_access(first, column.as_str());
+                        }
+                    }
+                }
+
+                crate::bail_parse_error!(
+                    "no such column: {}.{}.{}",
+                    database.as_str(),
                     table.as_str(),
-                    column.as_str(),
-                )?
-                else {
-                    crate::bail_parse_error!(
-                        "no such column: {}.{}.{}",
-                        database.as_str(),
-                        table.as_str(),
-                        column.as_str()
-                    );
-                };
-                self.resolve_atomic_expr(resolved.expr, scope)
+                    column.as_str()
+                );
             }
             ast::Expr::Column { table, column, .. } if table.is_self_table() => {
                 expect_no_expr_children(children)?;
@@ -1230,6 +1272,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     )
                 })?;
                 self.resolve_atomic_expr(hir::Expr::rowid(source), scope)
+            }
+            ast::Expr::FieldAccess { field, .. } => {
+                let [base] = expect_expr_children(children)?;
+                self.build_field_access(base, field.as_str())
             }
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
@@ -1904,10 +1950,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                                     .to_string(),
                             )
                         })?;
-                let (tag_index, result_name) = union_type
-                    .value()
-                    .find_union_variant(&tag_name)
-                    .map(|(index, variant)| (index, variant.type_name.clone()))
+                let member = self
+                    .resolve_custom_member(&arguments[0], &tag_name)?
                     .ok_or_else(|| {
                         LimboError::ParseError(format!(
                             "unknown variant '{}' in union type '{}'",
@@ -1915,13 +1959,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             union_type.value().name
                         ))
                     })?;
-                let result_type = self.resolve_named_type_fact(&result_name)?;
+                let hir::FieldAccessKind::Union { tag_index } = member.kind else {
+                    unreachable!("union member resolution returns a union variant")
+                };
                 Ok(Some((
                     hir::CustomTypeOperation::UnionExtract {
                         union_type,
                         tag_index,
                     },
-                    result_type,
+                    member.result_type,
                 )))
             }
             ScalarFunc::StructExtractFunc => {
@@ -1937,10 +1983,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                                     .to_string(),
                             )
                         })?;
-                let (field_index, result_name) = struct_type
-                    .value()
-                    .find_struct_field(&field_name)
-                    .map(|(index, field)| (index, field.type_name.clone()))
+                let member = self
+                    .resolve_custom_member(&arguments[0], &field_name)?
                     .ok_or_else(|| {
                         LimboError::ParseError(format!(
                             "unknown field '{}' in struct type '{}'",
@@ -1948,17 +1992,102 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             struct_type.value().name
                         ))
                     })?;
-                let result_type = self.resolve_named_type_fact(&result_name)?;
+                let hir::FieldAccessKind::Struct { field_index } = member.kind else {
+                    unreachable!("struct member resolution returns a struct field")
+                };
                 Ok(Some((
                     hir::CustomTypeOperation::StructExtract {
                         struct_type,
                         field_index,
                     },
-                    result_type,
+                    member.result_type,
                 )))
             }
             _ => unreachable!("custom-type read function match is exhaustive"),
         }
+    }
+
+    fn try_build_field_access(
+        &mut self,
+        base: ResolvedScopeExpr,
+        field_name: &str,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        let Some(member) = self.resolve_custom_member(&base, field_name)? else {
+            return Ok(None);
+        };
+        Ok(Some(field_access_expr(base, field_name, member)))
+    }
+
+    fn build_field_access(
+        &mut self,
+        base: ResolvedScopeExpr,
+        field_name: &str,
+    ) -> Result<ResolvedScopeExpr> {
+        if let Some(member) = self.resolve_custom_member(&base, field_name)? {
+            return Ok(field_access_expr(base, field_name, member));
+        }
+
+        let normalized = normalize_ident(field_name);
+        let Some(container) = custom_argument_type(&base, |_| true) else {
+            crate::bail_parse_error!(
+                "cannot access field '{}' on a value without a known struct or union type",
+                normalized
+            );
+        };
+        if container.value().is_struct() {
+            crate::bail_parse_error!(
+                "no such field '{}' in struct type '{}'",
+                normalized,
+                container.value().name
+            );
+        }
+        if container.value().is_union() {
+            crate::bail_parse_error!(
+                "no such variant '{}' in union type '{}'",
+                normalized,
+                container.value().name
+            );
+        }
+        crate::bail_parse_error!(
+            "type '{}' is not a struct or union type",
+            container.value().name
+        );
+    }
+
+    fn resolve_custom_member(
+        &mut self,
+        base: &ResolvedScopeExpr,
+        field_name: &str,
+    ) -> Result<Option<ResolvedCustomMember>> {
+        let Some(container_type) = custom_argument_type(base, |definition| {
+            definition.is_struct() || definition.is_union()
+        }) else {
+            return Ok(None);
+        };
+        let normalized = normalize_ident(field_name);
+        let (kind, result_name) = if let Some((field_index, field)) =
+            container_type.value().find_struct_field(&normalized)
+        {
+            (
+                hir::FieldAccessKind::Struct { field_index },
+                field.type_name.clone(),
+            )
+        } else if let Some((tag_index, variant)) =
+            container_type.value().find_union_variant(&normalized)
+        {
+            (
+                hir::FieldAccessKind::Union { tag_index },
+                variant.type_name.clone(),
+            )
+        } else {
+            return Ok(None);
+        };
+        let result_type = self.resolve_named_type_fact(&result_name)?;
+        Ok(Some(ResolvedCustomMember {
+            container_type,
+            result_type,
+            kind,
+        }))
     }
 
     fn resolve_sequence_operation(
@@ -2421,6 +2550,25 @@ fn computed_expr(
         has_affinity: false,
         collation,
     }
+}
+
+fn field_access_expr(
+    base: ResolvedScopeExpr,
+    field_name: &str,
+    member: ResolvedCustomMember,
+) -> ResolvedScopeExpr {
+    let result_type = member.result_type;
+    computed_expr(
+        hir::Expr::FieldAccess(hir::FieldAccess {
+            base: Box::new(base.expr),
+            field_name: normalize_ident(field_name),
+            kind: member.kind,
+            container_type: member.container_type,
+            result_type: result_type.clone(),
+        }),
+        result_type,
+        ExprCollation::Absent,
+    )
 }
 
 fn effective_window_frame(
