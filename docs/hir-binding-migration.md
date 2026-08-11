@@ -176,9 +176,11 @@ Completed:
 - Basic `INSERT ... VALUES` and `DEFAULT VALUES` statements become INSERT HIR.
   Target columns, duplicate-column write selection, rowid aliases, defaults,
   generated expressions, and row-width diagnostics are resolved during
-  analysis. This checkpoint accepts only targets without indexes, CHECK
-  constraints, triggers, foreign keys, or AUTOINCREMENT, so every accepted
-  document still carries honest complete metadata.
+  analysis.
+- INSERT targets freeze every CHECK expression plus every ordinary,
+  expression, and partial index in catalog order. Stable catalog identities
+  and `IndexCoverage::Complete` make the required write metadata explicit.
+  Trigger, foreign-key, and AUTOINCREMENT targets remain later checkpoints.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.
