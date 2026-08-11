@@ -4260,6 +4260,90 @@ mod tests {
     }
 
     #[test]
+    fn array_functions_derive_result_type_facts() {
+        let schema = schema_with_array_columns();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT array_append(vals, 1), array_prepend('x', matrix), \
+                    array_set_element(vals, 1, 2), array_cat(vals, vals), \
+                    array_remove(matrix, 'x'), array_slice(matrix, 1, 2), \
+                    string_to_array('a,b', ','), array_length(vals), \
+                    array_position(vals, 1), array_contains(vals, 1), \
+                    array_overlap(vals, vals), array_contains_all(vals, vals), \
+                    array_to_string(vals, ','), \
+                    array_element(array_append(vals, 3), 1), \
+                    array_remove(?1, 1) \
+             FROM arrays",
+        )
+        .expect("array utility functions bind");
+        document
+            .validate()
+            .expect("typed array calls produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+
+        for output in &outputs[..13] {
+            let Expr::Function(call) = &output.expr else {
+                panic!("array utility remains a resolved function call");
+            };
+            assert!(matches!(call.operation, FunctionOperation::Ordinary));
+            assert_eq!(output.type_fact, call.result_type);
+        }
+
+        for index in [0, 2, 3] {
+            assert_eq!(outputs[index].type_fact.storage, Some(Type::Blob));
+            assert_eq!(outputs[index].type_fact.array_dimensions, 1);
+            assert_eq!(
+                outputs[index]
+                    .type_fact
+                    .declared
+                    .as_ref()
+                    .map(|declaration| declaration.name.as_str()),
+                Some("INTEGER")
+            );
+        }
+        for index in [1, 4, 5] {
+            assert_eq!(outputs[index].type_fact.storage, Some(Type::Blob));
+            assert_eq!(outputs[index].type_fact.array_dimensions, 2);
+            assert_eq!(
+                outputs[index]
+                    .type_fact
+                    .declared
+                    .as_ref()
+                    .map(|declaration| declaration.name.as_str()),
+                Some("TEXT")
+            );
+        }
+        assert_eq!(outputs[6].type_fact.storage, Some(Type::Blob));
+        assert_eq!(outputs[6].type_fact.array_dimensions, 1);
+        assert!(outputs[6].type_fact.declared.is_none());
+        assert!(outputs[7..12]
+            .iter()
+            .all(|output| output.type_fact == TypeFact::known(Type::Integer)));
+        assert_eq!(outputs[12].type_fact, TypeFact::known(Type::Text));
+
+        let Expr::Subscript { base, .. } = &outputs[13].expr else {
+            panic!("array_element() remains dedicated subscript HIR");
+        };
+        let Expr::Function(append) = base.as_ref() else {
+            panic!("subscript keeps its typed array-producing call");
+        };
+        assert_eq!(append.result_type.array_dimensions, 1);
+        assert_eq!(outputs[13].type_fact.storage, Some(Type::Integer));
+        assert_eq!(outputs[13].type_fact.array_dimensions, 0);
+
+        let Expr::Function(dynamic_remove) = &outputs[14].expr else {
+            panic!("array_remove() remains a resolved function call");
+        };
+        assert_eq!(dynamic_remove.result_type.storage, Some(Type::Blob));
+        assert_eq!(dynamic_remove.result_type.array_dimensions, 1);
+        assert!(dynamic_remove.result_type.array_rank_unbounded);
+    }
+
+    #[test]
     fn custom_table_columns_keep_type_facts_and_transform_programs() {
         let schema = schema_with_custom_columns();
         let document = analyze_sql_with_schema(

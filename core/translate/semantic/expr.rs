@@ -2934,6 +2934,33 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
 
 fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir::TypeFact {
     match function {
+        Func::Scalar(ScalarFunc::ArraySetElement) => hir::TypeFact::array_with_element_result(
+            &arguments[0].type_fact,
+            &arguments[2].type_fact,
+        ),
+        Func::Scalar(ScalarFunc::ArrayAppend) => hir::TypeFact::array_with_element_result(
+            &arguments[0].type_fact,
+            &arguments[1].type_fact,
+        ),
+        Func::Scalar(ScalarFunc::ArrayPrepend) => hir::TypeFact::array_with_element_result(
+            &arguments[1].type_fact,
+            &arguments[0].type_fact,
+        ),
+        Func::Scalar(ScalarFunc::ArrayCat) => {
+            hir::TypeFact::array_concat_result(&arguments[0].type_fact, &arguments[1].type_fact)
+        }
+        Func::Scalar(ScalarFunc::ArrayRemove | ScalarFunc::ArraySlice) => {
+            hir::TypeFact::array_transform_result(&arguments[0].type_fact)
+        }
+        Func::Scalar(ScalarFunc::StringToArray) => hir::TypeFact::known_array(1),
+        Func::Scalar(
+            ScalarFunc::ArrayLength
+            | ScalarFunc::ArrayContains
+            | ScalarFunc::ArrayPosition
+            | ScalarFunc::ArrayOverlap
+            | ScalarFunc::ArrayContainsAll,
+        ) => hir::TypeFact::known(Type::Integer),
+        Func::Scalar(ScalarFunc::ArrayToString) => hir::TypeFact::known(Type::Text),
         Func::Scalar(
             ScalarFunc::Length | ScalarFunc::NextVal | ScalarFunc::CurrVal | ScalarFunc::SetVal,
         ) => hir::TypeFact::known(Type::Integer),

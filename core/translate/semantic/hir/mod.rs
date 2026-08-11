@@ -520,6 +520,20 @@ impl TypeFact {
         result
     }
 
+    /// Infer an array operation that changes values but preserves the
+    /// container shape, such as ARRAY_REMOVE or ARRAY_SLICE.
+    pub fn array_transform_result(container: &Self) -> Self {
+        if container.is_array() {
+            return container.clone();
+        }
+        Self {
+            storage: Some(Type::Blob),
+            declared: None,
+            array_dimensions: 1,
+            array_rank_unbounded: container.storage.is_none(),
+        }
+    }
+
     fn array_concat_result_with_rank(
         lhs: &Self,
         rhs: &Self,
