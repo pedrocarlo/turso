@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
-    cte::CteResolution,
+    cte::{CteBindingContext, CteResolution},
     expr::{build_using_column, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     scope::{resolve_source_column, Scope},
@@ -16,11 +16,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         syntax: &'ast ast::FromClause,
         owner: hir::QueryBlockId,
-        outer_scope: Option<Scope>,
+        outer_scope: Option<&Scope>,
     ) -> Result<(hir::From, Scope)> {
         let source_owner = SourceOwner::QueryBlock(owner);
-        let source = self.analyze_table_source(&syntax.select, source_owner, 0)?;
-        let mut scope = Scope::new(outer_scope);
+        let cte_context = CteBindingContext::new(owner.query, outer_scope);
+        let source = self.analyze_table_source(&syntax.select, source_owner, 0, cte_context)?;
+        let mut scope = Scope::new(outer_scope.cloned());
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
@@ -39,8 +40,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
-            let right =
-                self.analyze_table_source(&syntax_join.table, source_owner, joins.len() + 1)?;
+            let right = self.analyze_table_source(
+                &syntax_join.table,
+                source_owner,
+                joins.len() + 1,
+                cte_context,
+            )?;
             let definition = self.source(right).ok_or_else(|| {
                 crate::LimboError::InternalError(format!("missing semantic source {right}"))
             })?;
@@ -109,11 +114,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::SelectTable,
         owner: SourceOwner,
         position: usize,
+        cte_context: CteBindingContext<'_>,
     ) -> Result<hir::SourceId> {
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
-                    if let Some(cte) = self.resolve_cte(name.name.as_str())? {
+                    if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
                         return self.analyze_cte_source(
                             cte,
                             name.name.as_str(),
