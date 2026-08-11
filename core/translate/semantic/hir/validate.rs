@@ -1517,9 +1517,24 @@ impl<'document> HirValidator<'document> {
                 rhs,
                 escape,
                 function,
+                operator,
+                argument_count,
                 ..
             } => {
                 self.visit_catalog_object(function, "LIKE function")?;
+                let lhs_width = expression_width(lhs);
+                self.require(
+                    lhs_width == 1 || *operator == turso_parser::ast::LikeOperator::Match,
+                    "only MATCH accepts a row-valued left expression",
+                )?;
+                self.require(
+                    escape.is_none() || *operator == turso_parser::ast::LikeOperator::Like,
+                    "only LIKE accepts an ESCAPE expression",
+                )?;
+                self.require(
+                    *argument_count == lhs_width + 1 + usize::from(escape.is_some()),
+                    "LIKE-family argument count does not match its expressions",
+                )?;
                 self.visit_expr(lhs)?;
                 self.visit_expr(rhs)?;
                 self.visit_optional_expr(escape.as_deref())

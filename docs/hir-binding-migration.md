@@ -50,6 +50,9 @@ Completed:
 - One ordinary table source and basic result outputs, including stars.
 - Immutable AST-to-HIR binding for names, literals, unary and binary operators,
   null tests, parentheses, `COLLATE`, and SQL parameters.
+- `LIKE`, `GLOB`, `REGEXP`, and `MATCH` expressions carry resolved function
+  identity and argument count. Only `LIKE` accepts `ESCAPE`; row-valued left
+  sides remain limited to `MATCH`.
 - Iterative expression analysis, including deep-expression coverage.
 - `BETWEEN`, list `IN`, `CASE`, and built-in `CAST` expressions.
 - Catalog-resolved custom `CAST` targets that need no stored program.
