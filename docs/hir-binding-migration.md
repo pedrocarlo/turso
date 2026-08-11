@@ -154,6 +154,10 @@ Completed:
 - `ARRAY[...]`, `array(...)`, bracket subscripts, and `array_element(...)`
   normalize to dedicated array/subscript HIR. Constructors derive rank from
   their elements; typed column subscripts retain element type facts.
+- Array utility calls keep resolved function identity and derive exact result
+  categories. Mutators preserve or deepen array facts, concatenation merges
+  ranks, shape-preserving calls retain declarations, and scalar utilities have
+  fixed integer or text results.
 - `INDEXED BY` resolves to a snapshot-bound index identity on the source, while
   `NOT INDEXED` remains an explicit source hint. Missing and wrong-table indexes
   fail during analysis.
