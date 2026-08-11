@@ -496,7 +496,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .collect())
     }
 
-    fn analyze_base_table_source(
+    pub(super) fn analyze_base_table_source(
         &mut self,
         name: &ast::QualifiedName,
         alias: Option<&ast::As>,
