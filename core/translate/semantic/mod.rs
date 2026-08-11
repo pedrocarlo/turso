@@ -5,6 +5,7 @@ pub(crate) mod context;
 mod cte;
 mod expr;
 pub(crate) mod hir;
+mod insert;
 mod query;
 mod schema_program;
 mod scope;

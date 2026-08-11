@@ -10,8 +10,8 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, CompoundArm, Cte, CteId,
-        DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot, Limit,
+        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
+        CteId, DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot, Limit,
         OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
         QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId,
         SourceKind, TypeFact,
@@ -33,13 +33,28 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
                 trigger: None,
             })
         }
+        AnalyzeInput::Statement(ast::Stmt::Insert {
+            with,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+        }) => analyzer.analyze_insert(
+            with.as_ref(),
+            *or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+        )?,
         AnalyzeInput::Statement(_) => {
             return Err(LimboError::ParseError(
-                "semantic analysis accepts SELECT statements".to_string(),
+                "semantic analysis accepts SELECT and INSERT statements".to_string(),
             ));
         }
     };
-    analyzer.finish_column_reads()?;
+    analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
@@ -256,10 +271,26 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         })
     }
 
-    fn finish_column_reads(&mut self) -> Result<()> {
+    fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
         let mut pending = Vec::new();
         for query in self.queries.iter().flatten() {
             pending.extend(query.direct_column_reads(|source| self.source(source)));
+        }
+        if let HirRoot::Insert(insert) = root {
+            let width = self
+                .source(insert.target)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing INSERT target source {}",
+                        insert.target
+                    ))
+                })?
+                .columns
+                .len();
+            pending.extend((0..width).map(|column| ColumnRef {
+                source: insert.target,
+                column,
+            }));
         }
         let mut finished = HashSet::default();
 
@@ -1310,9 +1341,10 @@ mod tests {
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            BinaryOperand, CteBody, CustomTypeOperation, FieldAccessKind, FunctionEvaluation,
-            FunctionOperation, HirRoot, JoinConstraint, JoinKind, MergedColumnValue,
-            OutputNameKind, SourceKind, SourceOwner, SubqueryExpr,
+            BinaryOperand, ColumnReadExpression, CteBody, CustomTypeOperation, FieldAccessKind,
+            FunctionEvaluation, FunctionOperation, HirRoot, IndexCoverage, InsertSource,
+            JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, ResolvedDefault,
+            SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
         },
     };
 
@@ -1458,6 +1490,23 @@ mod tests {
         schema
             .resolve_all_custom_type_affinities()
             .expect("custom operator column affinities resolve");
+        schema
+    }
+
+    fn schema_with_writable_table() -> Schema {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE writable(\
+                id INTEGER PRIMARY KEY,\
+                value TEXT DEFAULT 'fallback',\
+                doubled INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL\
+             ) STRICT",
+            2,
+        )
+        .expect("writable table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("writable table name is unique");
         schema
     }
 
@@ -4624,6 +4673,142 @@ mod tests {
             custom[8].is_none(),
             "naked operator keeps normal comparison"
         );
+    }
+
+    #[test]
+    fn insert_values_bind_target_columns_rows_and_complete_row_metadata() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(value, id) VALUES ('first', 7), (\"second\", 8)",
+        )
+        .expect("plain multi-row INSERT binds");
+        document.validate().expect("INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(insert.columns.len(), 2);
+        assert_eq!(insert.columns[0].column, TargetColumn::Column(1));
+        assert_eq!(insert.columns[1].column, TargetColumn::Column(0));
+        assert!(insert.columns.iter().all(|target| target.uses_value));
+        assert!(insert.defaults.is_empty());
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("VALUES stays inline HIR");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            rows[1].as_slice(),
+            [Expr::Literal(ast::Literal::String(value)), Expr::Literal(ast::Literal::Numeric(id))]
+                if value.trim_matches(|ch| ch == '\'' || ch == '"') == "second" && id == "8"
+        ));
+
+        let source = document
+            .source(insert.target)
+            .expect("target source exists");
+        assert_eq!(source.owner, SourceOwner::Root);
+        assert!(matches!(
+            source.index_coverage,
+            IndexCoverage::Complete { ref indexes } if indexes.is_empty()
+        ));
+        assert!(matches!(
+            source.default_expressions[1],
+            ColumnReadExpression::Planned(Expr::Literal(ast::Literal::String(ref value)))
+                if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
+        ));
+        assert!(matches!(
+            source.generated_expressions[2],
+            ColumnReadExpression::Planned(Expr::Binary {
+                operator: ast::Operator::Multiply,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn insert_defaults_and_duplicate_targets_keep_write_selection_rules() {
+        let schema = schema_with_writable_table();
+        let explicit_default =
+            analyze_sql_with_schema(&schema, "INSERT INTO writable(value) VALUES (DEFAULT)")
+                .expect("explicit DEFAULT binds");
+        let HirRoot::Insert(insert) = &explicit_default.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("VALUES stays inline HIR");
+        };
+        assert!(matches!(
+            rows[0].as_slice(),
+            [Expr::Literal(ast::Literal::String(value))]
+                if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
+        ));
+        assert!(matches!(
+            insert.defaults.as_slice(),
+            [ResolvedDefault {
+                column: 0,
+                value: Expr::Literal(ast::Literal::Null),
+            }]
+        ));
+
+        let default_values =
+            analyze_sql_with_schema(&schema, "INSERT INTO writable DEFAULT VALUES")
+                .expect("DEFAULT VALUES binds");
+        let HirRoot::Insert(insert) = &default_values.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert!(insert.columns.is_empty());
+        assert!(matches!(insert.source, InsertSource::DefaultValues));
+        assert_eq!(insert.defaults.len(), 2);
+        assert_eq!(insert.defaults[0].column, 0);
+        assert_eq!(insert.defaults[1].column, 1);
+
+        let duplicates = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(value, value, id, rowid) VALUES ('first', 'last', 1, 2)",
+        )
+        .expect("duplicate targets bind");
+        let HirRoot::Insert(insert) = &duplicates.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(
+            insert
+                .columns
+                .iter()
+                .map(|target| (target.column, target.uses_value))
+                .collect::<Vec<_>>(),
+            [
+                (TargetColumn::Column(1), true),
+                (TargetColumn::Column(1), false),
+                (TargetColumn::Column(0), false),
+                (TargetColumn::Column(0), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_target_and_row_width_errors_keep_existing_diagnostics() {
+        let schema = schema_with_writable_table();
+        for (sql, expected) in [
+            (
+                "INSERT INTO writable VALUES (1)",
+                "Parse error: table writable has 2 columns but 1 values were supplied",
+            ),
+            (
+                "INSERT INTO writable(absent) VALUES (1)",
+                "Parse error: table writable has no column named absent",
+            ),
+            (
+                "INSERT INTO writable(doubled) VALUES (1)",
+                "Parse error: cannot INSERT into generated column \"doubled\"",
+            ),
+            (
+                "INSERT INTO writable(value) VALUES (absent)",
+                "Parse error: no such column: absent",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid INSERT fails");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]

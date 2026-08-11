@@ -40,7 +40,7 @@ documents.
 
 ## Current status
 
-Phase 1 and the early SELECT path are in progress.
+SELECT binding is complete. DML binding is in progress.
 
 Completed:
 
@@ -173,6 +173,12 @@ Completed:
   source-owned HIR expressions. A final required-column worklist follows
   generated-column dependencies transitively, while unused stored expressions
   remain `NotRequired`.
+- Basic `INSERT ... VALUES` and `DEFAULT VALUES` statements become INSERT HIR.
+  Target columns, duplicate-column write selection, rowid aliases, defaults,
+  generated expressions, and row-width diagnostics are resolved during
+  analysis. This checkpoint accepts only targets without indexes, CHECK
+  constraints, triggers, foreign keys, or AUTOINCREMENT, so every accepted
+  document still carries honest complete metadata.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.
