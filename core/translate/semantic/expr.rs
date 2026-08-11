@@ -440,6 +440,25 @@ impl<'a> ExprFrame<'a> {
                 }
                 lhs => (self.next_child == 0).then_some(lhs),
             },
+            ast::Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                let lhs_count = like_lhs_count(lhs);
+                if self.next_child < lhs_count {
+                    match lhs.as_ref() {
+                        ast::Expr::Parenthesized(expressions) if lhs_count > 1 => {
+                            expressions.get(self.next_child).map(Box::as_ref)
+                        }
+                        lhs => Some(lhs),
+                    }
+                } else if self.next_child == lhs_count {
+                    Some(rhs.as_ref())
+                } else if self.next_child == lhs_count + 1 {
+                    escape.as_deref()
+                } else {
+                    None
+                }
+            }
             ast::Expr::Case {
                 base,
                 when_then_pairs,
@@ -1276,6 +1295,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     collation,
                 ))
             }
+            ast::Expr::Like {
+                lhs,
+                not,
+                op,
+                escape,
+                ..
+            } => self.build_like(lhs, *not, *op, escape.is_some(), children),
             ast::Expr::Case {
                 base: base_syntax,
                 when_then_pairs,
@@ -1531,6 +1557,103 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             _ => super::analyze::unsupported_select(),
         }
+    }
+
+    fn build_like(
+        &mut self,
+        lhs_syntax: &ast::Expr,
+        negated: bool,
+        operator: ast::LikeOperator,
+        has_escape: bool,
+        children: ExprChildren,
+    ) -> Result<ResolvedScopeExpr> {
+        let lhs_count = like_lhs_count(lhs_syntax);
+        let expected_children = lhs_count + 1 + usize::from(has_escape);
+        if children.len() != expected_children {
+            return Err(LimboError::InternalError(format!(
+                "{operator} expression expected {expected_children} child values, got {}",
+                children.len()
+            )));
+        }
+        if lhs_count > 1 && operator != ast::LikeOperator::Match {
+            crate::bail_parse_error!("row value misused");
+        }
+        if has_escape && operator != ast::LikeOperator::Like {
+            crate::bail_parse_error!("wrong number of arguments to function {operator}()");
+        }
+
+        let mut children = children.into_iter();
+        let lhs = if lhs_count == 1 {
+            children
+                .next()
+                .expect("LIKE child count includes left expression")
+                .expr
+        } else {
+            hir::Expr::Row(
+                children
+                    .by_ref()
+                    .take(lhs_count)
+                    .map(|value| value.expr)
+                    .collect(),
+            )
+        };
+        let rhs = children
+            .next()
+            .expect("LIKE child count includes right expression")
+            .expr;
+        let escape = has_escape.then(|| {
+            Box::new(
+                children
+                    .next()
+                    .expect("LIKE child count includes ESCAPE expression")
+                    .expr,
+            )
+        });
+        debug_assert!(children.next().is_none());
+
+        let function_name = match operator {
+            ast::LikeOperator::Like => "like",
+            ast::LikeOperator::Glob => "glob",
+            ast::LikeOperator::Regexp => "regexp",
+            ast::LikeOperator::Match => {
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                {
+                    "fts_match"
+                }
+                #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+                {
+                    crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+                }
+            }
+        };
+        let argument_count = lhs_count + 1 + usize::from(has_escape);
+        let Some(function) = self
+            .context()
+            .resolve_function(function_name, argument_count)?
+        else {
+            crate::bail_parse_error!("no such function: {function_name}");
+        };
+        let id = self.catalog_object_id(
+            None,
+            CatalogObjectKind::Function { argument_count },
+            function_name,
+        );
+        let function =
+            hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
+
+        Ok(computed_expr(
+            hir::Expr::Like {
+                lhs: Box::new(lhs),
+                negated,
+                operator,
+                function,
+                argument_count,
+                rhs: Box::new(rhs),
+                escape,
+            },
+            hir::TypeFact::known(Type::Integer),
+            ExprCollation::Absent,
+        ))
     }
 
     fn build_function_call(
@@ -2090,6 +2213,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }),
             affinity,
         )
+    }
+}
+
+fn like_lhs_count(lhs: &ast::Expr) -> usize {
+    match lhs {
+        ast::Expr::Parenthesized(expressions) if expressions.len() > 1 => expressions.len(),
+        _ => 1,
     }
 }
 
@@ -2963,6 +3093,163 @@ mod tests {
             error.to_string(),
             "Parse error: misuse of aggregate function sum()"
         );
+    }
+
+    #[test]
+    fn like_family_becomes_resolved_hir() {
+        for (sql, expected_operator, expected_negated, expected_arguments) in [
+            (
+                "SELECT 'alphabet' LIKE 'alpha%'",
+                ast::LikeOperator::Like,
+                false,
+                2,
+            ),
+            (
+                "SELECT 'alphabet' NOT GLOB 'z*'",
+                ast::LikeOperator::Glob,
+                true,
+                2,
+            ),
+            (
+                "SELECT 'a_b' LIKE 'a!_b' ESCAPE '!'",
+                ast::LikeOperator::Like,
+                false,
+                3,
+            ),
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("LIKE-family expression binds");
+            let Expr::Like {
+                operator,
+                negated,
+                argument_count,
+                function,
+                escape,
+                ..
+            } = analyzed
+            else {
+                panic!("LIKE-family syntax becomes LIKE HIR");
+            };
+            assert_eq!(operator, expected_operator);
+            assert_eq!(negated, expected_negated);
+            assert_eq!(argument_count, expected_arguments);
+            assert_eq!(escape.is_some(), expected_arguments == 3);
+            assert!(matches!(
+                (operator, function.value()),
+                (ast::LikeOperator::Like, Func::Scalar(ScalarFunc::Like))
+                    | (ast::LikeOperator::Glob, Func::Scalar(ScalarFunc::Glob))
+            ));
+        }
+
+        for operator in ["GLOB", "REGEXP", "MATCH"] {
+            let error = analyze_expression(
+                &expression(&format!("SELECT 'value' {operator} 'pattern' ESCAPE '!'")),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("only LIKE accepts ESCAPE");
+            assert_eq!(
+                error.to_string(),
+                format!("Parse error: wrong number of arguments to function {operator}()")
+            );
+        }
+
+        let error = analyze_expression(
+            &expression("SELECT 'value' REGEXP 'pattern'"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect_err("REGEXP requires a registered function");
+        assert_eq!(error.to_string(), "Parse error: no such function: regexp");
+    }
+
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[test]
+    fn match_accepts_a_row_valued_left_side() {
+        let analyzed = analyze_expression(
+            &expression("SELECT ('one', 'two') MATCH 'query'"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("MATCH accepts multiple document columns");
+        let Expr::Like {
+            lhs,
+            operator: ast::LikeOperator::Match,
+            function,
+            argument_count: 3,
+            ..
+        } = analyzed
+        else {
+            panic!("MATCH becomes resolved LIKE-family HIR");
+        };
+        assert!(matches!(*lhs, Expr::Row(values) if values.len() == 2));
+        assert!(matches!(
+            function.value(),
+            Func::Fts(crate::function::FtsFunc::Match)
+        ));
+    }
+
+    #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+    #[test]
+    fn match_requires_fts_support() {
+        let error = analyze_expression(
+            &expression("SELECT 'document' MATCH 'query'"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect_err("MATCH requires FTS support");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: MATCH requires the 'fts' feature to be enabled"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_like_expressions_use_expression_frames() {
+        const DEPTH: usize = 10_000;
+
+        let mut syntax = ast::Expr::Literal(ast::Literal::String("value".to_string()));
+        for _ in 0..DEPTH {
+            syntax = ast::Expr::Like {
+                lhs: Box::new(syntax),
+                not: false,
+                op: ast::LikeOperator::Like,
+                rhs: Box::new(ast::Expr::Literal(ast::Literal::String("%".to_string()))),
+                escape: None,
+            };
+        }
+
+        let mut analyzed = analyze_expression(
+            &syntax,
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("deep LIKE expression binds without using the call stack");
+        for _ in 0..DEPTH {
+            let Expr::Like { lhs, .. } = analyzed else {
+                panic!("expected nested LIKE HIR expression");
+            };
+            analyzed = *lhs;
+        }
+        assert!(matches!(
+            analyzed,
+            Expr::Literal(ast::Literal::String(value)) if value == "value"
+        ));
+
+        for _ in 0..DEPTH {
+            let ast::Expr::Like { lhs, .. } = syntax else {
+                panic!("expected nested LIKE parser expression");
+            };
+            syntax = *lhs;
+        }
+        assert!(matches!(
+            syntax,
+            ast::Expr::Literal(ast::Literal::String(value)) if value == "value"
+        ));
     }
 
     #[test]

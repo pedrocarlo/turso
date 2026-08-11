@@ -3767,6 +3767,23 @@ mod tests {
     }
 
     #[test]
+    fn like_family_outputs_have_integer_boolean_facts() {
+        let document = analyze_sql("SELECT 'alphabet' LIKE 'alpha%'")
+            .expect("LIKE expression has valid SQL meaning");
+        document.validate().expect("LIKE produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        assert_eq!(output.type_fact, TypeFact::known(Type::Integer));
+        assert_eq!(output.affinity, crate::vdbe::affinity::Affinity::Blob);
+        assert!(!output.has_affinity);
+        assert!(output.collation.is_none());
+        assert!(!output.collation_is_explicit);
+    }
+
+    #[test]
     fn case_expressions_freeze_result_and_comparison_rules_in_hir() {
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
