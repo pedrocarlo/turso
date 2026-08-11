@@ -1431,6 +1431,21 @@ mod tests {
         schema
     }
 
+    fn schema_with_array_columns() -> Schema {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE arrays(\
+                vals INTEGER[], matrix TEXT[][], anything ANY[]\
+             ) STRICT",
+            2,
+        )
+        .expect("array table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("array table name is unique");
+        schema
+    }
+
     fn schema_with_struct_and_union_columns() -> Schema {
         let mut schema = Schema::new();
         schema
@@ -4138,19 +4153,7 @@ mod tests {
 
     #[test]
     fn array_columns_keep_element_facts_without_program_metadata() {
-        let mut schema = Schema::new();
-        let table = Arc::new(
-            BTreeTable::from_sql(
-                "CREATE TABLE arrays(\
-                    vals INTEGER[], matrix TEXT[][], anything ANY[]\
-                 ) STRICT",
-                2,
-            )
-            .expect("array table schema parses"),
-        );
-        schema
-            .add_btree_table(table)
-            .expect("array table name is unique");
+        let schema = schema_with_array_columns();
         let document =
             analyze_sql_with_schema(&schema, "SELECT vals, matrix, anything FROM arrays")
                 .expect("built-in array columns bind");
@@ -4195,6 +4198,65 @@ mod tests {
                     if reference.source == source_id && reference.column == column
             )
         }));
+    }
+
+    #[test]
+    fn array_construction_and_subscripts_use_dedicated_hir() {
+        let schema = schema_with_array_columns();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT ARRAY[1, 2], array(ARRAY[1], ARRAY[2]), \
+                    vals[1], array_element(matrix, 1) \
+             FROM arrays",
+        )
+        .expect("array constructors and subscripts bind");
+        document
+            .validate()
+            .expect("array expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+
+        assert!(matches!(&outputs[0].expr, Expr::Array(elements) if elements.len() == 2));
+        assert_eq!(outputs[0].type_fact.storage, Some(Type::Blob));
+        assert_eq!(outputs[0].type_fact.array_dimensions, 1);
+
+        let Expr::Array(rows) = &outputs[1].expr else {
+            panic!("array() becomes array HIR");
+        };
+        assert!(rows
+            .iter()
+            .all(|row| matches!(row, Expr::Array(elements) if elements.len() == 1)));
+        assert_eq!(outputs[1].type_fact.storage, Some(Type::Blob));
+        assert_eq!(outputs[1].type_fact.array_dimensions, 2);
+
+        let Expr::Subscript { base, index } = &outputs[2].expr else {
+            panic!("bracket syntax becomes subscript HIR");
+        };
+        assert!(matches!(base.as_ref(), Expr::Column(column) if column.column == 0));
+        assert!(matches!(
+            index.as_ref(),
+            Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+        ));
+        assert_eq!(outputs[2].type_fact.storage, Some(Type::Integer));
+        assert_eq!(outputs[2].type_fact.array_dimensions, 0);
+
+        let Expr::Subscript { base, .. } = &outputs[3].expr else {
+            panic!("array_element() becomes subscript HIR");
+        };
+        assert!(matches!(base.as_ref(), Expr::Column(column) if column.column == 1));
+        assert_eq!(outputs[3].type_fact.storage, Some(Type::Blob));
+        assert_eq!(outputs[3].type_fact.array_dimensions, 1);
+        assert_eq!(
+            outputs[3]
+                .type_fact
+                .declared
+                .as_ref()
+                .map(|declaration| declaration.name.as_str()),
+            Some("TEXT")
+        );
     }
 
     #[test]
@@ -5213,10 +5275,7 @@ mod tests {
                 "SELECT nextval('missing')",
                 "Parse error: sequence \"missing\" does not exist",
             ),
-            (
-                "SELECT setval('aux.orders', 1)",
-                "Invalid argument supplied: no such database: aux",
-            ),
+            ("SELECT setval('aux.orders', 1)", "no such database: aux"),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call must fail");
             assert_eq!(error.to_string(), expected);

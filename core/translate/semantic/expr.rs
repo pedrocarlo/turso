@@ -455,6 +455,12 @@ impl<'a> ExprFrame<'a> {
                 1 => Some(rhs.as_ref()),
                 _ => None,
             },
+            ast::Expr::Array { elements } => elements.get(self.next_child).map(Box::as_ref),
+            ast::Expr::Subscript { base, index } => match self.next_child {
+                0 => Some(base.as_ref()),
+                1 => Some(index.as_ref()),
+                _ => None,
+            },
             ast::Expr::Between {
                 lhs, start, end, ..
             } => match self.next_child {
@@ -1277,6 +1283,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let [base] = expect_expr_children(children)?;
                 self.build_field_access(base, field.as_str())
             }
+            ast::Expr::Array { .. } => Ok(array_expr(children)),
+            ast::Expr::Subscript { .. } => {
+                let [base, index] = expect_expr_children(children)?;
+                Ok(subscript_expr(base, index))
+            }
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
                 Ok(inner)
@@ -1847,6 +1858,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         crate::bail_parse_error!("misuse of window function: {name}()")
                     }
                 }
+            }
+        }
+        if matches!(binding, FunctionBinding::Scalar) {
+            match &function {
+                Func::Scalar(ScalarFunc::Array) => {
+                    let FunctionInput::Expressions { values, .. } = input else {
+                        unreachable!("array() only accepts ordinary expression arguments")
+                    };
+                    return Ok(array_expr(values));
+                }
+                Func::Scalar(ScalarFunc::ArrayElement) => {
+                    let FunctionInput::Expressions { values, .. } = input else {
+                        unreachable!("array_element() only accepts ordinary expression arguments")
+                    };
+                    let [base, index] = expect_expr_children(values)?;
+                    return Ok(subscript_expr(base, index));
+                }
+                _ => {}
             }
         }
         let (operation, result_type) = special_operation.map_or_else(
@@ -2550,6 +2579,32 @@ fn computed_expr(
         has_affinity: false,
         collation,
     }
+}
+
+fn array_expr(elements: ExprChildren) -> ResolvedScopeExpr {
+    let type_fact = hir::TypeFact::array_literal_result(
+        elements.iter().map(|element| element.type_fact.clone()),
+    );
+    computed_expr(
+        hir::Expr::Array(elements.into_iter().map(|element| element.expr).collect()),
+        type_fact,
+        ExprCollation::Absent,
+    )
+}
+
+fn subscript_expr(base: ResolvedScopeExpr, index: ResolvedScopeExpr) -> ResolvedScopeExpr {
+    let type_fact = base
+        .type_fact
+        .array_element()
+        .unwrap_or_else(hir::TypeFact::dynamic);
+    computed_expr(
+        hir::Expr::Subscript {
+            base: Box::new(base.expr),
+            index: Box::new(index.expr),
+        },
+        type_fact,
+        ExprCollation::Absent,
+    )
 }
 
 fn field_access_expr(

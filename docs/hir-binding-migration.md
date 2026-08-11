@@ -151,6 +151,9 @@ Completed:
   remain invisible.
 - Built-in array table columns. `SourceColumn::type_fact` carries array rank and
   element type without adding semantic storage metadata beside the column.
+- `ARRAY[...]`, `array(...)`, bracket subscripts, and `array_element(...)`
+  normalize to dedicated array/subscript HIR. Constructors derive rank from
+  their elements; typed column subscripts retain element type facts.
 - `INDEXED BY` resolves to a snapshot-bound index identity on the source, while
   `NOT INDEXED` remains an explicit source hint. Missing and wrong-table indexes
   fail during analysis.
