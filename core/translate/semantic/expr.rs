@@ -49,6 +49,18 @@ struct ResolvedCustomMember {
     kind: hir::FieldAccessKind,
 }
 
+struct CustomOperatorColumn {
+    declared_name: String,
+    definition: hir::ResolvedType,
+    encoder: Option<hir::BoundSchemaCall>,
+}
+
+struct CustomOperatorDefinition {
+    function_name: String,
+    swap_args: bool,
+    negate: bool,
+}
+
 impl ExprPolicy {
     pub(crate) const fn select(dqs_dml: DoubleQuotedDml) -> Self {
         Self {
@@ -1340,6 +1352,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 {
                     return Ok(null_test_expr(rhs, *operator == ast::Operator::Is));
                 }
+                let custom = self.resolve_custom_binary_operator(*operator, &lhs, &rhs)?;
                 let type_fact = binary_type_fact(*operator, &lhs.type_fact, &rhs.type_fact);
                 let array_concat = *operator == ast::Operator::Concat
                     && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
@@ -1353,7 +1366,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         operator: *operator,
                         rhs: Box::new(rhs.expr),
                         array_concat,
-                        custom: None,
+                        custom,
                         comparison,
                     },
                     type_fact,
@@ -2119,6 +2132,132 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }))
     }
 
+    fn resolve_custom_binary_operator(
+        &mut self,
+        operator: ast::Operator,
+        lhs: &ResolvedScopeExpr,
+        rhs: &ResolvedScopeExpr,
+    ) -> Result<Option<hir::CustomBinaryOperator>> {
+        if custom_operator_symbol(operator).is_none() {
+            return Ok(None);
+        }
+        let lhs_column = self.custom_operator_column(lhs)?;
+        let rhs_column = self.custom_operator_column(rhs)?;
+
+        let (column, literal_encoding) = match (&lhs_column, &rhs_column) {
+            (Some(lhs), Some(rhs)) => {
+                if !lhs.declared_name.eq_ignore_ascii_case(&rhs.declared_name) {
+                    return Ok(None);
+                }
+                (lhs, None)
+            }
+            (Some(lhs), None) => {
+                if !literal_matches_custom_type(rhs, lhs.definition.value()) {
+                    return Ok(None);
+                }
+                (
+                    lhs,
+                    Some(hir::CustomBinaryLiteralEncoding {
+                        operand: hir::BinaryOperand::Right,
+                        encoder: lhs.encoder.clone(),
+                    }),
+                )
+            }
+            (None, Some(rhs)) => {
+                if !literal_matches_custom_type(lhs, rhs.definition.value()) {
+                    return Ok(None);
+                }
+                (
+                    rhs,
+                    Some(hir::CustomBinaryLiteralEncoding {
+                        operand: hir::BinaryOperand::Left,
+                        encoder: rhs.encoder.clone(),
+                    }),
+                )
+            }
+            (None, None) => return Ok(None),
+        };
+
+        let Some(resolved) = resolve_custom_operator(column.definition.value(), operator) else {
+            return Ok(None);
+        };
+        let function_name = normalize_ident(&resolved.function_name);
+        let function = self
+            .context()
+            .resolve_function(&function_name, 2)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("function not found: {function_name}"))
+            })?;
+        let id = self.catalog_object_id(
+            None,
+            CatalogObjectKind::Function { argument_count: 2 },
+            function_name,
+        );
+        Ok(Some(hir::CustomBinaryOperator {
+            function: hir::CatalogObject::new(
+                id,
+                self.context().snapshot(),
+                None,
+                Arc::new(function),
+            ),
+            swap_args: resolved.swap_args,
+            negate: resolved.negate,
+            literal_encoding,
+        }))
+    }
+
+    fn custom_operator_column(
+        &self,
+        expression: &ResolvedScopeExpr,
+    ) -> Result<Option<CustomOperatorColumn>> {
+        let hir::Expr::Column(reference) = &expression.expr else {
+            return Ok(None);
+        };
+        let Some(declared) = expression.type_fact.declared.as_ref() else {
+            return Ok(None);
+        };
+        let Some(definition) = declared.custom().cloned() else {
+            return Ok(None);
+        };
+        let source = self.source(reference.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "custom operator refers to missing source {}",
+                reference.source
+            ))
+        })?;
+        if !matches!(
+            &source.kind,
+            hir::SourceKind::Table(_) | hir::SourceKind::TableFunction { .. }
+        ) {
+            return Ok(None);
+        }
+        let encoder = if definition.value().encode().is_some() {
+            let programs = source
+                .column_type_programs
+                .get(reference.column)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "custom column {}.{} has no bound type programs",
+                        reference.source, reference.column
+                    ))
+                })?;
+            Some(programs.encode.first().cloned().ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "custom column {}.{} has no bound leaf encoder",
+                    reference.source, reference.column
+                ))
+            })?)
+        } else {
+            None
+        };
+        Ok(Some(CustomOperatorColumn {
+            declared_name: declared.name.clone(),
+            definition,
+            encoder,
+        }))
+    }
+
     fn resolve_sequence_operation(
         &mut self,
         function: &Func,
@@ -2445,6 +2584,90 @@ fn custom_argument_type(
         .custom()
         .filter(|definition| expected(definition.value()))
         .cloned()
+}
+
+fn custom_operator_symbol(operator: ast::Operator) -> Option<&'static str> {
+    match operator {
+        ast::Operator::Add => Some("+"),
+        ast::Operator::Subtract => Some("-"),
+        ast::Operator::Multiply => Some("*"),
+        ast::Operator::Divide => Some("/"),
+        ast::Operator::Modulus => Some("%"),
+        ast::Operator::Less => Some("<"),
+        ast::Operator::LessEquals => Some("<="),
+        ast::Operator::Greater => Some(">"),
+        ast::Operator::GreaterEquals => Some(">="),
+        ast::Operator::Equals => Some("="),
+        ast::Operator::NotEquals => Some("!="),
+        _ => None,
+    }
+}
+
+fn resolve_custom_operator(
+    definition: &crate::schema::TypeDef,
+    operator: ast::Operator,
+) -> Option<CustomOperatorDefinition> {
+    let symbol = custom_operator_symbol(operator)?;
+    if let Some(direct) = definition
+        .operators()
+        .iter()
+        .find(|candidate| candidate.op == symbol)
+    {
+        return direct
+            .func_name
+            .as_ref()
+            .map(|function_name| CustomOperatorDefinition {
+                function_name: function_name.clone(),
+                swap_args: false,
+                negate: false,
+            });
+    }
+
+    let derived = match operator {
+        ast::Operator::Greater => ("<", true, false),
+        ast::Operator::GreaterEquals => ("<", false, true),
+        ast::Operator::LessEquals => ("<", true, true),
+        ast::Operator::NotEquals => ("=", false, true),
+        _ => return None,
+    };
+    let function_name = definition
+        .operators()
+        .iter()
+        .find(|candidate| candidate.op == derived.0)?
+        .func_name
+        .clone()?;
+    Some(CustomOperatorDefinition {
+        function_name,
+        swap_args: derived.1,
+        negate: derived.2,
+    })
+}
+
+fn literal_matches_custom_type(
+    expression: &ResolvedScopeExpr,
+    definition: &crate::schema::TypeDef,
+) -> bool {
+    let hir::Expr::Literal(literal) = &expression.expr else {
+        return false;
+    };
+    let literal_type = match literal {
+        ast::Literal::Numeric(value) => {
+            if value
+                .chars()
+                .any(|character| matches!(character, '.' | 'e' | 'E'))
+            {
+                "real"
+            } else {
+                "integer"
+            }
+        }
+        ast::Literal::String(_) => "text",
+        ast::Literal::Blob(_) => "blob",
+        ast::Literal::True | ast::Literal::False => "integer",
+        _ => return false,
+    };
+    let input_type = definition.value_input_type();
+    input_type.eq_ignore_ascii_case("any") || input_type.eq_ignore_ascii_case(literal_type)
 }
 
 fn string_literal_argument(argument: &ResolvedScopeExpr, error: &str) -> Result<String> {

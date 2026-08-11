@@ -1423,14 +1423,37 @@ impl<'document> HirValidator<'document> {
                 if let Some(comparison) = comparison {
                     self.visit_expression_comparison(comparison, lhs, rhs, "binary comparison")?;
                 }
-                if let Some(encoding) = custom
-                    .as_ref()
-                    .and_then(|custom| custom.literal_encoding.as_ref())
-                    .and_then(|encoding| encoding.encoder.as_ref())
-                {
-                    self.visit_schema_call(encoding)?;
-                }
                 if let Some(custom) = custom {
+                    self.require(
+                        matches!(
+                            operator,
+                            turso_parser::ast::Operator::Add
+                                | turso_parser::ast::Operator::Subtract
+                                | turso_parser::ast::Operator::Multiply
+                                | turso_parser::ast::Operator::Divide
+                                | turso_parser::ast::Operator::Modulus
+                                | turso_parser::ast::Operator::Less
+                                | turso_parser::ast::Operator::LessEquals
+                                | turso_parser::ast::Operator::Greater
+                                | turso_parser::ast::Operator::GreaterEquals
+                                | turso_parser::ast::Operator::Equals
+                                | turso_parser::ast::Operator::NotEquals
+                        ),
+                        "unsupported binary expression has custom operator metadata",
+                    )?;
+                    if let Some(encoding) = &custom.literal_encoding {
+                        let literal = match encoding.operand {
+                            BinaryOperand::Left => lhs,
+                            BinaryOperand::Right => rhs,
+                        };
+                        self.require(
+                            matches!(literal.as_ref(), Expr::Literal(_)),
+                            "custom operator literal encoding refers to a non-literal operand",
+                        )?;
+                        if let Some(encoder) = &encoding.encoder {
+                            self.visit_schema_call(encoder)?;
+                        }
+                    }
                     self.visit_catalog_object(&custom.function, "custom operator function")?;
                 }
                 Ok(())
