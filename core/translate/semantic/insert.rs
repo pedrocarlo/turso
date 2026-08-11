@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::Analyzer,
+    analyze::{Analyzer, CatalogObjectKind},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
@@ -51,15 +51,7 @@ impl Analyzer<'_, '_, '_> {
             }
         };
         self.require_basic_insert_target(table.value())?;
-        {
-            let source = self.source_mut(target).ok_or_else(|| {
-                LimboError::InternalError(format!("missing INSERT target source {target}"))
-            })?;
-            source.check_constraints = Some(Vec::new());
-            source.index_coverage = hir::IndexCoverage::Complete {
-                indexes: Vec::new(),
-            };
-        }
+        self.analyze_insert_target_metadata(target, &table)?;
 
         let (columns, source) = match body {
             ast::InsertBody::DefaultValues => {
@@ -128,19 +120,6 @@ impl Analyzer<'_, '_, '_> {
         if table.has_autoincrement {
             return unsupported_insert("AUTOINCREMENT targets");
         }
-        if !table.check_constraints.is_empty() {
-            return unsupported_insert("CHECK constraints");
-        }
-        if !table.unique_sets.is_empty()
-            || self
-                .context()
-                .main_schema()
-                .get_indices(&table.name)
-                .next()
-                .is_some()
-        {
-            return unsupported_insert("indexed targets");
-        }
         let schema = self.context().main_schema();
         if schema.get_triggers_for_table(&table.name).next().is_some() {
             return unsupported_insert("triggered targets");
@@ -148,6 +127,94 @@ impl Analyzer<'_, '_, '_> {
         if schema.has_child_fks(&table.name) || schema.any_resolved_fks_referencing(&table.name) {
             return unsupported_insert("foreign-key targets");
         }
+        Ok(())
+    }
+
+    fn analyze_insert_target_metadata(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<()> {
+        let btree = table.value().btree().ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "INSERT target {} stopped being a B-tree table",
+                table.value().get_name()
+            ))
+        })?;
+        let scope = {
+            let source = self.source(target).ok_or_else(|| {
+                LimboError::InternalError(format!("missing INSERT target source {target}"))
+            })?;
+            let mut scope = Scope::default();
+            scope.add_source(source, true);
+            scope
+        };
+        let policy = ExprPolicy::schema_expression().with_self_source(target);
+
+        let mut check_constraints = Vec::with_capacity(btree.check_constraints.len());
+        for (catalog_position, constraint) in btree.check_constraints.iter().enumerate() {
+            check_constraints.push(hir::CheckConstraint {
+                catalog_position,
+                expression: self.analyze_expr(&constraint.expr, &scope, policy)?,
+                description: constraint
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| constraint.expr.to_string()),
+            });
+        }
+
+        let indexes = self
+            .context()
+            .main_schema()
+            .get_indices(table.value().get_name())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut index_expressions = Vec::with_capacity(indexes.len());
+        let mut index_ids = Vec::with_capacity(indexes.len());
+        for index in indexes {
+            let index_id = self.catalog_object_id(
+                table.database(),
+                CatalogObjectKind::Index,
+                normalize_ident(&index.name),
+            );
+            let resolved = hir::CatalogObject::new(
+                index_id,
+                self.context().snapshot(),
+                table.database(),
+                index,
+            );
+            let columns = resolved
+                .value()
+                .columns
+                .iter()
+                .map(|column| {
+                    column
+                        .expr
+                        .as_deref()
+                        .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let predicate = resolved
+                .value()
+                .where_clause
+                .as_deref()
+                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .transpose()?;
+            index_ids.push(index_id);
+            index_expressions.push(hir::IndexExpressions {
+                index: resolved,
+                columns,
+                predicate,
+            });
+        }
+
+        let source = self.source_mut(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing INSERT target source {target}"))
+        })?;
+        source.check_constraints = Some(check_constraints);
+        source.index_expressions = index_expressions;
+        source.index_coverage = hir::IndexCoverage::Complete { indexes: index_ids };
         Ok(())
     }
 

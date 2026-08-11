@@ -1510,6 +1510,41 @@ mod tests {
         schema
     }
 
+    fn schema_with_insert_metadata() -> Schema {
+        let mut schema = Schema::new();
+        let table = Arc::new(
+            BTreeTable::from_sql(
+                "CREATE TABLE guarded(\
+                    id INTEGER PRIMARY KEY,\
+                    value TEXT,\
+                    score INTEGER,\
+                    CONSTRAINT positive_score CHECK (score > 0),\
+                    CHECK (length(value) > 0)\
+                 )",
+                2,
+            )
+            .expect("guarded table parses"),
+        );
+        schema
+            .add_btree_table(table.clone())
+            .expect("guarded table name is unique");
+        let symbols = SymbolTable::new();
+        for (sql, root_page) in [
+            ("CREATE UNIQUE INDEX guarded_value ON guarded(value)", 3),
+            (
+                "CREATE INDEX guarded_expression ON guarded(lower(value)) WHERE score > 1",
+                4,
+            ),
+        ] {
+            let index = Index::from_sql(&symbols, sql, root_page, &table)
+                .expect("guarded index schema parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("guarded index name is unique");
+        }
+        schema
+    }
+
     fn schema_with_array_columns() -> Schema {
         let mut schema = Schema::new();
         let table = BTreeTable::from_sql(
@@ -4723,6 +4758,74 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn insert_freezes_check_constraints_and_all_index_expressions() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded(value, score) VALUES ('kept', 3)",
+        )
+        .expect("indexed checked INSERT binds");
+        document
+            .validate()
+            .expect("INSERT metadata produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let source = document
+            .source(insert.target)
+            .expect("target source exists");
+        let constraints = source
+            .check_constraints
+            .as_ref()
+            .expect("INSERT enforces CHECK constraints");
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0].catalog_position, 0);
+        assert_eq!(constraints[0].description, "positive_score");
+        assert_eq!(constraints[1].catalog_position, 1);
+        for constraint in constraints {
+            let mut reads_target = false;
+            constraint.expression.walk(&mut |expression| {
+                if matches!(
+                    expression,
+                    Expr::Column(column) if column.source == insert.target
+                ) {
+                    reads_target = true;
+                }
+            });
+            assert!(reads_target, "CHECK reads the INSERT row image");
+        }
+
+        assert_eq!(source.index_expressions.len(), 2);
+        let expression_index = source
+            .index_expressions
+            .iter()
+            .find(|metadata| metadata.index.value().name == "guarded_expression")
+            .expect("expression index metadata exists");
+        assert!(matches!(expression_index.columns.as_slice(), [Some(_)]));
+        assert!(expression_index.predicate.is_some());
+        let ordinary_index = source
+            .index_expressions
+            .iter()
+            .find(|metadata| metadata.index.value().name == "guarded_value")
+            .expect("ordinary index metadata exists");
+        assert!(matches!(ordinary_index.columns.as_slice(), [None]));
+        assert!(ordinary_index.predicate.is_none());
+
+        let IndexCoverage::Complete { indexes } = &source.index_coverage else {
+            panic!("INSERT carries a complete index summary");
+        };
+        assert_eq!(
+            indexes,
+            &source
+                .index_expressions
+                .iter()
+                .map(|metadata| metadata.index.id())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
