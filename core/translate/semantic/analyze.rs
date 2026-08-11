@@ -1309,9 +1309,9 @@ mod tests {
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            CteBody, CustomTypeOperation, FunctionEvaluation, FunctionOperation, HirRoot,
-            JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, SourceKind, SourceOwner,
-            SubqueryExpr,
+            CteBody, CustomTypeOperation, FieldAccessKind, FunctionEvaluation, FunctionOperation,
+            HirRoot, JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, SourceKind,
+            SourceOwner, SubqueryExpr,
         },
     };
 
@@ -1428,6 +1428,30 @@ mod tests {
         schema
             .resolve_all_custom_type_affinities()
             .expect("custom column affinities resolve");
+        schema
+    }
+
+    fn schema_with_struct_and_union_columns() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql("CREATE TYPE point AS STRUCT(x INT, label TEXT)")
+            .expect("struct type parses");
+        schema
+            .add_type_from_sql("CREATE TYPE shape AS UNION(point point, label TEXT)")
+            .expect("union type parses");
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE custom_values(\
+                id INTEGER, point_value point, shape_value shape\
+             ) STRICT",
+            2,
+        )
+        .expect("custom field table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("custom field table name is unique");
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("custom field affinities resolve");
         schema
     }
 
@@ -5011,6 +5035,98 @@ mod tests {
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid read must fail");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn custom_field_access_freezes_member_identity_and_result_type() {
+        let schema = schema_with_struct_and_union_columns();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT point_value.x, shape_value.point.x FROM custom_values",
+        )
+        .expect("direct and nested custom fields bind");
+        document
+            .validate()
+            .expect("custom field access produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+
+        let Expr::FieldAccess(point_x) = &outputs[0].expr else {
+            panic!("struct field becomes field-access HIR");
+        };
+        assert_eq!(point_x.field_name, "x");
+        assert_eq!(point_x.kind, FieldAccessKind::Struct { field_index: 0 });
+        assert_eq!(point_x.container_type.value().name, "point");
+        assert_eq!(point_x.result_type.storage, Some(Type::Integer));
+        assert_eq!(outputs[0].type_fact, point_x.result_type);
+        assert!(matches!(
+            point_x.base.as_ref(),
+            Expr::Column(column) if column.column == 1
+        ));
+
+        let Expr::FieldAccess(nested_x) = &outputs[1].expr else {
+            panic!("nested struct field becomes field-access HIR");
+        };
+        assert_eq!(nested_x.kind, FieldAccessKind::Struct { field_index: 0 });
+        assert_eq!(nested_x.container_type.value().name, "point");
+        assert_eq!(nested_x.result_type.storage, Some(Type::Integer));
+        assert_eq!(outputs[1].type_fact, nested_x.result_type);
+        let Expr::FieldAccess(shape_point) = nested_x.base.as_ref() else {
+            panic!("nested access keeps the union access as its base");
+        };
+        assert_eq!(shape_point.field_name, "point");
+        assert_eq!(shape_point.kind, FieldAccessKind::Union { tag_index: 0 });
+        assert_eq!(shape_point.container_type.value().name, "shape");
+        assert_eq!(
+            shape_point
+                .result_type
+                .declared
+                .as_ref()
+                .map(|declaration| declaration.name.as_str()),
+            Some("point")
+        );
+        assert!(matches!(
+            shape_point.base.as_ref(),
+            Expr::Column(column) if column.column == 2
+        ));
+    }
+
+    #[test]
+    fn custom_field_access_keeps_qualifier_precedence_and_errors() {
+        let schema = schema_with_struct_and_union_columns();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT point_value.id FROM custom_values AS point_value",
+        )
+        .expect("real table qualifier wins over field fallback");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        assert!(matches!(
+            &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr,
+            Expr::Column(column) if column.column == 0
+        ));
+
+        for (sql, expected) in [
+            (
+                "SELECT point_value.missing FROM custom_values",
+                "Parse error: no such field 'missing' in struct type 'point'",
+            ),
+            (
+                "SELECT shape_value.missing FROM custom_values",
+                "Parse error: no such variant 'missing' in union type 'shape'",
+            ),
+            (
+                "SELECT custom_values.id.x FROM custom_values",
+                "Parse error: column 'id' is not a STRUCT or UNION type; cannot access field 'x'",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid field must fail");
             assert_eq!(error.to_string(), expected);
         }
     }

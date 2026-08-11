@@ -1574,7 +1574,8 @@ impl<'document> HirValidator<'document> {
             Expr::FieldAccess(access) => {
                 self.visit_catalog_object(&access.container_type, "field-access type")?;
                 self.visit_type_fact(&access.result_type)?;
-                self.visit_expr(&access.base)
+                self.visit_expr(&access.base)?;
+                self.visit_field_access(access)
             }
             Expr::Raise { message, .. } => self.visit_optional_expr(message.as_deref()),
         }
@@ -2003,6 +2004,52 @@ impl<'document> HirValidator<'document> {
                         result_name.is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
                     }),
                     "struct-extract result type disagrees with its field",
+                )
+            }
+        }
+    }
+
+    fn visit_field_access(&self, access: &FieldAccess) -> ValidationResult {
+        let result_name = access
+            .result_type
+            .declared
+            .as_ref()
+            .map(|declaration| declaration.name.as_str());
+        match access.kind {
+            FieldAccessKind::Struct { field_index } => {
+                let field = access
+                    .container_type
+                    .value()
+                    .struct_def()
+                    .and_then(|structure| structure.fields.get(field_index));
+                self.require(field.is_some(), "field access has an unknown struct field")?;
+                self.require(
+                    field.is_some_and(|field| {
+                        field.name.eq_ignore_ascii_case(&access.field_name)
+                            && result_name
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
+                    }),
+                    "field access disagrees with its struct field",
+                )
+            }
+            FieldAccessKind::Union { tag_index } => {
+                let variant = access.container_type.value().union_def().and_then(|union| {
+                    union
+                        .variants
+                        .iter()
+                        .find(|variant| variant.tag_index == tag_index)
+                });
+                self.require(
+                    variant.is_some(),
+                    "field access has an unknown union variant",
+                )?;
+                self.require(
+                    variant.is_some_and(|variant| {
+                        variant.tag_name.eq_ignore_ascii_case(&access.field_name)
+                            && result_name
+                                .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
+                    }),
+                    "field access disagrees with its union variant",
                 )
             }
         }

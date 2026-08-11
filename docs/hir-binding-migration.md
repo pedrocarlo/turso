@@ -74,6 +74,9 @@ Completed:
   as `VARCHAR`.
 - Custom-type read functions. `union_tag`, `union_extract`, and
   `struct_extract` carry resolved types and stable member indexes in HIR.
+- Direct and nested struct/union dot access resolves database and table names
+  first, then freezes member kind, index, container type, and result type in
+  HIR. Function and dot syntax share one member resolver.
 - Sequence writes. `nextval` and `setval` carry the resolved sequence,
   backing table, and optional `sqlite_sequence` table. `currval` stays an
   ordinary scalar call because it only reads connection state.
