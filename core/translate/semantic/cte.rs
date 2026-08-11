@@ -4,7 +4,10 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
-    hir::{Cte, CteBody, CteColumn, CteId, RecursiveArm, RecursiveCte, RecursiveOrderTerm},
+    hir::{
+        Cte, CteBody, CteColumn, CteId, QueryId, RecursiveArm, RecursiveCte, RecursiveOrderTerm,
+    },
+    scope::Scope,
 };
 use crate::{
     translate::expr::{walk_expr, WalkControl},
@@ -13,6 +16,27 @@ use crate::{
 
 pub(super) struct CteScope<'ast> {
     entries: Vec<PendingCte<'ast>>,
+}
+
+/// Lexical query context available while a lazily resolved CTE is bound.
+/// `outer_scope` excludes sources owned by `parent` itself.
+#[derive(Clone, Copy)]
+pub(super) struct CteBindingContext<'scope> {
+    parent: QueryId,
+    outer_scope: Option<&'scope Scope>,
+}
+
+impl<'scope> CteBindingContext<'scope> {
+    pub(super) fn new(parent: QueryId, outer_scope: Option<&'scope Scope>) -> Self {
+        Self {
+            parent,
+            outer_scope,
+        }
+    }
+
+    fn query_parent(self) -> Option<QueryId> {
+        self.outer_scope.map(|_| self.parent)
+    }
 }
 
 fn recursive_arm_start(syntax: &ast::CommonTableExpr) -> Result<Option<usize>> {
@@ -408,7 +432,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
-    pub(super) fn resolve_cte(&mut self, name: &str) -> Result<Option<CteResolution>> {
+    pub(super) fn resolve_cte(
+        &mut self,
+        name: &str,
+        context: CteBindingContext<'_>,
+    ) -> Result<Option<CteResolution>> {
         let name = crate::util::normalize_ident(name);
         let Some((scope, entry)) =
             self.cte_scopes
@@ -455,7 +483,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let recursive_id = first_recursive_arm.map(|_| self.reserve_cte());
         self.cte_scopes[scope].entries[entry].state = CteState::BindingSeed(recursive_id);
-        let result = self.bind_cte(syntax, recursive_id, scope, entry, first_recursive_arm);
+        let result = self.bind_cte(
+            syntax,
+            recursive_id,
+            scope,
+            entry,
+            first_recursive_arm,
+            context,
+        );
         match result {
             Ok(id) => {
                 self.cte_scopes[scope].entries[entry].state = CteState::Bound(id);
@@ -479,12 +514,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: usize,
         entry: usize,
         first_recursive_arm: Option<usize>,
+        context: CteBindingContext<'_>,
     ) -> Result<CteId> {
         if let Some(first_recursive_arm) = first_recursive_arm {
             let id = recursive_id.expect("recursive CTE reserves its identity");
-            return self.bind_recursive_cte(syntax, id, scope, entry, first_recursive_arm);
+            return self.bind_recursive_cte(syntax, id, scope, entry, first_recursive_arm, context);
         }
-        let query = self.analyze_select(&syntax.select)?;
+        let query = self.analyze_cte_select(&syntax.select, context)?;
         let source_columns = self.query_source_columns(query)?;
 
         if !syntax.columns.is_empty() && syntax.columns.len() != source_columns.len() {
@@ -534,12 +570,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: usize,
         entry: usize,
         first_recursive_arm: usize,
+        context: CteBindingContext<'_>,
     ) -> Result<CteId> {
         let seed_compounds = &syntax.select.body.compounds[..first_recursive_arm - 1];
         let seed = self.analyze_cte_query_parts(
             &syntax.select,
             &syntax.select.body.select,
             seed_compounds,
+            context,
         )?;
         let source_columns = self.query_source_columns(seed)?;
         if !syntax.columns.is_empty() && syntax.columns.len() != source_columns.len() {
@@ -583,7 +621,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
         let mut arms = Vec::new();
         for compound in &syntax.select.body.compounds[first_recursive_arm - 1..] {
-            let query = self.analyze_cte_query_parts(&syntax.select, &compound.select, &[])?;
+            let query =
+                self.analyze_cte_query_parts(&syntax.select, &compound.select, &[], context)?;
             reject_recursive_query_functions(self, query)?;
             let width = self.query_source_columns(query)?.len();
             if width != columns.len() {
@@ -690,17 +729,36 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         whole: &'ast ast::Select,
         first: &'ast ast::OneSelect,
         compounds: &'ast [ast::CompoundSelect],
+        context: CteBindingContext<'_>,
     ) -> Result<super::hir::QueryId> {
         if let Some(with) = &whole.with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select_parts(first, compounds, &[], None, None, None);
+        let result = self.analyze_select_parts(
+            first,
+            compounds,
+            &[],
+            None,
+            context.query_parent(),
+            context.outer_scope,
+        );
         if whole.with.is_some() {
             self.cte_scopes
                 .pop()
                 .expect("recursive CTE body WITH scope was pushed");
         }
         result
+    }
+
+    fn analyze_cte_select(
+        &mut self,
+        select: &'ast ast::Select,
+        context: CteBindingContext<'_>,
+    ) -> Result<QueryId> {
+        match context.outer_scope {
+            Some(scope) => self.analyze_subquery(select, context.parent, scope),
+            None => self.analyze_select(select),
+        }
     }
 
     pub(super) fn record_recursive_input(

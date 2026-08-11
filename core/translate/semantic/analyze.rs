@@ -480,8 +480,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let block_id = QueryBlockId::new(query, index);
         let (from, scope) = match from {
             Some(from) => {
-                let (from, scope) =
-                    self.analyze_from_clause(from, block_id, outer_scope.cloned())?;
+                let (from, scope) = self.analyze_from_clause(from, block_id, outer_scope)?;
                 (Some(from), scope)
             }
             None => (None, Scope::new(outer_scope.cloned())),
@@ -2901,6 +2900,93 @@ mod tests {
             error.to_string(),
             "Parse error: multiple recursive references: seq"
         );
+    }
+
+    #[test]
+    fn cte_queries_capture_enclosing_sources() {
+        let schema = schema_with_items();
+        let ordinary = analyze_sql_with_schema(
+            &schema,
+            "SELECT (\
+                 WITH selected(x) AS (SELECT outer_items.id) \
+                 SELECT x FROM selected\
+             ) FROM items AS outer_items",
+        )
+        .expect("ordinary CTE sees its owning query's outer scope");
+        ordinary
+            .validate()
+            .expect("correlated ordinary CTE produces closed HIR");
+        let HirRoot::Query(ordinary_root) = &ordinary.root else {
+            panic!("SELECT produces query root");
+        };
+        let ordinary_outer = ordinary
+            .query(ordinary_root.query)
+            .expect("outer query exists");
+        let ordinary_source = ordinary_outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query reads items")
+            .first;
+        let CteBody::Query(ordinary_body) = ordinary.ctes[0].body else {
+            panic!("ordinary CTE owns a query body");
+        };
+        let ordinary_body = ordinary
+            .query(ordinary_body)
+            .expect("ordinary CTE query exists");
+        assert_eq!(ordinary_body.captures, vec![ordinary_source]);
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (\
+                 WITH RECURSIVE seq(x) AS (\
+                     VALUES(outer_items.id) \
+                     UNION ALL \
+                     SELECT x + 1 FROM seq WHERE x < outer_items.id + 2\
+                 ) SELECT max(x) FROM seq\
+             ) FROM items AS outer_items",
+        )
+        .expect("recursive CTE sees its owning query's outer scope");
+        document
+            .validate()
+            .expect("correlated recursive CTE produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query reads items")
+            .first;
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: owner_id, ..
+        }) = outer.blocks[0].outputs[0].expr
+        else {
+            panic!("outer output contains the CTE-owning query");
+        };
+        let CteBody::Recursive(recursive) = &document.ctes[0].body else {
+            panic!("self-reference produces recursive CTE");
+        };
+        let seed = document.query(recursive.seed).expect("seed query exists");
+        assert_eq!(seed.parent, Some(owner_id));
+        assert_eq!(seed.captures, vec![outer_source]);
+        assert_eq!(recursive.arms.len(), 1);
+        let arm = document
+            .query(recursive.arms[0].query)
+            .expect("recursive arm query exists");
+        assert_eq!(arm.parent, Some(owner_id));
+        assert_eq!(arm.captures, vec![outer_source]);
+
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT (\
+                 WITH c(x) AS (SELECT local_items.id) \
+                 SELECT x FROM c, items AS local_items\
+             ) FROM items AS outer_items",
+        )
+        .expect_err("CTE cannot see sibling sources from its owning SELECT");
+        assert_eq!(error.to_string(), "Parse error: no such table: local_items");
     }
 
     #[test]

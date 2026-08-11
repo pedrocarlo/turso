@@ -11,8 +11,8 @@ use crate::vdbe::affinity::Affinity;
 #[derive(Clone, Debug)]
 pub struct Query {
     pub id: QueryId,
-    /// Lexical query whose scope this query may capture. Root statement and
-    /// uncorrelated CTE queries have no parent.
+    /// Lexical query whose scope this query may capture. Queries without an
+    /// enclosing query scope have no parent.
     pub parent: Option<QueryId>,
     /// Exact source identities read from outside this query's own blocks.
     /// Kept sorted by document-local identity for stable planning and tests.
