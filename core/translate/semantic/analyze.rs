@@ -1300,18 +1300,19 @@ mod tests {
 
     use crate::{
         dialect::SqliteDialect,
+        function::ScalarFunc,
         schema::{BTreeTable, Index, Schema, Sequence, Type},
         sync::Arc,
-        SymbolTable,
+        Func, SymbolTable,
     };
 
     use super::*;
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
         hir::{
-            CteBody, CustomTypeOperation, FieldAccessKind, FunctionEvaluation, FunctionOperation,
-            HirRoot, JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, SourceKind,
-            SourceOwner, SubqueryExpr,
+            BinaryOperand, CteBody, CustomTypeOperation, FieldAccessKind, FunctionEvaluation,
+            FunctionOperation, HirRoot, JoinConstraint, JoinKind, MergedColumnValue,
+            OutputNameKind, SourceKind, SourceOwner, SubqueryExpr,
         },
     };
 
@@ -1428,6 +1429,35 @@ mod tests {
         schema
             .resolve_all_custom_type_affinities()
             .expect("custom column affinities resolve");
+        schema
+    }
+
+    fn schema_with_custom_operators() -> Schema {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TYPE amount(value INTEGER, factor INTEGER) BASE INTEGER \
+             ENCODE value * factor DECODE value / factor \
+             OPERATOR '+' numeric_add OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+            "CREATE TYPE alternate(value INTEGER) BASE INTEGER OPERATOR '+' numeric_add",
+            "CREATE TYPE ordered(value INTEGER) BASE INTEGER OPERATOR '<'",
+        ] {
+            schema
+                .add_type_from_sql(sql)
+                .expect("custom operator type parses");
+        }
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE custom_values(\
+                a amount(4), b amount(4), c alternate, d ordered, e ordered\
+             ) STRICT",
+            2,
+        )
+        .expect("custom operator table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("custom operator table name is unique");
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("custom operator column affinities resolve");
         schema
     }
 
@@ -4485,6 +4515,115 @@ mod tests {
             );
             assert_eq!(block.outputs[0].type_fact, source.columns[0].type_fact);
         }
+    }
+
+    #[test]
+    fn custom_binary_operators_freeze_functions_derivation_and_literal_encoding() {
+        let schema = schema_with_custom_operators();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT a + b, a > b, a >= 7, 7 <= a, a != 7, a + 'x', a + c, c + 7, d < e \
+             FROM custom_values",
+        )
+        .expect("custom operators bind");
+        document
+            .validate()
+            .expect("custom operators produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        let custom = outputs
+            .iter()
+            .map(|output| {
+                let Expr::Binary { custom, .. } = &output.expr else {
+                    panic!("output remains binary HIR");
+                };
+                custom.as_ref()
+            })
+            .collect::<Vec<_>>();
+
+        let direct = custom[0].expect("same-type columns use custom addition");
+        assert!(matches!(
+            direct.function.value(),
+            Func::Scalar(ScalarFunc::NumericAdd)
+        ));
+        assert!(!direct.swap_args);
+        assert!(!direct.negate);
+        assert!(direct.literal_encoding.is_none());
+
+        let greater = custom[1].expect("greater-than derives from less-than");
+        assert!(matches!(
+            greater.function.value(),
+            Func::Scalar(ScalarFunc::NumericLt)
+        ));
+        assert!(greater.swap_args);
+        assert!(!greater.negate);
+
+        let greater_equal = custom[2].expect("greater-equal derives from less-than");
+        assert!(!greater_equal.swap_args);
+        assert!(greater_equal.negate);
+        let encoding = greater_equal
+            .literal_encoding
+            .as_ref()
+            .expect("right literal is encoded");
+        assert_eq!(encoding.operand, BinaryOperand::Right);
+        assert!(matches!(
+            encoding
+                .encoder
+                .as_ref()
+                .expect("amount has an encoder")
+                .arguments
+                .as_slice(),
+            [Expr::Literal(ast::Literal::Numeric(value))] if value == "4"
+        ));
+
+        let reversed = custom[3].expect("left literal uses right custom column");
+        assert!(reversed.swap_args);
+        assert!(reversed.negate);
+        assert_eq!(
+            reversed
+                .literal_encoding
+                .as_ref()
+                .expect("left literal is encoded")
+                .operand,
+            BinaryOperand::Left
+        );
+
+        let not_equal = custom[4].expect("not-equal derives from equality");
+        assert!(matches!(
+            not_equal.function.value(),
+            Func::Scalar(ScalarFunc::NumericEq)
+        ));
+        assert!(!not_equal.swap_args);
+        assert!(not_equal.negate);
+
+        assert!(
+            custom[5].is_none(),
+            "incompatible literal uses normal addition"
+        );
+        assert!(
+            custom[6].is_none(),
+            "different custom types use normal addition"
+        );
+
+        let unencoded = custom[7].expect("compatible literal uses alternate addition");
+        assert!(matches!(
+            unencoded.function.value(),
+            Func::Scalar(ScalarFunc::NumericAdd)
+        ));
+        assert!(unencoded
+            .literal_encoding
+            .as_ref()
+            .expect("literal use is recorded")
+            .encoder
+            .is_none());
+
+        assert!(
+            custom[8].is_none(),
+            "naked operator keeps normal comparison"
+        );
     }
 
     #[test]

@@ -158,6 +158,10 @@ Completed:
   categories. Mutators preserve or deepen array facts, concatenation merges
   ranks, shape-preserving calls retain declarations, and scalar utilities have
   fixed integer or text results.
+- Custom binary operators freeze their two-argument function identity,
+  direct-or-derived swap/negate behavior, and any literal encoder call. Same
+  declared custom types and compatible literals use the operator; different
+  types and incompatible literals keep normal SQL behavior.
 - `INDEXED BY` resolves to a snapshot-bound index identity on the source, while
   `NOT INDEXED` remains an explicit source hint. Missing and wrong-table indexes
   fail during analysis.
