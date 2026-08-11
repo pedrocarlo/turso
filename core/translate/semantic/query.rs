@@ -11,6 +11,17 @@ use super::{
 };
 use crate::{schema::Table, sync::Arc, Result};
 
+struct AnalyzedTableSource<'ast> {
+    id: hir::SourceId,
+    function_arguments: Option<&'ast [Box<ast::Expr>]>,
+}
+
+#[derive(Clone, Copy)]
+enum CatalogSourceKind {
+    Table,
+    TableFunction,
+}
+
 impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_from_clause(
         &mut self,
@@ -20,7 +31,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<(hir::From, Scope)> {
         let source_owner = SourceOwner::QueryBlock(owner);
         let cte_context = CteBindingContext::new(owner.query, outer_scope);
-        let source = self.analyze_table_source(&syntax.select, source_owner, 0, cte_context)?;
+        let first = self.analyze_table_source(&syntax.select, source_owner, 0, cte_context)?;
+        let source = first.id;
+        let mut table_functions = Vec::new();
+        if let Some(arguments) = first.function_arguments {
+            table_functions.push((source, arguments));
+        }
         let mut scope = Scope::new(outer_scope.cloned());
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
@@ -40,12 +56,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
-            let right = self.analyze_table_source(
+            let analyzed = self.analyze_table_source(
                 &syntax_join.table,
                 source_owner,
                 joins.len() + 1,
                 cte_context,
             )?;
+            let right = analyzed.id;
+            if let Some(arguments) = analyzed.function_arguments {
+                table_functions.push((right, arguments));
+            }
             let definition = self.source(right).ok_or_else(|| {
                 crate::LimboError::InternalError(format!("missing semantic source {right}"))
             })?;
@@ -90,6 +110,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             });
         }
 
+        for (source, arguments) in table_functions {
+            self.analyze_table_function_arguments(source, arguments, &scope, owner.query)?;
+        }
+
         let policy = ExprPolicy::select(self.context().dqs_dml());
         for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
             if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
@@ -115,12 +139,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         owner: SourceOwner,
         position: usize,
         cte_context: CteBindingContext<'_>,
-    ) -> Result<hir::SourceId> {
+    ) -> Result<AnalyzedTableSource<'ast>> {
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
                     if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
-                        return self.analyze_cte_source(
+                        let id = self.analyze_cte_source(
                             cte,
                             name.name.as_str(),
                             alias
@@ -129,16 +153,136 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                                 .or(name.alias.as_ref())
                                 .map(ast::Name::as_str),
                             owner,
-                        );
+                        )?;
+                        return Ok(AnalyzedTableSource {
+                            id,
+                            function_arguments: None,
+                        });
                     }
                 }
-                self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)
+                let id =
+                    self.analyze_base_table_source(name, alias.as_ref(), indexed.as_ref(), owner)?;
+                Ok(AnalyzedTableSource {
+                    id,
+                    function_arguments: None,
+                })
             }
+            ast::SelectTable::TableCall(name, arguments, alias) => self
+                .analyze_table_function_source(name, arguments, alias.as_ref(), owner, cte_context),
             ast::SelectTable::Select(select, alias) => {
-                self.analyze_derived_source(select, alias.as_ref(), owner, position)
+                let id = self.analyze_derived_source(select, alias.as_ref(), owner, position)?;
+                Ok(AnalyzedTableSource {
+                    id,
+                    function_arguments: None,
+                })
             }
             _ => super::analyze::unsupported_select(),
         }
+    }
+
+    fn analyze_table_function_source(
+        &mut self,
+        name: &ast::QualifiedName,
+        arguments: &'ast [Box<ast::Expr>],
+        alias: Option<&ast::As>,
+        owner: SourceOwner,
+        cte_context: CteBindingContext<'_>,
+    ) -> Result<AnalyzedTableSource<'ast>> {
+        if name.db_name.is_none() {
+            if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
+                if !arguments.is_empty() {
+                    match cte {
+                        CteResolution::RecursiveInput { .. } => crate::bail_parse_error!(
+                            "too many arguments on {}() - max 0",
+                            name.name.as_str()
+                        ),
+                        CteResolution::Cte(_) => {
+                            crate::bail_parse_error!("'{}' is not a function", name.name.as_str())
+                        }
+                    }
+                }
+                let id = self.analyze_cte_source(
+                    cte,
+                    name.name.as_str(),
+                    alias.map(ast::As::name).map(ast::Name::as_str),
+                    owner,
+                )?;
+                return Ok(AnalyzedTableSource {
+                    id,
+                    function_arguments: None,
+                });
+            }
+        }
+
+        let (database, table) = self.context().resolve_table(name)?;
+        let kind = if table.virtual_table().is_some() {
+            let maximum = table
+                .columns()
+                .iter()
+                .filter(|column| column.hidden())
+                .count();
+            if arguments.len() > maximum {
+                crate::bail_parse_error!(
+                    "Too many arguments for {}: expected at most {}, got {}",
+                    table.get_name(),
+                    maximum,
+                    arguments.len()
+                );
+            }
+            CatalogSourceKind::TableFunction
+        } else {
+            if !arguments.is_empty() {
+                crate::bail_parse_error!("'{}' is not a function", name.name.as_str());
+            }
+            CatalogSourceKind::Table
+        };
+        let id =
+            self.analyze_catalog_table_source(name, alias, None, owner, database, table, kind)?;
+        Ok(AnalyzedTableSource {
+            id,
+            function_arguments: matches!(kind, CatalogSourceKind::TableFunction)
+                .then_some(arguments)
+                .filter(|arguments| !arguments.is_empty()),
+        })
+    }
+
+    fn analyze_table_function_arguments(
+        &mut self,
+        source: hir::SourceId,
+        syntax: &'ast [Box<ast::Expr>],
+        scope: &Scope,
+        parent: hir::QueryId,
+    ) -> Result<()> {
+        let policy = ExprPolicy::table_function(self.context().dqs_dml());
+        let mut arguments = Vec::with_capacity(syntax.len());
+        for argument in syntax {
+            arguments.push(
+                self.analyze_query_scalar_expr(argument, scope, policy, parent)?
+                    .expr,
+            );
+        }
+        let source = self.source_mut(source).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing semantic table-function source {source}"
+            ))
+        })?;
+        let hir::SourceKind::TableFunction {
+            arguments: bound, ..
+        } = &mut source.kind
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "source {} is not a table function",
+                source.id
+            )));
+        };
+        if !bound.is_empty() {
+            return Err(crate::LimboError::InternalError(format!(
+                "table-function source {} arguments were already bound",
+                source.id
+            )));
+        }
+        *bound = arguments;
+        Ok(())
     }
 
     fn analyze_cte_source(
@@ -278,6 +422,28 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         owner: SourceOwner,
     ) -> Result<hir::SourceId> {
         let (database, table) = self.context().resolve_table(name)?;
+        self.analyze_catalog_table_source(
+            name,
+            alias,
+            indexed,
+            owner,
+            database,
+            table,
+            CatalogSourceKind::Table,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_catalog_table_source(
+        &mut self,
+        name: &ast::QualifiedName,
+        alias: Option<&ast::As>,
+        indexed: Option<&ast::Indexed>,
+        owner: SourceOwner,
+        database: hir::DatabaseId,
+        table: Arc<Table>,
+        source_kind: CatalogSourceKind,
+    ) -> Result<hir::SourceId> {
         let table_name = crate::util::normalize_ident(name.name.as_str());
         let table_id =
             self.catalog_object_id(Some(database), CatalogObjectKind::Table, table_name.clone());
@@ -324,7 +490,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(ast::As::name)
                     .or(name.alias.as_ref())
                     .map(|name| crate::util::normalize_ident(name.as_str())),
-                kind: hir::SourceKind::Table(table.clone()),
+                kind: match source_kind {
+                    CatalogSourceKind::Table => hir::SourceKind::Table(table.clone()),
+                    CatalogSourceKind::TableFunction => hir::SourceKind::TableFunction {
+                        table: table.clone(),
+                        arguments: Vec::new(),
+                    },
+                },
                 columns,
                 generated_expressions,
                 default_expressions,

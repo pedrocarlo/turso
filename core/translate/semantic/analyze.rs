@@ -136,6 +136,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.sources.get(id.index())?.as_ref()
     }
 
+    pub(super) fn source_mut(&mut self, id: SourceId) -> Option<&mut Source> {
+        self.sources.get_mut(id.index())?.as_mut()
+    }
+
     pub(super) fn reserve_schema_program(&mut self) -> SchemaProgramId {
         let id = SchemaProgramId::new(self.schema_programs.len());
         self.schema_programs.push(None);
@@ -3253,6 +3257,144 @@ mod tests {
             .as_ref()
             .expect("joined query has FROM");
         assert_eq!(from.joins[0].kind, JoinKind::Inner);
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn table_function_arguments_bind_against_the_complete_from_scope() {
+        let schema = schema_with_items();
+        for sql in [
+            "SELECT j.value FROM items JOIN json_each(items.value) AS j",
+            "SELECT j.value FROM json_each(items.value) AS j JOIN items",
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .expect("table-function arguments can use any FROM source");
+            document
+                .validate()
+                .expect("table functions produce closed HIR");
+
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let block = &document.query(root.query).expect("query exists").blocks[0];
+            let from = block.from.as_ref().expect("query has FROM");
+            let source_ids = [from.first, from.joins[0].right];
+            let function_id = source_ids
+                .into_iter()
+                .find(|source| {
+                    matches!(
+                        document.source(*source).expect("source exists").kind,
+                        SourceKind::TableFunction { .. }
+                    )
+                })
+                .expect("FROM contains table function");
+            let items_id = source_ids
+                .into_iter()
+                .find(|source| *source != function_id)
+                .expect("FROM contains items table");
+            let source = document
+                .source(function_id)
+                .expect("function source exists");
+            let SourceKind::TableFunction { table, arguments } = &source.kind else {
+                panic!("json_each is a table-function source");
+            };
+            assert_eq!(table.value().get_name(), "json_each");
+            assert_eq!(arguments.len(), 1);
+            assert!(matches!(
+                arguments[0],
+                Expr::Column(reference)
+                    if reference.source == items_id && reference.column == 1
+            ));
+        }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn table_function_arguments_contribute_query_captures() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (SELECT j.value FROM json_each(items.value) AS j LIMIT 1) FROM items",
+        )
+        .expect("table-function argument can capture an outer source");
+        document
+            .validate()
+            .expect("captured table-function argument produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("output contains scalar query");
+        };
+        let inner = document.query(*query).expect("inner query exists");
+        assert_eq!(inner.captures, vec![outer_source]);
+        let function_source = inner.blocks[0]
+            .from
+            .as_ref()
+            .expect("inner query has FROM")
+            .first;
+        let SourceKind::TableFunction { arguments, .. } = &document
+            .source(function_source)
+            .expect("source exists")
+            .kind
+        else {
+            panic!("inner source is a table function");
+        };
+        assert!(matches!(
+            arguments.as_slice(),
+            [Expr::Column(reference)]
+                if reference.source == outer_source && reference.column == 1
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn table_function_calls_keep_source_diagnostics() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM items(1)",
+                "Parse error: 'items' is not a function",
+            ),
+            (
+                "SELECT * FROM json_each(1, 2, 3)",
+                "Parse error: Too many arguments for json_each: expected at most 2, got 3",
+            ),
+            (
+                "WITH c(value) AS (VALUES (1)) SELECT * FROM c(1)",
+                "Parse error: 'c' is not a function",
+            ),
+            (
+                "SELECT * FROM json_each(sum(items.value)) JOIN items",
+                "Parse error: misuse of aggregate function sum()",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call fails");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM items()")
+            .expect("zero-argument call syntax keeps plain-table behavior");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let source = document.query(root.query).expect("query exists").blocks[0]
+            .from
+            .as_ref()
+            .expect("query has FROM")
+            .first;
+        assert!(matches!(
+            document.source(source).expect("source exists").kind,
+            SourceKind::Table(_)
+        ));
     }
 
     #[test]
