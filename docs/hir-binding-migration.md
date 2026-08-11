@@ -110,6 +110,9 @@ Completed:
   negation, child query, and one frozen comparison rule per column in HIR.
   Correlated right sides capture outer sources, and row-width errors keep the
   existing diagnostic.
+- `IN table` and `IN table(arguments)` normalize to the same membership-query
+  HIR. The generated query selects visible source columns from a resolved
+  table, CTE, or table function; arguments and CTE bodies keep exact captures.
 - WHERE expressions become query-block filters. Source columns win over result
   aliases, aliases remain stable `OutputId` references, correlated subqueries
   keep their captures, and aggregate or window calls retain their existing

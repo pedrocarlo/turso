@@ -90,7 +90,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.context
     }
 
-    fn reserve_query(&mut self) -> QueryId {
+    pub(super) fn reserve_query(&mut self) -> QueryId {
         let id = QueryId::new(self.queries.len());
         self.queries.push(None);
         id
@@ -189,7 +189,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         id
     }
 
-    fn insert_query(&mut self, id: QueryId, query: Query) -> Result<()> {
+    pub(super) fn insert_query(&mut self, id: QueryId, query: Query) -> Result<()> {
         if query.id != id {
             return Err(LimboError::InternalError(format!(
                 "query {} was inserted into slot {}",
@@ -399,7 +399,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(query_id)
     }
 
-    fn direct_ctes(&self, blocks: &[QueryBlock]) -> Result<Vec<CteId>> {
+    pub(super) fn direct_ctes(&self, blocks: &[QueryBlock]) -> Result<Vec<CteId>> {
         let mut ctes = Vec::new();
         for block in blocks {
             let Some(from) = &block.from else {
@@ -897,7 +897,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 }
 
-fn output_from_resolved(
+pub(super) fn output_from_resolved(
     id: OutputId,
     name: String,
     name_kind: OutputNameKind,
@@ -2506,6 +2506,150 @@ mod tests {
                 .captures,
             vec![outer_source]
         );
+    }
+
+    #[test]
+    fn in_named_relations_reuse_query_membership_hir() {
+        let mut schema = schema_with_items();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE candidates(value TEXT COLLATE RTRIM)", 3)
+                    .expect("fixed membership table schema parses"),
+            ))
+            .expect("fixed membership table name is unique");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH c(value) AS (VALUES ('cte')) \
+             SELECT outer_items.value IN candidates, \
+                    outer_items.value NOT IN c \
+             FROM items AS outer_items",
+        )
+        .expect("named relations bind as membership queries");
+        document
+            .validate()
+            .expect("named relation membership produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        assert_eq!(outer.blocks[0].outputs.len(), 2);
+        for (index, expected_negated) in [false, true].into_iter().enumerate() {
+            let output = &outer.blocks[0].outputs[index];
+            assert_eq!(output.type_fact, TypeFact::known(Type::Integer));
+            let Expr::Subquery(SubqueryExpr::In {
+                query,
+                negated,
+                comparison,
+                ..
+            }) = &output.expr
+            else {
+                panic!("named relation uses IN-query HIR");
+            };
+            assert_eq!(*negated, expected_negated);
+            assert_eq!(comparison.components.len(), 1);
+            assert_eq!(
+                comparison.components[0]
+                    .collation
+                    .as_ref()
+                    .expect("left declared collation reaches membership comparison")
+                    .value(),
+                &crate::translate::collate::CollationSeq::NoCase
+            );
+
+            let relation = document.query(*query).expect("relation query exists");
+            assert_eq!(relation.parent, Some(outer.id));
+            assert!(relation.captures.is_empty());
+            assert_eq!(relation.output.len(), 1);
+            let block = &relation.blocks[0];
+            let source = block.from.as_ref().expect("relation query has FROM").first;
+            assert!(matches!(
+                block.outputs[0].expr,
+                Expr::Column(reference)
+                    if reference.source == source && reference.column == 0
+            ));
+            match (&document.source(source).expect("source exists").kind, index) {
+                (SourceKind::Table(table), 0) => {
+                    assert_eq!(table.value().get_name(), "candidates");
+                }
+                (SourceKind::Cte(cte), 1) => {
+                    assert_eq!(relation.reachable_ctes, vec![*cte]);
+                }
+                _ => panic!("named relation keeps resolved source kind"),
+            }
+        }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn in_table_function_arguments_become_relation_query_captures() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (NULL, items.value, NULL, NULL, NULL, NULL, NULL, NULL) \
+                    IN json_each(json_array(items.value)) \
+             FROM items",
+        )
+        .expect("row membership matches json_each visible width");
+        document
+            .validate()
+            .expect("table-function membership produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outer_source = outer.blocks[0]
+            .from
+            .as_ref()
+            .expect("outer query has FROM")
+            .first;
+        let Expr::Subquery(SubqueryExpr::In {
+            lhs,
+            query,
+            comparison,
+            ..
+        }) = &outer.blocks[0].outputs[0].expr
+        else {
+            panic!("table function uses IN-query HIR");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 8));
+        assert_eq!(comparison.components.len(), 8);
+
+        let relation = document.query(*query).expect("relation query exists");
+        assert_eq!(relation.captures, vec![outer_source]);
+        assert_eq!(relation.output.len(), 8);
+        let source = relation.blocks[0]
+            .from
+            .as_ref()
+            .expect("relation query has FROM")
+            .first;
+        let SourceKind::TableFunction { table, arguments } =
+            &document.source(source).expect("source exists").kind
+        else {
+            panic!("relation source is table function");
+        };
+        assert_eq!(table.value().get_name(), "json_each");
+        assert_eq!(arguments.len(), 1);
+    }
+
+    #[test]
+    fn in_named_relations_keep_source_and_width_errors() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            ("SELECT 1 IN missing", "Parse error: no such table: missing"),
+            (
+                "SELECT 1 IN items(2)",
+                "Parse error: 'items' is not a function",
+            ),
+            (
+                "SELECT 1 IN items",
+                "Parse error: sub-select returns 3 columns - expected 1",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid IN table fails");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
     }
 
     #[test]
