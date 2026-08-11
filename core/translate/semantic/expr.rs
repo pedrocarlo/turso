@@ -27,6 +27,7 @@ pub(crate) struct ExprPolicy {
     aggregates: AggregatePolicy,
     allow_windows: bool,
     raise: RaisePolicy,
+    self_source: Option<hir::SourceId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +51,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::Allow,
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -60,6 +62,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -70,6 +73,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -80,6 +84,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::Allow,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -94,6 +99,7 @@ impl ExprPolicy {
             },
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -104,6 +110,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -114,6 +121,7 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
     }
 
@@ -129,7 +137,13 @@ impl ExprPolicy {
             aggregates: AggregatePolicy::RejectFunction,
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
+            self_source: None,
         }
+    }
+
+    pub(super) const fn with_self_source(mut self, source: hir::SourceId) -> Self {
+        self.self_source = Some(source);
+        self
     }
 }
 
@@ -1199,6 +1213,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 };
                 self.resolve_atomic_expr(resolved.expr, scope)
             }
+            ast::Expr::Column { table, column, .. } if table.is_self_table() => {
+                expect_no_expr_children(children)?;
+                let source = policy.self_source.ok_or_else(|| {
+                    LimboError::InternalError(
+                        "SELF_TABLE column appeared outside a stored schema expression".to_string(),
+                    )
+                })?;
+                self.resolve_atomic_expr(hir::Expr::column(source, *column), scope)
+            }
+            ast::Expr::RowId { table, .. } if table.is_self_table() => {
+                expect_no_expr_children(children)?;
+                let source = policy.self_source.ok_or_else(|| {
+                    LimboError::InternalError(
+                        "SELF_TABLE rowid appeared outside a stored schema expression".to_string(),
+                    )
+                })?;
+                self.resolve_atomic_expr(hir::Expr::rowid(source), scope)
+            }
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 let [inner] = expect_expr_children(children)?;
                 Ok(inner)
@@ -2061,14 +2093,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         reference.source, reference.column
                     ))
                 })?;
-                for state in [
-                    &source.generated_expressions[reference.column],
-                    &source.default_expressions[reference.column],
-                ] {
-                    if matches!(state, hir::ColumnReadExpression::NotRequired) {
-                        return super::analyze::unsupported_select();
-                    }
-                }
                 Ok(ResolvedScopeExpr {
                     expr: hir::Expr::Column(reference),
                     type_fact: column.type_fact.clone(),
