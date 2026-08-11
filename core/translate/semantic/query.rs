@@ -7,6 +7,7 @@ use super::{
     cte::{CteBindingContext, CteResolution},
     expr::{build_using_column, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
+    schema_program::TypeTransform,
     scope::{resolve_source_column, Scope},
 };
 use crate::{schema::Table, sync::Arc, Result};
@@ -14,6 +15,11 @@ use crate::{schema::Table, sync::Arc, Result};
 struct AnalyzedTableSource<'ast> {
     id: hir::SourceId,
     function_arguments: Option<&'ast [Box<ast::Expr>]>,
+}
+
+struct AnalyzedSourceColumn {
+    column: hir::SourceColumn,
+    programs: Option<hir::BoundColumnTypePrograms>,
 }
 
 #[derive(Clone, Copy)]
@@ -524,7 +530,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let table_id =
             self.catalog_object_id(Some(database), CatalogObjectKind::Table, table_name.clone());
         let table = CatalogObject::new(table_id, self.context().snapshot(), Some(database), table);
-        let columns = self.source_columns(&table)?;
+        let analyzed_columns = self.source_columns(&table)?;
+        let mut columns = Vec::with_capacity(analyzed_columns.len());
+        let mut column_type_programs = Vec::with_capacity(analyzed_columns.len());
+        for analyzed in analyzed_columns {
+            columns.push(analyzed.column);
+            column_type_programs.push(analyzed.programs);
+        }
         let generated_expressions = table
             .value()
             .columns()
@@ -587,7 +599,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 columns,
                 generated_expressions,
                 default_expressions,
-                column_type_programs: vec![None; table.value().columns().len()],
+                column_type_programs,
                 check_constraints: None,
                 rowid_available: table_has_rowid(table.value()),
                 index_hint,
@@ -599,44 +611,91 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(source)
     }
 
-    fn source_columns(&mut self, table: &hir::ResolvedTable) -> Result<Vec<hir::SourceColumn>> {
+    fn source_columns(&mut self, table: &hir::ResolvedTable) -> Result<Vec<AnalyzedSourceColumn>> {
         let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
-            if self
+            let resolved_type = self
                 .context()
                 .main_schema()
-                .get_type_def(&column.ty_str, is_strict)
-                .is_some()
-            {
-                return super::analyze::unsupported_select();
-            }
-            let type_fact = if column.ty_str.is_empty() {
-                TypeFact::known(column.ty())
-            } else {
-                TypeFact::declared(DeclaredType {
-                    name: column.ty_str.clone(),
-                    storage: column.ty(),
-                    custom_chain: Vec::new(),
-                    array_dimensions: column.array_dimensions(),
-                })
+                .resolve_type(&column.ty_str, is_strict)?;
+            let (type_fact, programs) = match resolved_type {
+                Some(resolved) => {
+                    let (type_fact, _) =
+                        self.freeze_type_fact(&column.ty_str, resolved, column.array_dimensions());
+                    let arguments = column
+                        .ty_params
+                        .iter()
+                        .map(|argument| {
+                            self.analyze_resolved_expr(
+                                argument,
+                                &Scope::default(),
+                                ExprPolicy::schema_expression(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let chain = &type_fact
+                        .declared
+                        .as_ref()
+                        .expect("resolved custom column has a declaration")
+                        .custom_chain;
+                    let mut encode = Vec::new();
+                    for definition in chain {
+                        if let Some(call) =
+                            self.bind_type_transform(definition, &arguments, TypeTransform::Encode)?
+                        {
+                            encode.push(call);
+                        }
+                    }
+                    let mut decode = Vec::new();
+                    for definition in chain.iter().rev() {
+                        if let Some(call) =
+                            self.bind_type_transform(definition, &arguments, TypeTransform::Decode)?
+                        {
+                            decode.push(call);
+                        }
+                    }
+                    let encode_nulls = column.array_dimensions() == 0
+                        && chain.iter().any(|definition| definition.value().not_null);
+                    (
+                        type_fact,
+                        Some(hir::BoundColumnTypePrograms {
+                            encode,
+                            decode,
+                            encode_nulls,
+                        }),
+                    )
+                }
+                None if column.ty_str.is_empty() => (TypeFact::known(column.ty()), None),
+                None => (
+                    TypeFact::declared(DeclaredType {
+                        name: column.ty_str.clone(),
+                        storage: column.ty(),
+                        custom_chain: Vec::new(),
+                        array_dimensions: column.array_dimensions(),
+                    }),
+                    None,
+                ),
             };
             let collation = column.collation_opt().map(|collation| {
                 let name = collation.to_string();
                 let id = self.catalog_object_id(None, CatalogObjectKind::Collation, name);
                 CatalogObject::new(id, self.context().snapshot(), None, Arc::new(collation))
             });
-            columns.push(hir::SourceColumn {
-                name: column
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("column{}", index + 1)),
-                type_fact,
-                affinity: column.affinity_with_strict(is_strict),
-                has_affinity: true,
-                collation,
-                hidden: column.hidden(),
-                rowid_alias: column.is_rowid_alias(),
+            columns.push(AnalyzedSourceColumn {
+                column: hir::SourceColumn {
+                    name: column
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("column{}", index + 1)),
+                    type_fact,
+                    affinity: column.affinity_with_strict(is_strict),
+                    has_affinity: true,
+                    collation,
+                    hidden: column.hidden(),
+                    rowid_alias: column.is_rowid_alias(),
+                },
+                programs,
             });
         }
         Ok(columns)

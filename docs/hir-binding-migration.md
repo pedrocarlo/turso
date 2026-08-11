@@ -151,12 +151,13 @@ Completed:
 - `INDEXED BY` resolves to a snapshot-bound index identity on the source, while
   `NOT INDEXED` remains an explicit source hint. Missing and wrong-table indexes
   fail during analysis.
+- Custom-type table columns keep their resolved type chain and declaration
+  parameters in HIR. Encode programs follow leaf-to-base order, decode programs
+  reverse it, and custom arrays reuse element `TypeFact` without separate array
+  storage metadata.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.
-
-Custom-type table columns, including custom array element programs, remain
-separate from built-in array columns.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.

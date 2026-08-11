@@ -1290,6 +1290,35 @@ mod tests {
         schema
     }
 
+    fn schema_with_custom_columns() -> Schema {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TYPE scaled(value INTEGER, factor INTEGER) BASE INTEGER \
+             ENCODE value * factor DECODE value / factor",
+            "CREATE TYPE shifted(value INTEGER) BASE INTEGER \
+             ENCODE value + 1 DECODE value - 1",
+            "CREATE DOMAIN wrapped AS shifted NOT NULL",
+        ] {
+            schema
+                .add_type_from_sql(sql)
+                .expect("custom type definition parses");
+        }
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE typed_values(\
+                scalar scaled(4), nested wrapped, array_values scaled(5)[]\
+             ) STRICT",
+            2,
+        )
+        .expect("custom column table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("custom column table name is unique");
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("custom column affinities resolve");
+        schema
+    }
+
     fn schema_with_sequence(name: &str) -> Schema {
         let mut schema = Schema::new();
         let normalized = crate::util::normalize_ident(name);
@@ -3926,6 +3955,150 @@ mod tests {
                     if reference.source == source_id && reference.column == column
             )
         }));
+    }
+
+    #[test]
+    fn custom_table_columns_keep_type_facts_and_transform_programs() {
+        let schema = schema_with_custom_columns();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT scalar, nested, array_values FROM typed_values",
+        )
+        .expect("custom table columns bind");
+        document
+            .validate()
+            .expect("custom table columns produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("custom table source exists");
+
+        let scalar = &source.columns[0].type_fact;
+        assert_eq!(scalar.storage, Some(Type::Integer));
+        assert_eq!(scalar.array_dimensions, 0);
+        let scalar_chain = &scalar
+            .declared
+            .as_ref()
+            .expect("custom scalar keeps its declaration")
+            .custom_chain;
+        assert_eq!(scalar_chain.len(), 1);
+        assert_eq!(scalar_chain[0].value().name, "scaled");
+        assert_eq!(scalar_chain[0].snapshot(), document.snapshot);
+        let scalar_programs = source.column_type_programs[0]
+            .as_ref()
+            .expect("custom scalar has transform programs");
+        assert_eq!(scalar_programs.encode.len(), 1);
+        assert_eq!(scalar_programs.decode.len(), 1);
+        assert!(!scalar_programs.encode_nulls);
+        for call in scalar_programs.encode.iter().chain(&scalar_programs.decode) {
+            assert!(matches!(
+                call.arguments.as_slice(),
+                [Expr::Literal(ast::Literal::Numeric(value))] if value == "4"
+            ));
+        }
+
+        let nested = &source.columns[1].type_fact;
+        let nested_chain = &nested
+            .declared
+            .as_ref()
+            .expect("custom chain keeps its declaration")
+            .custom_chain;
+        assert_eq!(
+            nested_chain
+                .iter()
+                .map(|definition| definition.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["wrapped", "shifted"]
+        );
+        let nested_programs = source.column_type_programs[1]
+            .as_ref()
+            .expect("custom chain has transform programs");
+        assert!(nested_programs.encode_nulls);
+        let operators = nested_programs
+            .encode
+            .iter()
+            .chain(&nested_programs.decode)
+            .map(|call| {
+                let program = document
+                    .schema_program(call.program)
+                    .expect("transform program exists");
+                let Expr::Binary { operator, .. } = program.body else {
+                    panic!("fixed transform is binary");
+                };
+                operator
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operators, [ast::Operator::Add, ast::Operator::Subtract]);
+
+        let array = &source.columns[2].type_fact;
+        assert_eq!(array.storage, Some(Type::Blob));
+        assert_eq!(array.array_dimensions, 1);
+        let element = array
+            .array_element()
+            .expect("custom array has element facts");
+        assert_eq!(element.storage, Some(Type::Integer));
+        assert_eq!(element.array_dimensions, 0);
+        assert_eq!(
+            element
+                .declared
+                .as_ref()
+                .and_then(|declared| declared.custom())
+                .map(|definition| definition.value().name.as_str()),
+            Some("scaled")
+        );
+        let array_programs = source.column_type_programs[2]
+            .as_ref()
+            .expect("custom array has element transform programs");
+        assert!(!array_programs.encode_nulls);
+        assert!(matches!(
+            array_programs.encode[0].arguments.as_slice(),
+            [Expr::Literal(ast::Literal::Numeric(value))] if value == "5"
+        ));
+
+        assert!(block
+            .outputs
+            .iter()
+            .zip(&source.columns)
+            .all(|(output, column)| output.type_fact == column.type_fact));
+    }
+
+    #[test]
+    fn custom_type_facts_cross_query_boundaries_without_redecoding() {
+        let schema = schema_with_custom_columns();
+        for sql in [
+            "WITH selected AS (SELECT scalar FROM typed_values) \
+             SELECT scalar FROM selected",
+            "SELECT scalar FROM (SELECT scalar FROM typed_values) AS selected",
+        ] {
+            let document = analyze_sql_with_schema(&schema, sql)
+                .expect("custom type crosses a query boundary");
+            document
+                .validate()
+                .expect("query output does not decode a custom value twice");
+
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let block = &document.query(root.query).expect("query exists").blocks[0];
+            let source = document
+                .source(block.from.as_ref().expect("query has FROM").first)
+                .expect("outer source exists");
+            assert!(source.column_type_programs[0].is_none());
+            assert_eq!(
+                source.columns[0]
+                    .type_fact
+                    .declared
+                    .as_ref()
+                    .and_then(|declared| declared.custom())
+                    .map(|definition| definition.value().name.as_str()),
+                Some("scaled")
+            );
+            assert_eq!(block.outputs[0].type_fact, source.columns[0].type_fact);
+        }
     }
 
     #[test]
