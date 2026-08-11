@@ -107,6 +107,16 @@ impl ExprPolicy {
         }
     }
 
+    pub(crate) const fn table_function(dqs_dml: DoubleQuotedDml) -> Self {
+        Self {
+            precedence: NamePrecedence::SourcesOnly,
+            allow_dqs_fallback: dqs_dml.is_enabled(),
+            aggregates: AggregatePolicy::RejectFunction,
+            allow_windows: false,
+            raise: RaisePolicy::AbortOnly,
+        }
+    }
+
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
         self

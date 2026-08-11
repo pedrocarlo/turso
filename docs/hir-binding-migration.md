@@ -79,6 +79,10 @@ Completed:
   ordinary scalar call because it only reads connection state.
 - Basic joins. Comma, plain, inner, and cross joins preserve source order and
   bind `ON` expressions against the complete FROM scope.
+- Table-valued functions become `SourceKind::TableFunction` sources with a
+  resolved catalog table and bound HIR arguments. Arguments use the complete
+  FROM scope, including forward references, while aggregate/window calls and
+  excess hidden-column arguments keep their binding-time errors.
 - `USING` and `NATURAL` joins resolve both column expressions once, freeze
   comparison rules in HIR, and expose one merged unqualified column while
   keeping qualified columns available.

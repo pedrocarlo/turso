@@ -1003,6 +1003,23 @@ impl<'document> HirValidator<'document> {
             SourceKind::Pseudo { table, .. } => self.visit_source_table(source, table, false)?,
             SourceKind::TableFunction { table, arguments } => {
                 self.visit_source_table(source, table, false)?;
+                self.require(
+                    table.value().virtual_table().is_some(),
+                    format!("table-function source {id} does not resolve to a virtual table"),
+                )?;
+                let maximum = table
+                    .value()
+                    .columns()
+                    .iter()
+                    .filter(|column| column.hidden())
+                    .count();
+                self.require(
+                    arguments.len() <= maximum,
+                    format!(
+                        "table-function source {id} has {} arguments but accepts at most {maximum}",
+                        arguments.len()
+                    ),
+                )?;
                 self.visit_exprs(arguments)?;
             }
             SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
