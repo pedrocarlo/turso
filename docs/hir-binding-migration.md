@@ -181,6 +181,9 @@ Completed:
   expression, and partial index in catalog order. Stable catalog identities
   and `IndexCoverage::Complete` make the required write metadata explicit.
   Trigger, foreign-key, and AUTOINCREMENT targets remain later checkpoints.
+- Plain `INSERT ... SELECT` sources retain their query identity and complete
+  SELECT HIR. Destination width is checked during analysis, and nested query
+  captures remain attached to the source query tree.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.

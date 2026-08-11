@@ -1545,6 +1545,16 @@ mod tests {
         schema
     }
 
+    fn schema_with_insert_source() -> Schema {
+        let mut schema = schema_with_writable_table();
+        let table = BTreeTable::from_sql("CREATE TABLE insert_source(id INTEGER, value TEXT)", 3)
+            .expect("INSERT source table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("INSERT source table name is unique");
+        schema
+    }
+
     fn schema_with_array_columns() -> Schema {
         let mut schema = Schema::new();
         let table = BTreeTable::from_sql(
@@ -4829,6 +4839,41 @@ mod tests {
     }
 
     #[test]
+    fn insert_select_keeps_query_hir_and_correlated_subquery_captures() {
+        let schema = schema_with_insert_source();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(value, id) \
+             SELECT value, (SELECT id) FROM insert_source",
+        )
+        .expect("INSERT SELECT binds");
+        document
+            .validate()
+            .expect("INSERT SELECT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Query(query_id) = insert.source else {
+            panic!("SELECT source keeps its query identity");
+        };
+        let query = document.query(query_id).expect("INSERT query exists");
+        assert!(query.parent.is_none());
+        assert!(query.captures.is_empty());
+        assert_eq!(query.output.len(), 2);
+        let block = &query.blocks[0];
+        let input = block.from.as_ref().expect("SELECT has FROM").first;
+        let Expr::Subquery(SubqueryExpr::Scalar { query: inner, .. }) = &block.outputs[1].expr
+        else {
+            panic!("second output remains a scalar subquery");
+        };
+        assert_eq!(
+            document.query(*inner).expect("inner query exists").captures,
+            [input]
+        );
+    }
+
+    #[test]
     fn insert_defaults_and_duplicate_targets_keep_write_selection_rules() {
         let schema = schema_with_writable_table();
         let explicit_default =
@@ -4907,6 +4952,10 @@ mod tests {
             (
                 "INSERT INTO writable(value) VALUES (absent)",
                 "Parse error: no such column: absent",
+            ),
+            (
+                "INSERT INTO writable SELECT 1",
+                "Parse error: table writable has 2 columns but 1 values were supplied",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid INSERT fails");
