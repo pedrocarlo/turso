@@ -68,6 +68,132 @@ impl Query {
         captures.sort_unstable();
         captures
     }
+
+    /// Return every table column read directly by this query. Nested queries
+    /// own their reads and are visited separately by the analyzer.
+    pub(crate) fn direct_column_reads<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+    ) -> Vec<ColumnRef> {
+        let mut reads = HashSet::default();
+        for block in &self.blocks {
+            if let Some(from) = &block.from {
+                collect_from_column_reads(from, &mut reads, source_by_id);
+            }
+            for output in &block.outputs {
+                collect_expr_column_reads(&output.expr, &mut reads);
+            }
+            match &block.body {
+                QueryBlockBody::Select {
+                    filter, grouping, ..
+                } => {
+                    collect_optional_expr_column_reads(filter.as_ref(), &mut reads);
+                    if let Some(grouping) = grouping {
+                        collect_exprs_column_reads(&grouping.keys, &mut reads);
+                        collect_optional_expr_column_reads(grouping.having.as_ref(), &mut reads);
+                    }
+                }
+                QueryBlockBody::Values { rows } => {
+                    for row in rows {
+                        collect_exprs_column_reads(row, &mut reads);
+                    }
+                }
+            }
+            for window in &block.windows {
+                collect_window_column_reads(window, &mut reads);
+            }
+        }
+        collect_order_column_reads(&self.order_by, &mut reads);
+        if let Some(limit) = &self.limit {
+            collect_expr_column_reads(&limit.limit, &mut reads);
+            collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
+        }
+
+        let mut reads = reads.into_iter().collect::<Vec<_>>();
+        reads.sort_unstable_by_key(|read| (read.source.index(), read.column));
+        reads
+    }
+}
+
+fn collect_from_column_reads<'source>(
+    from: &From,
+    reads: &mut HashSet<ColumnRef>,
+    source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+) {
+    collect_source_argument_column_reads(from.first, reads, source_by_id);
+    for join in &from.joins {
+        collect_source_argument_column_reads(join.right, reads, source_by_id);
+        match &join.constraint {
+            JoinConstraint::None => {}
+            JoinConstraint::On(expression) => collect_expr_column_reads(expression, reads),
+            JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                for column in columns {
+                    collect_expr_column_reads(&column.left, reads);
+                    reads.insert(column.right);
+                }
+            }
+        }
+    }
+}
+
+fn collect_source_argument_column_reads<'source>(
+    id: SourceId,
+    reads: &mut HashSet<ColumnRef>,
+    source_by_id: impl Fn(SourceId) -> Option<&'source Source>,
+) {
+    let Some(source) = source_by_id(id) else {
+        return;
+    };
+    if let SourceKind::TableFunction { arguments, .. } = &source.kind {
+        collect_exprs_column_reads(arguments, reads);
+    }
+}
+
+fn collect_expr_column_reads(expression: &Expr, reads: &mut HashSet<ColumnRef>) {
+    expression.walk(&mut |expression| match expression {
+        Expr::Column(reference) => {
+            reads.insert(*reference);
+        }
+        Expr::MergedColumn(column) => {
+            reads.insert(column.right);
+        }
+        _ => {}
+    });
+}
+
+fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut HashSet<ColumnRef>) {
+    for expression in expressions {
+        collect_expr_column_reads(expression, reads);
+    }
+}
+
+fn collect_optional_expr_column_reads(expression: Option<&Expr>, reads: &mut HashSet<ColumnRef>) {
+    if let Some(expression) = expression {
+        collect_expr_column_reads(expression, reads);
+    }
+}
+
+fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut HashSet<ColumnRef>) {
+    for term in terms {
+        collect_expr_column_reads(&term.expr, reads);
+    }
+}
+
+fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut HashSet<ColumnRef>) {
+    collect_exprs_column_reads(&window.partition_by, reads);
+    collect_order_column_reads(&window.order_by, reads);
+    let frame = &window.frame;
+    collect_window_bound_column_reads(&frame.start, reads);
+    if let Some(end) = &frame.end {
+        collect_window_bound_column_reads(end, reads);
+    }
+}
+
+fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut HashSet<ColumnRef>) {
+    if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
+    {
+        collect_expr_column_reads(expression, reads);
+    }
 }
 
 fn collect_from_references<'source>(

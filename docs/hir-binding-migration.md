@@ -155,6 +155,10 @@ Completed:
   parameters in HIR. Encode programs follow leaf-to-base order, decode programs
   reverse it, and custom arrays reuse element `TypeFact` without separate array
   storage metadata.
+- Referenced virtual generated columns and short-record defaults become
+  source-owned HIR expressions. A final required-column worklist follows
+  generated-column dependencies transitively, while unused stored expressions
+  remain `NotRequired`.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.

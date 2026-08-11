@@ -10,10 +10,11 @@ use super::{
     context::SemanticContext,
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
-        BoundSchemaProgram, CatalogObjectId, CompoundArm, Cte, CteId, DatabaseId, DatabaseSnapshot,
-        Expr, FunctionEvaluation, HirDocument, HirRoot, Limit, OrderTerm, Output, OutputId,
-        OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
-        QueryRoot, SchemaProgramId, Source, SourceId, TypeFact,
+        BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, CompoundArm, Cte, CteId,
+        DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot, Limit,
+        OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
+        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId,
+        SourceKind, TypeFact,
     },
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
     AnalyzeInput,
@@ -38,6 +39,7 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             ));
         }
     };
+    analyzer.finish_column_reads()?;
     let document = analyzer.finish(root)?;
     document.validate().map_err(|error| {
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
@@ -252,6 +254,116 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             schema_programs: Self::finish_arena(self.schema_programs, "schema program")?,
             cdc: None,
         })
+    }
+
+    fn finish_column_reads(&mut self) -> Result<()> {
+        let mut pending = Vec::new();
+        for query in self.queries.iter().flatten() {
+            pending.extend(query.direct_column_reads(|source| self.source(source)));
+        }
+        let mut finished = HashSet::default();
+
+        while let Some(reference) = pending.pop() {
+            if !finished.insert(reference) {
+                continue;
+            }
+            let (scope, generated_syntax, default_syntax) = {
+                let source = self.source(reference.source).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing source {} while planning stored column expressions",
+                        reference.source
+                    ))
+                })?;
+                source.columns.get(reference.column).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing column {}.{} while planning stored column expressions",
+                        reference.source, reference.column
+                    ))
+                })?;
+                let catalog_table = match &source.kind {
+                    SourceKind::Table(table) | SourceKind::TableFunction { table, .. } => {
+                        table.value()
+                    }
+                    _ => continue,
+                };
+                let catalog_column =
+                    catalog_table
+                        .columns()
+                        .get(reference.column)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "catalog column {}.{} is missing",
+                                reference.source, reference.column
+                            ))
+                        })?;
+                let generated_syntax = match &source.generated_expressions[reference.column] {
+                    ColumnReadExpression::NotRequired => Some(
+                        catalog_column
+                            .generated_expr()
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "source {} column {} requires a missing generated expression",
+                                    reference.source, reference.column
+                                ))
+                            })?
+                            .clone(),
+                    ),
+                    ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
+                };
+                let default_syntax = match &source.default_expressions[reference.column] {
+                    ColumnReadExpression::NotRequired => Some(
+                        catalog_column
+                            .default
+                            .as_deref()
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "source {} column {} requires a missing default expression",
+                                    reference.source, reference.column
+                                ))
+                            })?
+                            .clone(),
+                    ),
+                    ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
+                };
+                let mut scope = Scope::default();
+                scope.add_source(source, true);
+                (scope, generated_syntax, default_syntax)
+            };
+
+            let policy = ExprPolicy::schema_expression().with_self_source(reference.source);
+            let generated = generated_syntax
+                .as_ref()
+                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .transpose()?;
+            let default = default_syntax
+                .as_ref()
+                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .transpose()?;
+
+            for expression in generated.iter().chain(default.iter()) {
+                expression.walk(&mut |expression| match expression {
+                    Expr::Column(dependency) => pending.push(*dependency),
+                    Expr::MergedColumn(column) => pending.push(column.right),
+                    _ => {}
+                });
+            }
+
+            let source = self.source_mut(reference.source).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "missing source {} after planning stored column expressions",
+                    reference.source
+                ))
+            })?;
+            if let Some(expression) = generated {
+                source.generated_expressions[reference.column] =
+                    ColumnReadExpression::Planned(expression);
+            }
+            if let Some(expression) = default {
+                source.default_expressions[reference.column] =
+                    ColumnReadExpression::Planned(expression);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
@@ -1319,6 +1431,24 @@ mod tests {
         schema
     }
 
+    fn schema_with_stored_column_expressions() -> Schema {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE calculated(\
+                base INTEGER DEFAULT 7,\
+                doubled INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL,\
+                combined INTEGER GENERATED ALWAYS AS (doubled + base) VIRTUAL,\
+                unused INTEGER DEFAULT 11\
+             )",
+            2,
+        )
+        .expect("stored column expressions parse");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("stored-expression table name is unique");
+        schema
+    }
+
     fn schema_with_sequence(name: &str) -> Schema {
         let mut schema = Schema::new();
         let normalized = crate::util::normalize_ident(name);
@@ -1487,6 +1617,92 @@ mod tests {
         ));
         assert!(matches!(&block.outputs[3].expr, Expr::RowId(id) if *id == source.id));
         assert_eq!(block.outputs[3].type_fact.storage, Some(Type::Integer));
+    }
+
+    #[test]
+    fn referenced_stored_column_expressions_are_planned_transitively() {
+        let schema = schema_with_stored_column_expressions();
+        let document = analyze_sql_with_schema(&schema, "SELECT combined FROM calculated")
+            .expect("generated-column dependencies bind");
+        document
+            .validate()
+            .expect("stored expressions produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("source exists");
+
+        let ColumnReadExpression::Planned(base_default) = &source.default_expressions[0] else {
+            panic!("transitive base dependency plans its read-time default");
+        };
+        assert!(matches!(
+            base_default,
+            Expr::Literal(ast::Literal::Numeric(value)) if value == "7"
+        ));
+
+        let ColumnReadExpression::Planned(doubled) = &source.generated_expressions[1] else {
+            panic!("generated dependency is planned");
+        };
+        assert!(matches!(
+            doubled,
+            Expr::Binary { lhs, .. }
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == source.id && column.column == 0)
+        ));
+
+        let ColumnReadExpression::Planned(combined) = &source.generated_expressions[2] else {
+            panic!("directly read generated column is planned");
+        };
+        assert!(matches!(
+            combined,
+            Expr::Binary { lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == source.id && column.column == 1)
+                && matches!(rhs.as_ref(), Expr::Column(column)
+                    if column.source == source.id && column.column == 0)
+        ));
+        assert!(matches!(
+            &source.default_expressions[3],
+            ColumnReadExpression::NotRequired
+        ));
+    }
+
+    #[test]
+    fn unused_stored_column_expressions_remain_not_required() {
+        let schema = schema_with_stored_column_expressions();
+        let document = analyze_sql_with_schema(&schema, "SELECT 1 FROM calculated")
+            .expect("unused stored expressions do not need binding");
+        document
+            .validate()
+            .expect("unused stored expressions remain valid HIR state");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("source exists");
+        assert!(matches!(
+            &source.default_expressions[0],
+            ColumnReadExpression::NotRequired
+        ));
+        assert!(matches!(
+            &source.generated_expressions[1],
+            ColumnReadExpression::NotRequired
+        ));
+        assert!(matches!(
+            &source.generated_expressions[2],
+            ColumnReadExpression::NotRequired
+        ));
+        assert!(matches!(
+            &source.default_expressions[3],
+            ColumnReadExpression::NotRequired
+        ));
     }
 
     #[test]
