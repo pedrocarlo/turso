@@ -15,14 +15,14 @@ use crate::{
     LimboError, Result,
 };
 
-impl Analyzer<'_, '_, '_> {
+impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_insert(
         &mut self,
         with: Option<&ast::With>,
         conflict: Option<ast::ResolveType>,
         table_name: &ast::QualifiedName,
         column_names: &[ast::Name],
-        body: &ast::InsertBody,
+        body: &'ast ast::InsertBody,
         returning: &[ast::ResultColumn],
     ) -> Result<HirRoot> {
         if with.is_some() {
@@ -64,33 +64,56 @@ impl Analyzer<'_, '_, '_> {
                 if upsert.is_some() {
                     return unsupported_insert("UPSERT clauses");
                 }
-                let rows = simple_values_rows(select)?;
-                if rows.is_empty() {
-                    crate::bail_parse_error!("no values to insert");
-                }
                 let columns = resolve_insert_targets(table.value(), column_names)?;
                 let expected = columns.len();
-                let mut bound_rows = Vec::with_capacity(rows.len());
-                for row in rows {
-                    if row.len() != expected {
-                        crate::bail_parse_error!(
-                            "table {} has {expected} columns but {} values were supplied",
-                            table.value().get_name(),
-                            row.len()
-                        );
+                match &select.body.select {
+                    ast::OneSelect::Values(_) => {
+                        let rows = simple_values_rows(select)?;
+                        if rows.is_empty() {
+                            crate::bail_parse_error!("no values to insert");
+                        }
+                        let mut bound_rows = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            if row.len() != expected {
+                                crate::bail_parse_error!(
+                                    "table {} has {expected} columns but {} values were supplied",
+                                    table.value().get_name(),
+                                    row.len()
+                                );
+                            }
+                            let mut bound = Vec::with_capacity(row.len());
+                            for (syntax, target_column) in row.iter().zip(&columns) {
+                                bound.push(self.analyze_insert_value(
+                                    syntax,
+                                    target,
+                                    table.value(),
+                                    target_column.column,
+                                )?);
+                            }
+                            bound_rows.push(bound);
+                        }
+                        (columns, hir::InsertSource::Values(bound_rows))
                     }
-                    let mut bound = Vec::with_capacity(row.len());
-                    for (syntax, target_column) in row.iter().zip(&columns) {
-                        bound.push(self.analyze_insert_value(
-                            syntax,
-                            target,
-                            table.value(),
-                            target_column.column,
-                        )?);
+                    ast::OneSelect::Select { .. } => {
+                        let query = self.analyze_select(select)?;
+                        let actual = self
+                            .query(query)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "missing INSERT source query {query}"
+                                ))
+                            })?
+                            .output
+                            .len();
+                        if actual != expected {
+                            crate::bail_parse_error!(
+                                "table {} has {expected} columns but {actual} values were supplied",
+                                table.value().get_name()
+                            );
+                        }
+                        (columns, hir::InsertSource::Query(query))
                     }
-                    bound_rows.push(bound);
                 }
-                (columns, hir::InsertSource::Values(bound_rows))
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
