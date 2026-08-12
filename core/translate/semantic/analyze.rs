@@ -14,10 +14,10 @@ use super::{
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot, Limit,
-        OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock,
-        QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source, SourceId,
-        SourceKind, TypeFact,
+        CteId, DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot,
+        InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query,
+        QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source,
+        SourceId, SourceKind, TypeFact,
     },
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
     AnalyzeInput,
@@ -287,30 +287,32 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             pending.extend(query.direct_column_reads(|source| self.source(source)));
         }
         if let HirRoot::Insert(insert) = root {
-            let width = self
-                .source(insert.target)
-                .ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "missing INSERT target source {}",
-                        insert.target
-                    ))
-                })?
-                .columns
-                .len();
-            pending.extend((0..width).map(|column| ColumnRef {
-                source: insert.target,
-                column,
-            }));
-            pending.extend(insert.foreign_keys.incoming.iter().flat_map(|foreign_key| {
-                foreign_key
-                    .child_positions
-                    .iter()
-                    .copied()
-                    .map(|column| ColumnRef {
-                        source: foreign_key.child_source,
-                        column,
-                    })
-            }));
+            if let InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind {
+                let width = self
+                    .source(insert.target)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing INSERT target source {}",
+                            insert.target
+                        ))
+                    })?
+                    .columns
+                    .len();
+                pending.extend((0..width).map(|column| ColumnRef {
+                    source: insert.target,
+                    column,
+                }));
+                pending.extend(foreign_keys.incoming.iter().flat_map(|foreign_key| {
+                    foreign_key
+                        .child_positions
+                        .iter()
+                        .copied()
+                        .map(|column| ColumnRef {
+                            source: foreign_key.child_source,
+                            column,
+                        })
+                }));
+            }
         }
         let mut finished = HashSet::default();
 
@@ -1744,6 +1746,13 @@ mod tests {
                 .add_btree_table(Arc::new(table))
                 .expect("foreign-key child table name is unique");
         }
+        schema
+    }
+
+    fn schema_with_virtual_insert_target() -> Schema {
+        let mut schema = Schema::new();
+        crate::dialect::sqlite::register_builtin_catalog(&mut schema, false)
+            .expect("SQLite virtual catalog registers");
         schema
     }
 
@@ -4978,8 +4987,10 @@ mod tests {
             let HirRoot::Insert(insert) = &document.root else {
                 panic!("INSERT produces INSERT root");
             };
-            let autoincrement = insert
-                .autoincrement
+            let hir::InsertTargetKind::BTree { autoincrement, .. } = &insert.target_kind else {
+                panic!("AUTOINCREMENT INSERT has a B-tree target");
+            };
+            let autoincrement = autoincrement
                 .as_ref()
                 .expect("AUTOINCREMENT target carries resolved metadata");
             assert_eq!(
@@ -5043,9 +5054,11 @@ mod tests {
         let HirRoot::Insert(insert) = &document.root else {
             panic!("INSERT produces INSERT root");
         };
+        let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+            panic!("triggered INSERT has a B-tree target");
+        };
         assert_eq!(
-            insert
-                .triggers
+            triggers
                 .insert
                 .iter()
                 .map(|trigger| trigger.value().name.as_str())
@@ -5053,19 +5066,17 @@ mod tests {
             ["insert_after", "insert_before"]
         );
         assert_eq!(
-            insert
-                .triggers
+            triggers
                 .upsert_update
                 .iter()
                 .map(|trigger| trigger.value().name.as_str())
                 .collect::<Vec<_>>(),
             ["update_value", "update_all"]
         );
-        assert!(insert
-            .triggers
+        assert!(triggers
             .insert
             .iter()
-            .chain(&insert.triggers.upsert_update)
+            .chain(&triggers.upsert_update)
             .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
 
         let plain = analyze_sql_with_schema(
@@ -5076,8 +5087,11 @@ mod tests {
         let HirRoot::Insert(insert) = &plain.root else {
             panic!("INSERT produces INSERT root");
         };
-        assert_eq!(insert.triggers.insert.len(), 2);
-        assert!(insert.triggers.upsert_update.is_empty());
+        let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
+            panic!("triggered INSERT has a B-tree target");
+        };
+        assert_eq!(triggers.insert.len(), 2);
+        assert!(triggers.upsert_update.is_empty());
     }
 
     #[test]
@@ -5101,16 +5115,18 @@ mod tests {
         let SourceKind::Table(target_table) = &target.kind else {
             panic!("INSERT target is a table");
         };
-        assert_eq!(insert.foreign_keys.outgoing.len(), 2);
-        assert_eq!(insert.foreign_keys.incoming.len(), 1);
-        assert!(insert.foreign_keys.outgoing.iter().all(|foreign_key| {
+        let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
+            panic!("foreign-key INSERT has a B-tree target");
+        };
+        assert_eq!(foreign_keys.outgoing.len(), 2);
+        assert_eq!(foreign_keys.incoming.len(), 1);
+        assert!(foreign_keys.outgoing.iter().all(|foreign_key| {
             foreign_key.child_source == insert.target
                 && &foreign_key.child_table == target_table
                 && foreign_key.parent_table.value().get_name() == "parents"
         }));
 
-        let parent_id = insert
-            .foreign_keys
+        let parent_id = foreign_keys
             .outgoing
             .iter()
             .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_id")
@@ -5120,8 +5136,7 @@ mod tests {
         assert!(parent_id.parent_uses_rowid);
         assert!(parent_id.parent_unique_index.is_none());
 
-        let parent_code = insert
-            .foreign_keys
+        let parent_code = foreign_keys
             .outgoing
             .iter()
             .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_code")
@@ -5139,7 +5154,7 @@ mod tests {
             "parents_code"
         );
 
-        let incoming = &insert.foreign_keys.incoming[0];
+        let incoming = &foreign_keys.incoming[0];
         assert_ne!(incoming.child_source, insert.target);
         assert_eq!(incoming.child_table.value().get_name(), "item_notes");
         assert_eq!(&incoming.parent_table, target_table);
@@ -5160,6 +5175,69 @@ mod tests {
     }
 
     #[test]
+    fn virtual_table_insert_has_only_virtual_target_metadata() {
+        let schema = schema_with_virtual_insert_target();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO pragma_table_info(\
+                rowid, cid, name, type, \"notnull\", dflt_value, pk\
+             ) VALUES (9, 0, 'value', 'TEXT', 0, NULL, 0)",
+        )
+        .expect("virtual-table VALUES INSERT binds");
+        document
+            .validate()
+            .expect("virtual-table INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert!(matches!(insert.target_kind, hir::InsertTargetKind::Virtual));
+        assert_eq!(insert.columns[0].column, TargetColumn::RowId);
+        assert!(insert.upserts.is_empty());
+        assert!(insert.excluded_source.is_none());
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("virtual-table VALUES stay inline");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 7);
+
+        let target = document
+            .source(insert.target)
+            .expect("virtual INSERT target exists");
+        assert!(matches!(
+            &target.kind,
+            SourceKind::Table(table) if table.value().virtual_table().is_some()
+        ));
+        assert!(target.check_constraints.is_none());
+        assert!(matches!(target.index_coverage, IndexCoverage::Selective));
+
+        let default_values =
+            analyze_sql_with_schema(&schema, "INSERT INTO pragma_table_info DEFAULT VALUES")
+                .expect("virtual-table DEFAULT VALUES binds");
+        let HirRoot::Insert(insert) = &default_values.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert!(matches!(insert.target_kind, hir::InsertTargetKind::Virtual));
+        assert!(matches!(insert.source, InsertSource::DefaultValues));
+    }
+
+    #[test]
+    fn virtual_table_insert_keeps_values_only_rule() {
+        let schema = schema_with_virtual_insert_target();
+        for sql in [
+            "INSERT INTO pragma_table_info(cid) SELECT 1",
+            "INSERT INTO pragma_table_info(cid) VALUES (1) ON CONFLICT DO NOTHING",
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("unsupported virtual-table INSERT source fails");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: semantic INSERT does not yet accept UPSERT or non-VALUES sources for virtual-table targets"
+            );
+        }
+    }
+
+    #[test]
     fn insert_values_bind_target_columns_rows_and_complete_row_metadata() {
         let schema = schema_with_writable_table();
         let document = analyze_sql_with_schema(
@@ -5176,7 +5254,10 @@ mod tests {
         assert_eq!(insert.columns[0].column, TargetColumn::Column(1));
         assert_eq!(insert.columns[1].column, TargetColumn::Column(0));
         assert!(insert.columns.iter().all(|target| target.uses_value));
-        assert!(insert.defaults.is_empty());
+        let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
+            panic!("ordinary INSERT has a B-tree target");
+        };
+        assert!(defaults.is_empty());
         let InsertSource::Values(rows) = &insert.source else {
             panic!("VALUES stays inline HIR");
         };
@@ -6321,13 +6402,16 @@ mod tests {
         let InsertSource::Values(rows) = &insert.source else {
             panic!("VALUES stays inline HIR");
         };
+        let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
+            panic!("ordinary INSERT has a B-tree target");
+        };
         assert!(matches!(
             rows[0].as_slice(),
             [Expr::Literal(ast::Literal::String(value))]
                 if value.trim_matches(|ch| ch == '\'' || ch == '"') == "fallback"
         ));
         assert!(matches!(
-            insert.defaults.as_slice(),
+            defaults.as_slice(),
             [ResolvedDefault {
                 column: 0,
                 value: Expr::Literal(ast::Literal::Null),
@@ -6342,9 +6426,12 @@ mod tests {
         };
         assert!(insert.columns.is_empty());
         assert!(matches!(insert.source, InsertSource::DefaultValues));
-        assert_eq!(insert.defaults.len(), 2);
-        assert_eq!(insert.defaults[0].column, 0);
-        assert_eq!(insert.defaults[1].column, 1);
+        let hir::InsertTargetKind::BTree { defaults, .. } = &insert.target_kind else {
+            panic!("ordinary INSERT has a B-tree target");
+        };
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(defaults[0].column, 0);
+        assert_eq!(defaults[1].column, 1);
 
         let duplicates = analyze_sql_with_schema(
             &schema,

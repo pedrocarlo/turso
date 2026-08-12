@@ -41,9 +41,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 )));
             }
         };
-        self.require_basic_insert_target(table.value())?;
-        self.analyze_insert_target_metadata(target, &table)?;
-        let autoincrement = self.analyze_insert_autoincrement(&table)?;
+        let autoincrement = if table.value().btree().is_some() {
+            self.analyze_insert_target_metadata(target, &table)?;
+            self.analyze_insert_autoincrement(&table)?
+        } else {
+            None
+        };
 
         if let Some(with) = with {
             self.push_cte_scope(with)?;
@@ -75,6 +78,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         autoincrement: Option<hir::ResolvedAutoincrement>,
     ) -> Result<HirRoot> {
+        let virtual_target = table.value().virtual_table().is_some();
         let (columns, source, upserts, excluded_source) = match body {
             ast::InsertBody::DefaultValues => {
                 if !column_names.is_empty() {
@@ -88,6 +92,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 )
             }
             ast::InsertBody::Select(select, upsert) => {
+                if virtual_target
+                    && (upsert.is_some()
+                        || !is_simple_values(select)
+                        || !matches!(select.body.select, ast::OneSelect::Values(_)))
+                {
+                    return unsupported_insert(
+                        "UPSERT or non-VALUES sources for virtual-table targets",
+                    );
+                }
                 let columns = resolve_insert_targets(table.value(), column_names)?;
                 let expected = columns.len();
                 let source = match &select.body.select {
@@ -146,24 +159,28 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 (columns, source, upserts, excluded_source)
             }
         };
-        let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
         let returning = self.analyze_insert_returning(returning, target)?;
-        let triggers = self.analyze_insert_triggers(table, &upserts);
-        let foreign_keys = self.analyze_insert_foreign_keys(target, table)?;
+        let target_kind = if virtual_target {
+            hir::InsertTargetKind::Virtual
+        } else {
+            hir::InsertTargetKind::BTree {
+                autoincrement,
+                defaults: self.analyze_insert_defaults(target, table.value(), &columns)?,
+                triggers: self.analyze_insert_triggers(table, &upserts),
+                foreign_keys: self.analyze_insert_foreign_keys(target, table)?,
+            }
+        };
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
-            autoincrement,
+            target_kind,
             columns,
-            defaults,
             source,
             conflict,
             upserts,
             excluded_source,
             returning,
             trigger: None,
-            triggers,
-            foreign_keys,
         }))
     }
 
@@ -173,13 +190,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         expected_outputs: &[Option<Arc<TypeDef>>],
     ) -> Result<hir::QueryId> {
         self.analyze_select_with_expected_outputs(select, expected_outputs)
-    }
-
-    fn require_basic_insert_target(&self, table: &Table) -> Result<()> {
-        if table.btree().is_none() {
-            return unsupported_insert("non-B-tree targets");
-        }
-        Ok(())
     }
 
     fn analyze_insert_foreign_keys(
@@ -1050,7 +1060,7 @@ fn is_rowid_target(table: &Table, target: hir::TargetColumn) -> bool {
 }
 
 fn table_has_rowid(table: &Table) -> bool {
-    table.btree().is_some_and(|table| table.has_rowid)
+    table.btree().is_some_and(|table| table.has_rowid) || table.virtual_table().is_some()
 }
 
 fn is_rowid_name(name: &str) -> bool {
