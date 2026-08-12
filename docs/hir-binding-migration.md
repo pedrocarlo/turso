@@ -197,6 +197,10 @@ Completed:
   and VALUES compound arm. Destination-aware functions therefore resolve the
   same way in direct VALUES and query sources without changing standalone
   SELECT rules.
+- Scalar INSERT RETURNING expressions bind against the target source and become
+  root-owned HIR outputs. Unqualified and qualified stars, aliases, type facts,
+  affinities, collations, and generated-column dependencies are resolved during
+  analysis. RETURNING subqueries remain a later root-expression checkpoint.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

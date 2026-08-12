@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::{Analyzer, CatalogObjectKind},
+    analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
@@ -26,9 +26,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         body: &'ast ast::InsertBody,
         returning: &[ast::ResultColumn],
     ) -> Result<HirRoot> {
-        if !returning.is_empty() {
-            return unsupported_insert("RETURNING clauses");
-        }
         if with.is_some()
             && !matches!(
                 body,
@@ -125,6 +122,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
+        let returning = self.analyze_insert_returning(returning, target)?;
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
@@ -136,7 +134,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             conflict,
             upserts: Vec::new(),
             excluded_source: None,
-            returning: None,
+            returning,
             trigger: None,
             triggers: Vec::new(),
             upsert_triggers: Vec::new(),
@@ -383,6 +381,78 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .main_schema()
             .get_type_def_unchecked(&definition.ty_str)
             .cloned())
+    }
+
+    fn analyze_insert_returning(
+        &mut self,
+        columns: &'ast [ast::ResultColumn],
+        target: hir::SourceId,
+    ) -> Result<Option<hir::Returning>> {
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let source = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing INSERT target source {target}"))
+        })?;
+        let mut scope = Scope::default();
+        scope.add_source(source, true);
+        let policy = ExprPolicy::returning(self.context().dqs_dml());
+        let mut outputs = Vec::with_capacity(columns.len());
+
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(expression, alias) => {
+                    if expression_contains_subquery(expression) {
+                        return unsupported_insert("subqueries in RETURNING clauses");
+                    }
+                    let resolved = self.analyze_resolved_expr(expression, &scope, policy)?;
+                    let (name, name_kind) = match alias {
+                        Some(alias) if alias.is_explicit() => (
+                            alias.name().as_str().to_string(),
+                            hir::OutputNameKind::ExplicitAlias,
+                        ),
+                        Some(ast::As::ImplicitColumnName(name)) => {
+                            (name.as_str().to_string(), hir::OutputNameKind::Inferred)
+                        }
+                        None => (expression.to_string(), hir::OutputNameKind::Inferred),
+                        Some(_) => unreachable!("all explicit aliases were handled"),
+                    };
+                    outputs.push(output_from_resolved(
+                        hir::OutputId::root(outputs.len()),
+                        name,
+                        name_kind,
+                        resolved,
+                    ));
+                }
+                ast::ResultColumn::Star => {
+                    let expanded = scope.expand_star()?;
+                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                }
+                ast::ResultColumn::TableStar(table) => {
+                    let expanded = scope.expand_table_star(table.as_str())?;
+                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                }
+            }
+        }
+        Ok(Some(hir::Returning { outputs }))
+    }
+
+    fn append_returning_star_outputs(
+        &self,
+        outputs: &mut Vec<hir::Output>,
+        expanded: Vec<super::scope::ExpandedColumn>,
+        scope: &Scope,
+    ) -> Result<()> {
+        for column in expanded {
+            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            outputs.push(output_from_resolved(
+                hir::OutputId::root(outputs.len()),
+                column.name,
+                hir::OutputNameKind::StarExpansion,
+                resolved,
+            ));
+        }
+        Ok(())
     }
 }
 
