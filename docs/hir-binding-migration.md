@@ -210,7 +210,10 @@ Completed:
 - Targeted `DO NOTHING` clauses freeze bound conflict expressions, explicit
   collations, sort order, partial-index predicates, and the exact PRIMARY KEY
   or UNIQUE index match. Chained clauses retain parser order. `DO UPDATE`
-  remains a separate checkpoint.
+  actions bind assignments and predicates against the current target row plus
+  one root-owned, qualified-only EXCLUDED pseudo-source. Row assignments,
+  duplicate targets, generated-column checks, destination types, and existing
+  subquery restrictions keep their binding rules.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

@@ -54,12 +54,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         self.require_basic_insert_target(table.value())?;
         self.analyze_insert_target_metadata(target, &table)?;
 
-        let (columns, source, upserts) = match body {
+        let (columns, source, upserts, excluded_source) = match body {
             ast::InsertBody::DefaultValues => {
                 if !column_names.is_empty() {
                     return unsupported_insert("a column list with DEFAULT VALUES");
                 }
-                (Vec::new(), hir::InsertSource::DefaultValues, Vec::new())
+                (
+                    Vec::new(),
+                    hir::InsertSource::DefaultValues,
+                    Vec::new(),
+                    None,
+                )
             }
             ast::InsertBody::Select(select, upsert) => {
                 let columns = resolve_insert_targets(table.value(), column_names)?;
@@ -116,8 +121,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         hir::InsertSource::Query(query)
                     }
                 };
-                let upserts = self.analyze_upserts(upsert.as_deref(), target, &table)?;
-                (columns, source, upserts)
+                let (upserts, excluded_source) =
+                    self.analyze_upserts(upsert.as_deref(), target, &table)?;
+                (columns, source, upserts, excluded_source)
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
@@ -138,7 +144,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             source,
             conflict,
             upserts,
-            excluded_source: None,
+            excluded_source,
             returning,
             trigger: None,
             triggers: Vec::new(),
@@ -438,7 +444,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         mut syntax: Option<&'ast ast::Upsert>,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
-    ) -> Result<Vec<hir::Upsert>> {
+    ) -> Result<(Vec<hir::Upsert>, Option<hir::SourceId>)> {
         let scope = {
             let source = self.source(target).ok_or_else(|| {
                 LimboError::InternalError(format!("missing INSERT target source {target}"))
@@ -449,10 +455,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let policy = ExprPolicy::schema_expression().with_self_source(target);
         let mut upserts = Vec::new();
+        let mut excluded_source = None;
         while let Some(upsert) = syntax {
-            if matches!(upsert.do_clause, ast::UpsertDo::Set { .. }) {
-                return unsupported_insert("UPSERT DO UPDATE clauses");
-            }
             let conflict_target = upsert
                 .index
                 .as_ref()
@@ -509,13 +513,156 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     })
                 })
                 .transpose()?;
+            let action =
+                self.analyze_upsert_action(&upsert.do_clause, target, table, &mut excluded_source)?;
             upserts.push(hir::Upsert {
                 target: conflict_target,
-                action: hir::UpsertAction::Nothing,
+                action,
             });
             syntax = upsert.next.as_deref();
         }
-        Ok(upserts)
+        Ok((upserts, excluded_source))
+    }
+
+    fn analyze_upsert_action(
+        &mut self,
+        syntax: &'ast ast::UpsertDo,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+        excluded_source: &mut Option<hir::SourceId>,
+    ) -> Result<hir::UpsertAction> {
+        let ast::UpsertDo::Set { sets, where_clause } = syntax else {
+            return Ok(hir::UpsertAction::Nothing);
+        };
+        let excluded = match *excluded_source {
+            Some(excluded) => excluded,
+            None => {
+                let excluded = self.create_excluded_source(target, table)?;
+                *excluded_source = Some(excluded);
+                excluded
+            }
+        };
+        let scope = {
+            let mut excluded_scope = Scope::default();
+            excluded_scope.add_source(
+                self.source(excluded).ok_or_else(|| {
+                    LimboError::InternalError(format!("missing INSERT EXCLUDED source {excluded}"))
+                })?,
+                false,
+            );
+            let mut scope = Scope::new(Some(excluded_scope));
+            scope.add_source(
+                self.source(target).ok_or_else(|| {
+                    LimboError::InternalError(format!("missing INSERT target source {target}"))
+                })?,
+                true,
+            );
+            scope
+        };
+        let policy = ExprPolicy::upsert_update(self.context().dqs_dml());
+        let mut assignments = Vec::<hir::Assignment>::new();
+        for set in sets {
+            let values: Vec<&ast::Expr> = match set.expr.as_ref() {
+                ast::Expr::Parenthesized(values) => {
+                    if set.col_names.len() != values.len() {
+                        crate::bail_parse_error!(
+                            "{} columns assigned {} values",
+                            set.col_names.len(),
+                            values.len()
+                        );
+                    }
+                    values.iter().map(Box::as_ref).collect()
+                }
+                expression => {
+                    if set.col_names.len() != 1 {
+                        crate::bail_parse_error!(
+                            "{} columns assigned 1 values",
+                            set.col_names.len()
+                        );
+                    }
+                    vec![expression]
+                }
+            };
+            for (name, value) in set.col_names.iter().zip(values) {
+                let normalized = normalize_ident(name.as_str());
+                let Some((column, definition)) = table.value().get_column_by_name(&normalized)
+                else {
+                    crate::bail_parse_error!("no such column: {}", name);
+                };
+                definition.ensure_not_generated("UPDATE", name.as_str())?;
+                if expression_contains_subquery(value) {
+                    crate::bail_parse_error!("Subquery is not supported in this position");
+                }
+                let value = self.analyze_expr_with_expected_type(
+                    value,
+                    &scope,
+                    policy,
+                    self.insert_target_type(table.value(), hir::TargetColumn::Column(column))?,
+                )?;
+                match assignments
+                    .iter_mut()
+                    .find(|assignment| assignment.columns == [hir::TargetColumn::Column(column)])
+                {
+                    Some(existing) => existing.value = value,
+                    None => assignments.push(hir::Assignment {
+                        columns: vec![hir::TargetColumn::Column(column)],
+                        value,
+                    }),
+                }
+            }
+        }
+        let predicate = where_clause
+            .as_deref()
+            .map(|predicate| {
+                if expression_contains_subquery(predicate) {
+                    crate::bail_parse_error!("Subquery is not supported in this position");
+                }
+                self.analyze_expr(predicate, &scope, policy)
+            })
+            .transpose()?;
+        Ok(hir::UpsertAction::Update {
+            assignments,
+            predicate,
+        })
+    }
+
+    fn create_excluded_source(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<hir::SourceId> {
+        let target_source = self.source(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing INSERT target source {target}"))
+        })?;
+        let columns = target_source.columns.clone();
+        let rowid_available = target_source.rowid_available;
+        let width = columns.len();
+        let excluded = self.reserve_source();
+        self.insert_source(
+            excluded,
+            hir::Source {
+                id: excluded,
+                owner: SourceOwner::Root,
+                database: table.database(),
+                name: "excluded".to_string(),
+                alias: None,
+                kind: hir::SourceKind::Pseudo {
+                    kind: hir::PseudoSource::Excluded,
+                    table: table.clone(),
+                },
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(excluded)
     }
 
     fn append_returning_star_outputs(
