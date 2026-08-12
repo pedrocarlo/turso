@@ -246,16 +246,44 @@ impl<'document> HirValidator<'document> {
             &upsert_assignments,
         )?;
         self.visit_dml_foreign_keys(insert.target, &insert.foreign_keys)?;
-        self.visit_optional_catalog_object(
-            insert.autoincrement.as_ref(),
-            "AUTOINCREMENT sequence table",
+        let target = self.source(insert.target)?;
+        let SourceKind::Table(target_table) = &target.kind else {
+            return Err(HirValidationError::new(
+                "INSERT target source is not a table",
+            ));
+        };
+        let target_has_autoincrement = target_table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_autoincrement);
+        self.require(
+            target_has_autoincrement == insert.autoincrement.is_some(),
+            "INSERT AUTOINCREMENT metadata disagrees with its target",
         )?;
-        if let Some(sequence) = &insert.autoincrement_sequence {
-            self.visit_sequence_operation(sequence)?;
-            self.require(
-                insert.autoincrement.is_some(),
-                "MVCC AUTOINCREMENT sequence has no sqlite_sequence table",
+        if let Some(autoincrement) = &insert.autoincrement {
+            self.visit_catalog_object(
+                &autoincrement.sqlite_sequence,
+                "AUTOINCREMENT sqlite_sequence table",
             )?;
+            self.require(
+                autoincrement.sqlite_sequence.database() == target_table.database(),
+                "INSERT target and sqlite_sequence belong to different databases",
+            )?;
+            self.require(
+                autoincrement
+                    .sqlite_sequence
+                    .value()
+                    .get_name()
+                    .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
+                "INSERT AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
+            )?;
+            if let Some(sequence) = &autoincrement.mvcc_sequence {
+                self.visit_sequence_operation(sequence)?;
+                self.require(
+                    sequence.sqlite_sequence.as_ref() == Some(&autoincrement.sqlite_sequence),
+                    "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
+                )?;
+            }
         }
         for target in &insert.columns {
             self.validate_target_column(insert.target, target.column)?;

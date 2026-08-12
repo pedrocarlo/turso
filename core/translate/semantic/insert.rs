@@ -9,7 +9,7 @@ use super::{
     scope::{ExprCollation, Scope},
 };
 use crate::{
-    schema::{Table, TypeDef},
+    schema::{autoincrement_sequence_name, Table, TypeDef, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
     translate::expr::{walk_expr, WalkControl},
     util::normalize_ident,
@@ -43,12 +43,20 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         self.require_basic_insert_target(table.value())?;
         self.analyze_insert_target_metadata(target, &table)?;
+        let autoincrement = self.analyze_insert_autoincrement(&table)?;
 
         if let Some(with) = with {
             self.push_cte_scope(with)?;
         }
-        let result =
-            self.analyze_insert_body(conflict, column_names, body, returning, target, &table);
+        let result = self.analyze_insert_body(
+            conflict,
+            column_names,
+            body,
+            returning,
+            target,
+            &table,
+            autoincrement,
+        );
         if with.is_some() {
             self.cte_scopes
                 .pop()
@@ -65,6 +73,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         returning: &'ast [ast::ResultColumn],
         target: hir::SourceId,
         table: &hir::ResolvedTable,
+        autoincrement: Option<hir::ResolvedAutoincrement>,
     ) -> Result<HirRoot> {
         let (columns, source, upserts, excluded_source) = match body {
             ast::InsertBody::DefaultValues => {
@@ -142,8 +151,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
-            autoincrement: None,
-            autoincrement_sequence: None,
+            autoincrement,
             columns,
             defaults,
             source,
@@ -170,9 +178,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let Some(table) = table.btree() else {
             return unsupported_insert("non-B-tree targets");
         };
-        if table.has_autoincrement {
-            return unsupported_insert("AUTOINCREMENT targets");
-        }
         let schema = self.context().main_schema();
         if schema.get_triggers_for_table(&table.name).next().is_some() {
             return unsupported_insert("triggered targets");
@@ -181,6 +186,84 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             return unsupported_insert("foreign-key targets");
         }
         Ok(())
+    }
+
+    fn analyze_insert_autoincrement(
+        &mut self,
+        table: &hir::ResolvedTable,
+    ) -> Result<Option<hir::ResolvedAutoincrement>> {
+        if !table
+            .value()
+            .btree()
+            .is_some_and(|table| table.has_autoincrement)
+        {
+            return Ok(None);
+        }
+        let database = table.database().ok_or_else(|| {
+            LimboError::InternalError("AUTOINCREMENT target has no owning database".to_string())
+        })?;
+        let sequence_name = autoincrement_sequence_name(table.value().get_name());
+        let backing_table_name =
+            crate::translate::sequence::sequence_backing_table_name(&sequence_name);
+        let (sqlite_sequence, sequence, backing_table) = {
+            let schema = self.context().main_schema();
+            let sqlite_sequence = schema
+                .get_table(SQLITE_SEQUENCE_TABLE_NAME)
+                .ok_or_else(|| LimboError::Corrupt("missing sqlite_sequence table".to_string()))?;
+            let sequence = schema.get_sequence(&sequence_name).cloned();
+            let backing_table = schema.get_table(&backing_table_name);
+            (sqlite_sequence, sequence, backing_table)
+        };
+        let sqlite_sequence_id = self.catalog_object_id(
+            Some(database),
+            CatalogObjectKind::Table,
+            SQLITE_SEQUENCE_TABLE_NAME,
+        );
+        let sqlite_sequence = hir::CatalogObject::new(
+            sqlite_sequence_id,
+            self.context().snapshot(),
+            Some(database),
+            sqlite_sequence,
+        );
+        let mvcc_sequence = match (sequence, backing_table) {
+            (Some(sequence), Some(backing_table)) => {
+                let sequence_id = self.catalog_object_id(
+                    Some(database),
+                    CatalogObjectKind::Sequence,
+                    sequence_name.clone(),
+                );
+                let sequence = hir::CatalogObject::new(
+                    sequence_id,
+                    self.context().snapshot(),
+                    Some(database),
+                    sequence,
+                );
+                let backing_table_id = self.catalog_object_id(
+                    Some(database),
+                    CatalogObjectKind::Table,
+                    backing_table_name,
+                );
+                let backing_table = hir::CatalogObject::new(
+                    backing_table_id,
+                    self.context().snapshot(),
+                    Some(database),
+                    backing_table,
+                );
+                Some(hir::SequenceOperation {
+                    kind: hir::SequenceOperationKind::NextValue,
+                    user_name: sequence_name.clone(),
+                    normalized_name: sequence_name,
+                    sequence,
+                    backing_table,
+                    sqlite_sequence: Some(sqlite_sequence.clone()),
+                })
+            }
+            _ => None,
+        };
+        Ok(Some(hir::ResolvedAutoincrement {
+            sqlite_sequence,
+            mvcc_sequence,
+        }))
     }
 
     fn analyze_insert_target_metadata(

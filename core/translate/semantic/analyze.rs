@@ -1717,6 +1717,31 @@ mod tests {
         schema
     }
 
+    fn schema_with_autoincrement(include_mvcc_sequence: bool) -> Schema {
+        let sequence_name = crate::schema::autoincrement_sequence_name("auto_items");
+        let mut schema = if include_mvcc_sequence {
+            schema_with_sequence(&sequence_name)
+        } else {
+            Schema::new()
+        };
+        for (sql, root_page) in [
+            (
+                "CREATE TABLE auto_items(\
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT\
+                 )",
+                3,
+            ),
+            ("CREATE TABLE sqlite_sequence(name, seq)", 4),
+        ] {
+            schema
+                .add_btree_table(Arc::new(
+                    BTreeTable::from_sql(sql, root_page).expect("AUTOINCREMENT schema parses"),
+                ))
+                .expect("AUTOINCREMENT schema names are unique");
+        }
+        schema
+    }
+
     #[test]
     fn source_free_literals_become_closed_hir() {
         let document = analyze_sql("SELECT 1, 1.5 AS real_value, 'text', NULL, TRUE")
@@ -4803,6 +4828,69 @@ mod tests {
         assert!(
             custom[8].is_none(),
             "naked operator keeps normal comparison"
+        );
+    }
+
+    #[test]
+    fn insert_autoincrement_metadata_is_one_resolved_object() {
+        for include_mvcc_sequence in [false, true] {
+            let schema = schema_with_autoincrement(include_mvcc_sequence);
+            let document =
+                analyze_sql_with_schema(&schema, "INSERT INTO auto_items(value) VALUES ('kept')")
+                    .expect("AUTOINCREMENT INSERT binds");
+            document
+                .validate()
+                .expect("AUTOINCREMENT INSERT produces closed HIR");
+
+            let HirRoot::Insert(insert) = &document.root else {
+                panic!("INSERT produces INSERT root");
+            };
+            let autoincrement = insert
+                .autoincrement
+                .as_ref()
+                .expect("AUTOINCREMENT target carries resolved metadata");
+            assert_eq!(
+                autoincrement.sqlite_sequence.value().get_name(),
+                "sqlite_sequence"
+            );
+            assert_eq!(
+                autoincrement.sqlite_sequence.database(),
+                document
+                    .source(insert.target)
+                    .expect("target source exists")
+                    .database
+            );
+            assert_eq!(autoincrement.mvcc_sequence.is_some(), include_mvcc_sequence);
+            if let Some(sequence) = &autoincrement.mvcc_sequence {
+                assert_eq!(
+                    sequence.kind,
+                    crate::translate::semantic::hir::SequenceOperationKind::NextValue
+                );
+                assert_eq!(
+                    sequence.sqlite_sequence.as_ref(),
+                    Some(&autoincrement.sqlite_sequence)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_autoincrement_requires_sqlite_sequence() {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE auto_items(id INTEGER PRIMARY KEY AUTOINCREMENT)",
+                    2,
+                )
+                .expect("AUTOINCREMENT table parses"),
+            ))
+            .expect("AUTOINCREMENT table name is unique");
+        let error = analyze_sql_with_schema(&schema, "INSERT INTO auto_items DEFAULT VALUES")
+            .expect_err("missing sqlite_sequence is corrupt catalog state");
+        assert_eq!(
+            error.to_string(),
+            "Corrupt database: missing sqlite_sequence table"
         );
     }
 
