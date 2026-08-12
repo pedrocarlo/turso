@@ -205,6 +205,9 @@ Completed:
   query parent and exact captures of the INSERT target. Query-owned expressions
   keep their lexical parent. INSERT-level WITH scopes remain alive through
   RETURNING so lazy CTE definitions keep one statement-local identity.
+- Catch-all `ON CONFLICT DO NOTHING` clauses become ordered INSERT HIR without
+  creating an EXCLUDED source. Conflict targets and `DO UPDATE` actions remain
+  separate checkpoints with distinct diagnostics.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
