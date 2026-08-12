@@ -189,9 +189,14 @@ Completed:
   unused invalid definitions remain unbound.
 - Statement-level INSERT conflict resolution remains an exact parser enum in
   HIR, distinguishing ROLLBACK, ABORT, FAIL, IGNORE, REPLACE, and no override.
+- Direct INSERT values and defaults carry their destination type through the
+  iterative expression frames. `union_value` freezes the destination union and
+  tag in HIR, and its value argument receives the selected variant type,
+  including for nested unions.
 
-The standalone SELECT expression checkpoints are complete. `union_value`
-remains with DML because it needs the destination column type.
+The standalone SELECT expression checkpoints are complete. `union_value` is
+resolved only in destination-aware DML expressions; INSERT-SELECT destination
+type propagation remains pending.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
