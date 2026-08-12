@@ -42,7 +42,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
         };
         let autoincrement = if table.value().btree().is_some() {
-            self.analyze_insert_target_metadata(target, &table)?;
+            self.analyze_btree_write_metadata(target, &table)?;
             self.analyze_insert_autoincrement(&table)?
         } else {
             None
@@ -133,7 +133,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     ast::OneSelect::Select { .. } | ast::OneSelect::Values(_) => {
                         let expected_outputs = columns
                             .iter()
-                            .map(|target| self.insert_target_type(table.value(), target.column))
+                            .map(|target| self.write_target_type(table.value(), target.column))
                             .collect::<Result<Vec<_>>>()?;
                         let query = self.analyze_insert_select(select, &expected_outputs)?;
                         let actual = self
@@ -468,20 +468,20 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
-    fn analyze_insert_target_metadata(
+    pub(super) fn analyze_btree_write_metadata(
         &mut self,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
     ) -> Result<()> {
         let btree = table.value().btree().ok_or_else(|| {
             LimboError::InternalError(format!(
-                "INSERT target {} stopped being a B-tree table",
+                "write target {} stopped being a B-tree table",
                 table.value().get_name()
             ))
         })?;
         let scope = {
             let source = self.source(target).ok_or_else(|| {
-                LimboError::InternalError(format!("missing INSERT target source {target}"))
+                LimboError::InternalError(format!("missing write target source {target}"))
             })?;
             let mut scope = Scope::default();
             scope.add_source(source, true);
@@ -548,7 +548,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }
 
         let source = self.source_mut(target).ok_or_else(|| {
-            LimboError::InternalError(format!("missing INSERT target source {target}"))
+            LimboError::InternalError(format!("missing write target source {target}"))
         })?;
         source.check_constraints = Some(check_constraints);
         source.index_expressions = index_expressions;
@@ -564,14 +564,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         column: hir::TargetColumn,
     ) -> Result<hir::Expr> {
         if matches!(syntax, ast::Expr::Default) {
-            return self.analyze_default_value(target, table, column);
+            return self.analyze_write_default(target, table, column);
         }
         Ok(self
             .analyze_root_expr_with_expected_type(
                 syntax,
                 &Scope::default(),
                 ExprPolicy::insert_values(self.context().dqs_dml()),
-                self.insert_target_type(table, column)?,
+                self.write_target_type(table, column)?,
             )?
             .expr)
     }
@@ -601,7 +601,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         for column in missing {
             defaults.push(hir::ResolvedDefault {
                 column,
-                value: self.analyze_default_value(
+                value: self.analyze_write_default(
                     target,
                     table,
                     hir::TargetColumn::Column(column),
@@ -611,7 +611,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(defaults)
     }
 
-    fn analyze_default_value(
+    pub(super) fn analyze_write_default(
         &mut self,
         target: hir::SourceId,
         table: &Table,
@@ -622,7 +622,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::TargetColumn::Column(column) => {
                 let definition = table.columns().get(column).ok_or_else(|| {
                     LimboError::InternalError(format!(
-                        "INSERT target column {column} is outside table {}",
+                        "write target column {column} is outside table {}",
                         table.get_name()
                     ))
                 })?;
@@ -640,7 +640,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
         };
         let source = self.source(target).ok_or_else(|| {
-            LimboError::InternalError(format!("missing INSERT target source {target}"))
+            LimboError::InternalError(format!("missing write target source {target}"))
         })?;
         let mut scope = Scope::default();
         scope.add_source(source, true);
@@ -648,11 +648,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             &syntax,
             &scope,
             ExprPolicy::schema_expression().with_self_source(target),
-            self.insert_target_type(table, column)?,
+            self.write_target_type(table, column)?,
         )
     }
 
-    fn insert_target_type(
+    pub(super) fn write_target_type(
         &self,
         table: &Table,
         column: hir::TargetColumn,
@@ -662,7 +662,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let definition = table.columns().get(column).ok_or_else(|| {
             LimboError::InternalError(format!(
-                "INSERT target column {column} is outside table {}",
+                "write target column {column} is outside table {}",
                 table.get_name()
             ))
         })?;
@@ -882,7 +882,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     value,
                     &scope,
                     policy,
-                    self.insert_target_type(table.value(), hir::TargetColumn::Column(column))?,
+                    self.write_target_type(table.value(), hir::TargetColumn::Column(column))?,
                 )?;
                 match assignments
                     .iter_mut()

@@ -391,6 +391,12 @@ impl<'document> HirValidator<'document> {
     fn visit_update(&self, update: &Update) -> ValidationResult {
         self.visit_source(update.target, Some(SourceOwner::Root))?;
         self.visit_source(update.new_source, Some(SourceOwner::Root))?;
+        let target_table = match &self.source(update.target)?.kind {
+            SourceKind::Table(table) => table,
+            _ => return self.invalid("UPDATE target is not a catalog table source"),
+        };
+        self.require_pseudo_source(update.new_source, PseudoSource::New)?;
+        self.require_pseudo_table(update.new_source, target_table)?;
         self.require(
             update.target != update.new_source,
             "UPDATE OLD and NEW rows must have distinct source identities",

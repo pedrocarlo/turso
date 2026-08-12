@@ -9,6 +9,7 @@ mod insert;
 mod query;
 mod schema_program;
 mod scope;
+mod update;
 
 pub(crate) use analyze::analyze;
 

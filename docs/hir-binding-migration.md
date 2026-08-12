@@ -237,6 +237,14 @@ Completed:
   one root-owned, qualified-only EXCLUDED pseudo-source. Row assignments,
   duplicate targets, generated-column checks, destination types, and existing
   subquery restrictions keep their binding rules.
+- Basic B-tree UPDATE statements become UPDATE HIR with distinct OLD table and
+  NEW pseudo-source identities. SET and WHERE expressions read OLD values;
+  generated columns, defaults, CHECK constraints, and complete index metadata
+  close separately against both row identities. Row assignments, duplicate
+  targets, rowid aliases, SET DEFAULT, array-setter composition, destination
+  types, and correlated expression subqueries keep their binding rules. WITH,
+  FROM, RETURNING, virtual/WITHOUT ROWID targets, triggers, and foreign keys
+  remain explicit later checkpoints.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
