@@ -280,15 +280,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_default_value(target, table, column);
         }
-        if expression_contains_subquery(syntax) {
-            return unsupported_insert("subqueries in VALUES rows");
-        }
-        self.analyze_expr_with_expected_type(
-            syntax,
-            &Scope::default(),
-            ExprPolicy::insert_values(self.context().dqs_dml()),
-            self.insert_target_type(table, column)?,
-        )
+        Ok(self
+            .analyze_root_expr_with_expected_type(
+                syntax,
+                &Scope::default(),
+                ExprPolicy::insert_values(self.context().dqs_dml()),
+                self.insert_target_type(table, column)?,
+            )?
+            .expr)
     }
 
     fn analyze_insert_defaults(
