@@ -177,6 +177,10 @@ Completed:
   Target columns, duplicate-column write selection, rowid aliases, defaults,
   generated expressions, and row-width diagnostics are resolved during
   analysis.
+- Scalar, EXISTS, and IN queries inside direct INSERT VALUES are root-owned
+  queries with no INSERT-target scope or query parent. Their own FROM sources
+  resolve normally, captures stay exact, and destination types remain attached
+  to the containing VALUES expression.
 - INSERT targets freeze every CHECK expression plus every ordinary,
   expression, and partial index in catalog order. Stable catalog identities
   and `IndexCoverage::Complete` make the required write metadata explicit.

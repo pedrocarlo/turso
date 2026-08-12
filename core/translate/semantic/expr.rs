@@ -942,13 +942,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
     ) -> Result<ResolvedScopeExpr> {
+        self.analyze_root_expr_with_expected_type(syntax, scope, policy, None)
+    }
+
+    pub(super) fn analyze_root_expr_with_expected_type(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        expected_type: Option<Arc<TypeDef>>,
+    ) -> Result<ResolvedScopeExpr> {
         self.analyze_owned_expr(
             syntax,
             scope,
             policy,
             ExprOwner::Root,
             &mut FunctionContext::ScalarOnly,
-            None,
+            expected_type,
         )
     }
 

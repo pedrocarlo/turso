@@ -4856,6 +4856,74 @@ mod tests {
     }
 
     #[test]
+    fn insert_values_bind_root_owned_scalar_exists_and_in_queries() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded(id, value, score) VALUES (\
+                 (SELECT id FROM guarded LIMIT 1),\
+                 EXISTS(SELECT 1),\
+                 1 IN (SELECT 1)\
+             )",
+        )
+        .expect("VALUES subqueries bind");
+        document
+            .validate()
+            .expect("VALUES subqueries produce closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("VALUES stays inline HIR");
+        };
+        let queries = [
+            match rows[0][0] {
+                Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
+                _ => panic!("first value is scalar query"),
+            },
+            match rows[0][1] {
+                Expr::Subquery(SubqueryExpr::Exists(query)) => query,
+                _ => panic!("second value is EXISTS query"),
+            },
+            match rows[0][2] {
+                Expr::Subquery(SubqueryExpr::In { query, .. }) => query,
+                _ => panic!("third value is IN query"),
+            },
+        ];
+        for query in queries {
+            let query = document.query(query).expect("VALUES child query exists");
+            assert_eq!(query.parent, None);
+            assert!(query.captures.is_empty());
+        }
+        let scalar = document.query(queries[0]).expect("scalar query exists");
+        let scalar_source = scalar.blocks[0]
+            .from
+            .as_ref()
+            .expect("scalar query owns its FROM source")
+            .first;
+        assert_ne!(scalar_source, insert.target);
+    }
+
+    #[test]
+    fn insert_values_subqueries_keep_scopeless_name_and_width_errors() {
+        let schema = schema_with_insert_metadata();
+        for (sql, expected) in [
+            (
+                "INSERT INTO guarded(id) VALUES ((SELECT guarded.id))",
+                "Parse error: no such table: guarded",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES ((SELECT 1, 2))",
+                "Parse error: sub-select returns 2 columns - expected 1",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid subquery fails");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn insert_freezes_check_constraints_and_all_index_expressions() {
         let schema = schema_with_insert_metadata();
         let document = analyze_sql_with_schema(
