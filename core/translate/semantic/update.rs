@@ -50,6 +50,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
         let triggers = self.analyze_update_triggers(&table, &assignments);
         let foreign_keys = self.analyze_dml_foreign_keys(&table, new_source)?;
+        let returning = self.analyze_dml_returning(&syntax.returning, new_source)?;
         let predicate = syntax
             .where_clause
             .as_deref()
@@ -73,7 +74,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             order_by: Vec::new(),
             limit: None,
             conflict: syntax.or_conflict,
-            returning: None,
+            returning,
             trigger: None,
             triggers,
             foreign_keys,
@@ -133,7 +134,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 id: new_source,
                 owner: SourceOwner::Root,
                 database: table.database(),
-                name: "new".to_string(),
+                name: table.value().get_name().to_string(),
                 alias: None,
                 kind: hir::SourceKind::Pseudo {
                     kind: hir::PseudoSource::New,
@@ -220,9 +221,6 @@ fn reject_deferred_update_clauses(syntax: &ast::Update) -> Result<()> {
     }
     if syntax.from.is_some() {
         return unsupported_update("FROM clauses");
-    }
-    if !syntax.returning.is_empty() {
-        return unsupported_update("RETURNING clauses");
     }
     Ok(())
 }

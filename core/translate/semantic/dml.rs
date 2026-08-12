@@ -3,12 +3,14 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::{Analyzer, CatalogObjectKind},
+    analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
+    expr::ExprPolicy,
     hir,
+    scope::{ExpandedColumn, Scope},
 };
 use crate::{schema::Table, sync::Arc, util::normalize_ident, LimboError, Result};
 
-impl Analyzer<'_, '_, '_> {
+impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn freeze_trigger(
         &mut self,
         database: hir::DatabaseId,
@@ -93,6 +95,75 @@ impl Analyzer<'_, '_, '_> {
             outgoing: resolved_outgoing,
             incoming: resolved_incoming,
         })
+    }
+
+    pub(super) fn analyze_dml_returning(
+        &mut self,
+        columns: &'ast [ast::ResultColumn],
+        row_source: hir::SourceId,
+    ) -> Result<Option<hir::Returning>> {
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let source = self.source(row_source).ok_or_else(|| {
+            LimboError::InternalError(format!("missing RETURNING row source {row_source}"))
+        })?;
+        let mut scope = Scope::default();
+        scope.add_source(source, true);
+        let policy = ExprPolicy::returning(self.context().dqs_dml());
+        let mut outputs = Vec::with_capacity(columns.len());
+
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(expression, alias) => {
+                    let resolved = self.analyze_root_expr(expression, &scope, policy)?;
+                    let (name, name_kind) = match alias {
+                        Some(alias) if alias.is_explicit() => (
+                            alias.name().as_str().to_string(),
+                            hir::OutputNameKind::ExplicitAlias,
+                        ),
+                        Some(ast::As::ImplicitColumnName(name)) => {
+                            (name.as_str().to_string(), hir::OutputNameKind::Inferred)
+                        }
+                        None => (expression.to_string(), hir::OutputNameKind::Inferred),
+                        Some(_) => unreachable!("all explicit aliases were handled"),
+                    };
+                    outputs.push(output_from_resolved(
+                        hir::OutputId::root(outputs.len()),
+                        name,
+                        name_kind,
+                        resolved,
+                    ));
+                }
+                ast::ResultColumn::Star => {
+                    let expanded = scope.expand_star()?;
+                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                }
+                ast::ResultColumn::TableStar(table) => {
+                    let expanded = scope.expand_table_star(table.as_str())?;
+                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
+                }
+            }
+        }
+        Ok(Some(hir::Returning { outputs }))
+    }
+
+    fn append_returning_star_outputs(
+        &self,
+        outputs: &mut Vec<hir::Output>,
+        expanded: Vec<ExpandedColumn>,
+        scope: &Scope,
+    ) -> Result<()> {
+        for column in expanded {
+            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            outputs.push(output_from_resolved(
+                hir::OutputId::root(outputs.len()),
+                column.name,
+                hir::OutputNameKind::StarExpansion,
+                resolved,
+            ));
+        }
+        Ok(())
     }
 
     fn freeze_foreign_key_table(

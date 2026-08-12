@@ -8435,6 +8435,91 @@ mod tests {
     }
 
     #[test]
+    fn update_returning_reads_new_row_with_base_table_visibility() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable AS old SET value = 'changed' \
+             RETURNING writable.*, value COLLATE nocase AS folded",
+        )
+        .expect("UPDATE RETURNING binds");
+        document
+            .validate()
+            .expect("UPDATE RETURNING produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let returning = update.returning.as_ref().expect("RETURNING is preserved");
+        assert_eq!(
+            returning
+                .outputs
+                .iter()
+                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .collect::<Vec<_>>(),
+            [
+                (OutputId::root(0), "id", OutputNameKind::StarExpansion),
+                (OutputId::root(1), "value", OutputNameKind::StarExpansion),
+                (OutputId::root(2), "doubled", OutputNameKind::StarExpansion),
+                (OutputId::root(3), "folded", OutputNameKind::ExplicitAlias),
+            ]
+        );
+        assert!(returning.outputs.iter().all(|output| {
+            let mut uses_other_source = false;
+            output.expr.walk(&mut |expression| {
+                if matches!(expression, Expr::Column(column) if column.source != update.new_source)
+                {
+                    uses_other_source = true;
+                }
+            });
+            !uses_other_source
+        }));
+        assert!(returning.outputs[3].collation_is_explicit);
+        assert!(document.output(OutputId::root(3)).is_some());
+
+        let alias = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable AS old SET value = 'changed' RETURNING old.value",
+        )
+        .expect_err("UPDATE alias is hidden from RETURNING");
+        assert_eq!(alias.to_string(), "Parse error: no such table: old");
+    }
+
+    #[test]
+    fn update_returning_subqueries_capture_new_row() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = 'changed' RETURNING \
+             (SELECT value) AS copied, EXISTS(SELECT 1 WHERE id = 3) AS found",
+        )
+        .expect("UPDATE RETURNING subqueries bind");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let outputs = &update
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs;
+        let query_ids = [
+            match outputs[0].expr {
+                Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
+                _ => panic!("first output is scalar subquery"),
+            },
+            match outputs[1].expr {
+                Expr::Subquery(SubqueryExpr::Exists(query)) => query,
+                _ => panic!("second output is EXISTS subquery"),
+            },
+        ];
+        for query in query_ids {
+            let query = document.query(query).expect("RETURNING child query exists");
+            assert_eq!(query.parent, None);
+            assert_eq!(query.captures, [update.new_source]);
+        }
+    }
+
+    #[test]
     fn update_rejects_deferred_clauses_before_binding_the_target() {
         let schema = schema_with_writable_table();
         for (sql, feature) in [
@@ -8445,10 +8530,6 @@ mod tests {
             (
                 "UPDATE absent SET value = other.value FROM writable AS other",
                 "FROM clauses",
-            ),
-            (
-                "UPDATE absent SET value = 'x' RETURNING value",
-                "RETURNING clauses",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql)
