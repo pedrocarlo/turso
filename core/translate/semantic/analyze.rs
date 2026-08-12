@@ -5162,14 +5162,181 @@ mod tests {
                  ON CONFLICT(value NULLS LAST) DO NOTHING",
                 "Parse error: unsupported use of NULLS LAST",
             ),
-            (
-                "INSERT INTO guarded(id) VALUES (1) \
-                 ON CONFLICT DO UPDATE SET value = 'x'",
-                "Parse error: semantic INSERT does not yet accept UPSERT DO UPDATE clauses",
-            ),
         ] {
             let error =
                 analyze_sql_with_schema(&schema, sql).expect_err("invalid UPSERT target fails");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn insert_binds_upsert_update_against_target_and_excluded_rows() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded AS g(id, value, score) VALUES (1, 'one', 2) \
+             ON CONFLICT(value) DO UPDATE \
+             SET (value, score) = (excluded.value, score + 1), \
+                 score = excluded.score + 2 \
+             WHERE g.id = excluded.id \
+             ON CONFLICT DO NOTHING",
+        )
+        .expect("UPSERT DO UPDATE binds");
+        document
+            .validate()
+            .expect("UPSERT DO UPDATE produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let excluded = insert
+            .excluded_source
+            .expect("DO UPDATE creates EXCLUDED source");
+        let source = document.source(excluded).expect("EXCLUDED source exists");
+        assert!(matches!(
+            &source.kind,
+            SourceKind::Pseudo {
+                kind: hir::PseudoSource::Excluded,
+                table,
+            } if table.value().get_name() == "guarded"
+        ));
+        assert_eq!(source.owner, SourceOwner::Root);
+
+        let hir::UpsertAction::Update {
+            assignments,
+            predicate,
+        } = &insert.upserts[0].action
+        else {
+            panic!("first clause is DO UPDATE");
+        };
+        assert_eq!(assignments.len(), 2, "duplicate score keeps one assignment");
+        assert_eq!(assignments[0].columns, [TargetColumn::Column(1)]);
+        assert!(matches!(
+            assignments[0].value,
+            Expr::Column(column) if column.source == excluded && column.column == 1
+        ));
+        assert_eq!(assignments[1].columns, [TargetColumn::Column(2)]);
+        assert!(matches!(
+            &assignments[1].value,
+            Expr::Binary { lhs, rhs, .. }
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == excluded && column.column == 2)
+                    && matches!(rhs.as_ref(), Expr::Literal(ast::Literal::Numeric(value))
+                        if value == "2")
+        ));
+        assert!(matches!(
+            predicate,
+            Some(Expr::Binary { lhs, rhs, .. })
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == insert.target && column.column == 0)
+                    && matches!(rhs.as_ref(), Expr::Column(column)
+                        if column.source == excluded && column.column == 0)
+        ));
+        assert!(matches!(
+            insert.upserts[1],
+            hir::Upsert {
+                target: None,
+                action: hir::UpsertAction::Nothing,
+            }
+        ));
+    }
+
+    #[test]
+    fn upsert_update_assignment_uses_destination_type() {
+        let schema = schema_with_insert_unions();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO union_values VALUES (1, union_value('y', 1.0), union_value('red', 'r')) \
+             ON CONFLICT(id) DO UPDATE SET \
+             nested = union_value('x', union_value('b', 'updated'))",
+        )
+        .expect("DO UPDATE assignment receives destination type");
+        document
+            .validate()
+            .expect("typed DO UPDATE produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let hir::UpsertAction::Update { assignments, .. } = &insert.upserts[0].action else {
+            panic!("UPSERT action is UPDATE");
+        };
+        assert!(matches!(
+            &assignments[0].value,
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 0,
+                }) if union_type.value().name == "outer_u"
+            )
+        ));
+    }
+
+    #[test]
+    fn upsert_target_named_excluded_shadows_the_pseudo_source() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE excluded(id INTEGER PRIMARY KEY, value TEXT)",
+            2,
+        )
+        .expect("table named excluded parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table named excluded is unique");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO excluded(id, value) VALUES (1, 'new') \
+             ON CONFLICT DO UPDATE SET value = excluded.value",
+        )
+        .expect("target qualifier shadows outer EXCLUDED scope");
+        document
+            .validate()
+            .expect("shadowed EXCLUDED source produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let hir::UpsertAction::Update { assignments, .. } = &insert.upserts[0].action else {
+            panic!("UPSERT action is UPDATE");
+        };
+        assert!(matches!(
+            assignments[0].value,
+            Expr::Column(column) if column.source == insert.target && column.column == 1
+        ));
+    }
+
+    #[test]
+    fn upsert_update_keeps_assignment_diagnostics() {
+        let schema = schema_with_writable_table();
+        for (sql, expected) in [
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET missing = 1",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET doubled = 1",
+                "Parse error: cannot UPDATE generated column \"doubled\"",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET (id, value) = (1)",
+                "Parse error: 2 columns assigned 1 values",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET value = (SELECT value)",
+                "Parse error: Subquery is not supported in this position",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET value = excluded.missing",
+                "Parse error: no such column: excluded.missing",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid UPDATE fails");
             assert_eq!(error.to_string(), expected);
         }
     }

@@ -158,6 +158,10 @@ impl ExprPolicy {
         Self::insert_values(dqs_dml)
     }
 
+    pub(super) const fn upsert_update(dqs_dml: DoubleQuotedDml) -> Self {
+        Self::insert_values(dqs_dml)
+    }
+
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
         self
