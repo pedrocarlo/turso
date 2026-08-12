@@ -187,6 +187,8 @@ Completed:
 - Top-level INSERT WITH clauses use the same lazy CTE scopes as SELECT.
   Referenced ordinary and recursive CTEs enter the closed document, while
   unused invalid definitions remain unbound.
+- Statement-level INSERT conflict resolution remains an exact parser enum in
+  HIR, distinguishing ROLLBACK, ABORT, FAIL, IGNORE, REPLACE, and no override.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.

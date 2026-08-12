@@ -25,9 +25,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         body: &'ast ast::InsertBody,
         returning: &[ast::ResultColumn],
     ) -> Result<HirRoot> {
-        if conflict.is_some() {
-            return unsupported_insert("conflict resolution");
-        }
         if !returning.is_empty() {
             return unsupported_insert("RETURNING clauses");
         }
@@ -131,7 +128,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             columns,
             defaults,
             source,
-            conflict: None,
+            conflict,
             upserts: Vec::new(),
             excluded_source: None,
             returning: None,
