@@ -3,7 +3,7 @@
 use turso_parser::ast;
 
 use super::{
-    analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
+    analyze::{Analyzer, CatalogObjectKind},
     dml::{trigger_matches_update, trigger_targets_database},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
@@ -160,7 +160,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 (columns, source, upserts, excluded_source)
             }
         };
-        let returning = self.analyze_insert_returning(returning, target)?;
+        let returning = self.analyze_dml_returning(returning, target)?;
         let target_kind = if virtual_target {
             hir::InsertTargetKind::Virtual
         } else {
@@ -533,57 +533,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .cloned())
     }
 
-    fn analyze_insert_returning(
-        &mut self,
-        columns: &'ast [ast::ResultColumn],
-        target: hir::SourceId,
-    ) -> Result<Option<hir::Returning>> {
-        if columns.is_empty() {
-            return Ok(None);
-        }
-        let source = self.source(target).ok_or_else(|| {
-            LimboError::InternalError(format!("missing INSERT target source {target}"))
-        })?;
-        let mut scope = Scope::default();
-        scope.add_source(source, true);
-        let policy = ExprPolicy::returning(self.context().dqs_dml());
-        let mut outputs = Vec::with_capacity(columns.len());
-
-        for column in columns {
-            match column {
-                ast::ResultColumn::Expr(expression, alias) => {
-                    let resolved = self.analyze_root_expr(expression, &scope, policy)?;
-                    let (name, name_kind) = match alias {
-                        Some(alias) if alias.is_explicit() => (
-                            alias.name().as_str().to_string(),
-                            hir::OutputNameKind::ExplicitAlias,
-                        ),
-                        Some(ast::As::ImplicitColumnName(name)) => {
-                            (name.as_str().to_string(), hir::OutputNameKind::Inferred)
-                        }
-                        None => (expression.to_string(), hir::OutputNameKind::Inferred),
-                        Some(_) => unreachable!("all explicit aliases were handled"),
-                    };
-                    outputs.push(output_from_resolved(
-                        hir::OutputId::root(outputs.len()),
-                        name,
-                        name_kind,
-                        resolved,
-                    ));
-                }
-                ast::ResultColumn::Star => {
-                    let expanded = scope.expand_star()?;
-                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
-                }
-                ast::ResultColumn::TableStar(table) => {
-                    let expanded = scope.expand_table_star(table.as_str())?;
-                    self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
-                }
-            }
-        }
-        Ok(Some(hir::Returning { outputs }))
-    }
-
     fn analyze_upserts(
         &mut self,
         mut syntax: Option<&'ast ast::Upsert>,
@@ -808,24 +757,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             },
         )?;
         Ok(excluded)
-    }
-
-    fn append_returning_star_outputs(
-        &self,
-        outputs: &mut Vec<hir::Output>,
-        expanded: Vec<super::scope::ExpandedColumn>,
-        scope: &Scope,
-    ) -> Result<()> {
-        for column in expanded {
-            let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
-            outputs.push(output_from_resolved(
-                hir::OutputId::root(outputs.len()),
-                column.name,
-                hir::OutputNameKind::StarExpansion,
-                resolved,
-            ));
-        }
-        Ok(())
     }
 }
 

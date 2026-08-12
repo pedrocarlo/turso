@@ -253,6 +253,10 @@ Completed:
   identities, column positions, UNIQUE indexes, and generated child keys use
   the same closed metadata as INSERT. Enforcement remains outside semantic
   analysis.
+- UPDATE RETURNING expressions bind against the NEW row identity. Stars,
+  output facts, aliases, collations, generated columns, and root-owned
+  subqueries share INSERT's DML RETURNING path. The base table name remains
+  visible when the UPDATE target has an alias; that alias is not visible.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
