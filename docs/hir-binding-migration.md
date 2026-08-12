@@ -206,8 +206,11 @@ Completed:
   keep their lexical parent. INSERT-level WITH scopes remain alive through
   RETURNING so lazy CTE definitions keep one statement-local identity.
 - Catch-all `ON CONFLICT DO NOTHING` clauses become ordered INSERT HIR without
-  creating an EXCLUDED source. Conflict targets and `DO UPDATE` actions remain
-  separate checkpoints with distinct diagnostics.
+  creating an EXCLUDED source.
+- Targeted `DO NOTHING` clauses freeze bound conflict expressions, explicit
+  collations, sort order, partial-index predicates, and the exact PRIMARY KEY
+  or UNIQUE index match. Chained clauses retain parser order. `DO UPDATE`
+  remains a separate checkpoint.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

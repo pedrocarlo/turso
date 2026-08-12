@@ -6,7 +6,7 @@ use super::{
     analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
-    scope::Scope,
+    scope::{ExprCollation, Scope},
 };
 use crate::{
     schema::{Table, TypeDef},
@@ -116,7 +116,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         hir::InsertSource::Query(query)
                     }
                 };
-                let upserts = analyze_catch_all_upserts(upsert.as_deref())?;
+                let upserts = self.analyze_upserts(upsert.as_deref(), target, &table)?;
                 (columns, source, upserts)
             }
         };
@@ -433,6 +433,91 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(Some(hir::Returning { outputs }))
     }
 
+    fn analyze_upserts(
+        &mut self,
+        mut syntax: Option<&'ast ast::Upsert>,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<Vec<hir::Upsert>> {
+        let scope = {
+            let source = self.source(target).ok_or_else(|| {
+                LimboError::InternalError(format!("missing INSERT target source {target}"))
+            })?;
+            let mut scope = Scope::default();
+            scope.add_source(source, true);
+            scope
+        };
+        let policy = ExprPolicy::schema_expression().with_self_source(target);
+        let mut upserts = Vec::new();
+        while let Some(upsert) = syntax {
+            if matches!(upsert.do_clause, ast::UpsertDo::Set { .. }) {
+                return unsupported_insert("UPSERT DO UPDATE clauses");
+            }
+            let conflict_target = upsert
+                .index
+                .as_ref()
+                .map(|conflict| {
+                    crate::translate::index::reject_explicit_nulls(&conflict.targets)?;
+                    let terms = conflict
+                        .targets
+                        .iter()
+                        .map(|term| {
+                            let resolved =
+                                self.analyze_resolved_expr(&term.expr, &scope, policy)?;
+                            Ok(hir::ConflictTerm {
+                                collation: match resolved.collation {
+                                    ExprCollation::Explicit(collation) => Some(collation),
+                                    ExprCollation::Absent | ExprCollation::Inherited(_) => None,
+                                },
+                                expr: resolved.expr,
+                                order: term.order.unwrap_or(ast::SortOrder::Asc),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let predicate = conflict
+                        .where_clause
+                        .as_deref()
+                        .map(|predicate| self.analyze_expr(predicate, &scope, policy))
+                        .transpose()?;
+                    let matched_index = match crate::translate::upsert::resolve_upsert_target(
+                        self.context().main_schema(),
+                        table.value(),
+                        upsert,
+                    )? {
+                        crate::translate::upsert::ResolvedUpsertTarget::PrimaryKey => None,
+                        crate::translate::upsert::ResolvedUpsertTarget::Index(index) => {
+                            let id = self.catalog_object_id(
+                                table.database(),
+                                CatalogObjectKind::Index,
+                                normalize_ident(&index.name),
+                            );
+                            Some(hir::CatalogObject::new(
+                                id,
+                                self.context().snapshot(),
+                                table.database(),
+                                index,
+                            ))
+                        }
+                        crate::translate::upsert::ResolvedUpsertTarget::CatchAll => {
+                            unreachable!("a present conflict target is not catch-all")
+                        }
+                    };
+                    Ok(hir::ConflictTarget {
+                        terms,
+                        predicate,
+                        matched_index,
+                    })
+                })
+                .transpose()?;
+            upserts.push(hir::Upsert {
+                target: conflict_target,
+                action: hir::UpsertAction::Nothing,
+            });
+            syntax = upsert.next.as_deref();
+        }
+        Ok(upserts)
+    }
+
     fn append_returning_star_outputs(
         &self,
         outputs: &mut Vec<hir::Output>,
@@ -450,24 +535,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }
         Ok(())
     }
-}
-
-fn analyze_catch_all_upserts(mut syntax: Option<&ast::Upsert>) -> Result<Vec<hir::Upsert>> {
-    let mut upserts = Vec::new();
-    while let Some(upsert) = syntax {
-        if upsert.index.is_some() {
-            return unsupported_insert("UPSERT conflict targets");
-        }
-        if matches!(upsert.do_clause, ast::UpsertDo::Set { .. }) {
-            return unsupported_insert("UPSERT DO UPDATE clauses");
-        }
-        upserts.push(hir::Upsert {
-            target: None,
-            action: hir::UpsertAction::Nothing,
-        });
-        syntax = upsert.next.as_deref();
-    }
-    Ok(upserts)
 }
 
 fn simple_values_rows(select: &ast::Select) -> Result<&[Vec<Box<ast::Expr>>]> {
