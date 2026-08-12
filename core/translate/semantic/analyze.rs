@@ -4874,6 +4874,50 @@ mod tests {
     }
 
     #[test]
+    fn insert_with_uses_lazy_and_recursive_cte_binding() {
+        let schema = schema_with_insert_source();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH broken AS (SELECT absent), \
+                  picked(value, id) AS (SELECT value, id FROM insert_source) \
+             INSERT INTO writable(value, id) SELECT value, id FROM picked",
+        )
+        .expect("INSERT WITH binds referenced CTEs lazily");
+        document
+            .validate()
+            .expect("INSERT WITH produces closed HIR");
+
+        assert_eq!(document.ctes.len(), 1, "unused invalid CTE stays unbound");
+        assert_eq!(document.ctes[0].name, "picked");
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Query(query) = insert.source else {
+            panic!("INSERT WITH retains source query");
+        };
+        assert_eq!(
+            document
+                .query(query)
+                .expect("source query exists")
+                .reachable_ctes,
+            [document.ctes[0].id]
+        );
+
+        let recursive = analyze_sql_with_schema(
+            &schema,
+            "WITH RECURSIVE seq(x) AS (\
+                 VALUES (1) UNION ALL SELECT x + 1 FROM seq WHERE x < 2\
+             ) \
+             INSERT INTO writable(id, value) SELECT x, 'recursive' FROM seq",
+        )
+        .expect("recursive INSERT CTE binds");
+        recursive
+            .validate()
+            .expect("recursive INSERT CTE produces closed HIR");
+        assert!(matches!(recursive.ctes[0].body, CteBody::Recursive(_)));
+    }
+
+    #[test]
     fn insert_defaults_and_duplicate_targets_keep_write_selection_rules() {
         let schema = schema_with_writable_table();
         let explicit_default =
