@@ -184,6 +184,9 @@ Completed:
 - Plain `INSERT ... SELECT` sources retain their query identity and complete
   SELECT HIR. Destination width is checked during analysis, and nested query
   captures remain attached to the source query tree.
+- Top-level INSERT WITH clauses use the same lazy CTE scopes as SELECT.
+  Referenced ordinary and recursive CTEs enter the closed document, while
+  unused invalid definitions remain unbound.
 
 The standalone SELECT expression checkpoints are complete. `union_value`
 remains with DML because it needs the destination column type.

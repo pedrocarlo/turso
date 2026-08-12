@@ -18,21 +18,27 @@ use crate::{
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_insert(
         &mut self,
-        with: Option<&ast::With>,
+        with: Option<&'ast ast::With>,
         conflict: Option<ast::ResolveType>,
         table_name: &ast::QualifiedName,
         column_names: &[ast::Name],
         body: &'ast ast::InsertBody,
         returning: &[ast::ResultColumn],
     ) -> Result<HirRoot> {
-        if with.is_some() {
-            return unsupported_insert("WITH clauses");
-        }
         if conflict.is_some() {
             return unsupported_insert("conflict resolution");
         }
         if !returning.is_empty() {
             return unsupported_insert("RETURNING clauses");
+        }
+        if with.is_some()
+            && !matches!(
+                body,
+                ast::InsertBody::Select(select, _)
+                    if matches!(select.body.select, ast::OneSelect::Select { .. })
+            )
+        {
+            return unsupported_insert("WITH clauses on non-query sources");
         }
 
         let target = self.analyze_base_table_source(table_name, None, None, SourceOwner::Root)?;
@@ -95,7 +101,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         (columns, hir::InsertSource::Values(bound_rows))
                     }
                     ast::OneSelect::Select { .. } => {
-                        let query = self.analyze_select(select)?;
+                        let query = self.analyze_insert_select(select, with)?;
                         let actual = self
                             .query(query)
                             .ok_or_else(|| {
@@ -134,6 +140,23 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             upsert_triggers: Vec::new(),
             foreign_keys: hir::DmlForeignKeys::default(),
         }))
+    }
+
+    fn analyze_insert_select(
+        &mut self,
+        select: &'ast ast::Select,
+        with: Option<&'ast ast::With>,
+    ) -> Result<hir::QueryId> {
+        if let Some(with) = with {
+            self.push_cte_scope(with)?;
+        }
+        let result = self.analyze_select(select);
+        if with.is_some() {
+            self.cte_scopes
+                .pop()
+                .expect("an INSERT WITH clause must own one CTE scope");
+        }
+        result
     }
 
     fn require_basic_insert_target(&self, table: &Table) -> Result<()> {
