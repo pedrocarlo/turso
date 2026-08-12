@@ -55,12 +55,7 @@ pub struct TriggerEnvironment {
 #[derive(Clone, Debug)]
 pub struct Insert {
     pub target: SourceId,
-    /// Resolved sqlite_sequence table for an AUTOINCREMENT target.
-    pub autoincrement: Option<ResolvedTable>,
-    /// Hidden MVCC sequence used instead of scanning sqlite_sequence for key
-    /// allocation. Present only when the target database exposes that
-    /// sequence in the semantic snapshot.
-    pub autoincrement_sequence: Option<super::SequenceOperation>,
+    pub autoincrement: Option<ResolvedAutoincrement>,
     pub columns: Vec<InsertTarget>,
     pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,
@@ -74,6 +69,17 @@ pub struct Insert {
     /// Exact UPDATE triggers that can fire from an UPSERT DO UPDATE arm.
     pub upsert_triggers: Vec<ResolvedTrigger>,
     pub foreign_keys: DmlForeignKeys,
+}
+
+/// Catalog objects needed to allocate and persist an AUTOINCREMENT key.
+#[derive(Clone, Debug)]
+pub struct ResolvedAutoincrement {
+    /// SQLite-compatible sequence storage required in every journal mode.
+    pub sqlite_sequence: ResolvedTable,
+    /// Hidden MVCC sequence used instead of scanning sqlite_sequence for key
+    /// allocation. Present only when the target database exposes that
+    /// sequence in the semantic snapshot.
+    pub mvcc_sequence: Option<super::SequenceOperation>,
 }
 
 #[derive(Clone, Debug)]
