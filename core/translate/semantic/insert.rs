@@ -26,16 +26,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         body: &'ast ast::InsertBody,
         returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
-        if with.is_some()
-            && !matches!(
-                body,
-                ast::InsertBody::Select(select, _)
-                    if matches!(select.body.select, ast::OneSelect::Select { .. })
-            )
-        {
-            return unsupported_insert("WITH clauses on non-query sources");
-        }
-
         let target = self.analyze_base_table_source(table_name, None, None, SourceOwner::Root)?;
         let table = match &self
             .source(target)
@@ -54,6 +44,28 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         self.require_basic_insert_target(table.value())?;
         self.analyze_insert_target_metadata(target, &table)?;
 
+        if let Some(with) = with {
+            self.push_cte_scope(with)?;
+        }
+        let result =
+            self.analyze_insert_body(conflict, column_names, body, returning, target, &table);
+        if with.is_some() {
+            self.cte_scopes
+                .pop()
+                .expect("an INSERT WITH clause must own one CTE scope");
+        }
+        result
+    }
+
+    fn analyze_insert_body(
+        &mut self,
+        conflict: Option<ast::ResolveType>,
+        column_names: &[ast::Name],
+        body: &'ast ast::InsertBody,
+        returning: &'ast [ast::ResultColumn],
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<HirRoot> {
         let (columns, source, upserts, excluded_source) = match body {
             ast::InsertBody::DefaultValues => {
                 if !column_names.is_empty() {
@@ -101,7 +113,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             .iter()
                             .map(|target| self.insert_target_type(table.value(), target.column))
                             .collect::<Result<Vec<_>>>()?;
-                        let query = self.analyze_insert_select(select, with, &expected_outputs)?;
+                        let query = self.analyze_insert_select(select, &expected_outputs)?;
                         let actual = self
                             .query(query)
                             .ok_or_else(|| {
@@ -121,18 +133,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     }
                 };
                 let (upserts, excluded_source) =
-                    self.analyze_upserts(upsert.as_deref(), target, &table)?;
+                    self.analyze_upserts(upsert.as_deref(), target, table)?;
                 (columns, source, upserts, excluded_source)
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
-        let returning = self.analyze_insert_returning(returning, target);
-        if with.is_some() {
-            self.cte_scopes
-                .pop()
-                .expect("an INSERT WITH clause must own one CTE scope");
-        }
-        let returning = returning?;
+        let returning = self.analyze_insert_returning(returning, target)?;
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
@@ -155,12 +161,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     fn analyze_insert_select(
         &mut self,
         select: &'ast ast::Select,
-        with: Option<&'ast ast::With>,
         expected_outputs: &[Option<Arc<TypeDef>>],
     ) -> Result<hir::QueryId> {
-        if let Some(with) = with {
-            self.push_cte_scope(with)?;
-        }
         self.analyze_select_with_expected_outputs(select, expected_outputs)
     }
 
