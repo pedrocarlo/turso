@@ -243,8 +243,11 @@ Completed:
   close separately against both row identities. Row assignments, duplicate
   targets, rowid aliases, SET DEFAULT, array-setter composition, destination
   types, and correlated expression subqueries keep their binding rules. WITH,
-  FROM, RETURNING, virtual/WITHOUT ROWID targets, triggers, and foreign keys
-  remain explicit later checkpoints.
+  FROM, RETURNING, virtual/WITHOUT ROWID targets, and foreign keys remain
+  explicit later checkpoints.
+- UPDATE trigger identities retain catalog order and include ordinary UPDATE
+  triggers plus only the `UPDATE OF` triggers whose named columns are assigned.
+  Trigger programs and trigger environments remain later checkpoints.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

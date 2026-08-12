@@ -8237,6 +8237,45 @@ mod tests {
     }
 
     #[test]
+    fn update_freezes_only_matching_update_triggers() {
+        let schema = schema_with_insert_triggers();
+        let value = analyze_sql_with_schema(&schema, "UPDATE writable SET value = 'changed'")
+            .expect("triggered UPDATE binds");
+        value
+            .validate()
+            .expect("triggered UPDATE produces closed HIR");
+        let HirRoot::Update(update) = &value.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(
+            update
+                .triggers
+                .iter()
+                .map(|trigger| trigger.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["update_value", "update_all"]
+        );
+        assert!(update
+            .triggers
+            .iter()
+            .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
+
+        let rowid = analyze_sql_with_schema(&schema, "UPDATE writable SET rowid = 9")
+            .expect("rowid-alias UPDATE binds matching triggers");
+        let HirRoot::Update(update) = &rowid.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(
+            update
+                .triggers
+                .iter()
+                .map(|trigger| trigger.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["update_id", "update_all"]
+        );
+    }
+
+    #[test]
     fn update_keeps_row_assignment_duplicate_and_rowid_rules() {
         let schema = schema_with_writable_table();
         let document = analyze_sql_with_schema(
