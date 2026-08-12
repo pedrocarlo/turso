@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     function::{AggFunc, Func, ScalarFunc, WindowFunc},
-    schema::{Type, AUTOINCREMENT_SEQ_PREFIX, SQLITE_SEQUENCE_TABLE_NAME},
+    schema::{Schema, Type, TypeDef, AUTOINCREMENT_SEQ_PREFIX, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
     translate::collate::CollationSeq,
     util::normalize_ident,
@@ -447,21 +447,29 @@ impl FunctionInput {
 
 struct ExprFrame<'a> {
     syntax: &'a ast::Expr,
+    expected_type: Option<Arc<TypeDef>>,
     next_child: usize,
     resolved_children: ExprChildren,
 }
 
+struct ExprChild<'a> {
+    syntax: &'a ast::Expr,
+    expected_type: Option<Arc<TypeDef>>,
+}
+
 impl<'a> ExprFrame<'a> {
-    fn new(syntax: &'a ast::Expr) -> Result<Self> {
+    fn new(syntax: &'a ast::Expr, expected_type: Option<Arc<TypeDef>>) -> Result<Self> {
         validate_special_function_syntax(syntax)?;
         Ok(Self {
             syntax,
+            expected_type,
             next_child: 0,
             resolved_children: SmallVec::new(),
         })
     }
 
-    fn next_child(&mut self) -> Option<&'a ast::Expr> {
+    fn next_child(&mut self, schema: &Schema) -> Result<Option<ExprChild<'a>>> {
+        let child_index = self.next_child;
         let child = match self.syntax {
             ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
                 (self.next_child == 0).then(|| expressions[0].as_ref())
@@ -613,7 +621,52 @@ impl<'a> ExprFrame<'a> {
         if child.is_some() {
             self.next_child += 1;
         }
-        child
+        let Some(syntax) = child else {
+            return Ok(None);
+        };
+        let expected_type = self.child_expected_type(child_index, schema)?;
+        Ok(Some(ExprChild {
+            syntax,
+            expected_type,
+        }))
+    }
+
+    fn child_expected_type(
+        &self,
+        child_index: usize,
+        schema: &Schema,
+    ) -> Result<Option<Arc<TypeDef>>> {
+        let ast::Expr::FunctionCall { name, args, .. } = self.syntax else {
+            return Ok(self.expected_type.clone());
+        };
+        if normalize_ident(name.as_str()) != "union_value" {
+            return Ok(self.expected_type.clone());
+        }
+        let union = self
+            .expected_type
+            .as_ref()
+            .filter(|definition| definition.is_union())
+            .ok_or_else(|| {
+                LimboError::ParseError(
+                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column"
+                        .to_string(),
+                )
+            })?;
+        let ast::Expr::Literal(ast::Literal::String(tag_name)) = args[0].as_ref() else {
+            unreachable!("union_value syntax validation requires a string tag")
+        };
+        let tag_name = tag_name.trim_matches('\'');
+        let (_, variant) = union.find_union_variant(tag_name).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "unknown variant '{}' in union type '{}'",
+                tag_name, union.name
+            ))
+        })?;
+        match child_index {
+            0 => Ok(None),
+            1 => Ok(schema.get_type_def_unchecked(&variant.type_name).cloned()),
+            _ => unreachable!("union_value has exactly two arguments"),
+        }
     }
 }
 
@@ -787,6 +840,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(self.analyze_resolved_expr(syntax, scope, policy)?.expr)
     }
 
+    pub(super) fn analyze_expr_with_expected_type(
+        &mut self,
+        syntax: &ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        expected_type: Option<Arc<TypeDef>>,
+    ) -> Result<hir::Expr> {
+        Ok(self
+            .analyze_resolved_expr_with_functions(
+                syntax,
+                scope,
+                policy,
+                &mut FunctionContext::ScalarOnly,
+                expected_type,
+            )?
+            .expr)
+    }
+
     pub(super) fn analyze_resolved_expr(
         &mut self,
         syntax: &ast::Expr,
@@ -798,6 +869,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             scope,
             policy,
             &mut FunctionContext::ScalarOnly,
+            None,
         )
     }
 
@@ -837,14 +909,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: hir::QueryId,
         functions: &mut FunctionContext<'_>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax)?];
+        let mut frames = vec![ExprFrame::new(syntax, None)?];
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
-                .next_child()
+                .next_child(self.context().main_schema())?
             {
-                frames.push(ExprFrame::new(child)?);
+                frames.push(ExprFrame::new(child.syntax, child.expected_type)?);
                 continue;
             }
 
@@ -862,6 +934,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     scope,
                     policy,
                     functions,
+                    frame.expected_type.as_ref(),
                 )?,
             };
             match frames.last_mut() {
@@ -1166,15 +1239,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         functions: &mut FunctionContext<'_>,
+        expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax)?];
+        let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
         loop {
             if let Some(child) = frames
                 .last_mut()
                 .expect("root expression frame exists")
-                .next_child()
+                .next_child(self.context().main_schema())?
             {
-                frames.push(ExprFrame::new(child)?);
+                frames.push(ExprFrame::new(child.syntax, child.expected_type)?);
                 continue;
             }
 
@@ -1185,6 +1259,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 scope,
                 policy,
                 functions,
+                frame.expected_type.as_ref(),
             )?;
             match frames.last_mut() {
                 Some(parent) => parent.resolved_children.push(resolved),
@@ -1200,6 +1275,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         functions: &mut FunctionContext<'_>,
+        expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
             ast::Expr::Literal(literal) => {
@@ -1624,7 +1700,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         order_by: argument_order,
                     },
                 };
-                self.build_function_call(name, input, filter, window, scope, policy, functions)
+                self.build_function_call(
+                    name,
+                    input,
+                    filter,
+                    window,
+                    scope,
+                    policy,
+                    functions,
+                    expected_type,
+                )
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 let expected_children = usize::from(filter_over.filter_clause.is_some())
@@ -1651,6 +1736,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     scope,
                     policy,
                     functions,
+                    expected_type,
                 )
             }
             ast::Expr::Collate(_, name) => {
@@ -1806,6 +1892,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         functions: &mut FunctionContext<'_>,
+        expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let argument_count = input.argument_count();
         let function_name = normalize_ident(name.as_str());
@@ -1821,12 +1908,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 function
             }
         };
-        let special_operation = match self.resolve_custom_type_read(&function, &input)? {
-            Some((operation, result_type)) => {
-                Some((hir::FunctionOperation::CustomType(operation), result_type))
-            }
-            None => self.resolve_sequence_operation(&function, &input)?,
-        };
+        let special_operation =
+            match self.resolve_custom_type_operation(&function, &input, expected_type)? {
+                Some((operation, result_type)) => {
+                    Some((hir::FunctionOperation::CustomType(operation), result_type))
+                }
+                None => self.resolve_sequence_operation(&function, &input)?,
+            };
         let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
@@ -1952,14 +2040,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         ))
     }
 
-    fn resolve_custom_type_read(
+    fn resolve_custom_type_operation(
         &mut self,
         function: &Func,
         input: &FunctionInput,
+        expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<Option<(hir::CustomTypeOperation, hir::TypeFact)>> {
         let scalar = match function {
             Func::Scalar(
-                scalar @ (ScalarFunc::UnionTagFunc
+                scalar @ (ScalarFunc::UnionValueFunc
+                | ScalarFunc::UnionTagFunc
                 | ScalarFunc::UnionExtractFunc
                 | ScalarFunc::StructExtractFunc),
             ) => scalar,
@@ -1967,6 +2057,55 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let arguments = input.facts();
         match scalar {
+            ScalarFunc::UnionValueFunc => {
+                let union = expected_type
+                    .filter(|definition| definition.is_union())
+                    .ok_or_else(|| {
+                        LimboError::ParseError(
+                            "union_value() can only be used in INSERT/UPDATE targeting a union-typed column"
+                                .to_string(),
+                        )
+                    })?;
+                let tag_name = string_literal_argument(
+                    &arguments[0],
+                    "union_value() first argument must be a string literal",
+                )?;
+                let (tag_index, _) = union.find_union_variant(&tag_name).ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "unknown variant '{}' in union type '{}'",
+                        tag_name, union.name
+                    ))
+                })?;
+                let resolved = self
+                    .context()
+                    .main_schema()
+                    .resolve_type_unchecked(&union.name)?
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "expected INSERT type '{}' is missing from the schema",
+                            union.name
+                        ))
+                    })?;
+                let (result_type, _) = self.freeze_type_fact(&union.name, resolved, 0);
+                let union_type = result_type
+                    .declared
+                    .as_ref()
+                    .and_then(hir::DeclaredType::custom)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "expected INSERT union '{}' has no frozen type definition",
+                            union.name
+                        ))
+                    })?;
+                Ok(Some((
+                    hir::CustomTypeOperation::UnionValue {
+                        union_type,
+                        tag_index,
+                    },
+                    result_type,
+                )))
+            }
             ScalarFunc::UnionTagFunc => {
                 let union_type =
                     custom_argument_type(&arguments[0], |definition| definition.is_union())
@@ -2717,7 +2856,7 @@ fn validate_special_function_syntax(syntax: &ast::Expr) -> Result<()> {
     }
     let expected_arguments = match function.as_str() {
         "union_tag" => 1,
-        "union_extract" | "struct_extract" => 2,
+        "union_value" | "union_extract" | "struct_extract" => 2,
         _ => return Ok(()),
     };
     if args.len() != expected_arguments {
@@ -2737,13 +2876,24 @@ fn validate_special_function_syntax(syntax: &ast::Expr) -> Result<()> {
             function
         );
     }
-    if matches!(function.as_str(), "union_extract" | "struct_extract")
-        && !matches!(
-            args[1].as_ref(),
-            ast::Expr::Literal(ast::Literal::String(_))
-        )
-    {
-        crate::bail_parse_error!("{}() second argument must be a string literal", function);
+    match function.as_str() {
+        "union_value"
+            if !matches!(
+                args[0].as_ref(),
+                ast::Expr::Literal(ast::Literal::String(_))
+            ) =>
+        {
+            crate::bail_parse_error!("union_value() first argument must be a string literal");
+        }
+        "union_extract" | "struct_extract"
+            if !matches!(
+                args[1].as_ref(),
+                ast::Expr::Literal(ast::Literal::String(_))
+            ) =>
+        {
+            crate::bail_parse_error!("{}() second argument must be a string literal", function);
+        }
+        _ => {}
     }
     Ok(())
 }

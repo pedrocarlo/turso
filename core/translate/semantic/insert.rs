@@ -9,7 +9,8 @@ use super::{
     scope::Scope,
 };
 use crate::{
-    schema::Table,
+    schema::{Table, TypeDef},
+    sync::Arc,
     translate::expr::{walk_expr, WalkControl},
     util::normalize_ident,
     LimboError, Result,
@@ -274,10 +275,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         if expression_contains_subquery(syntax) {
             return unsupported_insert("subqueries in VALUES rows");
         }
-        self.analyze_expr(
+        self.analyze_expr_with_expected_type(
             syntax,
             &Scope::default(),
             ExprPolicy::insert_values(self.context().dqs_dml()),
+            self.insert_target_type(table, column)?,
         )
     }
 
@@ -349,11 +351,33 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })?;
         let mut scope = Scope::default();
         scope.add_source(source, true);
-        self.analyze_expr(
+        self.analyze_expr_with_expected_type(
             &syntax,
             &scope,
             ExprPolicy::schema_expression().with_self_source(target),
+            self.insert_target_type(table, column)?,
         )
+    }
+
+    fn insert_target_type(
+        &self,
+        table: &Table,
+        column: hir::TargetColumn,
+    ) -> Result<Option<Arc<TypeDef>>> {
+        let hir::TargetColumn::Column(column) = column else {
+            return Ok(None);
+        };
+        let definition = table.columns().get(column).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "INSERT target column {column} is outside table {}",
+                table.get_name()
+            ))
+        })?;
+        Ok(self
+            .context()
+            .main_schema()
+            .get_type_def_unchecked(&definition.ty_str)
+            .cloned())
     }
 }
 

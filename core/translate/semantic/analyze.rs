@@ -1342,9 +1342,9 @@ mod tests {
         context::DoubleQuotedDml,
         hir::{
             BinaryOperand, ColumnReadExpression, CteBody, CustomTypeOperation, FieldAccessKind,
-            FunctionEvaluation, FunctionOperation, HirRoot, IndexCoverage, InsertSource,
-            JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind, ResolvedDefault,
-            SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
+            FunctionArguments, FunctionEvaluation, FunctionOperation, HirRoot, IndexCoverage,
+            InsertSource, JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind,
+            ResolvedDefault, SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
         },
     };
 
@@ -1552,6 +1552,33 @@ mod tests {
         schema
             .add_btree_table(Arc::new(table))
             .expect("INSERT source table name is unique");
+        schema
+    }
+
+    fn schema_with_insert_unions() -> Schema {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TYPE inner_u AS UNION(a INTEGER, b TEXT)",
+            "CREATE TYPE outer_u AS UNION(x inner_u, y REAL)",
+            "CREATE TYPE color_u AS UNION(red TEXT, blue TEXT)",
+        ] {
+            schema
+                .add_type_from_sql(sql)
+                .expect("INSERT union type parses");
+        }
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE union_values(\
+                id INTEGER PRIMARY KEY, nested outer_u, color color_u\
+             ) STRICT",
+            2,
+        )
+        .expect("INSERT union table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("INSERT union table name is unique");
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("INSERT union affinities resolve");
         schema
     }
 
@@ -4944,6 +4971,101 @@ mod tests {
             panic!("INSERT produces INSERT root");
         };
         assert_eq!(insert.conflict, None);
+    }
+
+    #[test]
+    fn insert_values_resolve_union_value_from_each_destination_type() {
+        let schema = schema_with_insert_unions();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO union_values VALUES (\
+                 1,\
+                 union_value('x', union_value('a', 42)),\
+                 union_value('red', 'crimson')\
+             )",
+        )
+        .expect("destination-aware union values bind");
+        document
+            .validate()
+            .expect("union-value INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("INSERT keeps VALUES rows");
+        };
+        let Expr::Function(outer) = &rows[0][1] else {
+            panic!("outer union value is a function");
+        };
+        let FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+            union_type,
+            tag_index,
+        }) = &outer.operation
+        else {
+            panic!("outer union value has resolved operation");
+        };
+        assert_eq!(union_type.value().name, "outer_u");
+        assert_eq!(*tag_index, 0);
+        assert_eq!(
+            outer
+                .result_type
+                .declared
+                .as_ref()
+                .expect("outer result has declared type")
+                .name,
+            "outer_u"
+        );
+        let FunctionArguments::Expressions { values, .. } = &outer.arguments else {
+            panic!("union value has ordinary arguments");
+        };
+        let Expr::Function(inner) = &values[1] else {
+            panic!("selected variant contains nested union value");
+        };
+        assert!(matches!(
+            &inner.operation,
+            FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                union_type,
+                tag_index: 0,
+            }) if union_type.value().name == "inner_u"
+        ));
+
+        let Expr::Function(color) = &rows[0][2] else {
+            panic!("color union value is a function");
+        };
+        assert!(matches!(
+            &color.operation,
+            FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                union_type,
+                tag_index: 0,
+            }) if union_type.value().name == "color_u"
+        ));
+    }
+
+    #[test]
+    fn insert_union_value_keeps_destination_errors() {
+        let schema = schema_with_insert_unions();
+        for (sql, expected) in [
+            (
+                "INSERT INTO union_values(id) VALUES (union_value('x', 1))",
+                "Parse error: union_value() can only be used in INSERT/UPDATE targeting a union-typed column",
+            ),
+            (
+                "INSERT INTO union_values(nested) VALUES (union_value('red', 1))",
+                "Parse error: unknown variant 'red' in union type 'outer_u'",
+            ),
+            (
+                "INSERT INTO union_values(nested) VALUES (union_value(1, 2))",
+                "Parse error: union_value() first argument must be a string literal",
+            ),
+            (
+                "INSERT INTO union_values(nested) SELECT union_value('x', 1)",
+                "Parse error: union_value() can only be used in INSERT/UPDATE targeting a union-typed column",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid union value fails");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
