@@ -1590,7 +1590,7 @@ mod tests {
         for (sql, root_page) in [
             ("CREATE UNIQUE INDEX guarded_value ON guarded(value)", 3),
             (
-                "CREATE INDEX guarded_expression ON guarded(lower(value)) WHERE score > 1",
+                "CREATE UNIQUE INDEX guarded_expression ON guarded(lower(value)) WHERE score > 1",
                 4,
             ),
         ] {
@@ -5059,25 +5059,117 @@ mod tests {
     }
 
     #[test]
-    fn insert_keeps_later_upsert_forms_at_their_checkpoint_boundaries() {
-        let schema = schema_with_writable_table();
+    fn insert_binds_ordered_pk_index_and_partial_upsert_targets() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded(id, value, score) VALUES (1, 'one', 2) \
+             ON CONFLICT(id DESC) DO NOTHING \
+             ON CONFLICT(value COLLATE binary DESC) DO NOTHING \
+             ON CONFLICT(lower(value)) WHERE score > 1 DO NOTHING \
+             ON CONFLICT DO NOTHING",
+        )
+        .expect("targeted UPSERT DO NOTHING clauses bind");
+        document
+            .validate()
+            .expect("targeted UPSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(insert.upserts.len(), 4);
+
+        let primary = insert.upserts[0]
+            .target
+            .as_ref()
+            .expect("first target is explicit");
+        assert!(primary.matched_index.is_none());
+        assert!(matches!(
+            primary.terms.as_slice(),
+            [hir::ConflictTerm {
+                expr: Expr::Column(column),
+                order: ast::SortOrder::Desc,
+                ..
+            }] if column.source == insert.target && column.column == 0
+        ));
+
+        let ordinary = insert.upserts[1]
+            .target
+            .as_ref()
+            .expect("second target is explicit");
+        let ordinary_index = ordinary
+            .matched_index
+            .as_ref()
+            .expect("ordinary UNIQUE index is frozen");
+        assert_eq!(ordinary_index.value().name, "guarded_value");
+        assert_eq!(ordinary.terms[0].order, ast::SortOrder::Desc);
+        assert!(ordinary.terms[0].collation.as_ref().is_some_and(
+            |collation| collation.value() == &crate::translate::collate::CollationSeq::Binary
+        ));
+
+        let partial = insert.upserts[2]
+            .target
+            .as_ref()
+            .expect("third target is explicit");
+        let partial_index = partial
+            .matched_index
+            .as_ref()
+            .expect("partial expression index is frozen");
+        assert_eq!(partial_index.value().name, "guarded_expression");
+        assert!(matches!(partial.terms[0].expr, Expr::Function(_)));
+        assert!(matches!(partial.predicate, Some(Expr::Binary { .. })));
+
+        assert!(insert.upserts[3].target.is_none());
+        assert!(insert
+            .upserts
+            .iter()
+            .all(|upsert| matches!(upsert.action, hir::UpsertAction::Nothing)));
+        let source = document
+            .source(insert.target)
+            .expect("INSERT target source exists");
+        for resolved in [ordinary_index, partial_index] {
+            assert!(source
+                .index_expressions
+                .iter()
+                .any(|metadata| metadata.index.id() == resolved.id()));
+        }
+    }
+
+    #[test]
+    fn insert_conflict_targets_keep_matching_diagnostics() {
+        let schema = schema_with_insert_metadata();
         for (sql, expected) in [
             (
-                "INSERT INTO writable(id) VALUES (1) ON CONFLICT(id) DO NOTHING",
-                "Parse error: semantic INSERT does not yet accept UPSERT conflict targets",
+                "INSERT INTO guarded(id) VALUES (1) ON CONFLICT(missing) DO NOTHING",
+                "Parse error: no such column: missing",
             ),
             (
-                "INSERT INTO writable(id) VALUES (1) ON CONFLICT DO UPDATE SET value = 'x'",
+                "INSERT INTO guarded(id) VALUES (1) ON CONFLICT(score) DO NOTHING",
+                "Parse error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES (1) \
+                 ON CONFLICT(value COLLATE nocase) DO NOTHING",
+                "Parse error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES (1) \
+                 ON CONFLICT(lower(value)) WHERE score > 2 DO NOTHING",
+                "Parse error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES (1) \
+                 ON CONFLICT(value NULLS LAST) DO NOTHING",
+                "Parse error: unsupported use of NULLS LAST",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES (1) \
+                 ON CONFLICT DO UPDATE SET value = 'x'",
                 "Parse error: semantic INSERT does not yet accept UPSERT DO UPDATE clauses",
-            ),
-            (
-                "INSERT INTO writable(id) VALUES (1) \
-                 ON CONFLICT(id) DO NOTHING ON CONFLICT DO NOTHING",
-                "Parse error: semantic INSERT does not yet accept UPSERT conflict targets",
             ),
         ] {
             let error =
-                analyze_sql_with_schema(&schema, sql).expect_err("unsupported UPSERT fails");
+                analyze_sql_with_schema(&schema, sql).expect_err("invalid UPSERT target fails");
             assert_eq!(error.to_string(), expected);
         }
     }
