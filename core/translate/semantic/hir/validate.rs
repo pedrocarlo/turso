@@ -225,7 +225,7 @@ impl<'document> HirValidator<'document> {
         self.require_complete_index_metadata(insert.target)?;
         self.visit_dml_triggers(
             insert.target,
-            &insert.triggers,
+            &insert.triggers.insert,
             turso_parser::ast::TriggerEvent::Insert,
             &[],
         )?;
@@ -241,7 +241,7 @@ impl<'document> HirValidator<'document> {
             .collect::<Vec<_>>();
         self.visit_dml_triggers(
             insert.target,
-            &insert.upsert_triggers,
+            &insert.triggers.upsert_update,
             turso_parser::ast::TriggerEvent::Update,
             &upsert_assignments,
         )?;

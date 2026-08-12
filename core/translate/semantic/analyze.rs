@@ -87,6 +87,7 @@ pub(super) enum CatalogObjectKind {
     Table,
     Index,
     Sequence,
+    Trigger,
     Collation,
     Type,
     Function { argument_count: usize },
@@ -1390,7 +1391,7 @@ mod tests {
     use crate::{
         dialect::SqliteDialect,
         function::ScalarFunc,
-        schema::{BTreeTable, Index, Schema, Sequence, Type},
+        schema::{BTreeTable, Index, Schema, Sequence, Trigger, Type},
         sync::Arc,
         Func, SymbolTable,
     };
@@ -1611,6 +1612,79 @@ mod tests {
         schema
             .add_btree_table(Arc::new(table))
             .expect("INSERT source table name is unique");
+        schema
+    }
+
+    fn schema_with_insert_triggers() -> Schema {
+        let mut schema = schema_with_writable_table();
+        for (name, time, event, target_database_id) in [
+            (
+                "insert_before",
+                ast::TriggerTime::Before,
+                ast::TriggerEvent::Insert,
+                None,
+            ),
+            (
+                "insert_after",
+                ast::TriggerTime::After,
+                ast::TriggerEvent::Insert,
+                None,
+            ),
+            (
+                "update_all",
+                ast::TriggerTime::Before,
+                ast::TriggerEvent::Update,
+                None,
+            ),
+            (
+                "update_value",
+                ast::TriggerTime::After,
+                ast::TriggerEvent::UpdateOf(vec![ast::Name::exact("value".to_string())]),
+                None,
+            ),
+            (
+                "update_id",
+                ast::TriggerTime::After,
+                ast::TriggerEvent::UpdateOf(vec![ast::Name::exact("id".to_string())]),
+                None,
+            ),
+            (
+                "update_missing",
+                ast::TriggerTime::After,
+                ast::TriggerEvent::UpdateOf(vec![ast::Name::exact("missing".to_string())]),
+                None,
+            ),
+            (
+                "delete_only",
+                ast::TriggerTime::Before,
+                ast::TriggerEvent::Delete,
+                None,
+            ),
+            (
+                "other_database",
+                ast::TriggerTime::Before,
+                ast::TriggerEvent::Insert,
+                Some(99),
+            ),
+        ] {
+            schema
+                .add_trigger(
+                    Trigger::new(
+                        name.to_string(),
+                        String::new(),
+                        "writable".to_string(),
+                        Some(time),
+                        event,
+                        true,
+                        None,
+                        Vec::new(),
+                        false,
+                        target_database_id,
+                    ),
+                    "writable",
+                )
+                .expect("fixed trigger is added");
+        }
         schema
     }
 
@@ -4892,6 +4966,59 @@ mod tests {
             error.to_string(),
             "Corrupt database: missing sqlite_sequence table"
         );
+    }
+
+    #[test]
+    fn insert_freezes_matching_insert_and_upsert_update_triggers() {
+        let schema = schema_with_insert_triggers();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(id, value) VALUES (1, 'new') \
+             ON CONFLICT(id) DO UPDATE SET value = excluded.value",
+        )
+        .expect("triggered UPSERT binds");
+        document
+            .validate()
+            .expect("triggered UPSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(
+            insert
+                .triggers
+                .insert
+                .iter()
+                .map(|trigger| trigger.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["insert_after", "insert_before"]
+        );
+        assert_eq!(
+            insert
+                .triggers
+                .upsert_update
+                .iter()
+                .map(|trigger| trigger.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["update_value", "update_all"]
+        );
+        assert!(insert
+            .triggers
+            .insert
+            .iter()
+            .chain(&insert.triggers.upsert_update)
+            .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
+
+        let plain = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(id, value) VALUES (2, 'plain')",
+        )
+        .expect("triggered INSERT without UPSERT binds");
+        let HirRoot::Insert(insert) = &plain.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(insert.triggers.insert.len(), 2);
+        assert!(insert.triggers.upsert_update.is_empty());
     }
 
     #[test]
