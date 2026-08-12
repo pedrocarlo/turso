@@ -301,6 +301,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 source: insert.target,
                 column,
             }));
+            pending.extend(insert.foreign_keys.incoming.iter().flat_map(|foreign_key| {
+                foreign_key
+                    .child_positions
+                    .iter()
+                    .copied()
+                    .map(|column| ColumnRef {
+                        source: foreign_key.child_source,
+                        column,
+                    })
+            }));
         }
         let mut finished = HashSet::default();
 
@@ -1684,6 +1694,55 @@ mod tests {
                     "writable",
                 )
                 .expect("fixed trigger is added");
+        }
+        schema
+    }
+
+    fn schema_with_insert_foreign_keys() -> Schema {
+        let mut schema = Schema::new();
+        let parent = Arc::new(
+            BTreeTable::from_sql("CREATE TABLE parents(id INTEGER PRIMARY KEY, code TEXT)", 2)
+                .expect("foreign-key parent table parses"),
+        );
+        schema
+            .add_btree_table(parent.clone())
+            .expect("foreign-key parent table name is unique");
+        let symbols = SymbolTable::new();
+        let parent_code = Index::from_sql(
+            &symbols,
+            "CREATE UNIQUE INDEX parents_code ON parents(code)",
+            3,
+            &parent,
+        )
+        .expect("foreign-key parent index parses");
+        schema
+            .add_index(Arc::new(parent_code))
+            .expect("foreign-key parent index name is unique");
+
+        for (sql, root_page) in [
+            (
+                "CREATE TABLE fk_items(\
+                    id INTEGER PRIMARY KEY,\
+                    parent_id INTEGER REFERENCES parents(id),\
+                    parent_code TEXT REFERENCES parents(code)\
+                 )",
+                4,
+            ),
+            (
+                "CREATE TABLE item_notes(\
+                    item_id INTEGER,\
+                    parent_key INTEGER GENERATED ALWAYS AS (item_id + 0),\
+                    note TEXT,\
+                    FOREIGN KEY(parent_key) REFERENCES fk_items(id)\
+                 )",
+                5,
+            ),
+        ] {
+            let table =
+                BTreeTable::from_sql(sql, root_page).expect("foreign-key child table parses");
+            schema
+                .add_btree_table(Arc::new(table))
+                .expect("foreign-key child table name is unique");
         }
         schema
     }
@@ -5019,6 +5078,85 @@ mod tests {
         };
         assert_eq!(insert.triggers.insert.len(), 2);
         assert!(insert.triggers.upsert_update.is_empty());
+    }
+
+    #[test]
+    fn insert_freezes_outgoing_and_incoming_foreign_keys() {
+        let schema = schema_with_insert_foreign_keys();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO fk_items(id, parent_id, parent_code) VALUES (1, 2, 'two')",
+        )
+        .expect("foreign-key INSERT binds");
+        document
+            .validate()
+            .expect("foreign-key INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let target = document
+            .source(insert.target)
+            .expect("INSERT target source exists");
+        let SourceKind::Table(target_table) = &target.kind else {
+            panic!("INSERT target is a table");
+        };
+        assert_eq!(insert.foreign_keys.outgoing.len(), 2);
+        assert_eq!(insert.foreign_keys.incoming.len(), 1);
+        assert!(insert.foreign_keys.outgoing.iter().all(|foreign_key| {
+            foreign_key.child_source == insert.target
+                && &foreign_key.child_table == target_table
+                && foreign_key.parent_table.value().get_name() == "parents"
+        }));
+
+        let parent_id = insert
+            .foreign_keys
+            .outgoing
+            .iter()
+            .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_id")
+            .expect("rowid parent foreign key is present");
+        assert_eq!(parent_id.child_positions.as_ref(), [1]);
+        assert_eq!(parent_id.parent_positions.as_ref(), [0]);
+        assert!(parent_id.parent_uses_rowid);
+        assert!(parent_id.parent_unique_index.is_none());
+
+        let parent_code = insert
+            .foreign_keys
+            .outgoing
+            .iter()
+            .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_code")
+            .expect("indexed parent foreign key is present");
+        assert_eq!(parent_code.child_positions.as_ref(), [2]);
+        assert_eq!(parent_code.parent_positions.as_ref(), [1]);
+        assert!(!parent_code.parent_uses_rowid);
+        assert_eq!(
+            parent_code
+                .parent_unique_index
+                .as_ref()
+                .expect("non-rowid parent key uses a UNIQUE index")
+                .value()
+                .name,
+            "parents_code"
+        );
+
+        let incoming = &insert.foreign_keys.incoming[0];
+        assert_ne!(incoming.child_source, insert.target);
+        assert_eq!(incoming.child_table.value().get_name(), "item_notes");
+        assert_eq!(&incoming.parent_table, target_table);
+        assert_eq!(incoming.child_positions.as_ref(), [1]);
+        assert_eq!(incoming.parent_positions.as_ref(), [0]);
+        assert!(incoming.parent_uses_rowid);
+        assert!(!incoming.parent_action_guarantees_new_parent);
+        let child_source = document
+            .source(incoming.child_source)
+            .expect("incoming child scan source exists");
+        assert_eq!(child_source.name, "item_notes");
+        assert!(matches!(
+            &child_source.generated_expressions[1],
+            ColumnReadExpression::Planned(hir::Expr::Binary { lhs, .. })
+                if matches!(lhs.as_ref(), hir::Expr::Column(column)
+                    if column.source == incoming.child_source && column.column == 0)
+        ));
     }
 
     #[test]
