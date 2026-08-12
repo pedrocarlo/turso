@@ -41,8 +41,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 "semantic UPDATE does not yet accept WITHOUT ROWID tables".to_string(),
             ));
         }
-        self.reject_update_foreign_keys(table.value())?;
-
         let new_source = self.create_update_new_source(target, &table)?;
         self.analyze_btree_write_metadata(target, &table)?;
         self.analyze_btree_write_metadata(new_source, &table)?;
@@ -51,6 +49,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let assignments =
             self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
         let triggers = self.analyze_update_triggers(&table, &assignments);
+        let foreign_keys = self.analyze_dml_foreign_keys(&table, new_source)?;
         let predicate = syntax
             .where_clause
             .as_deref()
@@ -77,18 +76,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             returning: None,
             trigger: None,
             triggers,
-            foreign_keys: hir::DmlForeignKeys::default(),
+            foreign_keys,
             cdc_updates_override: None,
         }))
-    }
-
-    fn reject_update_foreign_keys(&self, table: &Table) -> Result<()> {
-        let name = table.get_name();
-        let schema = self.context().main_schema();
-        if schema.has_child_fks(name) || schema.any_resolved_fks_referencing(name) {
-            return unsupported_update("targets with foreign keys");
-        }
-        Ok(())
     }
 
     fn analyze_update_triggers(

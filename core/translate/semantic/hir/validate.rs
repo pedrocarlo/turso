@@ -262,7 +262,7 @@ impl<'document> HirValidator<'document> {
                     turso_parser::ast::TriggerEvent::Update,
                     &upsert_assignments,
                 )?;
-                self.visit_dml_foreign_keys(insert.target, foreign_keys)?;
+                self.visit_dml_foreign_keys(insert.target, insert.target, foreign_keys)?;
                 let target_has_autoincrement = target_table
                     .value()
                     .btree()
@@ -411,7 +411,7 @@ impl<'document> HirValidator<'document> {
             turso_parser::ast::TriggerEvent::Update,
             &update.assignments,
         )?;
-        self.visit_dml_foreign_keys(update.target, &update.foreign_keys)?;
+        self.visit_dml_foreign_keys(update.target, update.new_source, &update.foreign_keys)?;
         for default in &update.defaults {
             self.validate_column_position(update.new_source, default.column)?;
             self.visit_expr(&default.value)?;
@@ -437,7 +437,7 @@ impl<'document> HirValidator<'document> {
             turso_parser::ast::TriggerEvent::Delete,
             &[],
         )?;
-        self.visit_dml_foreign_keys(delete.target, &delete.foreign_keys)?;
+        self.visit_dml_foreign_keys(delete.target, delete.target, &delete.foreign_keys)?;
         self.visit_optional_expr(delete.predicate.as_ref())?;
         self.visit_order_terms(&delete.order_by)?;
         self.visit_optional_limit(delete.limit.as_ref())?;
@@ -588,6 +588,7 @@ impl<'document> HirValidator<'document> {
     fn visit_dml_foreign_keys(
         &self,
         target: SourceId,
+        outgoing_child_source: SourceId,
         foreign_keys: &DmlForeignKeys,
     ) -> ValidationResult {
         let target_source = self.source(target)?;
@@ -604,7 +605,11 @@ impl<'document> HirValidator<'document> {
                 &foreign_key.child_table == target_table,
                 format!("outgoing foreign key belongs to another DML target than {target}"),
             )?;
-            self.visit_resolved_foreign_key(foreign_key, true)?;
+            self.require(
+                foreign_key.child_source == outgoing_child_source,
+                "outgoing foreign key uses the wrong DML row source",
+            )?;
+            self.visit_resolved_foreign_key(foreign_key, true, outgoing_child_source != target)?;
             self.require(
                 outgoing_identities.insert((
                     foreign_key.child_table.database(),
@@ -620,7 +625,7 @@ impl<'document> HirValidator<'document> {
                 &foreign_key.parent_table == target_table,
                 format!("incoming foreign key belongs to another DML target than {target}"),
             )?;
-            self.visit_resolved_foreign_key(foreign_key, false)?;
+            self.visit_resolved_foreign_key(foreign_key, false, false)?;
             self.require(
                 incoming_identities.insert((
                     foreign_key.child_table.database(),
@@ -637,6 +642,7 @@ impl<'document> HirValidator<'document> {
         &self,
         foreign_key: &ResolvedForeignKey,
         require_parent_index: bool,
+        allow_new_child_source: bool,
     ) -> ValidationResult {
         self.visit_catalog_object(&foreign_key.child_table, "foreign-key child table")?;
         self.visit_catalog_object(&foreign_key.parent_table, "foreign-key parent table")?;
@@ -645,9 +651,17 @@ impl<'document> HirValidator<'document> {
             Some(crate::translate::semantic::hir::SourceOwner::Root),
         )?;
         let child_source = self.source(foreign_key.child_source)?;
+        let child_source_matches = match &child_source.kind {
+            SourceKind::Table(table) => table == &foreign_key.child_table,
+            SourceKind::Pseudo {
+                kind: PseudoSource::New,
+                table,
+            } => allow_new_child_source && table == &foreign_key.child_table,
+            _ => false,
+        };
         self.require(
-            matches!(&child_source.kind, SourceKind::Table(table) if table == &foreign_key.child_table),
-            "foreign-key child scan source belongs to another table",
+            child_source_matches,
+            "foreign-key child source belongs to another table or row identity",
         )?;
         self.require(
             foreign_key.child_table.database() == foreign_key.parent_table.database(),

@@ -248,6 +248,11 @@ Completed:
 - UPDATE trigger identities retain catalog order and include ordinary UPDATE
   triggers plus only the `UPDATE OF` triggers whose named columns are assigned.
   Trigger programs and trigger environments remain later checkpoints.
+- UPDATE foreign keys freeze outgoing constraints against the NEW row source
+  and incoming constraints against separate child-table scan sources. Parent
+  identities, column positions, UNIQUE indexes, and generated child keys use
+  the same closed metadata as INSERT. Enforcement remains outside semantic
+  analysis.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
