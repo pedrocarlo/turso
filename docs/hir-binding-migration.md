@@ -184,10 +184,14 @@ Completed:
 - INSERT targets freeze every CHECK expression plus every ordinary,
   expression, and partial index in catalog order. Stable catalog identities
   and `IndexCoverage::Complete` make the required write metadata explicit.
-  Trigger and foreign-key targets remain later checkpoints.
+  Foreign-key targets remain a later checkpoint.
 - AUTOINCREMENT INSERT targets carry one `ResolvedAutoincrement` object with
   the resolved `sqlite_sequence` table and an optional MVCC sequence operation.
   The grouped shape cannot represent an allocator without its sequence table.
+- INSERT trigger identities are grouped by the write that can fire them.
+  Ordinary INSERT triggers keep catalog order; UPSERT UPDATE triggers include
+  ordinary UPDATE triggers and matching `UPDATE OF` triggers. Trigger programs
+  and temp-schema catalog inputs remain later checkpoints.
 - Plain `INSERT ... SELECT` sources retain their query identity and complete
   SELECT HIR. Destination width is checked during analysis, and nested query
   captures remain attached to the source query tree.

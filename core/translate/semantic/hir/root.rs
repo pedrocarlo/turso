@@ -64,11 +64,15 @@ pub struct Insert {
     pub excluded_source: Option<SourceId>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
-    /// Exact schema and temp triggers that can fire for this write.
-    pub triggers: Vec<ResolvedTrigger>,
-    /// Exact UPDATE triggers that can fire from an UPSERT DO UPDATE arm.
-    pub upsert_triggers: Vec<ResolvedTrigger>,
+    pub triggers: InsertTriggers,
     pub foreign_keys: DmlForeignKeys,
+}
+
+/// Trigger identities selected for an INSERT and its possible UPSERT update.
+#[derive(Clone, Debug, Default)]
+pub struct InsertTriggers {
+    pub insert: Vec<ResolvedTrigger>,
+    pub upsert_update: Vec<ResolvedTrigger>,
 }
 
 /// Catalog objects needed to allocate and persist an AUTOINCREMENT key.

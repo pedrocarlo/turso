@@ -148,6 +148,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
         let returning = self.analyze_insert_returning(returning, target)?;
+        let triggers = self.analyze_insert_triggers(table, &upserts);
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
@@ -160,8 +161,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             excluded_source,
             returning,
             trigger: None,
-            triggers: Vec::new(),
-            upsert_triggers: Vec::new(),
+            triggers,
             foreign_keys: hir::DmlForeignKeys::default(),
         }))
     }
@@ -179,9 +179,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             return unsupported_insert("non-B-tree targets");
         };
         let schema = self.context().main_schema();
-        if schema.get_triggers_for_table(&table.name).next().is_some() {
-            return unsupported_insert("triggered targets");
-        }
         if schema.has_child_fks(&table.name) || schema.any_resolved_fks_referencing(&table.name) {
             return unsupported_insert("foreign-key targets");
         }
@@ -264,6 +261,76 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             sqlite_sequence,
             mvcc_sequence,
         }))
+    }
+
+    fn analyze_insert_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+        upserts: &[hir::Upsert],
+    ) -> hir::InsertTriggers {
+        let database = table
+            .database()
+            .expect("an INSERT target table must have an owning database");
+        let mut has_upsert_update = false;
+        let mut updated_columns = Vec::new();
+        for upsert in upserts {
+            if let hir::UpsertAction::Update { assignments, .. } = &upsert.action {
+                has_upsert_update = true;
+                updated_columns.extend(assignments.iter().flat_map(|assignment| {
+                    assignment.columns.iter().filter_map(|column| match column {
+                        hir::TargetColumn::Column(column) => Some(*column),
+                        hir::TargetColumn::RowId => None,
+                    })
+                }));
+            }
+        }
+        let (insert, upsert_update) = {
+            let schema = self.context().main_schema();
+            let triggers = schema.get_triggers_for_table(table.value().get_name());
+            let insert = triggers
+                .clone()
+                .filter(|trigger| {
+                    trigger_targets_database(trigger, database)
+                        && matches!(trigger.event, ast::TriggerEvent::Insert)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let upsert_update = if has_upsert_update {
+                triggers
+                    .filter(|trigger| {
+                        trigger_targets_database(trigger, database)
+                            && trigger_matches_update(trigger, table.value(), &updated_columns)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (insert, upsert_update)
+        };
+        hir::InsertTriggers {
+            insert: insert
+                .into_iter()
+                .map(|trigger| self.freeze_trigger(database, trigger))
+                .collect(),
+            upsert_update: upsert_update
+                .into_iter()
+                .map(|trigger| self.freeze_trigger(database, trigger))
+                .collect(),
+        }
+    }
+
+    fn freeze_trigger(
+        &mut self,
+        database: hir::DatabaseId,
+        trigger: Arc<crate::schema::Trigger>,
+    ) -> hir::ResolvedTrigger {
+        let id = self.catalog_object_id(
+            Some(database),
+            CatalogObjectKind::Trigger,
+            normalize_ident(&trigger.name),
+        );
+        hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
     fn analyze_insert_target_metadata(
@@ -772,6 +839,28 @@ fn is_simple_values(select: &ast::Select) -> bool {
         && select.body.compounds.is_empty()
         && select.order_by.is_empty()
         && select.limit.is_none()
+}
+
+fn trigger_targets_database(trigger: &crate::schema::Trigger, database: hir::DatabaseId) -> bool {
+    trigger
+        .target_database_id
+        .is_none_or(|target| target == database.index())
+}
+
+fn trigger_matches_update(
+    trigger: &crate::schema::Trigger,
+    table: &Table,
+    updated_columns: &[usize],
+) -> bool {
+    match &trigger.event {
+        ast::TriggerEvent::Update => true,
+        ast::TriggerEvent::UpdateOf(columns) => columns.iter().any(|column| {
+            table
+                .get_column_by_name(&normalize_ident(column.as_str()))
+                .is_some_and(|(position, _)| updated_columns.contains(&position))
+        }),
+        ast::TriggerEvent::Delete | ast::TriggerEvent::Insert => false,
+    }
 }
 
 fn resolve_insert_targets(table: &Table, names: &[ast::Name]) -> Result<Vec<hir::InsertTarget>> {
