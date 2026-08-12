@@ -326,6 +326,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .len();
                 pending.extend((0..width).map(|column| ColumnRef { source, column }));
             }
+            pending.extend(update.foreign_keys.incoming.iter().flat_map(|foreign_key| {
+                foreign_key
+                    .child_positions
+                    .iter()
+                    .copied()
+                    .map(|column| ColumnRef {
+                        source: foreign_key.child_source,
+                        column,
+                    })
+            }));
         }
         let mut finished = HashSet::default();
 
@@ -8273,6 +8283,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["update_id", "update_all"]
         );
+    }
+
+    #[test]
+    fn update_freezes_foreign_keys_against_new_and_child_rows() {
+        let schema = schema_with_insert_foreign_keys();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE fk_items SET parent_id = 2, parent_code = 'two' WHERE id = 1",
+        )
+        .expect("foreign-key UPDATE binds");
+        document
+            .validate()
+            .expect("foreign-key UPDATE produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.foreign_keys.outgoing.len(), 2);
+        assert_eq!(update.foreign_keys.incoming.len(), 1);
+        assert!(update.foreign_keys.outgoing.iter().all(|foreign_key| {
+            foreign_key.child_source == update.new_source
+                && foreign_key.child_table.value().get_name() == "fk_items"
+                && foreign_key.parent_table.value().get_name() == "parents"
+        }));
+
+        let parent_code = update
+            .foreign_keys
+            .outgoing
+            .iter()
+            .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_code")
+            .expect("indexed parent foreign key is present");
+        assert_eq!(parent_code.child_positions.as_ref(), [2]);
+        assert_eq!(parent_code.parent_positions.as_ref(), [1]);
+        assert_eq!(
+            parent_code
+                .parent_unique_index
+                .as_ref()
+                .expect("non-rowid parent key uses a UNIQUE index")
+                .value()
+                .name,
+            "parents_code"
+        );
+
+        let incoming = &update.foreign_keys.incoming[0];
+        assert_ne!(incoming.child_source, update.target);
+        assert_ne!(incoming.child_source, update.new_source);
+        assert_eq!(incoming.child_table.value().get_name(), "item_notes");
+        assert_eq!(incoming.parent_table.value().get_name(), "fk_items");
+        let child_source = document
+            .source(incoming.child_source)
+            .expect("incoming child scan source exists");
+        assert!(matches!(child_source.kind, SourceKind::Table(_)));
+        assert!(matches!(
+            &child_source.generated_expressions[1],
+            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == incoming.child_source && column.column == 0)
+        ));
     }
 
     #[test]
