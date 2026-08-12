@@ -193,10 +193,13 @@ Completed:
   iterative expression frames. `union_value` freezes the destination union and
   tag in HIR, and its value argument receives the selected variant type,
   including for nested unions.
+- INSERT-SELECT passes destination types by output position into every SELECT
+  and VALUES compound arm. Destination-aware functions therefore resolve the
+  same way in direct VALUES and query sources without changing standalone
+  SELECT rules.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
-resolved only in destination-aware DML expressions; INSERT-SELECT destination
-type propagation remains pending.
+resolved only in destination-aware DML expressions.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.

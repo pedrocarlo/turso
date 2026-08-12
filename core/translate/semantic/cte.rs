@@ -739,8 +739,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             compounds,
             &[],
             None,
-            context.query_parent(),
-            context.outer_scope,
+            super::analyze::SelectContext {
+                parent: context.query_parent(),
+                outer_scope: context.outer_scope,
+                expected_outputs: None,
+            },
         );
         if whole.with.is_some() {
             self.cte_scopes
