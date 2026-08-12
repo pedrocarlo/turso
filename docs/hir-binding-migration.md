@@ -196,6 +196,10 @@ Completed:
   and the exact child scan source. Incoming generated child keys close their
   stored expressions against that scan source. Enforcement remains outside
   semantic analysis.
+- INSERT target metadata is split by storage kind. B-tree targets own defaults,
+  AUTOINCREMENT, triggers, and foreign keys; virtual targets cannot represent
+  any of those fields and retain the existing VALUES or DEFAULT VALUES source
+  rule.
 - Plain `INSERT ... SELECT` sources retain their query identity and complete
   SELECT HIR. Destination width is checked during analysis, and nested query
   captures remain attached to the source query tree.

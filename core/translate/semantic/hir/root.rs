@@ -55,17 +55,26 @@ pub struct TriggerEnvironment {
 #[derive(Clone, Debug)]
 pub struct Insert {
     pub target: SourceId,
-    pub autoincrement: Option<ResolvedAutoincrement>,
+    pub target_kind: InsertTargetKind,
     pub columns: Vec<InsertTarget>,
-    pub defaults: Vec<ResolvedDefault>,
     pub source: InsertSource,
     pub conflict: Option<ResolveType>,
     pub upserts: Vec<Upsert>,
     pub excluded_source: Option<SourceId>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
-    pub triggers: InsertTriggers,
-    pub foreign_keys: DmlForeignKeys,
+}
+
+/// Metadata required by the concrete kind of INSERT destination.
+#[derive(Clone, Debug)]
+pub enum InsertTargetKind {
+    BTree {
+        autoincrement: Option<ResolvedAutoincrement>,
+        defaults: Vec<ResolvedDefault>,
+        triggers: InsertTriggers,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
 }
 
 /// Trigger identities selected for an INSERT and its possible UPSERT update.
