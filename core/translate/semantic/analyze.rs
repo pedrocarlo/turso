@@ -5834,6 +5834,103 @@ mod tests {
     }
 
     #[test]
+    fn insert_with_scope_is_shared_by_inline_values_and_returning() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH label(v) AS (VALUES ('from cte')) \
+             INSERT INTO writable(id, value) \
+             VALUES (3, (SELECT v FROM label)) \
+             RETURNING (SELECT v FROM label)",
+        )
+        .expect("inline VALUES and RETURNING see the INSERT CTE scope");
+        document
+            .validate()
+            .expect("shared INSERT CTE scope produces closed HIR");
+
+        assert_eq!(document.ctes.len(), 1);
+        let cte = document.ctes[0].id;
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("simple VALUES stays inline HIR");
+        };
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: values_query,
+            ..
+        }) = rows[0][1]
+        else {
+            panic!("VALUES expression is a scalar subquery");
+        };
+        let Expr::Subquery(SubqueryExpr::Scalar {
+            query: returning_query,
+            ..
+        }) = insert
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs[0]
+            .expr
+        else {
+            panic!("RETURNING expression is a scalar subquery");
+        };
+        assert_eq!(
+            document
+                .query(values_query)
+                .expect("VALUES query exists")
+                .reachable_ctes,
+            [cte]
+        );
+        assert_eq!(
+            document
+                .query(returning_query)
+                .expect("RETURNING query exists")
+                .reachable_ctes,
+            [cte]
+        );
+    }
+
+    #[test]
+    fn failed_insert_with_does_not_leak_its_cte_scope() {
+        let schema = schema_with_writable_table();
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            &schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        let statement = parse_statement(
+            "WITH broken AS (SELECT missing) \
+             INSERT INTO writable(id) VALUES ((SELECT * FROM broken))",
+        );
+        let ast::Stmt::Insert {
+            with,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+        } = &statement
+        else {
+            panic!("SQL contains INSERT");
+        };
+        let mut analyzer = Analyzer::new(&context);
+        analyzer
+            .analyze_insert(
+                with.as_ref(),
+                *or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+            )
+            .expect_err("invalid CTE body fails INSERT analysis");
+        assert!(analyzer.cte_scopes.is_empty());
+    }
+
+    #[test]
     fn insert_returning_rejects_non_scalar_forms_at_analysis_time() {
         let schema = schema_with_writable_table();
         for (sql, expected) in [

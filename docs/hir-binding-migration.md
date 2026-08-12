@@ -188,9 +188,10 @@ Completed:
 - Plain `INSERT ... SELECT` sources retain their query identity and complete
   SELECT HIR. Destination width is checked during analysis, and nested query
   captures remain attached to the source query tree.
-- Top-level INSERT WITH clauses use the same lazy CTE scopes as SELECT.
-  Referenced ordinary and recursive CTEs enter the closed document, while
-  unused invalid definitions remain unbound.
+- Top-level INSERT WITH clauses use one lazy CTE scope across query sources,
+  inline VALUES, UPSERT expressions, and RETURNING. Referenced ordinary and
+  recursive CTEs enter the closed document, unused invalid definitions remain
+  unbound, and failed analysis always removes the statement scope.
 - Statement-level INSERT conflict resolution remains an exact parser enum in
   HIR, distinguishing ROLLBACK, ABORT, FAIL, IGNORE, REPLACE, and no override.
 - Direct INSERT values and defaults carry their destination type through the
