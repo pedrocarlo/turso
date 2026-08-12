@@ -5201,6 +5201,110 @@ mod tests {
     }
 
     #[test]
+    fn insert_returning_builds_root_outputs_from_the_target_scope() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(id, value) VALUES (3, 'hello') \
+             RETURNING *, value COLLATE nocase AS folded",
+        )
+        .expect("scalar RETURNING binds");
+        document
+            .validate()
+            .expect("INSERT RETURNING produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let returning = insert.returning.as_ref().expect("RETURNING is preserved");
+        assert_eq!(
+            returning
+                .outputs
+                .iter()
+                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .collect::<Vec<_>>(),
+            [
+                (OutputId::root(0), "id", OutputNameKind::StarExpansion),
+                (OutputId::root(1), "value", OutputNameKind::StarExpansion),
+                (OutputId::root(2), "doubled", OutputNameKind::StarExpansion),
+                (OutputId::root(3), "folded", OutputNameKind::ExplicitAlias),
+            ]
+        );
+        assert!(matches!(
+            &returning.outputs[0].expr,
+            Expr::Column(column) if column.source == insert.target && column.column == 0
+        ));
+        assert!(matches!(
+            &returning.outputs[3].expr,
+            Expr::Collate { expr, .. }
+                if matches!(expr.as_ref(), Expr::Column(column)
+                    if column.source == insert.target && column.column == 1)
+        ));
+        assert_eq!(
+            returning.outputs[0].type_fact.known_type(),
+            Some(Type::Integer)
+        );
+        assert_eq!(
+            returning.outputs[1].type_fact.known_type(),
+            Some(Type::Text)
+        );
+        assert!(returning.outputs[3].collation_is_explicit);
+        assert!(document.output(OutputId::root(3)).is_some());
+
+        let target = document
+            .source(insert.target)
+            .expect("INSERT target source exists");
+        assert!(matches!(
+            target.generated_expressions[2],
+            ColumnReadExpression::Planned(_)
+        ));
+
+        let qualified = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(id) VALUES (4) RETURNING writable.*",
+        )
+        .expect("qualified RETURNING star binds");
+        let HirRoot::Insert(insert) = &qualified.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(
+            insert
+                .returning
+                .as_ref()
+                .expect("qualified star is preserved")
+                .outputs
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn insert_returning_rejects_non_scalar_forms_at_analysis_time() {
+        let schema = schema_with_writable_table();
+        for (sql, expected) in [
+            (
+                "INSERT INTO writable(id) VALUES (1) RETURNING missing",
+                "Parse error: no such column: missing",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) RETURNING sum(id)",
+                "Parse error: misuse of aggregate function sum()",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) RETURNING row_number() OVER ()",
+                "Parse error: misuse of window function: row_number()",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) RETURNING (SELECT id)",
+                "Parse error: semantic INSERT does not yet accept subqueries in RETURNING clauses",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid RETURNING fails");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn insert_defaults_and_duplicate_targets_keep_write_selection_rules() {
         let schema = schema_with_writable_table();
         let explicit_default =
