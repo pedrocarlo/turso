@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
+    dml::{trigger_matches_update, trigger_targets_database},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
     scope::{ExprCollation, Scope},
@@ -453,19 +454,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 .map(|trigger| self.freeze_trigger(database, trigger))
                 .collect(),
         }
-    }
-
-    fn freeze_trigger(
-        &mut self,
-        database: hir::DatabaseId,
-        trigger: Arc<crate::schema::Trigger>,
-    ) -> hir::ResolvedTrigger {
-        let id = self.catalog_object_id(
-            Some(database),
-            CatalogObjectKind::Trigger,
-            normalize_ident(&trigger.name),
-        );
-        hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
     pub(super) fn analyze_btree_write_metadata(
@@ -974,28 +962,6 @@ fn is_simple_values(select: &ast::Select) -> bool {
         && select.body.compounds.is_empty()
         && select.order_by.is_empty()
         && select.limit.is_none()
-}
-
-fn trigger_targets_database(trigger: &crate::schema::Trigger, database: hir::DatabaseId) -> bool {
-    trigger
-        .target_database_id
-        .is_none_or(|target| target == database.index())
-}
-
-fn trigger_matches_update(
-    trigger: &crate::schema::Trigger,
-    table: &Table,
-    updated_columns: &[usize],
-) -> bool {
-    match &trigger.event {
-        ast::TriggerEvent::Update => true,
-        ast::TriggerEvent::UpdateOf(columns) => columns.iter().any(|column| {
-            table
-                .get_column_by_name(&normalize_ident(column.as_str()))
-                .is_some_and(|(position, _)| updated_columns.contains(&position))
-        }),
-        ast::TriggerEvent::Delete | ast::TriggerEvent::Insert => false,
-    }
 }
 
 fn resolve_insert_targets(table: &Table, names: &[ast::Name]) -> Result<Vec<hir::InsertTarget>> {

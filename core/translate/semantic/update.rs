@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
+    dml::{trigger_matches_update, trigger_targets_database},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
@@ -40,7 +41,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 "semantic UPDATE does not yet accept WITHOUT ROWID tables".to_string(),
             ));
         }
-        self.reject_update_write_sidecars(table.value())?;
+        self.reject_update_foreign_keys(table.value())?;
 
         let new_source = self.create_update_new_source(target, &table)?;
         self.analyze_btree_write_metadata(target, &table)?;
@@ -49,6 +50,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let scope = self.update_read_scope(target)?;
         let assignments =
             self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
+        let triggers = self.analyze_update_triggers(&table, &assignments);
         let predicate = syntax
             .where_clause
             .as_deref()
@@ -74,22 +76,51 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             conflict: syntax.or_conflict,
             returning: None,
             trigger: None,
-            triggers: Vec::new(),
+            triggers,
             foreign_keys: hir::DmlForeignKeys::default(),
             cdc_updates_override: None,
         }))
     }
 
-    fn reject_update_write_sidecars(&self, table: &Table) -> Result<()> {
+    fn reject_update_foreign_keys(&self, table: &Table) -> Result<()> {
         let name = table.get_name();
         let schema = self.context().main_schema();
-        if schema.get_triggers_for_table(name).next().is_some() {
-            return unsupported_update("targets with triggers");
-        }
         if schema.has_child_fks(name) || schema.any_resolved_fks_referencing(name) {
             return unsupported_update("targets with foreign keys");
         }
         Ok(())
+    }
+
+    fn analyze_update_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+        assignments: &[hir::Assignment],
+    ) -> Vec<hir::ResolvedTrigger> {
+        let database = table
+            .database()
+            .expect("an UPDATE target table must have an owning database");
+        let updated_columns = assignments
+            .iter()
+            .flat_map(|assignment| assignment.columns.iter())
+            .filter_map(|column| match column {
+                hir::TargetColumn::Column(column) => Some(*column),
+                hir::TargetColumn::RowId => None,
+            })
+            .collect::<Vec<_>>();
+        let triggers = self
+            .context()
+            .main_schema()
+            .get_triggers_for_table(table.value().get_name())
+            .filter(|trigger| {
+                trigger_targets_database(trigger, database)
+                    && trigger_matches_update(trigger, table.value(), &updated_columns)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        triggers
+            .into_iter()
+            .map(|trigger| self.freeze_trigger(database, trigger))
+            .collect()
     }
 
     fn create_update_new_source(
