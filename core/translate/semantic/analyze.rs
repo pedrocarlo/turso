@@ -51,9 +51,10 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             body,
             returning,
         )?,
+        AnalyzeInput::Statement(ast::Stmt::Update(update)) => analyzer.analyze_update(update)?,
         AnalyzeInput::Statement(_) => {
             return Err(LimboError::ParseError(
-                "semantic analysis accepts SELECT and INSERT statements".to_string(),
+                "semantic analysis accepts SELECT, INSERT, and UPDATE statements".to_string(),
             ));
         }
     };
@@ -314,6 +315,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
+        if let HirRoot::Update(update) = root {
+            for source in [update.target, update.new_source] {
+                let width = self
+                    .source(source)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("missing UPDATE row source {source}"))
+                    })?
+                    .columns
+                    .len();
+                pending.extend((0..width).map(|column| ColumnRef { source, column }));
+            }
+        }
         let mut finished = HashSet::default();
 
         while let Some(reference) = pending.pop() {
@@ -334,9 +347,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ))
                 })?;
                 let catalog_table = match &source.kind {
-                    SourceKind::Table(table) | SourceKind::TableFunction { table, .. } => {
-                        table.value()
-                    }
+                    SourceKind::Table(table)
+                    | SourceKind::TableFunction { table, .. }
+                    | SourceKind::Pseudo { table, .. } => table.value(),
                     _ => continue,
                 };
                 let catalog_column =
@@ -1416,7 +1429,7 @@ mod tests {
             BinaryOperand, ColumnReadExpression, CteBody, CustomTypeOperation, FieldAccessKind,
             FunctionArguments, FunctionEvaluation, FunctionOperation, HirRoot, IndexCoverage,
             InsertSource, JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind,
-            ResolvedDefault, SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
+            PseudoSource, ResolvedDefault, SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
         },
     };
 
@@ -6115,7 +6128,8 @@ mod tests {
                 "Parse error: unknown variant 'red' in union type 'outer_u'",
             ),
         ] {
-            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid union value fails");
+            let error =
+                analyze_sql_with_schema(&schema, sql).expect_err("invalid union value fails");
             assert_eq!(error.to_string(), expected);
         }
     }
@@ -8159,5 +8173,183 @@ mod tests {
     fn missing_table_fails_before_hir_is_built() {
         let error = analyze_sql("SELECT value FROM absent").expect_err("table must exist");
         assert_eq!(error.to_string(), "Parse error: no such table: absent");
+    }
+
+    #[test]
+    fn update_binds_old_and_new_rows_assignments_and_predicate() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = value || '!', id = id + 1 WHERE id = 7",
+        )
+        .expect("basic UPDATE binds");
+        document.validate().expect("UPDATE produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_ne!(update.target, update.new_source);
+        assert_eq!(update.assignments.len(), 2);
+        assert_eq!(update.assignments[0].columns, [TargetColumn::Column(1)]);
+        assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Binary {
+                lhs: ref left,
+                operator: ast::Operator::Concat,
+                ..
+            } if matches!(left.as_ref(), Expr::Column(reference) if reference.source == update.target && reference.column == 1)
+        ));
+        assert!(matches!(
+            update.predicate,
+            Some(Expr::Binary { lhs: ref left, .. })
+                if matches!(left.as_ref(), Expr::Column(reference) if reference.source == update.target && reference.column == 0)
+        ));
+
+        let old = document.source(update.target).expect("OLD source exists");
+        let new = document
+            .source(update.new_source)
+            .expect("NEW source exists");
+        let SourceKind::Table(table) = &old.kind else {
+            panic!("OLD row is the target table");
+        };
+        assert!(matches!(
+            &new.kind,
+            SourceKind::Pseudo {
+                kind: PseudoSource::New,
+                table: new_table,
+            } if new_table == table
+        ));
+        for source in [old, new] {
+            assert!(matches!(
+                source.index_coverage,
+                IndexCoverage::Complete { ref indexes } if indexes.is_empty()
+            ));
+            assert!(matches!(
+                source.generated_expressions[2],
+                ColumnReadExpression::Planned(Expr::Binary {
+                    lhs: ref left,
+                    operator: ast::Operator::Multiply,
+                    ..
+                }) if matches!(left.as_ref(), Expr::Column(reference) if reference.source == source.id && reference.column == 0)
+            ));
+        }
+    }
+
+    #[test]
+    fn update_keeps_row_assignment_duplicate_and_rowid_rules() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET (value, id) = ('first', 8), value = 'last', rowid = 9",
+        )
+        .expect("row assignments and duplicate targets bind");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.assignments.len(), 2);
+        assert_eq!(update.assignments[0].columns, [TargetColumn::Column(1)]);
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Literal(ast::Literal::String(ref value)) if value.contains("last")
+        ));
+        assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
+        assert!(matches!(
+            update.assignments[1].value,
+            Expr::Literal(ast::Literal::Numeric(ref value)) if value == "9"
+        ));
+
+        let generated = analyze_sql_with_schema(&schema, "UPDATE writable SET doubled = 4")
+            .expect_err("generated columns cannot be assigned");
+        assert!(generated.to_string().contains("generated column"));
+        let missing = analyze_sql_with_schema(&schema, "UPDATE writable SET absent = 4")
+            .expect_err("missing assignment target fails");
+        assert_eq!(
+            missing.to_string(),
+            "Parse error: no such column: writable.absent"
+        );
+
+        let default = analyze_sql_with_schema(&schema, "UPDATE writable SET value = DEFAULT")
+            .expect("SET DEFAULT binds the target default");
+        let HirRoot::Update(default) = &default.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert!(matches!(
+            default.assignments[0].value,
+            Expr::Literal(ast::Literal::String(ref value)) if value.contains("fallback")
+        ));
+    }
+
+    #[test]
+    fn update_composes_array_setters_and_keeps_subquery_captures() {
+        let arrays = schema_with_array_columns();
+        let document = analyze_sql_with_schema(
+            &arrays,
+            "UPDATE arrays \
+             SET vals = array_set_element(vals, 1, 2), \
+                 vals = array_set_element(vals, 2, 3)",
+        )
+        .expect("repeated array setters bind");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let Expr::Function(outer) = &update.assignments[0].value else {
+            panic!("last array setter remains the assignment");
+        };
+        let FunctionArguments::Expressions { values, .. } = &outer.arguments else {
+            panic!("array setter has expression arguments");
+        };
+        assert!(matches!(values[0], Expr::Function(_)));
+
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = (SELECT value) WHERE EXISTS (SELECT id)",
+        )
+        .expect("UPDATE expressions may own correlated subqueries");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = &update.assignments[0].value
+        else {
+            panic!("SET subquery remains explicit");
+        };
+        assert_eq!(
+            document.query(*query).expect("SET query exists").captures,
+            [update.target]
+        );
+        let Some(Expr::Subquery(SubqueryExpr::Exists(query))) = update.predicate.as_ref() else {
+            panic!("WHERE subquery remains explicit");
+        };
+        assert_eq!(
+            document.query(*query).expect("WHERE query exists").captures,
+            [update.target]
+        );
+    }
+
+    #[test]
+    fn update_rejects_deferred_clauses_before_binding_the_target() {
+        let schema = schema_with_writable_table();
+        for (sql, feature) in [
+            (
+                "WITH input(x) AS (VALUES(1)) UPDATE absent SET value = x",
+                "WITH clauses",
+            ),
+            (
+                "UPDATE absent SET value = other.value FROM writable AS other",
+                "FROM clauses",
+            ),
+            (
+                "UPDATE absent SET value = 'x' RETURNING value",
+                "RETURNING clauses",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql)
+                .expect_err("deferred UPDATE clause fails first");
+            assert_eq!(
+                error.to_string(),
+                format!("Parse error: semantic UPDATE does not yet accept {feature}")
+            );
+        }
     }
 }
