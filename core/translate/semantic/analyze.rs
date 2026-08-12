@@ -2,8 +2,11 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
 
 use crate::{
-    numeric::Numeric, schema::Type, util::parse_numeric_literal, LimboError, Result, Value,
-    MAIN_DB_ID,
+    numeric::Numeric,
+    schema::{Type, TypeDef},
+    sync::Arc,
+    util::parse_numeric_literal,
+    LimboError, Result, Value, MAIN_DB_ID,
 };
 
 use super::{
@@ -71,6 +74,12 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     schema_programs_in_progress: HashSet<CatalogObjectId>,
     catalog_ids: HashMap<CatalogIdentity, CatalogObjectId>,
     pub(super) cte_scopes: Vec<super::cte::CteScope<'ast>>,
+}
+
+pub(super) struct SelectContext<'scope> {
+    pub(super) parent: Option<QueryId>,
+    pub(super) outer_scope: Option<&'scope Scope>,
+    pub(super) expected_outputs: Option<&'scope [Option<Arc<TypeDef>>]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -398,7 +407,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, None, None)
+        self.analyze_select_with_scope(select, None, None, None)
+    }
+
+    pub(super) fn analyze_select_with_expected_outputs(
+        &mut self,
+        select: &'ast ast::Select,
+        expected_outputs: &[Option<Arc<TypeDef>>],
+    ) -> Result<QueryId> {
+        self.analyze_select_with_scope(select, None, None, Some(expected_outputs))
     }
 
     pub(super) fn analyze_select_with_parent(
@@ -406,7 +423,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, parent, None)
+        self.analyze_select_with_scope(select, parent, None, None)
     }
 
     pub(super) fn analyze_subquery(
@@ -415,7 +432,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: QueryId,
         outer_scope: &Scope,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, Some(parent), Some(outer_scope))
+        self.analyze_select_with_scope(select, Some(parent), Some(outer_scope), None)
     }
 
     fn analyze_select_with_scope(
@@ -423,11 +440,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<QueryId> {
         if let Some(with) = &select.with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select_body(select, parent, outer_scope);
+        let result = self.analyze_select_body(select, parent, outer_scope, expected_outputs);
         if select.with.is_some() {
             self.cte_scopes
                 .pop()
@@ -441,14 +459,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<QueryId> {
         self.analyze_select_parts(
             &select.body.select,
             &select.body.compounds,
             &select.order_by,
             select.limit.as_ref(),
-            parent,
-            outer_scope,
+            SelectContext {
+                parent,
+                outer_scope,
+                expected_outputs,
+            },
         )
     }
 
@@ -458,9 +480,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         compounds: &'ast [ast::CompoundSelect],
         order_by_syntax: &'ast [ast::SortedColumn],
         limit_syntax: Option<&'ast ast::Limit>,
-        parent: Option<QueryId>,
-        outer_scope: Option<&Scope>,
+        context: SelectContext<'_>,
     ) -> Result<QueryId> {
+        let SelectContext {
+            parent,
+            outer_scope,
+            expected_outputs,
+        } = context;
         let rightmost = compounds
             .last()
             .map(|compound| &compound.select)
@@ -477,8 +503,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
         let ordinary_order_by = compounds.is_empty().then_some(order_by_syntax);
-        let (first_block, mut order_by) =
-            self.analyze_select_block(first_select, query_id, 0, outer_scope, ordinary_order_by)?;
+        let (first_block, mut order_by) = self.analyze_select_block(
+            first_select,
+            query_id,
+            0,
+            outer_scope,
+            ordinary_order_by,
+            expected_outputs,
+        )?;
         blocks.push(first_block);
         for (index, compound) in compounds.iter().enumerate() {
             let (block, block_order_by) = self.analyze_select_block(
@@ -487,6 +519,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 index + 1,
                 outer_scope,
                 None,
+                expected_outputs,
             )?;
             debug_assert!(block_order_by.is_empty());
             blocks.push(block);
@@ -574,6 +607,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         index: usize,
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         match select {
             ast::OneSelect::Select {
@@ -594,10 +628,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 index,
                 outer_scope,
                 order_by,
+                expected_outputs,
             ),
             ast::OneSelect::Values(rows) => {
                 debug_assert!(order_by.is_none_or(<[_]>::is_empty));
-                self.analyze_values_block(rows, query, index, outer_scope)
+                self.analyze_values_block(rows, query, index, outer_scope, expected_outputs)
                     .map(|block| (block, Vec::new()))
             }
         }
@@ -616,6 +651,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         index: usize,
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         if from.is_none()
             && columns
@@ -640,7 +676,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ExprPolicy::select(self.context.dqs_dml()),
             &mut functions,
         )?;
-        let outputs = self.analyze_outputs(block_id, columns, &scope, &mut functions)?;
+        let outputs =
+            self.analyze_outputs(block_id, columns, &scope, &mut functions, expected_outputs)?;
         let filter = match where_clause {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
@@ -703,6 +740,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         query: QueryId,
         index: usize,
         outer_scope: Option<&Scope>,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
         let scope = Scope::new(outer_scope.cloned());
@@ -711,13 +749,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let mut resolved_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let mut resolved_row = Vec::with_capacity(row.len());
-            for expression in row {
-                resolved_row.push(self.analyze_query_expr(
-                    expression,
-                    &scope,
-                    policy,
-                    &mut functions,
-                )?);
+            for (index, expression) in row.iter().enumerate() {
+                resolved_row.push(
+                    self.analyze_query_expr_with_expected_type(
+                        expression,
+                        &scope,
+                        policy,
+                        &mut functions,
+                        expected_outputs
+                            .and_then(|outputs| outputs.get(index))
+                            .cloned()
+                            .flatten(),
+                    )?,
+                );
             }
             resolved_rows.push(resolved_row);
         }
@@ -962,17 +1006,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         columns: &'ast [ast::ResultColumn],
         scope: &Scope,
         functions: &mut QueryFunctionState,
+        expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<Vec<Output>> {
         let mut outputs = Vec::with_capacity(columns.len());
         for column in columns {
             match column {
                 ast::ResultColumn::Expr(_, _) => {
+                    let index = outputs.len();
+                    let expected_type = expected_outputs
+                        .and_then(|expected| expected.get(index))
+                        .cloned()
+                        .flatten();
                     outputs.push(self.analyze_output(
                         block,
-                        outputs.len(),
+                        index,
                         column,
                         scope,
                         functions,
+                        expected_type,
                     )?);
                 }
                 ast::ResultColumn::Star => {
@@ -1014,13 +1065,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         column: &'ast ast::ResultColumn,
         scope: &Scope,
         functions: &mut QueryFunctionState,
+        expected_type: Option<Arc<TypeDef>>,
     ) -> Result<Output> {
         let ast::ResultColumn::Expr(expression, alias) = column else {
             return unsupported_select();
         };
         let syntax = expression;
         let policy = ExprPolicy::select(self.context.dqs_dml());
-        let resolved = self.analyze_query_expr(syntax, scope, policy, functions)?;
+        let resolved = self.analyze_query_expr_with_expected_type(
+            syntax,
+            scope,
+            policy,
+            functions,
+            expected_type,
+        )?;
         let (name, name_kind) = match alias {
             Some(alias) if alias.is_explicit() => (
                 alias.name().as_str().to_string(),
@@ -5043,6 +5101,80 @@ mod tests {
     }
 
     #[test]
+    fn insert_select_resolves_union_values_in_every_compound_arm() {
+        let schema = schema_with_insert_unions();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO union_values(nested, color) \
+             SELECT union_value('x', union_value('b', 'deep')), \
+                    union_value('blue', 'navy') \
+             UNION ALL \
+             VALUES (union_value('y', 1.5), union_value('red', 'scarlet'))",
+        )
+        .expect("destination types reach every INSERT-SELECT arm");
+        document
+            .validate()
+            .expect("compound union-value INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Query(query) = insert.source else {
+            panic!("INSERT keeps query source");
+        };
+        let query = document.query(query).expect("INSERT source query exists");
+        assert_eq!(query.blocks.len(), 2);
+
+        let Expr::Function(outer) = &query.blocks[0].outputs[0].expr else {
+            panic!("first arm resolves outer union value");
+        };
+        assert!(matches!(
+            &outer.operation,
+            FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                union_type,
+                tag_index: 0,
+            }) if union_type.value().name == "outer_u"
+        ));
+        let FunctionArguments::Expressions { values, .. } = &outer.arguments else {
+            panic!("union value has ordinary arguments");
+        };
+        assert!(matches!(
+            &values[1],
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 1,
+                }) if union_type.value().name == "inner_u"
+            )
+        ));
+
+        let QueryBlockBody::Values { rows } = &query.blocks[1].body else {
+            panic!("second arm remains VALUES");
+        };
+        assert!(matches!(
+            &rows[0][0],
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 1,
+                }) if union_type.value().name == "outer_u"
+            )
+        ));
+        assert!(matches!(
+            &rows[0][1],
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 0,
+                }) if union_type.value().name == "color_u"
+            )
+        ));
+    }
+
+    #[test]
     fn insert_union_value_keeps_destination_errors() {
         let schema = schema_with_insert_unions();
         for (sql, expected) in [
@@ -5059,8 +5191,8 @@ mod tests {
                 "Parse error: union_value() first argument must be a string literal",
             ),
             (
-                "INSERT INTO union_values(nested) SELECT union_value('x', 1)",
-                "Parse error: union_value() can only be used in INSERT/UPDATE targeting a union-typed column",
+                "INSERT INTO union_values(nested) SELECT union_value('red', 1)",
+                "Parse error: unknown variant 'red' in union type 'outer_u'",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid union value fails");

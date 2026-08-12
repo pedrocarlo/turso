@@ -99,7 +99,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         (columns, hir::InsertSource::Values(bound_rows))
                     }
                     ast::OneSelect::Select { .. } => {
-                        let query = self.analyze_insert_select(select, with)?;
+                        let expected_outputs = columns
+                            .iter()
+                            .map(|target| self.insert_target_type(table.value(), target.column))
+                            .collect::<Result<Vec<_>>>()?;
+                        let query = self.analyze_insert_select(select, with, &expected_outputs)?;
                         let actual = self
                             .query(query)
                             .ok_or_else(|| {
@@ -144,11 +148,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         select: &'ast ast::Select,
         with: Option<&'ast ast::With>,
+        expected_outputs: &[Option<Arc<TypeDef>>],
     ) -> Result<hir::QueryId> {
         if let Some(with) = with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select(select);
+        let result = self.analyze_select_with_expected_outputs(select, expected_outputs);
         if with.is_some() {
             self.cte_scopes
                 .pop()

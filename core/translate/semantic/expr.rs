@@ -880,9 +880,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policy: ExprPolicy,
         functions: &mut QueryFunctionState,
     ) -> Result<ResolvedScopeExpr> {
+        self.analyze_query_expr_with_expected_type(syntax, scope, policy, functions, None)
+    }
+
+    pub(super) fn analyze_query_expr_with_expected_type(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        functions: &mut QueryFunctionState,
+        expected_type: Option<Arc<TypeDef>>,
+    ) -> Result<ResolvedScopeExpr> {
         let parent = functions.block.query;
         let mut functions = FunctionContext::Query(functions);
-        self.analyze_query_scoped_expr(syntax, scope, policy, parent, &mut functions)
+        self.analyze_query_scoped_expr(syntax, scope, policy, parent, &mut functions, expected_type)
     }
 
     pub(super) fn analyze_query_scalar_expr(
@@ -898,6 +909,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             policy,
             parent,
             &mut FunctionContext::ScalarOnly,
+            None,
         )
     }
 
@@ -908,8 +920,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policy: ExprPolicy,
         parent: hir::QueryId,
         functions: &mut FunctionContext<'_>,
+        expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let mut frames = vec![ExprFrame::new(syntax, None)?];
+        let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
         loop {
             if let Some(child) = frames
                 .last_mut()
