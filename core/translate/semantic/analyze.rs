@@ -429,10 +429,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_subquery(
         &mut self,
         select: &'ast ast::Select,
-        parent: QueryId,
+        parent: Option<QueryId>,
         outer_scope: &Scope,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, Some(parent), Some(outer_scope), None)
+        self.analyze_select_with_scope(select, parent, Some(outer_scope), None)
     }
 
     fn analyze_select_with_scope(
@@ -5279,6 +5279,81 @@ mod tests {
     }
 
     #[test]
+    fn insert_returning_subqueries_are_root_owned_and_capture_the_target() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO writable(id, value) VALUES (3, 'hello') RETURNING \
+             (SELECT value) AS copied, \
+             EXISTS(SELECT 1 WHERE id = 3) AS found, \
+             id IN (SELECT id) AS matched",
+        )
+        .expect("RETURNING subqueries bind");
+        document
+            .validate()
+            .expect("root-owned RETURNING subqueries produce closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let outputs = &insert
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs;
+        let query_ids = [
+            match outputs[0].expr {
+                Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
+                _ => panic!("first output is scalar subquery"),
+            },
+            match outputs[1].expr {
+                Expr::Subquery(SubqueryExpr::Exists(query)) => query,
+                _ => panic!("second output is EXISTS subquery"),
+            },
+            match outputs[2].expr {
+                Expr::Subquery(SubqueryExpr::In { query, .. }) => query,
+                _ => panic!("third output is IN subquery"),
+            },
+        ];
+        for query in query_ids {
+            let query = document.query(query).expect("RETURNING child query exists");
+            assert_eq!(query.parent, None);
+            assert_eq!(query.captures, [insert.target]);
+        }
+    }
+
+    #[test]
+    fn insert_returning_subqueries_share_the_insert_with_scope() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH label(v) AS (SELECT 'from cte') \
+             INSERT INTO writable(id) SELECT 3 \
+             RETURNING (SELECT v FROM label)",
+        )
+        .expect("RETURNING subquery sees INSERT CTEs");
+        document
+            .validate()
+            .expect("RETURNING CTE reference produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = insert
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs[0]
+            .expr
+        else {
+            panic!("RETURNING output is a scalar subquery");
+        };
+        let query = document.query(query).expect("RETURNING query exists");
+        assert_eq!(query.parent, None);
+        assert_eq!(query.reachable_ctes.len(), 1);
+    }
+
+    #[test]
     fn insert_returning_rejects_non_scalar_forms_at_analysis_time() {
         let schema = schema_with_writable_table();
         for (sql, expected) in [
@@ -5295,8 +5370,8 @@ mod tests {
                 "Parse error: misuse of window function: row_number()",
             ),
             (
-                "INSERT INTO writable(id) VALUES (1) RETURNING (SELECT id)",
-                "Parse error: semantic INSERT does not yet accept subqueries in RETURNING clauses",
+                "INSERT INTO writable(id) VALUES (1) RETURNING (SELECT id, value)",
+                "Parse error: sub-select returns 2 columns - expected 1",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid RETURNING fails");

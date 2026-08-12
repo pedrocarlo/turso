@@ -200,7 +200,11 @@ Completed:
 - Scalar INSERT RETURNING expressions bind against the target source and become
   root-owned HIR outputs. Unqualified and qualified stars, aliases, type facts,
   affinities, collations, and generated-column dependencies are resolved during
-  analysis. RETURNING subqueries remain a later root-expression checkpoint.
+  analysis.
+- RETURNING scalar, EXISTS, and IN subqueries are root-owned queries with no
+  query parent and exact captures of the INSERT target. Query-owned expressions
+  keep their lexical parent. INSERT-level WITH scopes remain alive through
+  RETURNING so lazy CTE definitions keep one statement-local identity.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

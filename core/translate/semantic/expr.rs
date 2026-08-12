@@ -241,6 +241,21 @@ enum FunctionContext<'state> {
     Query(&'state mut QueryFunctionState),
 }
 
+#[derive(Clone, Copy)]
+enum ExprOwner {
+    Root,
+    Query(hir::QueryId),
+}
+
+impl ExprOwner {
+    const fn query(self) -> Option<hir::QueryId> {
+        match self {
+            Self::Root => None,
+            Self::Query(query) => Some(query),
+        }
+    }
+}
+
 enum FunctionBinding {
     Scalar,
     Aggregate(AggregateBinding),
@@ -895,9 +910,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut QueryFunctionState,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let parent = functions.block.query;
+        let owner = ExprOwner::Query(functions.block.query);
         let mut functions = FunctionContext::Query(functions);
-        self.analyze_query_scoped_expr(syntax, scope, policy, parent, &mut functions, expected_type)
+        self.analyze_owned_expr(syntax, scope, policy, owner, &mut functions, expected_type)
     }
 
     pub(super) fn analyze_query_scalar_expr(
@@ -907,22 +922,38 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policy: ExprPolicy,
         parent: hir::QueryId,
     ) -> Result<ResolvedScopeExpr> {
-        self.analyze_query_scoped_expr(
+        self.analyze_owned_expr(
             syntax,
             scope,
             policy,
-            parent,
+            ExprOwner::Query(parent),
             &mut FunctionContext::ScalarOnly,
             None,
         )
     }
 
-    fn analyze_query_scoped_expr(
+    pub(super) fn analyze_root_expr(
         &mut self,
         syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        parent: hir::QueryId,
+    ) -> Result<ResolvedScopeExpr> {
+        self.analyze_owned_expr(
+            syntax,
+            scope,
+            policy,
+            ExprOwner::Root,
+            &mut FunctionContext::ScalarOnly,
+            None,
+        )
+    }
+
+    fn analyze_owned_expr(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        owner: ExprOwner,
         functions: &mut FunctionContext<'_>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
@@ -943,7 +974,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 | ast::Expr::Exists(_)
                 | ast::Expr::InSelect { .. }
                 | ast::Expr::InTable { .. } => {
-                    self.build_subquery_expr(frame.syntax, frame.resolved_children, scope, parent)?
+                    self.build_subquery_expr(frame.syntax, frame.resolved_children, scope, owner)?
                 }
                 _ => self.build_expr(
                     frame.syntax,
@@ -966,17 +997,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::Expr,
         children: ExprChildren,
         scope: &Scope,
-        parent: hir::QueryId,
+        owner: ExprOwner,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
             ast::Expr::Subquery(select) => {
                 expect_no_expr_children(children)?;
-                let query = self.analyze_subquery(select, parent, scope)?;
+                let query = self.analyze_subquery(select, owner.query(), scope)?;
                 self.resolve_query_output(query, 0)
             }
             ast::Expr::Exists(select) => {
                 expect_no_expr_children(children)?;
-                let query = self.analyze_subquery(select, parent, scope)?;
+                let query = self.analyze_subquery(select, owner.query(), scope)?;
                 Ok(computed_expr(
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
                     hir::TypeFact::known(Type::Integer),
@@ -985,9 +1016,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::InSelect {
                 not, rhs: select, ..
-            } => self.build_in_subquery(children, select, *not, scope, parent),
+            } => self.build_in_subquery(children, select, *not, scope, owner),
             ast::Expr::InTable { not, rhs, args, .. } => {
-                let query = self.analyze_named_relation_query(rhs, args, parent, scope)?;
+                let query = self.analyze_named_relation_query(rhs, args, owner.query(), scope)?;
                 self.build_in_query(children, query, *not)
             }
             _ => Err(LimboError::InternalError(
@@ -1002,9 +1033,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         negated: bool,
         scope: &Scope,
-        parent: hir::QueryId,
+        owner: ExprOwner,
     ) -> Result<ResolvedScopeExpr> {
-        let query = self.analyze_subquery(select, parent, scope)?;
+        let query = self.analyze_subquery(select, owner.query(), scope)?;
         self.build_in_query(lhs, query, negated)
     }
 

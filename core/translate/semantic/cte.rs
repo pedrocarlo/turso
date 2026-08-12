@@ -759,7 +759,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         context: CteBindingContext<'_>,
     ) -> Result<QueryId> {
         match context.outer_scope {
-            Some(scope) => self.analyze_subquery(select, context.parent, scope),
+            Some(scope) => self.analyze_subquery(select, Some(context.parent), scope),
             None => self.analyze_select(select),
         }
     }

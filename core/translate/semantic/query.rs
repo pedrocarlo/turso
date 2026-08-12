@@ -33,7 +33,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         name: &ast::QualifiedName,
         arguments: &'ast [Box<ast::Expr>],
-        parent: hir::QueryId,
+        parent: Option<hir::QueryId>,
         outer_scope: &Scope,
     ) -> Result<hir::QueryId> {
         let query = self.reserve_query();
@@ -86,7 +86,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let reachable_ctes = self.direct_ctes(std::slice::from_ref(&block))?;
         let mut query = hir::Query {
             id: query,
-            parent: Some(parent),
+            parent,
             captures: Vec::new(),
             reachable_ctes,
             first: block_id,
