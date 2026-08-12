@@ -5032,6 +5032,57 @@ mod tests {
     }
 
     #[test]
+    fn insert_binds_catch_all_upsert_do_nothing() {
+        let schema = schema_with_writable_table();
+        for sql in [
+            "INSERT INTO writable(id) VALUES (1) ON CONFLICT DO NOTHING",
+            "INSERT INTO writable(id) SELECT 1 WHERE true ON CONFLICT DO NOTHING",
+            "INSERT INTO writable(id) VALUES (1) ON CONFLICT DO NOTHING RETURNING id",
+        ] {
+            let document =
+                analyze_sql_with_schema(&schema, sql).expect("catch-all UPSERT DO NOTHING binds");
+            document
+                .validate()
+                .expect("UPSERT DO NOTHING produces closed HIR");
+            let HirRoot::Insert(insert) = &document.root else {
+                panic!("INSERT produces INSERT root");
+            };
+            assert!(matches!(
+                insert.upserts.as_slice(),
+                [hir::Upsert {
+                    target: None,
+                    action: hir::UpsertAction::Nothing,
+                }]
+            ));
+            assert!(insert.excluded_source.is_none());
+        }
+    }
+
+    #[test]
+    fn insert_keeps_later_upsert_forms_at_their_checkpoint_boundaries() {
+        let schema = schema_with_writable_table();
+        for (sql, expected) in [
+            (
+                "INSERT INTO writable(id) VALUES (1) ON CONFLICT(id) DO NOTHING",
+                "Parse error: semantic INSERT does not yet accept UPSERT conflict targets",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) ON CONFLICT DO UPDATE SET value = 'x'",
+                "Parse error: semantic INSERT does not yet accept UPSERT DO UPDATE clauses",
+            ),
+            (
+                "INSERT INTO writable(id) VALUES (1) \
+                 ON CONFLICT(id) DO NOTHING ON CONFLICT DO NOTHING",
+                "Parse error: semantic INSERT does not yet accept UPSERT conflict targets",
+            ),
+        ] {
+            let error =
+                analyze_sql_with_schema(&schema, sql).expect_err("unsupported UPSERT fails");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn insert_values_resolve_union_value_from_each_destination_type() {
         let schema = schema_with_insert_unions();
         let document = analyze_sql_with_schema(

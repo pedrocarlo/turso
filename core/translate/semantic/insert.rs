@@ -54,20 +54,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         self.require_basic_insert_target(table.value())?;
         self.analyze_insert_target_metadata(target, &table)?;
 
-        let (columns, source) = match body {
+        let (columns, source, upserts) = match body {
             ast::InsertBody::DefaultValues => {
                 if !column_names.is_empty() {
                     return unsupported_insert("a column list with DEFAULT VALUES");
                 }
-                (Vec::new(), hir::InsertSource::DefaultValues)
+                (Vec::new(), hir::InsertSource::DefaultValues, Vec::new())
             }
             ast::InsertBody::Select(select, upsert) => {
-                if upsert.is_some() {
-                    return unsupported_insert("UPSERT clauses");
-                }
                 let columns = resolve_insert_targets(table.value(), column_names)?;
                 let expected = columns.len();
-                match &select.body.select {
+                let source = match &select.body.select {
                     ast::OneSelect::Values(_) => {
                         let rows = simple_values_rows(select)?;
                         if rows.is_empty() {
@@ -93,7 +90,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             }
                             bound_rows.push(bound);
                         }
-                        (columns, hir::InsertSource::Values(bound_rows))
+                        hir::InsertSource::Values(bound_rows)
                     }
                     ast::OneSelect::Select { .. } => {
                         let expected_outputs = columns
@@ -116,9 +113,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                 table.value().get_name()
                             );
                         }
-                        (columns, hir::InsertSource::Query(query))
+                        hir::InsertSource::Query(query)
                     }
-                }
+                };
+                let upserts = analyze_catch_all_upserts(upsert.as_deref())?;
+                (columns, source, upserts)
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
@@ -138,7 +137,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             defaults,
             source,
             conflict,
-            upserts: Vec::new(),
+            upserts,
             excluded_source: None,
             returning,
             trigger: None,
@@ -451,6 +450,24 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }
         Ok(())
     }
+}
+
+fn analyze_catch_all_upserts(mut syntax: Option<&ast::Upsert>) -> Result<Vec<hir::Upsert>> {
+    let mut upserts = Vec::new();
+    while let Some(upsert) = syntax {
+        if upsert.index.is_some() {
+            return unsupported_insert("UPSERT conflict targets");
+        }
+        if matches!(upsert.do_clause, ast::UpsertDo::Set { .. }) {
+            return unsupported_insert("UPSERT DO UPDATE clauses");
+        }
+        upserts.push(hir::Upsert {
+            target: None,
+            action: hir::UpsertAction::Nothing,
+        });
+        syntax = upsert.next.as_deref();
+    }
+    Ok(upserts)
 }
 
 fn simple_values_rows(select: &ast::Select) -> Result<&[Vec<Box<ast::Expr>>]> {
