@@ -4918,6 +4918,35 @@ mod tests {
     }
 
     #[test]
+    fn insert_keeps_statement_conflict_resolution() {
+        let schema = schema_with_writable_table();
+        for (keyword, expected) in [
+            ("ROLLBACK", ast::ResolveType::Rollback),
+            ("ABORT", ast::ResolveType::Abort),
+            ("FAIL", ast::ResolveType::Fail),
+            ("IGNORE", ast::ResolveType::Ignore),
+            ("REPLACE", ast::ResolveType::Replace),
+        ] {
+            let document = analyze_sql_with_schema(
+                &schema,
+                &format!("INSERT OR {keyword} INTO writable(id) VALUES (1)"),
+            )
+            .expect("INSERT conflict mode binds");
+            let HirRoot::Insert(insert) = document.root else {
+                panic!("INSERT produces INSERT root");
+            };
+            assert_eq!(insert.conflict, Some(expected));
+        }
+
+        let document = analyze_sql_with_schema(&schema, "INSERT INTO writable(id) VALUES (1)")
+            .expect("plain INSERT binds");
+        let HirRoot::Insert(insert) = document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert_eq!(insert.conflict, None);
+    }
+
+    #[test]
     fn insert_defaults_and_duplicate_targets_keep_write_selection_rules() {
         let schema = schema_with_writable_table();
         let explicit_default =
