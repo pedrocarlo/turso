@@ -201,6 +201,9 @@ Completed:
   and VALUES compound arm. Destination-aware functions therefore resolve the
   same way in direct VALUES and query sources without changing standalone
   SELECT rules.
+- Simple INSERT VALUES sources stay as inline rows. Compound VALUES and VALUES
+  with query-level decorations use query HIR, preserving compound blocks,
+  ORDER BY/LIMIT, width checks, and destination types in every arm.
 - Scalar INSERT RETURNING expressions bind against the target source and become
   root-owned HIR outputs. Unqualified and qualified stars, aliases, type facts,
   affinities, collations, and generated-column dependencies are resolved during

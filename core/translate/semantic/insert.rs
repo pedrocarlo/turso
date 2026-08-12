@@ -24,7 +24,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table_name: &ast::QualifiedName,
         column_names: &[ast::Name],
         body: &'ast ast::InsertBody,
-        returning: &[ast::ResultColumn],
+        returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
         if with.is_some()
             && !matches!(
@@ -70,8 +70,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 let columns = resolve_insert_targets(table.value(), column_names)?;
                 let expected = columns.len();
                 let source = match &select.body.select {
-                    ast::OneSelect::Values(_) => {
-                        let rows = simple_values_rows(select)?;
+                    ast::OneSelect::Values(rows) if is_simple_values(select) => {
                         if rows.is_empty() {
                             crate::bail_parse_error!("no values to insert");
                         }
@@ -97,7 +96,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         }
                         hir::InsertSource::Values(bound_rows)
                     }
-                    ast::OneSelect::Select { .. } => {
+                    ast::OneSelect::Select { .. } | ast::OneSelect::Values(_) => {
                         let expected_outputs = columns
                             .iter()
                             .map(|target| self.insert_target_type(table.value(), target.column))
@@ -272,7 +271,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
     fn analyze_insert_value(
         &mut self,
-        syntax: &ast::Expr,
+        syntax: &'ast ast::Expr,
         target: hir::SourceId,
         table: &Table,
         column: hir::TargetColumn,
@@ -505,7 +504,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             unreachable!("a present conflict target is not catch-all")
                         }
                     };
-                    Ok(hir::ConflictTarget {
+                    Ok::<_, LimboError>(hir::ConflictTarget {
                         terms,
                         predicate,
                         matched_index,
@@ -683,18 +682,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 }
 
-fn simple_values_rows(select: &ast::Select) -> Result<&[Vec<Box<ast::Expr>>]> {
-    if select.with.is_some()
-        || !select.body.compounds.is_empty()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
-    {
-        return unsupported_insert("compound or decorated VALUES sources");
-    }
-    let ast::OneSelect::Values(rows) = &select.body.select else {
-        return unsupported_insert("INSERT-SELECT sources");
-    };
-    Ok(rows)
+fn is_simple_values(select: &ast::Select) -> bool {
+    select.with.is_none()
+        && select.body.compounds.is_empty()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
 }
 
 fn resolve_insert_targets(table: &Table, names: &[ast::Name]) -> Result<Vec<hir::InsertTarget>> {

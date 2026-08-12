@@ -1398,6 +1398,7 @@ mod tests {
     use super::*;
     use crate::translate::semantic::{
         context::DoubleQuotedDml,
+        hir,
         hir::{
             BinaryOperand, ColumnReadExpression, CteBody, CustomTypeOperation, FieldAccessKind,
             FunctionArguments, FunctionEvaluation, FunctionOperation, HirRoot, IndexCoverage,
@@ -4924,6 +4925,113 @@ mod tests {
     }
 
     #[test]
+    fn compound_values_insert_sources_use_query_hir() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded(id) \
+             VALUES (2) UNION ALL SELECT 1 ORDER BY 1 LIMIT 1",
+        )
+        .expect("compound decorated VALUES source binds");
+        document
+            .validate()
+            .expect("compound VALUES INSERT produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Query(query) = insert.source else {
+            panic!("compound VALUES uses query source");
+        };
+        let query = document.query(query).expect("INSERT source query exists");
+        assert_eq!(query.blocks.len(), 2);
+        assert!(matches!(
+            query.blocks[0].body,
+            QueryBlockBody::Values { .. }
+        ));
+        assert!(matches!(
+            query.blocks[1].body,
+            QueryBlockBody::Select { .. }
+        ));
+        assert_eq!(query.order_by.len(), 1);
+        assert!(query.limit.is_some());
+
+        let plain = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO guarded(id) VALUES (1) UNION ALL VALUES (2)",
+        )
+        .expect("compound VALUES arms bind");
+        let HirRoot::Insert(insert) = &plain.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        assert!(matches!(insert.source, InsertSource::Query(_)));
+    }
+
+    #[test]
+    fn first_values_compound_arm_receives_insert_destination_type() {
+        let schema = schema_with_insert_unions();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "INSERT INTO union_values(nested) \
+             VALUES (union_value('x', union_value('a', 1))) \
+             UNION ALL SELECT union_value('y', 2.0) LIMIT 1",
+        )
+        .expect("destination types reach first VALUES compound arm");
+        document
+            .validate()
+            .expect("typed compound VALUES produces closed HIR");
+
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let InsertSource::Query(query) = insert.source else {
+            panic!("compound VALUES uses query source");
+        };
+        let query = document.query(query).expect("INSERT source query exists");
+        let QueryBlockBody::Values { rows } = &query.blocks[0].body else {
+            panic!("first arm remains VALUES");
+        };
+        assert!(matches!(
+            &rows[0][0],
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 0,
+                }) if union_type.value().name == "outer_u"
+            )
+        ));
+        assert!(matches!(
+            &query.blocks[1].outputs[0].expr,
+            Expr::Function(function) if matches!(
+                &function.operation,
+                FunctionOperation::CustomType(CustomTypeOperation::UnionValue {
+                    union_type,
+                    tag_index: 1,
+                }) if union_type.value().name == "outer_u"
+            )
+        ));
+    }
+
+    #[test]
+    fn query_backed_values_keep_query_diagnostics() {
+        let schema = schema_with_insert_metadata();
+        for (sql, expected) in [
+            (
+                "INSERT INTO guarded(id) VALUES (1) UNION ALL VALUES (2) ORDER BY 1",
+                "Parse error: ORDER BY clause is not allowed with VALUES clause",
+            ),
+            (
+                "INSERT INTO guarded(id) VALUES (1) UNION ALL SELECT 2, 3",
+                "Parse error: SELECTs to the left and right of UNION ALL do not have the same number of result columns",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid VALUES fails");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn insert_freezes_check_constraints_and_all_index_expressions() {
         let schema = schema_with_insert_metadata();
         let document = analyze_sql_with_schema(
@@ -5618,14 +5726,8 @@ mod tests {
                 if matches!(expr.as_ref(), Expr::Column(column)
                     if column.source == insert.target && column.column == 1)
         ));
-        assert_eq!(
-            returning.outputs[0].type_fact.known_type(),
-            Some(Type::Integer)
-        );
-        assert_eq!(
-            returning.outputs[1].type_fact.known_type(),
-            Some(Type::Text)
-        );
+        assert_eq!(returning.outputs[0].type_fact.storage, Some(Type::Integer));
+        assert_eq!(returning.outputs[1].type_fact.storage, Some(Type::Text));
         assert!(returning.outputs[3].collation_is_explicit);
         assert!(document.output(OutputId::root(3)).is_some());
 
