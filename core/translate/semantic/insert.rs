@@ -122,7 +122,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
         };
         let defaults = self.analyze_insert_defaults(target, table.value(), &columns)?;
-        let returning = self.analyze_insert_returning(returning, target)?;
+        let returning = self.analyze_insert_returning(returning, target);
+        if with.is_some() {
+            self.cte_scopes
+                .pop()
+                .expect("an INSERT WITH clause must own one CTE scope");
+        }
+        let returning = returning?;
 
         Ok(HirRoot::Insert(hir::Insert {
             target,
@@ -151,13 +157,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         if let Some(with) = with {
             self.push_cte_scope(with)?;
         }
-        let result = self.analyze_select_with_expected_outputs(select, expected_outputs);
-        if with.is_some() {
-            self.cte_scopes
-                .pop()
-                .expect("an INSERT WITH clause must own one CTE scope");
-        }
-        result
+        self.analyze_select_with_expected_outputs(select, expected_outputs)
     }
 
     fn require_basic_insert_target(&self, table: &Table) -> Result<()> {
@@ -402,10 +402,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         for column in columns {
             match column {
                 ast::ResultColumn::Expr(expression, alias) => {
-                    if expression_contains_subquery(expression) {
-                        return unsupported_insert("subqueries in RETURNING clauses");
-                    }
-                    let resolved = self.analyze_resolved_expr(expression, &scope, policy)?;
+                    let resolved = self.analyze_root_expr(expression, &scope, policy)?;
                     let (name, name_kind) = match alias {
                         Some(alias) if alias.is_explicit() => (
                             alias.name().as_str().to_string(),
