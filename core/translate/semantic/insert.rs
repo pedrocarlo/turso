@@ -49,24 +49,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             None
         };
 
-        if let Some(with) = with {
-            self.push_cte_scope(with)?;
-        }
-        let result = self.analyze_insert_body(
-            conflict,
-            column_names,
-            body,
-            returning,
-            target,
-            &table,
-            autoincrement,
-        );
-        if with.is_some() {
-            self.cte_scopes
-                .pop()
-                .expect("an INSERT WITH clause must own one CTE scope");
-        }
-        result
+        self.with_cte_scope(with, |analyzer| {
+            analyzer.analyze_insert_body(
+                conflict,
+                column_names,
+                body,
+                returning,
+                target,
+                &table,
+                autoincrement,
+            )
+        })
     }
 
     fn analyze_insert_body(

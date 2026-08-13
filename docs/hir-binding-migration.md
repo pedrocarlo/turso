@@ -242,9 +242,8 @@ Completed:
   generated columns, defaults, CHECK constraints, and complete index metadata
   close separately against both row identities. Row assignments, duplicate
   targets, rowid aliases, SET DEFAULT, array-setter composition, destination
-  types, and correlated expression subqueries keep their binding rules. WITH,
-  FROM, RETURNING, virtual/WITHOUT ROWID targets, and foreign keys remain
-  explicit later checkpoints.
+  types, and correlated expression subqueries keep their binding rules. FROM
+  and virtual/WITHOUT ROWID targets remain explicit later checkpoints.
 - UPDATE trigger identities retain catalog order and include ordinary UPDATE
   triggers plus only the `UPDATE OF` triggers whose named columns are assigned.
   Trigger programs and trigger environments remain later checkpoints.
@@ -257,6 +256,11 @@ Completed:
   output facts, aliases, collations, generated columns, and root-owned
   subqueries share INSERT's DML RETURNING path. The base table name remains
   visible when the UPDATE target has an alias; that alias is not visible.
+- SELECT, INSERT, recursive CTE bodies, and UPDATE use one scoped CTE helper,
+  which removes the statement scope on success or error and checks that nested
+  analysis did not leak another scope. UPDATE WITH definitions remain lazy,
+  reach SET, WHERE, and RETURNING subqueries, support recursive bodies, and do
+  not shadow the catalog UPDATE target.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
