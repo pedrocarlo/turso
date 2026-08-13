@@ -28,6 +28,7 @@ pub(crate) struct ExprPolicy {
     allow_windows: bool,
     raise: RaisePolicy,
     self_source: Option<hir::SourceId>,
+    unavailable_trigger_row: Option<UnavailableTriggerRow>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +42,12 @@ enum AggregatePolicy {
 enum RaisePolicy {
     AbortOnly,
     Trigger,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnavailableTriggerRow {
+    New,
+    Old,
 }
 
 struct ResolvedCustomMember {
@@ -70,6 +77,7 @@ impl ExprPolicy {
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -81,6 +89,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -92,6 +101,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -103,6 +113,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -118,6 +129,7 @@ impl ExprPolicy {
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -129,6 +141,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -140,6 +153,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -151,6 +165,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -166,6 +181,17 @@ impl ExprPolicy {
         Self::insert_values(dqs_dml)
     }
 
+    pub(super) fn trigger_predicate(dqs_dml: DoubleQuotedDml, event: &ast::TriggerEvent) -> Self {
+        let mut policy = Self::where_clause(dqs_dml);
+        policy.raise = RaisePolicy::Trigger;
+        policy.unavailable_trigger_row = match event {
+            ast::TriggerEvent::Insert => Some(UnavailableTriggerRow::Old),
+            ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => None,
+            ast::TriggerEvent::Delete => Some(UnavailableTriggerRow::New),
+        };
+        policy
+    }
+
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
         self
@@ -179,6 +205,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
+            unavailable_trigger_row: None,
         }
     }
 
@@ -1705,6 +1732,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::Qualified(table, column) => {
                 expect_no_expr_children(children)?;
+                reject_unavailable_trigger_row(policy, table.as_str())?;
                 if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
                     return self.resolve_atomic_expr(resolved.expr, scope);
                 }
@@ -1723,6 +1751,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::DoublyQualified(database, table, column) => {
                 expect_no_expr_children(children)?;
+                reject_unavailable_trigger_row(policy, table.as_str())?;
                 if let Some(database_id) = self.context().database(database.as_str()) {
                     if let Some(resolved) = scope.resolve_database_qualified(
                         database_id,
@@ -3691,6 +3720,19 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
         (RaisePolicy::AbortOnly, _) => {
             crate::bail_parse_error!("RAISE() may only be used within a trigger-program")
         }
+    }
+}
+
+fn reject_unavailable_trigger_row(policy: ExprPolicy, namespace: &str) -> Result<()> {
+    let namespace = normalize_ident(namespace);
+    match policy.unavailable_trigger_row {
+        Some(UnavailableTriggerRow::New) if namespace == "new" => {
+            crate::bail_parse_error!("NEW references are only valid in INSERT and UPDATE triggers");
+        }
+        Some(UnavailableTriggerRow::Old) if namespace == "old" => {
+            crate::bail_parse_error!("OLD references are only valid in UPDATE and DELETE triggers");
+        }
+        _ => Ok(()),
     }
 }
 

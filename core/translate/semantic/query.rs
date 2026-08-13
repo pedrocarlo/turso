@@ -18,9 +18,9 @@ struct AnalyzedTableSource<'ast> {
     qualified_scope: Option<Scope>,
 }
 
-struct AnalyzedSourceColumn {
-    column: hir::SourceColumn,
-    programs: Option<hir::BoundColumnTypePrograms>,
+pub(super) struct AnalyzedSourceColumn {
+    pub(super) column: hir::SourceColumn,
+    pub(super) programs: Option<hir::BoundColumnTypePrograms>,
 }
 
 #[derive(Clone, Copy)]
@@ -751,7 +751,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(source)
     }
 
-    fn source_columns(&mut self, table: &hir::ResolvedTable) -> Result<Vec<AnalyzedSourceColumn>> {
+    pub(super) fn source_columns(
+        &mut self,
+        table: &hir::ResolvedTable,
+    ) -> Result<Vec<AnalyzedSourceColumn>> {
         let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
@@ -885,6 +888,6 @@ fn is_natural_join(operator: ast::JoinOperator) -> bool {
     )
 }
 
-fn table_has_rowid(table: &Table) -> bool {
+pub(super) fn table_has_rowid(table: &Table) -> bool {
     table.btree().is_some_and(|table| table.has_rowid) || table.virtual_table().is_some()
 }
