@@ -35,8 +35,31 @@ documents.
 4. Move INSERT, UPDATE, DELETE, and pseudo-sources.
 5. Move triggers and stored schema expressions.
 6. Validate every completed document.
-7. Switch the production entry point after coverage is complete.
-8. Delete `Bound*`, `TableReferences` conversion, and planner-era binding code.
+7. Feed resolved HIR into the existing plan, optimizer, and emitter pipeline.
+8. Switch the production entry point after coverage is complete.
+9. Delete `Bound*`, source-ID conversion, and planner-era binding code.
+
+## Planner handoff
+
+Keep the existing plan algorithms, optimizer, and emitter. Replace only work
+already completed by semantic analysis:
+
+- Build existing planning source records from resolved HIR sources.
+- Move SELECT plan expressions from parser AST to resolved HIR expressions.
+- Assemble existing SELECT plans from HIR without name lookup, star expansion,
+  alias or ordinal replacement, function lookup, or expression rewriting.
+- Switch SELECT preparation to HIR in one step; do not run both binders.
+- Remove the name-resolution half of `TableReferences`, keeping column usage,
+  join planning, index selection, and other physical planning data.
+
+Do not convert HIR expressions back into parser AST. That would discard
+resolved function, type, collation, and comparison choices, forcing later
+stages to repeat semantic work.
+
+During migration, one document-local map gives every HIR `SourceId` a stable
+planner `TableInternalId`. This map is compatibility glue, not the final model.
+Once plan and emitter column references use `SourceId`, delete the map. IDs for
+planner-created runtime objects may remain separate.
 
 ## Current status
 
