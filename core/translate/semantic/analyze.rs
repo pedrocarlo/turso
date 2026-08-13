@@ -6826,6 +6826,131 @@ mod tests {
     }
 
     #[test]
+    fn row_operands_freeze_each_comparison_component() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT ((id, value)) = ((1, 'first')), \
+             (id, value) BETWEEN (1, 'a') AND (3, 'z'), \
+             (id, value) IN ((1, 'one'), (2, 'two')) \
+             FROM items",
+        )
+        .expect("supported row operands bind");
+        document
+            .validate()
+            .expect("row operands produce closed comparison metadata");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        assert_eq!(outputs.len(), 3);
+        assert!(outputs.iter().all(|output| {
+            output.type_fact.storage == Some(Type::Integer) && !output.has_affinity
+        }));
+
+        let Expr::Binary {
+            lhs,
+            rhs,
+            comparison: Some(comparison),
+            ..
+        } = &outputs[0].expr
+        else {
+            panic!("row equality becomes binary HIR");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(matches!(rhs.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert_row_comparison_facts(comparison);
+
+        let Expr::Between {
+            expr,
+            start,
+            end,
+            start_comparison,
+            end_comparison,
+            ..
+        } = &outputs[1].expr
+        else {
+            panic!("row BETWEEN becomes HIR");
+        };
+        assert!(matches!(expr.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(matches!(start.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(matches!(end.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert_row_comparison_facts(start_comparison);
+        assert_row_comparison_facts(end_comparison);
+
+        let Expr::InList {
+            lhs,
+            values,
+            comparisons,
+            ..
+        } = &outputs[2].expr
+        else {
+            panic!("row list IN becomes HIR");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 2));
+        assert!(
+            values
+                .iter()
+                .all(|value| matches!(value, Expr::Row(values) if values.len() == 2))
+        );
+        assert_eq!(comparisons.len(), 2);
+        for comparison in comparisons {
+            assert_row_comparison_facts(comparison);
+        }
+    }
+
+    fn assert_row_comparison_facts(comparison: &hir::ComparisonSemantics) {
+        assert_eq!(comparison.components.len(), 2);
+        assert_eq!(
+            comparison.components[0].affinity,
+            crate::vdbe::affinity::Affinity::Integer
+        );
+        assert_eq!(
+            comparison.components[1].affinity,
+            crate::vdbe::affinity::Affinity::Text
+        );
+        assert_eq!(
+            comparison.components[1]
+                .collation
+                .as_ref()
+                .expect("text row component keeps column collation")
+                .value(),
+            &crate::translate::collate::CollationSeq::NoCase
+        );
+    }
+
+    #[test]
+    fn row_operands_keep_width_and_context_errors() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            (
+                "SELECT (id, value) = 1 FROM items",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT (id, value) + (1, 2) FROM items",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT id IN ((1, 2)) FROM items",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT (id, value) IN ((1, 2, 3)) FROM items",
+                "Parse error: IN(...) element has 3 terms - expected 2",
+            ),
+            (
+                "SELECT (id, value) FROM items",
+                "Parse error: row value misused",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid row use fails");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+    }
+
+    #[test]
     fn like_family_outputs_have_integer_boolean_facts() {
         let document = analyze_sql("SELECT 'alphabet' LIKE 'alpha%'")
             .expect("LIKE expression has valid SQL meaning");
