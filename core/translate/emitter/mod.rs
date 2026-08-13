@@ -208,6 +208,19 @@ pub struct Resolver<'a> {
     unqualified_database_search_path: Option<Vec<String>>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct SemanticCatalogDatabase {
+    pub(crate) id: usize,
+    pub(crate) name: String,
+    pub(crate) schema: Arc<Schema>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct SemanticCatalogSnapshot {
+    pub(crate) databases: Vec<SemanticCatalogDatabase>,
+    pub(crate) unqualified_database_search_path: Vec<usize>,
+}
+
 #[derive(Clone)]
 struct SelfTableScope {
     context: SelfTableContext,
@@ -325,6 +338,71 @@ impl<'a> Resolver<'a> {
 
     pub fn schema(&self) -> &Schema {
         self.schema
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn semantic_catalog_snapshot(
+        &self,
+        main_schema: Arc<Schema>,
+    ) -> Result<SemanticCatalogSnapshot> {
+        let mut databases = vec![SemanticCatalogDatabase {
+            id: crate::MAIN_DB_ID,
+            name: Self::MAIN_DB.to_string(),
+            schema: main_schema,
+        }];
+
+        // TEMP remains a valid qualified namespace before its first object is created,
+        // but only participates in unqualified lookup after initialization.
+        databases.push(SemanticCatalogDatabase {
+            id: crate::TEMP_DB_ID,
+            name: Self::TEMP_DB.to_string(),
+            schema: self.cached_non_main_schema(crate::TEMP_DB_ID),
+        });
+
+        let attached = self.attached_databases.read();
+        let mut attached_databases = attached
+            .name_to_index
+            .iter()
+            .map(|(name, database)| (*database, name.clone()))
+            .collect::<Vec<_>>();
+        drop(attached);
+        attached_databases.sort_unstable_by_key(|(database, _)| *database);
+
+        for (database, name) in &attached_databases {
+            databases.push(SemanticCatalogDatabase {
+                id: *database,
+                name: name.clone(),
+                schema: self.cached_non_main_schema(*database),
+            });
+        }
+
+        let mut search_path = Vec::new();
+        if self.has_temp_schema {
+            search_path.push(crate::TEMP_DB_ID);
+        }
+        match &self.unqualified_database_search_path {
+            Some(configured) => {
+                for name in configured {
+                    if name.eq_ignore_ascii_case("public") {
+                        search_path.push(crate::MAIN_DB_ID);
+                    } else if let Some((database, _)) = attached_databases
+                        .iter()
+                        .find(|(_, attached_name)| attached_name.eq_ignore_ascii_case(name))
+                    {
+                        search_path.push(*database);
+                    }
+                }
+            }
+            None => {
+                search_path.push(crate::MAIN_DB_ID);
+                search_path.extend(attached_databases.iter().map(|(database, _)| *database));
+            }
+        }
+
+        Ok(SemanticCatalogSnapshot {
+            databases,
+            unqualified_database_search_path: search_path,
+        })
     }
 
     pub fn has_temp_database(&self) -> bool {
@@ -2370,4 +2448,47 @@ pub(crate) fn emit_check_constraints<'a>(
     resolver.expr_to_reg_cache_enabled = false;
 
     result
+}
+
+#[cfg(test)]
+mod semantic_catalog_tests {
+    use super::*;
+    use crate::{dialect::SqliteDialect, MAIN_DB_ID, TEMP_DB_ID};
+
+    #[test]
+    fn resolver_catalog_snapshot_owns_schemas_and_lookup_order() {
+        let main_schema = Arc::new(Schema::new());
+        let database_schemas = RwLock::new(HashMap::default());
+        let temp_database = RwLock::new(None);
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let symbols = SymbolTable::new();
+        let resolver = Resolver::new(
+            &main_schema,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &symbols,
+            true,
+            DoubleQuotedDml::Disabled,
+            Arc::new(SqliteDialect),
+            &None,
+        );
+
+        let snapshot = resolver
+            .semantic_catalog_snapshot(main_schema.clone())
+            .expect("resolver catalog freezes");
+        drop(resolver);
+        drop(main_schema);
+
+        assert_eq!(
+            snapshot
+                .databases
+                .iter()
+                .map(|database| (database.id, database.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(MAIN_DB_ID, "main"), (TEMP_DB_ID, "temp")]
+        );
+        assert_eq!(snapshot.unqualified_database_search_path, [MAIN_DB_ID]);
+        assert_eq!(snapshot.databases[0].schema.schema_version, 0);
+    }
 }
