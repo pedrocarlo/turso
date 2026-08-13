@@ -107,6 +107,10 @@ Completed:
   environment. The inner target remains distinct from the outer OLD row;
   predicates and nested queries keep trigger policies, and the target resolves
   directly in the trigger database without AST rewriting.
+- Trigger roots own their environment once and distinguish predicates from
+  SELECT, INSERT, UPDATE, and DELETE commands with enums. Ordinary query and
+  DML nodes no longer carry optional trigger-only state; validation receives
+  trigger-command context from the root shape.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,

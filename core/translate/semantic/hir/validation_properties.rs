@@ -97,10 +97,7 @@ fn generated_query_document(tc: &hegel::TestCase) -> HirDocument {
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
         databases: Vec::new(),
-        root: HirRoot::Query(QueryRoot {
-            query: query_id,
-            trigger: None,
-        }),
+        root: HirRoot::Query(QueryRoot { query: query_id }),
         queries: vec![Query {
             id: query_id,
             parent: None,
@@ -196,10 +193,7 @@ fn generated_cte_document(tc: &hegel::TestCase) -> HirDocument {
     HirDocument {
         snapshot: CatalogSnapshot::from_id(1),
         databases: Vec::new(),
-        root: HirRoot::Query(QueryRoot {
-            query: root_query,
-            trigger: None,
-        }),
+        root: HirRoot::Query(QueryRoot { query: root_query }),
         queries: vec![
             Query {
                 id: root_query,

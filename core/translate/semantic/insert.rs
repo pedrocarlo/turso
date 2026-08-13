@@ -62,7 +62,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             returning,
             target,
             expressions,
-            None,
         )
     }
 
@@ -76,7 +75,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         returning: &'ast [ast::ResultColumn],
         target: hir::SourceId,
         expressions: InsertExprContext<'_>,
-        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
         let table = match &self
             .source(target)
@@ -109,7 +107,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 &table,
                 autoincrement,
                 expressions,
-                trigger,
             )
         })
     }
@@ -124,7 +121,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         autoincrement: Option<hir::ResolvedAutoincrement>,
         expressions: InsertExprContext<'_>,
-        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
         let virtual_target = table.value().virtual_table().is_some();
         let (columns, source, upserts, excluded_source) = match body {
@@ -231,7 +227,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             upserts,
             excluded_source,
             returning,
-            trigger,
         }))
     }
 

@@ -17,7 +17,8 @@ use super::{
         CteId, DatabaseId, DatabaseSnapshot, DeleteTargetKind, Expr, FunctionEvaluation,
         HirDocument, HirRoot, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
         OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-        SchemaProgramId, Source, SourceId, SourceKind, TypeFact, UpdateTargetKind,
+        SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand, TriggerRoot,
+        TypeFact, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -30,13 +31,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
 ) -> Result<HirDocument> {
     let mut analyzer = Analyzer::new(context);
     let root = match input {
-        AnalyzeInput::Statement(ast::Stmt::Select(select)) => {
-            let query = analyzer.analyze_select(select)?;
-            HirRoot::Query(QueryRoot {
-                query,
-                trigger: None,
-            })
-        }
+        AnalyzeInput::Statement(ast::Stmt::Select(select)) => HirRoot::Query(QueryRoot {
+            query: analyzer.analyze_select(select)?,
+        }),
         AnalyzeInput::Statement(ast::Stmt::Insert {
             with,
             or_conflict,
@@ -319,7 +316,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for query in self.queries.iter().flatten() {
             pending.extend(query.direct_column_reads(|source| self.source(source)));
         }
-        if let HirRoot::Insert(insert) = root {
+        let insert = match root {
+            HirRoot::Insert(insert) => Some(insert),
+            HirRoot::Trigger(TriggerRoot {
+                body: TriggerBody::Command(TriggerCommand::Insert(insert)),
+                ..
+            }) => Some(insert),
+            _ => None,
+        };
+        if let Some(insert) = insert {
             if let InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind {
                 let width = self
                     .source(insert.target)
@@ -347,7 +352,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
-        if let HirRoot::Update(update) = root {
+        let update = match root {
+            HirRoot::Update(update) => Some(update),
+            HirRoot::Trigger(TriggerRoot {
+                body: TriggerBody::Command(TriggerCommand::Update(update)),
+                ..
+            }) => Some(update),
+            _ => None,
+        };
+        if let Some(update) = update {
             pending.extend(update.direct_column_reads(|source| self.source(source)));
             if let UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind {
                 for source in [update.target, update.new_source] {
@@ -372,7 +385,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
-        if let HirRoot::Delete(delete) = root {
+        let delete = match root {
+            HirRoot::Delete(delete) => Some(delete),
+            HirRoot::Trigger(TriggerRoot {
+                body: TriggerBody::Command(TriggerCommand::Delete(delete)),
+                ..
+            }) => Some(delete),
+            _ => None,
+        };
+        if let Some(delete) = delete {
             pending.extend(delete.direct_column_reads());
             if let DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind {
                 let width = self
@@ -1791,6 +1812,13 @@ mod tests {
         };
         assert_eq!(commands.len(), 1);
         commands.pop().expect("trigger contains one command")
+    }
+
+    fn trigger_root(document: &HirDocument) -> &hir::TriggerRoot {
+        let HirRoot::Trigger(root) = &document.root else {
+            panic!("document has trigger root");
+        };
+        root
     }
 
     fn trigger_column(row: &str, column: &str) -> ast::Expr {
@@ -5554,17 +5582,18 @@ mod tests {
                 &trigger_column(row, "value"),
             )
             .expect("event row is visible");
-            let HirRoot::TriggerPredicate(predicate) = &document.root else {
-                panic!("trigger predicate produces trigger root");
+            let root = trigger_root(&document);
+            let hir::TriggerBody::Predicate(expression) = &root.body else {
+                panic!("trigger root contains predicate");
             };
             let expected_source = match kind {
-                PseudoSource::New => predicate.environment.new_source,
-                PseudoSource::Old => predicate.environment.old_source,
+                PseudoSource::New => root.environment.new_source,
+                PseudoSource::Old => root.environment.old_source,
                 PseudoSource::Excluded => unreachable!("EXCLUDED is not a trigger row"),
             }
             .expect("event exposes requested row");
             assert!(matches!(
-                predicate.expression,
+                expression,
                 Expr::Column(column)
                     if column.source == expected_source && column.column == 1
             ));
@@ -5621,12 +5650,13 @@ mod tests {
             &trigger_column("new", "rowid"),
         )
         .expect("trigger rowid binds");
-        let HirRoot::TriggerPredicate(predicate) = &document.root else {
-            panic!("trigger predicate produces trigger root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Predicate(expression) = &root.body else {
+            panic!("trigger root contains predicate");
         };
         assert!(matches!(
-            predicate.expression,
-            Expr::RowId(source) if Some(source) == predicate.environment.new_source
+            expression,
+            Expr::RowId(source) if Some(*source) == root.environment.new_source
         ));
 
         let missing = analyze_trigger_predicate_with_schema(
@@ -5679,16 +5709,14 @@ mod tests {
         let document =
             analyze_trigger_select_with_schema(&schema, ast::TriggerEvent::Update, &select)
                 .expect("trigger SELECT binds");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("trigger SELECT produces query root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Select(query_id)) = &root.body else {
+            panic!("trigger root contains SELECT command");
         };
-        let environment = root
-            .trigger
-            .as_ref()
-            .expect("trigger SELECT carries its environment");
+        let environment = &root.environment;
         let new_source = environment.new_source.expect("UPDATE has NEW");
         let old_source = environment.old_source.expect("UPDATE has OLD");
-        let query = document.query(root.query).expect("trigger query exists");
+        let query = document.query(*query_id).expect("trigger query exists");
         assert!(query.captures.contains(&new_source));
         assert!(query.captures.contains(&old_source));
         assert!(matches!(
@@ -5707,15 +5735,12 @@ mod tests {
         let document =
             analyze_trigger_select_with_schema(&schema, ast::TriggerEvent::Insert, &select)
                 .expect("trigger NEW shadows a table alias");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("trigger SELECT produces query root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Select(query_id)) = &root.body else {
+            panic!("trigger root contains SELECT command");
         };
-        let new_source = root
-            .trigger
-            .as_ref()
-            .and_then(|environment| environment.new_source)
-            .expect("INSERT has NEW");
-        let query = document.query(root.query).expect("trigger query exists");
+        let new_source = root.environment.new_source.expect("INSERT has NEW");
+        let query = document.query(*query_id).expect("trigger query exists");
         assert!(matches!(
             query.blocks[0].outputs[0].expr,
             Expr::Column(column) if column.source == new_source && column.column == 1
@@ -5747,14 +5772,12 @@ mod tests {
             Some(ast::ResolveType::Replace),
         )
         .expect("trigger INSERT binds");
-        let HirRoot::Insert(insert) = &document.root else {
-            panic!("trigger INSERT produces INSERT root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Insert(insert)) = &root.body else {
+            panic!("trigger root contains INSERT command");
         };
         assert_eq!(insert.conflict, Some(ast::ResolveType::Replace));
-        let environment = insert
-            .trigger
-            .as_ref()
-            .expect("trigger INSERT carries its environment");
+        let environment = &root.environment;
         let new_source = environment.new_source.expect("UPDATE has NEW");
         let old_source = environment.old_source.expect("UPDATE has OLD");
         let InsertSource::Query(query) = insert.source else {
@@ -5780,10 +5803,11 @@ mod tests {
         let document =
             analyze_trigger_insert_with_schema(&schema, ast::TriggerEvent::Update, &command, None)
                 .expect("trigger VALUES and UPSERT bind");
-        let HirRoot::Insert(insert) = &document.root else {
-            panic!("trigger INSERT produces INSERT root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Insert(insert)) = &root.body else {
+            panic!("trigger root contains INSERT command");
         };
-        let environment = insert.trigger.as_ref().expect("environment exists");
+        let environment = &root.environment;
         let new_source = environment.new_source.expect("UPDATE has NEW");
         let old_source = environment.old_source.expect("UPDATE has OLD");
         let InsertSource::Values(rows) = &insert.source else {
@@ -5833,14 +5857,12 @@ mod tests {
             Some(ast::ResolveType::Replace),
         )
         .expect("trigger UPDATE binds");
-        let HirRoot::Update(update) = &document.root else {
-            panic!("trigger UPDATE produces UPDATE root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Update(update)) = &root.body else {
+            panic!("trigger root contains UPDATE command");
         };
         assert_eq!(update.conflict, Some(ast::ResolveType::Replace));
-        let environment = update
-            .trigger
-            .as_ref()
-            .expect("trigger UPDATE carries its environment");
+        let environment = &root.environment;
         let outer_new = environment.new_source.expect("outer UPDATE has NEW");
         let outer_old = environment.old_source.expect("outer UPDATE has OLD");
         assert_ne!(update.target, outer_old);
@@ -5877,10 +5899,11 @@ mod tests {
         let document =
             analyze_trigger_update_with_schema(&schema, ast::TriggerEvent::Update, &command, None)
                 .expect("trigger UPDATE FROM binds");
-        let HirRoot::Update(update) = &document.root else {
-            panic!("trigger UPDATE produces UPDATE root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Update(update)) = &root.body else {
+            panic!("trigger root contains UPDATE command");
         };
-        let environment = update.trigger.as_ref().expect("environment exists");
+        let environment = &root.environment;
         let outer_new = environment.new_source.expect("UPDATE has NEW");
         let outer_old = environment.old_source.expect("UPDATE has OLD");
         let Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) = &update.assignments[0].value
@@ -5930,13 +5953,11 @@ mod tests {
         let document =
             analyze_trigger_delete_with_schema(&schema, ast::TriggerEvent::Update, &command)
                 .expect("trigger DELETE binds");
-        let HirRoot::Delete(delete) = &document.root else {
-            panic!("trigger DELETE produces DELETE root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Delete(delete)) = &root.body else {
+            panic!("trigger root contains DELETE command");
         };
-        let environment = delete
-            .trigger
-            .as_ref()
-            .expect("trigger DELETE carries its environment");
+        let environment = &root.environment;
         let outer_new = environment.new_source.expect("outer UPDATE has NEW");
         let outer_old = environment.old_source.expect("outer UPDATE has OLD");
         assert_ne!(delete.target, outer_old);
@@ -5969,14 +5990,11 @@ mod tests {
         let document =
             analyze_trigger_delete_with_schema(&schema, ast::TriggerEvent::Delete, &command)
                 .expect("trigger DELETE subquery binds");
-        let HirRoot::Delete(delete) = &document.root else {
-            panic!("trigger DELETE produces DELETE root");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Command(hir::TriggerCommand::Delete(delete)) = &root.body else {
+            panic!("trigger root contains DELETE command");
         };
-        let outer_old = delete
-            .trigger
-            .as_ref()
-            .and_then(|environment| environment.old_source)
-            .expect("DELETE trigger has OLD");
+        let outer_old = root.environment.old_source.expect("DELETE trigger has OLD");
         let mut queries = Vec::new();
         delete
             .predicate

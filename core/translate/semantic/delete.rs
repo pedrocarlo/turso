@@ -37,7 +37,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     outer_scope: None,
                     policies: ExprPolicies::statement(analyzer.context().dqs_dml()),
                 },
-                None,
             )
         })
     }
@@ -48,7 +47,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         where_clause: Option<&'ast ast::Expr>,
         returning: &'ast [ast::ResultColumn],
         expressions: DeleteExprContext<'_>,
-        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
         let table = match &self
             .source(target)
@@ -100,7 +98,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             order_by: Vec::new(),
             limit: None,
             returning,
-            trigger,
         }))
     }
 
