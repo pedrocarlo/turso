@@ -20,7 +20,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         where_clause: Option<&'ast ast::Expr>,
         returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
-        reject_deferred_delete_clauses(with, returning)?;
+        reject_deferred_delete_clauses(with)?;
 
         let target =
             self.analyze_base_table_source(table_name, None, indexed, SourceOwner::Root)?;
@@ -58,6 +58,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 .map(|resolved| resolved.expr)
             })
             .transpose()?;
+        let returning = self.analyze_dml_returning(returning, target)?;
 
         Ok(HirRoot::Delete(hir::Delete {
             target,
@@ -68,7 +69,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             predicate,
             order_by: Vec::new(),
             limit: None,
-            returning: None,
+            returning,
             trigger: None,
         }))
     }
@@ -103,15 +104,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 }
 
-fn reject_deferred_delete_clauses(
-    with: Option<&ast::With>,
-    returning: &[ast::ResultColumn],
-) -> Result<()> {
+fn reject_deferred_delete_clauses(with: Option<&ast::With>) -> Result<()> {
     if with.is_some() {
         return unsupported_delete("WITH clauses");
-    }
-    if !returning.is_empty() {
-        return unsupported_delete("RETURNING clauses");
     }
     Ok(())
 }
