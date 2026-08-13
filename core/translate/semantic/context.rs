@@ -58,8 +58,8 @@ pub(crate) struct SemanticContext<'catalog> {
 }
 
 impl<'catalog> SemanticContext<'catalog> {
-    pub(crate) fn for_catalog_snapshot(
-        catalog: &'catalog crate::translate::emitter::SemanticCatalogSnapshot,
+    pub(crate) fn for_catalog(
+        catalog: &'catalog super::catalog::SemanticCatalog,
         symbols: &'catalog SymbolTable,
         custom_types_enabled: bool,
         dialect: Arc<dyn Dialect>,
@@ -67,18 +67,9 @@ impl<'catalog> SemanticContext<'catalog> {
     ) -> Result<Self> {
         Self::for_databases(
             catalog.databases.iter().map(|database| {
-                SemanticDatabase::new(
-                    DatabaseId::new(database.id),
-                    database.name.clone(),
-                    &database.schema,
-                )
+                SemanticDatabase::new(database.id, database.name.clone(), &database.schema)
             }),
-            catalog
-                .unqualified_database_search_path
-                .iter()
-                .copied()
-                .map(DatabaseId::new)
-                .collect(),
+            catalog.unqualified_database_search_path.clone(),
             symbols,
             custom_types_enabled,
             dialect,

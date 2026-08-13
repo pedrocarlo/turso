@@ -1,6 +1,7 @@
 //! Semantic analysis from parser AST into resolved HIR.
 
 mod analyze;
+pub(crate) mod catalog;
 pub(crate) mod context;
 mod cte;
 mod delete;
@@ -33,7 +34,7 @@ pub(crate) enum SemanticRootInput<'ast> {
 }
 
 pub(crate) fn analyze_root(
-    catalog: &crate::translate::emitter::SemanticCatalogSnapshot,
+    catalog: &catalog::SemanticCatalog,
     symbols: &crate::SymbolTable,
     options: SemanticOptions,
     input: SemanticRootInput<'_>,
@@ -42,7 +43,7 @@ pub(crate) fn analyze_root(
         crate::translate::emitter::DoubleQuotedDml::Enabled => context::DoubleQuotedDml::Enabled,
         crate::translate::emitter::DoubleQuotedDml::Disabled => context::DoubleQuotedDml::Disabled,
     };
-    let context = context::SemanticContext::for_catalog_snapshot(
+    let context = context::SemanticContext::for_catalog(
         catalog,
         symbols,
         options.custom_types_enabled,
@@ -150,15 +151,15 @@ mod tests {
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
         sync::Arc,
-        translate::emitter::{DoubleQuotedDml, Resolver},
+        translate::emitter::DoubleQuotedDml,
         DatabaseCatalog, RwLock, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
     };
     use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::parser::Parser;
+    use turso_parser::{ast, parser::Parser};
 
     #[test]
-    fn owned_resolver_snapshot_produces_validated_hir() {
-        let snapshot = {
+    fn owned_catalog_produces_validated_hir() {
+        let catalog = {
             let mut main_schema = Schema::new();
             main_schema
                 .add_btree_table(Arc::new(
@@ -170,21 +171,16 @@ mod tests {
             let database_schemas = RwLock::new(HashMap::default());
             let temp_database = RwLock::new(None);
             let attached_databases = RwLock::new(DatabaseCatalog::new());
-            let symbols = SymbolTable::new();
-            let resolver = Resolver::new(
-                &main_schema,
+            catalog::SemanticCatalog::capture(
+                main_schema,
                 &database_schemas,
                 &temp_database,
                 &attached_databases,
-                &symbols,
                 true,
-                DoubleQuotedDml::Disabled,
-                Arc::new(SqliteDialect),
-                &None,
-            );
-            resolver
-                .semantic_catalog_snapshot(main_schema)
-                .expect("resolver catalog freezes")
+                &SqliteDialect,
+                None,
+            )
+            .expect("catalog capture succeeds")
         };
         let symbols = SymbolTable::new();
         let ast::Cmd::Stmt(statement) = Parser::new(b"SELECT value FROM items")
@@ -201,12 +197,12 @@ mod tests {
             dqs_dml: DoubleQuotedDml::Disabled,
         };
         let document = analyze_root(
-            &snapshot,
+            &catalog,
             &symbols,
             options(),
             SemanticRootInput::Statement(&statement),
         )
-        .expect("owned resolver snapshot produces HIR");
+        .expect("owned catalog produces HIR");
         assert_eq!(
             document
                 .databases
@@ -233,19 +229,19 @@ mod tests {
             panic!("SQL contains CREATE TRIGGER");
         };
         let document = analyze_root(
-            &snapshot,
+            &catalog,
             &symbols,
             options(),
             SemanticRootInput::TriggerProgram {
                 database: hir::DatabaseId::new(MAIN_DB_ID),
                 table_name: "items",
-                event,
+                event: event.clone(),
                 predicate: when_clause.as_deref(),
                 commands: &commands,
                 conflict_override: None,
             },
         )
-        .expect("snapshot resolves trigger target and produces HIR");
+        .expect("catalog resolves trigger target and produces HIR");
         let hir::HirRoot::Trigger(root) = &document.root else {
             panic!("trigger program produces trigger root");
         };
@@ -256,7 +252,7 @@ mod tests {
         assert_eq!(program.commands.len(), 1);
 
         let error = analyze_root(
-            &snapshot,
+            &catalog,
             &symbols,
             options(),
             SemanticRootInput::TriggerProgram {
@@ -268,7 +264,7 @@ mod tests {
                 conflict_override: None,
             },
         )
-        .expect_err("trigger target must belong to snapshot database");
+        .expect_err("trigger target must belong to catalog database");
         assert_eq!(error.to_string(), "Parse error: no such table: missing");
     }
 }
