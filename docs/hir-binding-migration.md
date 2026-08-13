@@ -45,11 +45,11 @@ coverage audit is complete; deferred migration work remains below.
 
 ### Remaining binding coverage audit
 
-This audit compares every remaining semantic catch-all with parser AST shapes,
-the archived PR #8111 binder in `core/translate/semantic/binding/`, the current
-planner and expression translator, and existing conformance tests. A generic
-`unsupported SELECT statement` error is not evidence that the old path rejects
-the same SQL.
+This audit compared every remaining semantic catch-all with parser AST shapes,
+the PR #8111 binder, the current planner and expression translator, and existing
+conformance tests. The temporary copy of the PR binder was removed after the
+audit completed. A generic `unsupported SELECT statement` error is not evidence
+that the old path rejects the same SQL.
 
 No audited user-visible SELECT binding gaps remain.
 
