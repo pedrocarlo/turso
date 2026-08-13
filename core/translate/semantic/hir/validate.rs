@@ -459,15 +459,46 @@ impl<'document> HirValidator<'document> {
 
     fn visit_delete(&self, delete: &Delete) -> ValidationResult {
         self.visit_source(delete.target, Some(SourceOwner::Root))?;
-        self.require_complete_row_image(delete.target)?;
-        self.require_complete_index_metadata(delete.target)?;
-        self.visit_dml_triggers(
-            delete.target,
-            &delete.triggers,
-            turso_parser::ast::TriggerEvent::Delete,
-            &[],
-        )?;
-        self.visit_dml_foreign_keys(delete.target, delete.target, &delete.foreign_keys)?;
+        let target_table = match &self.source(delete.target)?.kind {
+            SourceKind::Table(table) => table,
+            _ => return self.invalid("DELETE target is not a catalog table source"),
+        };
+        match &delete.target_kind {
+            DeleteTargetKind::BTree {
+                triggers,
+                foreign_keys,
+            } => {
+                self.require(
+                    target_table.value().btree().is_some(),
+                    "B-tree DELETE metadata belongs to a non-B-tree target",
+                )?;
+                self.require_complete_row_image(delete.target)?;
+                self.require_complete_index_metadata(delete.target)?;
+                self.visit_dml_triggers(
+                    delete.target,
+                    triggers,
+                    turso_parser::ast::TriggerEvent::Delete,
+                    &[],
+                )?;
+                self.visit_dml_foreign_keys(delete.target, delete.target, foreign_keys)?;
+            }
+            DeleteTargetKind::Virtual => {
+                self.require(
+                    target_table.value().virtual_table().is_some(),
+                    "virtual DELETE metadata belongs to a non-virtual target",
+                )?;
+                let source = self.source(delete.target)?;
+                self.require(
+                    source.check_constraints.is_none()
+                        && matches!(source.index_coverage, IndexCoverage::Selective),
+                    "virtual-table DELETE row carries B-tree constraint metadata",
+                )?;
+                self.require(
+                    delete.trigger.is_none(),
+                    "trigger command writes an unsafe virtual-table target",
+                )?;
+            }
+        }
         self.visit_optional_expr(delete.predicate.as_ref())?;
         self.visit_order_terms(&delete.order_by)?;
         self.visit_optional_limit(delete.limit.as_ref())?;

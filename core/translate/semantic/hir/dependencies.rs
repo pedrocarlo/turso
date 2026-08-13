@@ -152,6 +152,29 @@ impl Update {
     }
 }
 
+impl Delete {
+    /// Return every table column read directly by the DELETE root. Nested
+    /// queries own their reads and are visited separately by the analyzer.
+    pub(crate) fn direct_column_reads(&self) -> Vec<ColumnRef> {
+        let mut reads = HashSet::default();
+        collect_optional_expr_column_reads(self.predicate.as_ref(), &mut reads);
+        collect_order_column_reads(&self.order_by, &mut reads);
+        if let Some(limit) = &self.limit {
+            collect_expr_column_reads(&limit.limit, &mut reads);
+            collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
+        }
+        if let Some(returning) = &self.returning {
+            for output in &returning.outputs {
+                collect_expr_column_reads(&output.expr, &mut reads);
+            }
+        }
+
+        let mut reads = reads.into_iter().collect::<Vec<_>>();
+        reads.sort_unstable_by_key(|read| (read.source.index(), read.column));
+        reads
+    }
+}
+
 fn collect_from_column_reads<'source>(
     from: &From,
     reads: &mut HashSet<ColumnRef>,

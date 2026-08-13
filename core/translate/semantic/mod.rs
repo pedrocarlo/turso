@@ -3,6 +3,7 @@
 mod analyze;
 pub(crate) mod context;
 mod cte;
+mod delete;
 mod dml;
 mod expr;
 pub(crate) mod hir;

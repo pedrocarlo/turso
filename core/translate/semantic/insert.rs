@@ -354,6 +354,44 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             });
         }
 
+        self.analyze_btree_index_metadata(target, table, &scope, policy)?;
+        let source = self.source_mut(target).ok_or_else(|| {
+            LimboError::InternalError(format!("missing write target source {target}"))
+        })?;
+        source.check_constraints = Some(check_constraints);
+        Ok(())
+    }
+
+    pub(super) fn analyze_btree_delete_metadata(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+    ) -> Result<()> {
+        if table.value().btree().is_none() {
+            return Err(LimboError::InternalError(format!(
+                "DELETE target {} stopped being a B-tree table",
+                table.value().get_name()
+            )));
+        }
+        let scope = {
+            let source = self.source(target).ok_or_else(|| {
+                LimboError::InternalError(format!("missing DELETE target source {target}"))
+            })?;
+            let mut scope = Scope::default();
+            scope.add_source(source, true);
+            scope
+        };
+        let policy = ExprPolicy::schema_expression().with_self_source(target);
+        self.analyze_btree_index_metadata(target, table, &scope, policy)
+    }
+
+    fn analyze_btree_index_metadata(
+        &mut self,
+        target: hir::SourceId,
+        table: &hir::ResolvedTable,
+        scope: &Scope,
+        policy: ExprPolicy,
+    ) -> Result<()> {
         let indexes = self
             .context()
             .main_schema()
@@ -382,7 +420,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     column
                         .expr
                         .as_deref()
-                        .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                        .map(|syntax| self.analyze_expr(syntax, scope, policy))
                         .transpose()
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -390,7 +428,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 .value()
                 .where_clause
                 .as_deref()
-                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .map(|syntax| self.analyze_expr(syntax, scope, policy))
                 .transpose()?;
             index_ids.push(index_id);
             index_expressions.push(hir::IndexExpressions {
@@ -403,7 +441,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let source = self.source_mut(target).ok_or_else(|| {
             LimboError::InternalError(format!("missing write target source {target}"))
         })?;
-        source.check_constraints = Some(check_constraints);
         source.index_expressions = index_expressions;
         source.index_coverage = hir::IndexCoverage::Complete { indexes: index_ids };
         Ok(())
