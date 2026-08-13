@@ -9313,19 +9313,67 @@ mod tests {
     }
 
     #[test]
-    fn basic_delete_rejects_deferred_and_unsupported_targets() {
-        let schema = schema_with_writable_table();
-        let virtual_schema = schema_with_virtual_insert_target();
-        let virtual_error = analyze_sql_with_schema(
-            &virtual_schema,
-            "DELETE FROM pragma_table_info WHERE rowid = 1",
+    fn virtual_table_delete_has_only_virtual_target_metadata() {
+        let schema = schema_with_virtual_insert_target();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH chosen(row) AS (VALUES(9)) \
+             DELETE FROM pragma_table_info AS target \
+             WHERE target.rowid = (SELECT row FROM chosen) \
+             RETURNING target.rowid, target.cid",
         )
-        .expect_err("virtual DELETE is deferred");
-        assert_eq!(
-            virtual_error.to_string(),
-            "Parse error: semantic DELETE does not yet accept virtual tables"
-        );
+        .expect("virtual-table DELETE binds");
+        document
+            .validate()
+            .expect("virtual-table DELETE produces closed HIR");
 
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        assert!(matches!(delete.target_kind, hir::DeleteTargetKind::Virtual));
+        assert!(matches!(
+            delete.predicate,
+            Some(Expr::Binary { ref lhs, ref rhs, .. })
+                if matches!(lhs.as_ref(), Expr::RowId(source) if *source == delete.target)
+                    && matches!(rhs.as_ref(), Expr::Subquery(SubqueryExpr::Scalar { .. }))
+        ));
+        let returning = delete.returning.as_ref().expect("RETURNING is preserved");
+        assert!(matches!(
+            returning.outputs[0].expr,
+            Expr::RowId(source) if source == delete.target
+        ));
+        assert!(matches!(
+            returning.outputs[1].expr,
+            Expr::Column(column) if column.source == delete.target && column.column == 0
+        ));
+        let source = document
+            .source(delete.target)
+            .expect("DELETE target exists");
+        assert_eq!(source.alias.as_deref(), Some("target"));
+        assert!(source.check_constraints.is_none());
+        assert!(source.index_expressions.is_empty());
+        assert!(matches!(source.index_coverage, IndexCoverage::Selective));
+        assert_eq!(document.ctes.len(), 1);
+
+        let mut invalid = document.clone();
+        let HirRoot::Delete(delete) = &mut invalid.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        delete.target_kind = hir::DeleteTargetKind::BTree {
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
+        };
+        assert_eq!(
+            invalid
+                .validate()
+                .expect_err("target kind must match table")
+                .to_string(),
+            "B-tree DELETE metadata belongs to a non-B-tree target"
+        );
+    }
+
+    #[test]
+    fn basic_delete_rejects_deferred_and_unsupported_targets() {
         let mut without_rowid_schema = Schema::new();
         let table = BTreeTable::from_sql(
             "CREATE TABLE no_rowid(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
