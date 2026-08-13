@@ -237,6 +237,10 @@ impl Scope {
             .collect()
     }
 
+    pub(crate) fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     pub(crate) fn set_outputs(&mut self, outputs: &[hir::Output]) {
         self.outputs = outputs
             .iter()

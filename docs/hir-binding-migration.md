@@ -56,7 +56,6 @@ Missing HIR binding:
 
 | Surface | Evidence | Required work |
 |---|---|---|
-| Scalar function modifiers | Production accepts and ignores `DISTINCT` on scalar calls; it currently also ignores scalar `FILTER`. Semantic analysis rejects every scalar call carrying `DISTINCT`, argument `ORDER BY`, `FILTER`, or `*` through one generic fallback. | Preserve current binding behavior deliberately, while retaining existing errors for scalar `OVER` and wrong arity. Do not silently conflate scalar and aggregate metadata. |
 | Custom CAST fallback | Production falls through to ordinary CAST when a resolved custom type has the wrong parameter count; semantic analysis emits a generic unsupported error. Custom array targets also take different paths. | Match production fallback and array behavior, then replace the generic catch-all with specific invariants or diagnostics. |
 
 Deferred migration surfaces:
@@ -376,6 +375,14 @@ predicates, query-level ORDER BY terms, and LIMIT/OFFSET and VALUES rows are
 also bound. Recursive CTE core identity, arms, queue ORDER BY, LIMIT/OFFSET,
 and nested CTE identity are bound. Correlation with enclosing queries is also
 bound for ordinary and recursive CTE queries.
+
+Scalar calls now deliberately normalize production-only syntax before entering
+HIR. `DISTINCT` is discarded after its arguments are bound, and a `FILTER`
+expression is bound but does not change scalar evaluation. Supported nullary
+`function(*)` calls become zero-argument calls, and JSON object star calls
+expand to name/value arguments from the visible source columns. Argument
+`ORDER BY`, scalar `OVER`, unsupported star syntax, and wrong arity retain
+their existing diagnostics. Aggregate and window metadata are unchanged.
 
 ## Working rules
 

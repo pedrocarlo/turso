@@ -4353,7 +4353,7 @@ mod tests {
         let block = &document.query(root.query).expect("query exists").blocks[0];
         let from = block.from.as_ref().expect("query has FROM");
         assert_eq!(from.joins.len(), 1);
-        assert_eq!(from.joins[0].kind, JoinKind::LeftOuter);
+        assert_eq!(from.joins[0].kind, JoinKind::Left);
         let group_source = document
             .source(from.joins[0].right)
             .expect("group source exists");
@@ -7555,6 +7555,136 @@ mod tests {
     }
 
     #[test]
+    fn scalar_function_modifiers_follow_production_normalization() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT length(DISTINCT value), \
+                    length(value) FILTER (WHERE id > 0), \
+                    random(*) \
+             FROM items",
+        )
+        .expect("ignored scalar modifiers bind");
+        document
+            .validate()
+            .expect("normalized scalar calls produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 0);
+        for output in &block.outputs[..2] {
+            let Expr::Function(call) = &output.expr else {
+                panic!("scalar output becomes a function call");
+            };
+            assert!(matches!(call.evaluation, FunctionEvaluation::Scalar));
+            assert!(matches!(
+                &call.arguments,
+                crate::translate::semantic::hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } if values.len() == 1 && order_by.is_empty()
+            ));
+        }
+        let Expr::Function(random) = &block.outputs[2].expr else {
+            panic!("random(*) becomes a function call");
+        };
+        assert!(matches!(
+            &random.arguments,
+            crate::translate::semantic::hir::FunctionArguments::Expressions {
+                values,
+                distinctness: None,
+                order_by,
+            } if values.is_empty() && order_by.is_empty()
+        ));
+
+        for (sql, expected) in [
+            (
+                "SELECT length(value ORDER BY score) FROM items",
+                "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+            ),
+            (
+                "SELECT length(*) FROM items",
+                "Parse error: wrong number of arguments to function length()",
+            ),
+            (
+                "SELECT length(value) FILTER (WHERE missing > 0) FROM items",
+                "Parse error: no such column: missing",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call fails");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT length(value) FILTER (WHERE sum(id) > 0) FROM items",
+        )
+        .expect("ignored scalar filter still binds its expression");
+        document
+            .validate()
+            .expect("ignored scalar filter leaves a closed document");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        assert_eq!(block.aggregate_count, 1);
+        assert!(matches!(
+            block.outputs[0].expr,
+            Expr::Function(ref call) if matches!(call.evaluation, FunctionEvaluation::Scalar)
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn scalar_star_expands_visible_columns_into_arguments() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT json_object(*) FROM items")
+            .expect("json_object star binds");
+        document
+            .validate()
+            .expect("expanded scalar star produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = block.from.as_ref().expect("query has FROM").first;
+        let Expr::Function(call) = &block.outputs[0].expr else {
+            panic!("json_object becomes a function call");
+        };
+        let crate::translate::semantic::hir::FunctionArguments::Expressions {
+            values,
+            distinctness: None,
+            order_by,
+        } = &call.arguments
+        else {
+            panic!("expanded star becomes expression arguments");
+        };
+        assert!(order_by.is_empty());
+        assert_eq!(values.len(), 6);
+        for (column, pair) in ["id", "value", "score"].into_iter().zip(values.chunks_exact(2)) {
+            assert!(matches!(
+                &pair[0],
+                Expr::Literal(ast::Literal::String(name)) if name == &format!("'{column}'")
+            ));
+            assert!(matches!(
+                pair[1],
+                Expr::Column(reference) if reference.source == source
+            ));
+        }
+
+        let error = analyze_sql("SELECT json_object(*)")
+            .expect_err("expanding star without a source fails");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: json_object(*) requires a FROM clause"
+        );
+    }
+
+    #[test]
     fn custom_type_reads_freeze_types_and_member_indexes() {
         let mut schema = Schema::new();
         schema
@@ -8345,7 +8475,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_checkpoint_rejects_nested_and_modified_calls() {
+    fn aggregate_checkpoint_rejects_nested_calls() {
         let schema = schema_with_items();
         let nested = analyze_sql_with_schema(&schema, "SELECT sum(max(score)) FROM items")
             .expect_err("aggregate calls cannot be nested");
@@ -8362,19 +8492,6 @@ mod tests {
             nested_filter.to_string(),
             "Parse error: misuse of aggregate function max()"
         );
-
-        for sql in [
-            "SELECT length(DISTINCT value) FROM items",
-            "SELECT length(value ORDER BY score) FROM items",
-            "SELECT length(value) FILTER (WHERE id > 0) FROM items",
-        ] {
-            let error = analyze_sql_with_schema(&schema, sql)
-                .expect_err("scalar functions reject aggregate modifiers");
-            assert_eq!(
-                error.to_string(),
-                "Parse error: semantic analysis accepts source-free literal SELECT statements"
-            );
-        }
     }
 
     #[test]
