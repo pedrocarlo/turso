@@ -7589,6 +7589,27 @@ mod tests {
     }
 
     #[test]
+    fn inconsistent_custom_type_chain_reports_schema_program_arity() {
+        let mut schema = schema_with_items();
+        for sql in [
+            "CREATE TYPE positive(value INTEGER, minimum INTEGER) BASE INTEGER \
+             ENCODE CASE WHEN value > minimum THEN value ELSE NULL END",
+            "CREATE DOMAIN wrapped AS positive",
+        ] {
+            schema
+                .add_type_from_sql(sql)
+                .expect("custom type definition parses");
+        }
+
+        let error = analyze_sql_with_schema(&schema, "SELECT CAST(value AS wrapped) FROM items")
+            .expect_err("parent program cannot consume the child argument list");
+        assert_eq!(
+            error.to_string(),
+            "Internal error: custom type 'positive' encode program expects 1 arguments, got 0"
+        );
+    }
+
+    #[test]
     fn scalar_functions_keep_resolved_identity_and_result_type() {
         let schema = schema_with_items();
         let document =

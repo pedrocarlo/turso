@@ -10,7 +10,7 @@ use super::{
     },
     scope::{ResolvedScopeExpr, Scope},
 };
-use crate::{schema::Type, vdbe::affinity::Affinity, Result};
+use crate::{schema::Type, vdbe::affinity::Affinity, LimboError, Result};
 
 struct SchemaInput {
     name: String,
@@ -59,7 +59,11 @@ impl Analyzer<'_, '_, '_> {
         } else if expected == arguments.len() {
             arguments
         } else {
-            return super::analyze::unsupported_select();
+            return Err(LimboError::InternalError(format!(
+                "custom type '{}' {description} program expects {expected} arguments, got {}",
+                definition.value().name,
+                arguments.len()
+            )));
         };
 
         let mut inputs = Vec::with_capacity(arguments.len() + 1);
