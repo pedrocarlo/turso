@@ -15,6 +15,7 @@ use crate::{schema::Table, sync::Arc, Result};
 struct AnalyzedTableSource<'ast> {
     id: hir::SourceId,
     function_arguments: Option<&'ast [Box<ast::Expr>]>,
+    qualified_scope: Option<Scope>,
 }
 
 struct AnalyzedSourceColumn {
@@ -153,9 +154,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::FromClause,
         context: FromContext<'_>,
     ) -> Result<(hir::From, Scope)> {
-        let source_owner = context.source_owner();
-        let cte_context = context.cte_context();
-        let first = self.analyze_table_source(&syntax.select, source_owner, 0, cte_context)?;
+        let first = self.analyze_table_source(&syntax.select, context, 0)?;
         let source = first.id;
         let mut table_functions = Vec::new();
         if let Some(arguments) = first.function_arguments {
@@ -166,6 +165,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
         scope.add_source(definition, true);
+        if let Some(qualified_scope) = first.qualified_scope {
+            scope.append_qualified_sources(qualified_scope);
+        }
 
         let mut joins = Vec::with_capacity(syntax.joins.len());
         for syntax_join in &syntax.joins {
@@ -180,12 +182,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             if natural && syntax_join.constraint.is_some() {
                 crate::bail_parse_error!("a NATURAL join may not have an ON or USING clause");
             }
-            let analyzed = self.analyze_table_source(
-                &syntax_join.table,
-                source_owner,
-                joins.len() + 1,
-                cte_context,
-            )?;
+            let analyzed =
+                self.analyze_table_source(&syntax_join.table, context, joins.len() + 1)?;
             let right = analyzed.id;
             if let Some(arguments) = analyzed.function_arguments {
                 table_functions.push((right, arguments));
@@ -219,6 +217,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .transpose()?;
 
             scope.add_source(definition, true);
+            if let Some(qualified_scope) = analyzed.qualified_scope {
+                scope.append_qualified_sources(qualified_scope);
+            }
             if let Some(columns) = &using_columns {
                 scope.apply_using(columns)?;
             }
@@ -267,10 +268,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn analyze_table_source(
         &mut self,
         syntax: &'ast ast::SelectTable,
-        owner: SourceOwner,
+        context: FromContext<'_>,
         position: usize,
-        cte_context: CteBindingContext<'_>,
     ) -> Result<AnalyzedTableSource<'ast>> {
+        let owner = context.source_owner();
+        let cte_context = context.cte_context();
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
@@ -291,6 +293,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         return Ok(AnalyzedTableSource {
                             id,
                             function_arguments: None,
+                            qualified_scope: None,
                         });
                     }
                 }
@@ -299,6 +302,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
+                    qualified_scope: None,
                 })
             }
             ast::SelectTable::TableCall(name, arguments, alias) => self
@@ -308,9 +312,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
+                    qualified_scope: None,
                 })
             }
-            _ => super::analyze::unsupported_select(),
+            ast::SelectTable::Sub(from, alias) => {
+                self.analyze_from_group(from, alias.as_ref(), context, position)
+            }
         }
     }
 
@@ -344,6 +351,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 return Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
+                    qualified_scope: None,
                 });
             }
         }
@@ -377,6 +385,68 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             function_arguments: matches!(kind, CatalogSourceKind::TableFunction)
                 .then_some(arguments)
                 .filter(|arguments| !arguments.is_empty()),
+            qualified_scope: None,
+        })
+    }
+
+    fn analyze_from_group(
+        &mut self,
+        syntax: &'ast ast::FromClause,
+        alias: Option<&ast::As>,
+        context: FromContext<'_>,
+        position: usize,
+    ) -> Result<AnalyzedTableSource<'ast>> {
+        let (from, inner_scope) = self.analyze_from_clause(syntax, context)?;
+        let group_columns = inner_scope.group_columns();
+        let width = group_columns.len();
+        let columns = group_columns
+            .iter()
+            .map(|column| hir::SourceColumn {
+                name: column.name.clone(),
+                type_fact: column.resolved.type_fact.clone(),
+                affinity: column.resolved.affinity,
+                has_affinity: column.resolved.has_affinity,
+                collation: column.resolved.collation.value().cloned(),
+                hidden: column.hidden,
+                rowid_alias: false,
+            })
+            .collect();
+        let values = group_columns
+            .into_iter()
+            .map(|column| column.resolved.expr)
+            .collect();
+        let source = self.reserve_source();
+        self.insert_source(
+            source,
+            hir::Source {
+                id: source,
+                owner: context.source_owner(),
+                database: None,
+                name: format!("(from-group-{position})"),
+                alias: alias
+                    .map(ast::As::name)
+                    .map(ast::Name::as_str)
+                    .map(crate::util::normalize_ident),
+                kind: hir::SourceKind::FromGroup(hir::FromGroup {
+                    from: Box::new(from),
+                    columns: values,
+                }),
+                columns,
+                generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+                column_type_programs: vec![None; width],
+                check_constraints: None,
+                rowid_available: false,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            },
+        )?;
+        Ok(AnalyzedTableSource {
+            id: source,
+            function_arguments: None,
+            qualified_scope: alias.is_none().then_some(inner_scope),
         })
     }
 

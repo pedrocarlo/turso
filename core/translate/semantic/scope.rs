@@ -68,6 +68,12 @@ pub(crate) struct ExpandedColumn {
     pub(crate) resolved: ResolvedScopeExpr,
 }
 
+pub(crate) struct GroupColumn {
+    pub(crate) name: String,
+    pub(crate) resolved: ResolvedScopeExpr,
+    pub(crate) hidden: bool,
+}
+
 #[derive(Clone, Debug)]
 struct ScopeColumn {
     source: SourceId,
@@ -209,6 +215,26 @@ impl Scope {
         );
         self.sources.extend(other.sources);
         self.visible_columns.extend(other.visible_columns);
+    }
+
+    /// Add only another scope's qualified table namespaces. Group columns
+    /// provide unqualified visibility; inner sources remain available for
+    /// `table.column` lookup when the group has no alias.
+    pub(crate) fn append_qualified_sources(&mut self, other: Self) {
+        assert!(self.outputs.is_empty(), "destination scope has outputs");
+        assert!(other.outputs.is_empty(), "appended scope has outputs");
+        self.sources.extend(other.sources);
+    }
+
+    pub(crate) fn group_columns(&self) -> Vec<GroupColumn> {
+        self.visible_columns
+            .iter()
+            .map(|column| GroupColumn {
+                name: column.display_name.clone(),
+                resolved: column.resolved(),
+                hidden: column.hidden,
+            })
+            .collect()
     }
 
     pub(crate) fn set_outputs(&mut self, outputs: &[hir::Output]) {

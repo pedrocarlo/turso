@@ -668,22 +668,35 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             let Some(from) = &block.from else {
                 continue;
             };
-            for source in
-                std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
-            {
-                let definition = self.source(source).ok_or_else(|| {
-                    LimboError::InternalError(format!("missing semantic source {source}"))
-                })?;
-                if let super::hir::SourceKind::Cte(cte)
-                | super::hir::SourceKind::RecursiveInput(cte) = definition.kind
-                {
-                    if !ctes.contains(&cte) {
-                        ctes.push(cte);
-                    }
-                }
-            }
+            self.add_from_ctes(from, &mut ctes)?;
         }
         Ok(ctes)
+    }
+
+    fn add_from_ctes(&self, from: &super::hir::From, ctes: &mut Vec<CteId>) -> Result<()> {
+        self.add_source_cte(from.first, ctes)?;
+        for join in &from.joins {
+            self.add_source_cte(join.right, ctes)?;
+        }
+        Ok(())
+    }
+
+    fn add_source_cte(&self, source: SourceId, ctes: &mut Vec<CteId>) -> Result<()> {
+        let definition = self.source(source).ok_or_else(|| {
+            LimboError::InternalError(format!("missing semantic source {source}"))
+        })?;
+        match &definition.kind {
+            super::hir::SourceKind::Cte(cte) | super::hir::SourceKind::RecursiveInput(cte) => {
+                if !ctes.contains(cte) {
+                    ctes.push(*cte);
+                }
+            }
+            super::hir::SourceKind::FromGroup(group) => {
+                self.add_from_ctes(&group.from, ctes)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn analyze_select_block(
@@ -4239,6 +4252,136 @@ mod tests {
             .as_ref()
             .expect("joined query has FROM");
         assert_eq!(from.joins[0].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn parenthesized_from_group_alias_exposes_group_columns_only() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT grouped.id, grouped.value, grouped.label, grouped.* \
+             FROM (items JOIN categories USING (id)) AS grouped",
+        )
+        .expect("aliased FROM group binds");
+        document
+            .validate()
+            .expect("aliased FROM group produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("query has FROM");
+        let group_source = document.source(from.first).expect("group source exists");
+        let SourceKind::FromGroup(group) = &group_source.kind else {
+            panic!("parenthesized FROM becomes a group source");
+        };
+        assert_eq!(group_source.alias.as_deref(), Some("grouped"));
+        assert_eq!(group.columns.len(), group_source.columns.len());
+        assert_eq!(group.from.joins.len(), 1);
+        assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
+        assert_eq!(block.outputs.len(), 7);
+        assert!(block.outputs.iter().all(|output| {
+            matches!(output.expr, Expr::Column(reference) if reference.source == group_source.id)
+        }));
+
+        let error = analyze_sql_with_schema(
+            &schema,
+            "SELECT items.value FROM (items JOIN categories USING (id)) AS grouped",
+        )
+        .expect_err("group alias hides inner table qualifiers");
+        assert_eq!(error.to_string(), "Parse error: no such table: items");
+    }
+
+    #[test]
+    fn unaliased_from_group_keeps_inner_qualifiers_and_merged_columns() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT items.value, categories.label, id \
+             FROM (items JOIN categories USING (id))",
+        )
+        .expect("unaliased FROM group binds");
+        document
+            .validate()
+            .expect("unaliased FROM group produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let group_id = block.from.as_ref().expect("query has FROM").first;
+        let group_source = document.source(group_id).expect("group source exists");
+        let SourceKind::FromGroup(group) = &group_source.kind else {
+            panic!("parenthesized FROM becomes a group source");
+        };
+        let items = group.from.first;
+        let categories = group.from.joins[0].right;
+        assert!(matches!(
+            block.outputs[0].expr,
+            Expr::Column(reference) if reference.source == items && reference.column == 1
+        ));
+        assert!(matches!(
+            block.outputs[1].expr,
+            Expr::Column(reference) if reference.source == categories && reference.column == 1
+        ));
+        assert!(matches!(
+            block.outputs[2].expr,
+            Expr::Column(reference) if reference.source == group_id && reference.column == 0
+        ));
+        assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
+    }
+
+    #[test]
+    fn parenthesized_from_group_preserves_nested_join_precedence() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT i.value, c.label \
+             FROM items AS i \
+             LEFT JOIN (categories AS c JOIN tags AS t ON t.item_id = c.id) \
+             ON i.id = c.id",
+        )
+        .expect("nested join group binds");
+        document
+            .validate()
+            .expect("nested join group produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("query has FROM");
+        assert_eq!(from.joins.len(), 1);
+        assert_eq!(from.joins[0].kind, JoinKind::LeftOuter);
+        let group_source = document
+            .source(from.joins[0].right)
+            .expect("group source exists");
+        let SourceKind::FromGroup(group) = &group_source.kind else {
+            panic!("right operand remains a FROM group");
+        };
+        assert_eq!(group.from.joins.len(), 1);
+        assert_eq!(group.from.joins[0].kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn ctes_inside_parenthesized_from_groups_remain_reachable() {
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH picked AS (SELECT * FROM items) \
+             SELECT p.value FROM (picked AS p JOIN categories USING (id))",
+        )
+        .expect("CTE inside FROM group binds");
+        document
+            .validate()
+            .expect("nested CTE remains reachable from the query");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        assert_eq!(query.reachable_ctes, vec![document.ctes[0].id]);
     }
 
     #[cfg(feature = "json")]

@@ -252,11 +252,19 @@ pub enum SourceKind {
     },
     Cte(CteId),
     Derived(QueryId),
+    FromGroup(FromGroup),
     RecursiveInput(CteId),
     Pseudo {
         kind: PseudoSource,
         table: ResolvedTable,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct FromGroup {
+    pub from: Box<From>,
+    /// Value supplied by each group column, aligned with `Source::columns`.
+    pub columns: Vec<Expr>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

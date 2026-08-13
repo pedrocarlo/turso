@@ -199,13 +199,20 @@ fn collect_from_column_reads<'source>(
 fn collect_source_argument_column_reads<'source>(
     id: SourceId,
     reads: &mut HashSet<ColumnRef>,
-    source_by_id: impl Fn(SourceId) -> Option<&'source Source>,
+    source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     let Some(source) = source_by_id(id) else {
         return;
     };
-    if let SourceKind::TableFunction { arguments, .. } = &source.kind {
-        collect_exprs_column_reads(arguments, reads);
+    match &source.kind {
+        SourceKind::TableFunction { arguments, .. } => {
+            collect_exprs_column_reads(arguments, reads);
+        }
+        SourceKind::FromGroup(group) => {
+            collect_from_column_reads(&group.from, reads, source_by_id);
+            collect_exprs_column_reads(&group.columns, reads);
+        }
+        _ => {}
     }
 }
 
@@ -282,13 +289,20 @@ fn collect_from_references<'source>(
 fn collect_source_arguments<'source>(
     id: SourceId,
     references: &mut HashSet<SourceId>,
-    source: impl Fn(SourceId) -> Option<&'source Source>,
+    source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
-    let Some(source) = source(id) else {
+    let Some(source) = source_by_id(id) else {
         return;
     };
-    if let SourceKind::TableFunction { arguments, .. } = &source.kind {
-        collect_exprs_references(arguments, references);
+    match &source.kind {
+        SourceKind::TableFunction { arguments, .. } => {
+            collect_exprs_references(arguments, references);
+        }
+        SourceKind::FromGroup(group) => {
+            collect_from_references(&group.from, references, source_by_id);
+            collect_exprs_references(&group.columns, references);
+        }
+        _ => {}
     }
 }
 
