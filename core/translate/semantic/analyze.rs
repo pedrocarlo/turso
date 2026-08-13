@@ -21,7 +21,7 @@ use super::{
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
-    AnalyzeInput,
+    AnalyzeInput, TriggerAnalysis,
 };
 
 pub(crate) fn analyze<'context, 'catalog, 'ast>(
@@ -72,6 +72,10 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
                     .to_string(),
             ));
         }
+        AnalyzeInput::TriggerPredicate {
+            context,
+            expression,
+        } => analyzer.analyze_trigger_predicate(context, expression)?,
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -1538,6 +1542,38 @@ mod tests {
         );
         let statement = parse_statement(sql);
         analyze(&context, AnalyzeInput::Statement(&statement))
+    }
+
+    fn analyze_trigger_predicate_with_schema(
+        schema: &Schema,
+        event: ast::TriggerEvent,
+        expression: &ast::Expr,
+    ) -> Result<HirDocument> {
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerPredicate {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
+                },
+                expression,
+            },
+        )
+    }
+
+    fn trigger_column(row: &str, column: &str) -> ast::Expr {
+        ast::Expr::Qualified(
+            ast::Name::exact(row.to_string()),
+            ast::Name::exact(column.to_string()),
+        )
     }
 
     fn schema_with_items() -> Schema {
@@ -5263,6 +5299,108 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Corrupt database: missing sqlite_sequence table"
+        );
+    }
+
+    #[test]
+    fn trigger_predicates_bind_event_row_sources() {
+        let schema = schema_with_writable_table();
+        for (event, row, kind) in [
+            (ast::TriggerEvent::Insert, "new", PseudoSource::New),
+            (ast::TriggerEvent::Update, "new", PseudoSource::New),
+            (ast::TriggerEvent::Update, "old", PseudoSource::Old),
+            (ast::TriggerEvent::Delete, "old", PseudoSource::Old),
+        ] {
+            let document = analyze_trigger_predicate_with_schema(
+                &schema,
+                event,
+                &trigger_column(row, "value"),
+            )
+            .expect("event row is visible");
+            let HirRoot::TriggerPredicate(predicate) = &document.root else {
+                panic!("trigger predicate produces trigger root");
+            };
+            let expected_source = match kind {
+                PseudoSource::New => predicate.environment.new_source,
+                PseudoSource::Old => predicate.environment.old_source,
+                PseudoSource::Excluded => unreachable!("EXCLUDED is not a trigger row"),
+            }
+            .expect("event exposes requested row");
+            assert!(matches!(
+                predicate.expression,
+                Expr::Column(column)
+                    if column.source == expected_source && column.column == 1
+            ));
+            let source = document
+                .source(expected_source)
+                .expect("trigger row source exists");
+            assert!(matches!(
+                source.kind,
+                SourceKind::Pseudo { kind: actual, .. } if actual == kind
+            ));
+            assert_eq!(source.columns[1].type_fact.storage, Some(Type::Text));
+        }
+    }
+
+    #[test]
+    fn trigger_predicate_rows_are_qualified_only_and_event_checked() {
+        let schema = schema_with_writable_table();
+        let bare = analyze_trigger_predicate_with_schema(
+            &schema,
+            ast::TriggerEvent::Update,
+            &ast::Expr::Id(ast::Name::exact("value".to_string())),
+        )
+        .expect_err("bare trigger column is not visible");
+        assert_eq!(bare.to_string(), "Parse error: no such column: value");
+
+        for (event, row, expected) in [
+            (
+                ast::TriggerEvent::Insert,
+                "old",
+                "Parse error: OLD references are only valid in UPDATE and DELETE triggers",
+            ),
+            (
+                ast::TriggerEvent::Delete,
+                "new",
+                "Parse error: NEW references are only valid in INSERT and UPDATE triggers",
+            ),
+        ] {
+            let error = analyze_trigger_predicate_with_schema(
+                &schema,
+                event,
+                &trigger_column(row, "value"),
+            )
+            .expect_err("event rejects unavailable trigger row");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn trigger_predicates_bind_rowid_and_report_missing_columns() {
+        let schema = schema_with_writable_table();
+        let document = analyze_trigger_predicate_with_schema(
+            &schema,
+            ast::TriggerEvent::Insert,
+            &trigger_column("new", "rowid"),
+        )
+        .expect("trigger rowid binds");
+        let HirRoot::TriggerPredicate(predicate) = &document.root else {
+            panic!("trigger predicate produces trigger root");
+        };
+        assert!(matches!(
+            predicate.expression,
+            Expr::RowId(source) if Some(source) == predicate.environment.new_source
+        ));
+
+        let missing = analyze_trigger_predicate_with_schema(
+            &schema,
+            ast::TriggerEvent::Update,
+            &trigger_column("new", "absent"),
+        )
+        .expect_err("missing trigger column fails");
+        assert_eq!(
+            missing.to_string(),
+            "Parse error: no such column: new.absent"
         );
     }
 
