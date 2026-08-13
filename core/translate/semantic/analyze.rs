@@ -6961,6 +6961,92 @@ mod tests {
     }
 
     #[test]
+    fn row_subqueries_bind_as_comparison_operands() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT (id, value) = (SELECT 1, 'first'), \
+             (SELECT id, value) BETWEEN (1, 'a') AND (3, 'z') \
+             FROM items",
+        )
+        .expect("row subqueries bind in supported comparison positions");
+        document
+            .validate()
+            .expect("row-subquery comparisons produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outer = document.query(root.query).expect("outer query exists");
+        let outputs = &outer.blocks[0].outputs;
+
+        let Expr::Binary {
+            rhs,
+            comparison: Some(comparison),
+            ..
+        } = &outputs[0].expr
+        else {
+            panic!("row-subquery equality becomes binary HIR");
+        };
+        let Expr::Subquery(SubqueryExpr::Row { query }) = rhs.as_ref() else {
+            panic!("binary operand keeps one row-subquery node");
+        };
+        assert_eq!(
+            document
+                .query(*query)
+                .expect("right query exists")
+                .output
+                .len(),
+            2
+        );
+        assert_row_comparison_facts(comparison);
+
+        let Expr::Between {
+            expr,
+            start_comparison,
+            end_comparison,
+            ..
+        } = &outputs[1].expr
+        else {
+            panic!("row-subquery BETWEEN becomes HIR");
+        };
+        let Expr::Subquery(SubqueryExpr::Row { query }) = expr.as_ref() else {
+            panic!("BETWEEN operand keeps one row-subquery node");
+        };
+        assert_eq!(
+            document
+                .query(*query)
+                .expect("tested query exists")
+                .captures,
+            [outer.blocks[0].from.as_ref().expect("FROM exists").first]
+        );
+        assert_row_comparison_facts(start_comparison);
+        assert_row_comparison_facts(end_comparison);
+    }
+
+    #[test]
+    fn row_subqueries_keep_width_and_scalar_context_errors() {
+        let schema = schema_with_items();
+        for (sql, expected) in [
+            (
+                "SELECT (id, value) = (SELECT 1) FROM items",
+                "Parse error: row value misused",
+            ),
+            (
+                "SELECT (SELECT 1, 2) FROM items",
+                "Parse error: sub-select returns 2 columns - expected 1",
+            ),
+            (
+                "SELECT (SELECT 1, 2) + (1, 2) FROM items",
+                "Parse error: row value misused",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid row use fails");
+            assert_eq!(error.to_string(), expected, "{sql}");
+        }
+    }
+
+    #[test]
     fn like_family_outputs_have_integer_boolean_facts() {
         let document = analyze_sql("SELECT 'alphabet' LIKE 'alpha%'")
             .expect("LIKE expression has valid SQL meaning");
