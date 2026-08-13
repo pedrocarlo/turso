@@ -126,8 +126,10 @@ impl Update {
         if let Some(from) = &self.from {
             collect_from_column_reads(from, &mut reads, source_by_id);
         }
-        for default in &self.defaults {
-            collect_expr_column_reads(&default.value, &mut reads);
+        if let UpdateTargetKind::BTree { defaults, .. } = &self.target_kind {
+            for default in defaults {
+                collect_expr_column_reads(&default.value, &mut reads);
+            }
         }
         for assignment in &self.assignments {
             collect_expr_column_reads(&assignment.value, &mut reads);

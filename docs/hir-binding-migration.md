@@ -242,8 +242,8 @@ Completed:
   generated columns, defaults, CHECK constraints, and complete index metadata
   close separately against both row identities. Row assignments, duplicate
   targets, rowid aliases, SET DEFAULT, array-setter composition, destination
-  types, and correlated expression subqueries keep their binding rules. Virtual
-  and WITHOUT ROWID targets remain explicit later checkpoints.
+  types, and correlated expression subqueries keep their binding rules. WITHOUT
+  ROWID targets retain their existing unsupported diagnostic.
 - UPDATE trigger identities retain catalog order and include ordinary UPDATE
   triggers plus only the `UPDATE OF` triggers whose named columns are assigned.
   Trigger programs and trigger environments remain later checkpoints.
@@ -266,6 +266,10 @@ Completed:
   one resolution level; RETURNING still sees only the NEW target row. CTE and
   derived sources keep their resolved identities, and every root expression
   read participates in stored-column metadata closure.
+- UPDATE target metadata is split by storage kind. B-tree targets own defaults,
+  triggers, foreign keys, CHECKs, and complete index metadata; virtual targets
+  cannot represent those fields. Virtual SET, WHERE, FROM, RETURNING, aliases,
+  and rowid expressions use the ordinary UPDATE binding rules.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

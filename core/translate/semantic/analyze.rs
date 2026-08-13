@@ -17,7 +17,7 @@ use super::{
         CteId, DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot,
         InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query,
         QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source,
-        SourceId, SourceKind, TypeFact,
+        SourceId, SourceKind, TypeFact, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -318,26 +318,28 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         if let HirRoot::Update(update) = root {
             pending.extend(update.direct_column_reads(|source| self.source(source)));
-            for source in [update.target, update.new_source] {
-                let width = self
-                    .source(source)
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!("missing UPDATE row source {source}"))
-                    })?
-                    .columns
-                    .len();
-                pending.extend((0..width).map(|column| ColumnRef { source, column }));
+            if let UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind {
+                for source in [update.target, update.new_source] {
+                    let width = self
+                        .source(source)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!("missing UPDATE row source {source}"))
+                        })?
+                        .columns
+                        .len();
+                    pending.extend((0..width).map(|column| ColumnRef { source, column }));
+                }
+                pending.extend(foreign_keys.incoming.iter().flat_map(|foreign_key| {
+                    foreign_key
+                        .child_positions
+                        .iter()
+                        .copied()
+                        .map(|column| ColumnRef {
+                            source: foreign_key.child_source,
+                            column,
+                        })
+                }));
             }
-            pending.extend(update.foreign_keys.incoming.iter().flat_map(|foreign_key| {
-                foreign_key
-                    .child_positions
-                    .iter()
-                    .copied()
-                    .map(|column| ColumnRef {
-                        source: foreign_key.child_source,
-                        column,
-                    })
-            }));
         }
         let mut finished = HashSet::default();
 
@@ -8280,16 +8282,17 @@ mod tests {
         let HirRoot::Update(update) = &value.root else {
             panic!("UPDATE produces UPDATE root");
         };
+        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+            panic!("catalog table UPDATE has B-tree metadata");
+        };
         assert_eq!(
-            update
-                .triggers
+            triggers
                 .iter()
                 .map(|trigger| trigger.value().name.as_str())
                 .collect::<Vec<_>>(),
             ["update_value", "update_all"]
         );
-        assert!(update
-            .triggers
+        assert!(triggers
             .iter()
             .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
 
@@ -8298,9 +8301,11 @@ mod tests {
         let HirRoot::Update(update) = &rowid.root else {
             panic!("UPDATE produces UPDATE root");
         };
+        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+            panic!("catalog table UPDATE has B-tree metadata");
+        };
         assert_eq!(
-            update
-                .triggers
+            triggers
                 .iter()
                 .map(|trigger| trigger.value().name.as_str())
                 .collect::<Vec<_>>(),
@@ -8323,16 +8328,18 @@ mod tests {
         let HirRoot::Update(update) = &document.root else {
             panic!("UPDATE produces UPDATE root");
         };
-        assert_eq!(update.foreign_keys.outgoing.len(), 2);
-        assert_eq!(update.foreign_keys.incoming.len(), 1);
-        assert!(update.foreign_keys.outgoing.iter().all(|foreign_key| {
+        let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
+            panic!("catalog table UPDATE has B-tree metadata");
+        };
+        assert_eq!(foreign_keys.outgoing.len(), 2);
+        assert_eq!(foreign_keys.incoming.len(), 1);
+        assert!(foreign_keys.outgoing.iter().all(|foreign_key| {
             foreign_key.child_source == update.new_source
                 && foreign_key.child_table.value().get_name() == "fk_items"
                 && foreign_key.parent_table.value().get_name() == "parents"
         }));
 
-        let parent_code = update
-            .foreign_keys
+        let parent_code = foreign_keys
             .outgoing
             .iter()
             .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_code")
@@ -8349,7 +8356,7 @@ mod tests {
             "parents_code"
         );
 
-        let incoming = &update.foreign_keys.incoming[0];
+        let incoming = &foreign_keys.incoming[0];
         assert_ne!(incoming.child_source, update.target);
         assert_ne!(incoming.child_source, update.new_source);
         assert_eq!(incoming.child_table.value().get_name(), "item_notes");
@@ -8766,5 +8773,91 @@ mod tests {
         )
         .expect_err("RETURNING cannot see UPDATE FROM sources");
         assert_eq!(returning.to_string(), "Parse error: no such table: source");
+    }
+
+    #[test]
+    fn virtual_table_update_has_only_virtual_target_metadata() {
+        let schema = schema_with_virtual_insert_target();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE pragma_table_info AS target \
+             SET rowid = 9, cid = source.cid \
+             FROM pragma_table_info AS source \
+             WHERE target.rowid = source.rowid \
+             RETURNING pragma_table_info.rowid, cid",
+        )
+        .expect("virtual-table UPDATE binds");
+        document
+            .validate()
+            .expect("virtual-table UPDATE produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert!(matches!(update.target_kind, hir::UpdateTargetKind::Virtual));
+        assert_eq!(update.assignments[0].columns, [TargetColumn::RowId]);
+        assert_eq!(update.assignments[1].columns, [TargetColumn::Column(0)]);
+        let from = update.from.as_ref().expect("FROM is preserved");
+        assert!(matches!(
+            update.assignments[1].value,
+            Expr::Column(column) if column.source == from.first && column.column == 0
+        ));
+        assert!(matches!(
+            update.predicate,
+            Some(Expr::Binary { ref lhs, ref rhs, .. })
+                if matches!(lhs.as_ref(), Expr::RowId(source) if *source == update.target)
+                    && matches!(rhs.as_ref(), Expr::RowId(source) if *source == from.first)
+        ));
+        let returning = update.returning.as_ref().expect("RETURNING is preserved");
+        assert!(matches!(
+            returning.outputs[0].expr,
+            Expr::RowId(source) if source == update.new_source
+        ));
+        assert!(matches!(
+            returning.outputs[1].expr,
+            Expr::Column(column) if column.source == update.new_source && column.column == 0
+        ));
+        for source in [update.target, update.new_source] {
+            let source = document.source(source).expect("UPDATE row source exists");
+            assert!(source.check_constraints.is_none());
+            assert!(matches!(source.index_coverage, IndexCoverage::Selective));
+        }
+
+        let mut invalid = document.clone();
+        let HirRoot::Update(update) = &mut invalid.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        update.target_kind = hir::UpdateTargetKind::BTree {
+            defaults: Vec::new(),
+            triggers: Vec::new(),
+            foreign_keys: hir::DmlForeignKeys::default(),
+        };
+        assert_eq!(
+            invalid
+                .validate()
+                .expect_err("target kind must match table")
+                .to_string(),
+            "B-tree UPDATE metadata belongs to a non-B-tree target"
+        );
+    }
+
+    #[test]
+    fn update_without_rowid_keeps_existing_rejection() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE no_rowid(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
+            2,
+        )
+        .expect("WITHOUT ROWID table parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("WITHOUT ROWID table name is unique");
+
+        let error = analyze_sql_with_schema(&schema, "UPDATE no_rowid SET value = 'changed'")
+            .expect_err("WITHOUT ROWID UPDATE remains unsupported");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: UPDATE of WITHOUT ROWID tables is not supported"
+        );
     }
 }

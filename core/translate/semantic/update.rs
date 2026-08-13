@@ -38,17 +38,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 )));
             }
         };
-        let btree = table.value().btree().ok_or_else(|| {
-            LimboError::ParseError("semantic UPDATE does not yet accept virtual tables".to_string())
-        })?;
-        if !btree.has_rowid {
+        let virtual_target = table.value().virtual_table().is_some();
+        if table.value().btree().is_some_and(|btree| !btree.has_rowid) {
             return Err(LimboError::ParseError(
-                "semantic UPDATE does not yet accept WITHOUT ROWID tables".to_string(),
+                "UPDATE of WITHOUT ROWID tables is not supported".to_string(),
             ));
         }
         let new_source = self.create_update_new_source(target, &table)?;
-        self.analyze_btree_write_metadata(target, &table)?;
-        self.analyze_btree_write_metadata(new_source, &table)?;
+        if !virtual_target {
+            self.analyze_btree_write_metadata(target, &table)?;
+            self.analyze_btree_write_metadata(new_source, &table)?;
+        }
 
         let (from, from_scope) = match syntax.from.as_ref() {
             Some(syntax) => {
@@ -63,8 +63,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }
         let assignments =
             self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
-        let triggers = self.analyze_update_triggers(&table, &assignments);
-        let foreign_keys = self.analyze_dml_foreign_keys(&table, new_source)?;
+        let target_kind = if virtual_target {
+            hir::UpdateTargetKind::Virtual
+        } else {
+            hir::UpdateTargetKind::BTree {
+                defaults: Vec::new(),
+                triggers: self.analyze_update_triggers(&table, &assignments),
+                foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
+            }
+        };
         let returning = self.analyze_dml_returning(&syntax.returning, new_source)?;
         let predicate = syntax
             .where_clause
@@ -82,7 +89,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(HirRoot::Update(hir::Update {
             target,
             new_source,
-            defaults: Vec::new(),
+            target_kind,
             from,
             assignments,
             predicate,
@@ -91,8 +98,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             conflict: syntax.or_conflict,
             returning,
             trigger: None,
-            triggers,
-            foreign_keys,
             cdc_updates_override: None,
         }))
     }
@@ -236,7 +241,7 @@ fn resolve_update_target(table: &Table, name: &ast::Name) -> Result<hir::TargetC
         definition.ensure_not_generated("UPDATE", name.as_str())?;
         return Ok(hir::TargetColumn::Column(column));
     }
-    if table.btree().is_some_and(|btree| btree.has_rowid)
+    if (table.btree().is_some_and(|btree| btree.has_rowid) || table.virtual_table().is_some())
         && ["rowid", "_rowid_", "oid"]
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(&normalized))
