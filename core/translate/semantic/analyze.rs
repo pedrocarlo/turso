@@ -9107,21 +9107,113 @@ mod tests {
     }
 
     #[test]
+    fn delete_returning_reads_deleted_row_with_target_alias_visibility() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "DELETE FROM writable AS deleted WHERE id = 1 \
+             RETURNING deleted.*, deleted.rowid, value COLLATE nocase AS folded",
+        )
+        .expect("DELETE RETURNING binds");
+        document
+            .validate()
+            .expect("DELETE RETURNING produces closed HIR");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let returning = delete.returning.as_ref().expect("RETURNING is preserved");
+        assert_eq!(
+            returning
+                .outputs
+                .iter()
+                .map(|output| (output.id, output.name.as_str(), output.name_kind))
+                .collect::<Vec<_>>(),
+            [
+                (OutputId::root(0), "id", OutputNameKind::StarExpansion),
+                (OutputId::root(1), "value", OutputNameKind::StarExpansion),
+                (OutputId::root(2), "doubled", OutputNameKind::StarExpansion),
+                (OutputId::root(3), "deleted.rowid", OutputNameKind::Inferred),
+                (OutputId::root(4), "folded", OutputNameKind::ExplicitAlias),
+            ]
+        );
+        assert!(returning.outputs.iter().all(|output| {
+            let mut uses_other_source = false;
+            output.expr.walk(&mut |expression| match expression {
+                Expr::Column(column) if column.source != delete.target => {
+                    uses_other_source = true;
+                }
+                Expr::RowId(source) if *source != delete.target => uses_other_source = true,
+                _ => {}
+            });
+            !uses_other_source
+        }));
+        assert!(matches!(
+            returning.outputs[3].expr,
+            Expr::RowId(source) if source == delete.target
+        ));
+        assert!(returning.outputs[4].collation_is_explicit);
+        assert_eq!(returning.outputs[4].type_fact.storage, Some(Type::Text));
+        assert!(document.output(OutputId::root(4)).is_some());
+
+        let hidden_name = analyze_sql_with_schema(
+            &schema,
+            "DELETE FROM writable AS deleted RETURNING writable.value",
+        )
+        .expect_err("DELETE alias hides the original table name");
+        assert_eq!(
+            hidden_name.to_string(),
+            "Parse error: no such table: writable"
+        );
+    }
+
+    #[test]
+    fn delete_returning_subqueries_capture_deleted_row() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "DELETE FROM writable WHERE id = 1 RETURNING \
+             (SELECT value) AS copied, EXISTS(SELECT 1 WHERE rowid = 1) AS found",
+        )
+        .expect("DELETE RETURNING subqueries bind");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let outputs = &delete
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs;
+        let query_ids = [
+            match outputs[0].expr {
+                Expr::Subquery(SubqueryExpr::Scalar { query, output: 0 }) => query,
+                _ => panic!("first output is scalar subquery"),
+            },
+            match outputs[1].expr {
+                Expr::Subquery(SubqueryExpr::Exists(query)) => query,
+                _ => panic!("second output is EXISTS subquery"),
+            },
+        ];
+        for query in query_ids {
+            let query = document.query(query).expect("RETURNING child query exists");
+            assert_eq!(query.parent, None);
+            assert_eq!(query.captures, [delete.target]);
+        }
+    }
+
+    #[test]
     fn basic_delete_rejects_deferred_and_unsupported_targets() {
         let schema = schema_with_writable_table();
-        for (sql, expected) in [
-            (
-                "WITH chosen AS (SELECT 1) DELETE FROM writable WHERE id = 1",
-                "Parse error: semantic DELETE does not yet support WITH clauses",
-            ),
-            (
-                "DELETE FROM writable RETURNING value",
-                "Parse error: semantic DELETE does not yet support RETURNING clauses",
-            ),
-        ] {
-            let error = analyze_sql_with_schema(&schema, sql).expect_err("clause is deferred");
-            assert_eq!(error.to_string(), expected);
-        }
+        let error = analyze_sql_with_schema(
+            &schema,
+            "WITH chosen AS (SELECT 1) DELETE FROM writable WHERE id = 1",
+        )
+        .expect_err("WITH is deferred");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: semantic DELETE does not yet support WITH clauses"
+        );
 
         let virtual_schema = schema_with_virtual_insert_target();
         let virtual_error = analyze_sql_with_schema(

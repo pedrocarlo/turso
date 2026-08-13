@@ -275,8 +275,8 @@ Completed:
   and correlated subqueries. Generated-column reads and every ordinary,
   expression, and partial index close against that target; `INDEXED BY` keeps
   its resolved catalog identity. Target metadata is split between B-tree and
-  virtual variants from the start. WITH, RETURNING, and virtual targets remain
-  explicit later checkpoints, while WITHOUT ROWID targets keep their existing
+  virtual variants from the start. WITH and virtual targets remain explicit
+  later checkpoints, while WITHOUT ROWID targets keep their existing
   unsupported diagnostic.
 - DELETE trigger identities retain catalog order and include only DELETE
   triggers for the target database. Trigger programs and trigger environments
@@ -286,6 +286,10 @@ Completed:
   Parent identities, column positions, UNIQUE indexes, and generated child keys
   use the same closed metadata as INSERT and UPDATE. Enforcement remains
   outside semantic analysis.
+- DELETE RETURNING expressions bind against the deleted target row. Stars,
+  target aliases, rowid, output facts, collations, generated columns, and
+  root-owned subqueries retain the same resolved HIR rules as other DML
+  RETURNING clauses.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
