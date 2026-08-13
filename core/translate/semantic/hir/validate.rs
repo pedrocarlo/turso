@@ -984,22 +984,29 @@ impl<'document> HirValidator<'document> {
             let Some(from) = &block.from else {
                 continue;
             };
-            self.add_source_cte(from.first, &mut ctes)?;
-            for join in &from.joins {
-                self.add_source_cte(join.right, &mut ctes)?;
-            }
+            self.add_from_ctes(from, &mut ctes)?;
         }
         Ok(ctes)
     }
 
+    fn add_from_ctes(&self, from: &From, ctes: &mut Vec<CteId>) -> ValidationResult {
+        self.add_source_cte(from.first, ctes)?;
+        for join in &from.joins {
+            self.add_source_cte(join.right, ctes)?;
+        }
+        Ok(())
+    }
+
     fn add_source_cte(&self, source: SourceId, ctes: &mut Vec<CteId>) -> ValidationResult {
         let source = self.source(source)?;
-        let cte = match source.kind {
-            SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => cte,
-            _ => return Ok(()),
-        };
-        if !ctes.contains(&cte) {
-            ctes.push(cte);
+        match &source.kind {
+            SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
+                if !ctes.contains(cte) {
+                    ctes.push(*cte);
+                }
+            }
+            SourceKind::FromGroup(group) => self.add_from_ctes(&group.from, ctes)?,
+            _ => {}
         }
         Ok(())
     }
@@ -1187,6 +1194,16 @@ impl<'document> HirValidator<'document> {
                         query.id
                     ),
                 )?;
+            }
+            SourceKind::FromGroup(group) => {
+                self.require(
+                    group.columns.len() == width,
+                    format!(
+                        "FROM group source {id} column mapping width does not match its columns"
+                    ),
+                )?;
+                self.visit_from(&group.from, source.owner)?;
+                self.visit_exprs(&group.columns)?;
             }
         }
 
