@@ -217,6 +217,16 @@ impl Scope {
         self.visible_columns.extend(other.visible_columns);
     }
 
+    pub(crate) fn without_outer(mut self) -> Self {
+        self.outer = None;
+        self
+    }
+
+    pub(crate) fn set_outer(&mut self, outer: Option<&Self>) {
+        assert!(self.outer.is_none(), "scope already has an outer scope");
+        self.outer = outer.cloned().map(Arc::new);
+    }
+
     /// Add only another scope's qualified table namespaces. Group columns
     /// provide unqualified visibility; inner sources remain available for
     /// `table.column` lookup when the group has no alias.
