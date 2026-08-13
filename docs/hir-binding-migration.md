@@ -57,7 +57,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and lowering | Statement and trigger inputs produce HIR against a multi-database catalog snapshot, and the live resolver can freeze matching owned inputs. Passing that snapshot into semantic analysis and switching execution to HIR remain later steps; physical lowering is explicitly out of scope for now. |
+| Production entry point and lowering | Statement inputs produce validated HIR from a live resolver's owned multi-database snapshot. Calling that semantic entry point from preparation and switching execution to HIR remain later steps; physical lowering is explicitly out of scope for now. |
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -120,8 +120,10 @@ Completed:
   the target database, and documents record sorted schema-version snapshots.
 - The live resolver can freeze its main, temp, attached, and connection-local
   staged schemas into one owned catalog snapshot. The snapshot also freezes the
-  exact unqualified lookup order without holding catalog locks; connecting it
-  to the semantic entry point remains part of the production switch.
+  exact unqualified lookup order without holding catalog locks.
+- A standalone semantic entry point consumes that owned resolver snapshot and
+  produces a validated statement `HirDocument`. Analysis borrows only snapshot
+  schemas, symbols, and dialect; live resolver and catalog locks are not needed.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,
