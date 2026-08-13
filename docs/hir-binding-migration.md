@@ -41,8 +41,7 @@ documents.
 ## Current status
 
 Core SELECT and top-level DML binding are present. The user-visible SELECT
-coverage audit is complete; deferred migration work and one generic diagnostic
-cleanup remain below.
+coverage audit is complete; deferred migration work remains below.
 
 ### Remaining binding coverage audit
 
@@ -81,15 +80,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
-One generic fallback still needs cleanup even though it does not add a feature:
-
-- `INSERT INTO t(a) DEFAULT VALUES` reaches a specific old-path width error
-  (`0 values for 1 columns`), while semantic analysis reports unsupported
-  INSERT.
-
 Completed:
 
 - Analyzer-owned HIR arenas and mandatory document validation.
+- The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
+  VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,
   USING/NATURAL merged-column, star-expansion, and collation rules.
 - One ordinary table source and basic result outputs, including stars.

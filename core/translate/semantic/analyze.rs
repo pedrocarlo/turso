@@ -6733,6 +6733,28 @@ mod tests {
     }
 
     #[test]
+    fn insert_default_values_with_columns_preserves_width_error() {
+        let schema = schema_with_writable_table();
+        let mut statement = parse_statement("INSERT INTO writable DEFAULT VALUES");
+        let ast::Stmt::Insert { columns, .. } = &mut statement else {
+            panic!("statement is INSERT");
+        };
+        columns.push(ast::Name::exact("id".to_string()));
+
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            &schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        let error = analyze(&context, AnalyzeInput::Statement(&statement))
+            .expect_err("semantic analysis rejects columns with DEFAULT VALUES");
+
+        assert_eq!(error.to_string(), "Parse error: 0 values for 1 columns");
+    }
+
+    #[test]
     fn insert_target_and_row_width_errors_keep_existing_diagnostics() {
         let schema = schema_with_writable_table();
         for (sql, expected) in [
