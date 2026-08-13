@@ -275,9 +275,9 @@ Completed:
   and correlated subqueries. Generated-column reads and every ordinary,
   expression, and partial index close against that target; `INDEXED BY` keeps
   its resolved catalog identity. Target metadata is split between B-tree and
-  virtual variants from the start. WITH and virtual targets remain explicit
-  later checkpoints, while WITHOUT ROWID targets keep their existing
-  unsupported diagnostic.
+  virtual variants from the start. Virtual targets remain an explicit later
+  checkpoint, while WITHOUT ROWID targets keep their existing unsupported
+  diagnostic.
 - DELETE trigger identities retain catalog order and include only DELETE
   triggers for the target database. Trigger programs and trigger environments
   remain later checkpoints.
@@ -290,6 +290,10 @@ Completed:
   target aliases, rowid, output facts, collations, generated columns, and
   root-owned subqueries retain the same resolved HIR rules as other DML
   RETURNING clauses.
+- DELETE uses the shared scoped CTE helper across WHERE and RETURNING. Ordinary
+  and recursive definitions bind lazily, unused invalid definitions remain
+  absent, and a CTE named like the target does not shadow the catalog DELETE
+  destination. The statement scope is removed on success or error.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.
