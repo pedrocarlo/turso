@@ -18,24 +18,47 @@ pub(super) struct CteScope<'ast> {
     entries: Vec<PendingCte<'ast>>,
 }
 
-/// Lexical query context available while a lazily resolved CTE is bound.
-/// `outer_scope` excludes sources owned by `parent` itself.
+/// Lexical context available while a lazily resolved CTE is bound.
 #[derive(Clone, Copy)]
-pub(super) struct CteBindingContext<'scope> {
-    parent: QueryId,
-    outer_scope: Option<&'scope Scope>,
+pub(super) enum CteBindingContext<'scope> {
+    /// `outer_scope` excludes sources owned by `parent` itself.
+    Query {
+        parent: QueryId,
+        outer_scope: Option<&'scope Scope>,
+    },
+    Root,
 }
 
 impl<'scope> CteBindingContext<'scope> {
     pub(super) fn new(parent: QueryId, outer_scope: Option<&'scope Scope>) -> Self {
-        Self {
+        Self::Query {
             parent,
             outer_scope,
         }
     }
 
+    pub(super) const fn root() -> Self {
+        Self::Root
+    }
+
     fn query_parent(self) -> Option<QueryId> {
-        self.outer_scope.map(|_| self.parent)
+        match self {
+            Self::Query {
+                parent,
+                outer_scope: Some(_),
+            } => Some(parent),
+            Self::Query {
+                outer_scope: None, ..
+            }
+            | Self::Root => None,
+        }
+    }
+
+    fn outer_scope(self) -> Option<&'scope Scope> {
+        match self {
+            Self::Query { outer_scope, .. } => outer_scope,
+            Self::Root => None,
+        }
     }
 }
 
@@ -760,7 +783,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 None,
                 super::analyze::SelectContext {
                     parent: context.query_parent(),
-                    outer_scope: context.outer_scope,
+                    outer_scope: context.outer_scope(),
                     expected_outputs: None,
                 },
             )
@@ -772,9 +795,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         context: CteBindingContext<'_>,
     ) -> Result<QueryId> {
-        match context.outer_scope {
-            Some(scope) => self.analyze_subquery(select, Some(context.parent), scope),
-            None => self.analyze_select(select),
+        match context {
+            CteBindingContext::Query {
+                parent,
+                outer_scope: Some(scope),
+            } => self.analyze_subquery(select, Some(parent), scope),
+            CteBindingContext::Query {
+                outer_scope: None, ..
+            }
+            | CteBindingContext::Root => self.analyze_select(select),
         }
     }
 

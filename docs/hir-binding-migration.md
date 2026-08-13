@@ -242,8 +242,8 @@ Completed:
   generated columns, defaults, CHECK constraints, and complete index metadata
   close separately against both row identities. Row assignments, duplicate
   targets, rowid aliases, SET DEFAULT, array-setter composition, destination
-  types, and correlated expression subqueries keep their binding rules. FROM
-  and virtual/WITHOUT ROWID targets remain explicit later checkpoints.
+  types, and correlated expression subqueries keep their binding rules. Virtual
+  and WITHOUT ROWID targets remain explicit later checkpoints.
 - UPDATE trigger identities retain catalog order and include ordinary UPDATE
   triggers plus only the `UPDATE OF` triggers whose named columns are assigned.
   Trigger programs and trigger environments remain later checkpoints.
@@ -261,6 +261,11 @@ Completed:
   analysis did not leak another scope. UPDATE WITH definitions remain lazy,
   reach SET, WHERE, and RETURNING subqueries, support recursive bodies, and do
   not shadow the catalog UPDATE target.
+- UPDATE FROM reuses the SELECT source analyzer with root ownership. JOIN
+  constraints see only FROM sources; SET and WHERE see the target and FROM at
+  one resolution level; RETURNING still sees only the NEW target row. CTE and
+  derived sources keep their resolved identities, and every root expression
+  read participates in stored-column metadata closure.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

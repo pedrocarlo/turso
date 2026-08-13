@@ -7,13 +7,13 @@ use super::{
     dml::{trigger_matches_update, trigger_targets_database},
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
+    query::FromContext,
     scope::Scope,
 };
 use crate::{function::ScalarFunc, schema::Table, util::normalize_ident, LimboError, Result};
 
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_update(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
-        reject_deferred_update_clauses(syntax)?;
         self.with_cte_scope(syntax.with.as_ref(), |analyzer| {
             analyzer.analyze_update_body(syntax)
         })
@@ -50,7 +50,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         self.analyze_btree_write_metadata(target, &table)?;
         self.analyze_btree_write_metadata(new_source, &table)?;
 
-        let scope = self.update_read_scope(target)?;
+        let (from, from_scope) = match syntax.from.as_ref() {
+            Some(syntax) => {
+                let (from, scope) = self.analyze_from_clause(syntax, FromContext::Root)?;
+                (Some(from), Some(scope))
+            }
+            None => (None, None),
+        };
+        let mut scope = self.update_read_scope(target)?;
+        if let Some(from_scope) = from_scope {
+            scope.append_local(from_scope);
+        }
         let assignments =
             self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
         let triggers = self.analyze_update_triggers(&table, &assignments);
@@ -73,7 +83,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             target,
             new_source,
             defaults: Vec::new(),
-            from: None,
+            from,
             assignments,
             predicate,
             order_by: Vec::new(),
@@ -220,13 +230,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 }
 
-fn reject_deferred_update_clauses(syntax: &ast::Update) -> Result<()> {
-    if syntax.from.is_some() {
-        return unsupported_update("FROM clauses");
-    }
-    Ok(())
-}
-
 fn resolve_update_target(table: &Table, name: &ast::Name) -> Result<hir::TargetColumn> {
     let normalized = normalize_ident(name.as_str());
     if let Some((column, definition)) = table.get_column_by_name(&normalized) {
@@ -276,10 +279,4 @@ fn merge_update_assignment(
         }
     }
     existing.value = value;
-}
-
-fn unsupported_update<T>(feature: &str) -> Result<T> {
-    Err(LimboError::ParseError(format!(
-        "semantic UPDATE does not yet accept {feature}"
-    )))
 }

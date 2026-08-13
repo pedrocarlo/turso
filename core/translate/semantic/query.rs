@@ -23,6 +23,47 @@ struct AnalyzedSourceColumn {
 }
 
 #[derive(Clone, Copy)]
+pub(super) enum FromContext<'scope> {
+    QueryBlock {
+        block: hir::QueryBlockId,
+        outer_scope: Option<&'scope Scope>,
+    },
+    Root,
+}
+
+impl<'scope> FromContext<'scope> {
+    fn source_owner(self) -> SourceOwner {
+        match self {
+            Self::QueryBlock { block, .. } => SourceOwner::QueryBlock(block),
+            Self::Root => SourceOwner::Root,
+        }
+    }
+
+    fn query_parent(self) -> Option<hir::QueryId> {
+        match self {
+            Self::QueryBlock { block, .. } => Some(block.query),
+            Self::Root => None,
+        }
+    }
+
+    fn outer_scope(self) -> Option<&'scope Scope> {
+        match self {
+            Self::QueryBlock { outer_scope, .. } => outer_scope,
+            Self::Root => None,
+        }
+    }
+
+    fn cte_context(self) -> CteBindingContext<'scope> {
+        match self {
+            Self::QueryBlock { block, outer_scope } => {
+                CteBindingContext::new(block.query, outer_scope)
+            }
+            Self::Root => CteBindingContext::root(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum CatalogSourceKind {
     Table,
     TableFunction,
@@ -46,7 +87,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             CteBindingContext::new(query, Some(outer_scope)),
         )?;
         if let Some(arguments) = analyzed.function_arguments {
-            self.analyze_table_function_arguments(analyzed.id, arguments, outer_scope, query)?;
+            self.analyze_table_function_arguments(
+                analyzed.id,
+                arguments,
+                outer_scope,
+                Some(query),
+            )?;
         }
 
         let source = self.source(analyzed.id).ok_or_else(|| {
@@ -105,18 +151,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_from_clause(
         &mut self,
         syntax: &'ast ast::FromClause,
-        owner: hir::QueryBlockId,
-        outer_scope: Option<&Scope>,
+        context: FromContext<'_>,
     ) -> Result<(hir::From, Scope)> {
-        let source_owner = SourceOwner::QueryBlock(owner);
-        let cte_context = CteBindingContext::new(owner.query, outer_scope);
+        let source_owner = context.source_owner();
+        let cte_context = context.cte_context();
         let first = self.analyze_table_source(&syntax.select, source_owner, 0, cte_context)?;
         let source = first.id;
         let mut table_functions = Vec::new();
         if let Some(arguments) = first.function_arguments {
             table_functions.push((source, arguments));
         }
-        let mut scope = Scope::new(outer_scope.cloned());
+        let mut scope = Scope::new(context.outer_scope().cloned());
         let definition = self.source(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!("missing semantic source {source}"))
         })?;
@@ -190,16 +235,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
 
         for (source, arguments) in table_functions {
-            self.analyze_table_function_arguments(source, arguments, &scope, owner.query)?;
+            self.analyze_table_function_arguments(
+                source,
+                arguments,
+                &scope,
+                context.query_parent(),
+            )?;
         }
 
         let policy = ExprPolicy::select(self.context().dqs_dml());
         for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
             if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
-                join.constraint = hir::JoinConstraint::On(
-                    self.analyze_query_scalar_expr(expression, &scope, policy, owner.query)?
-                        .expr,
-                );
+                join.constraint = hir::JoinConstraint::On(self.analyze_source_scalar_expr(
+                    expression,
+                    &scope,
+                    policy,
+                    context.query_parent(),
+                )?);
             }
         }
 
@@ -333,15 +385,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         source: hir::SourceId,
         syntax: &'ast [Box<ast::Expr>],
         scope: &Scope,
-        parent: hir::QueryId,
+        parent: Option<hir::QueryId>,
     ) -> Result<()> {
         let policy = ExprPolicy::table_function(self.context().dqs_dml());
         let mut arguments = Vec::with_capacity(syntax.len());
         for argument in syntax {
-            arguments.push(
-                self.analyze_query_scalar_expr(argument, scope, policy, parent)?
-                    .expr,
-            );
+            arguments.push(self.analyze_source_scalar_expr(argument, scope, policy, parent)?);
         }
         let source = self.source_mut(source).ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -365,6 +414,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         *bound = arguments;
         Ok(())
+    }
+
+    fn analyze_source_scalar_expr(
+        &mut self,
+        syntax: &'ast ast::Expr,
+        scope: &Scope,
+        policy: ExprPolicy,
+        parent: Option<hir::QueryId>,
+    ) -> Result<hir::Expr> {
+        match parent {
+            Some(parent) => self
+                .analyze_query_scalar_expr(syntax, scope, policy, parent)
+                .map(|resolved| resolved.expr),
+            None => self
+                .analyze_root_expr(syntax, scope, policy)
+                .map(|resolved| resolved.expr),
+        }
     }
 
     fn analyze_cte_source(
@@ -435,12 +501,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         owner: SourceOwner,
         position: usize,
     ) -> Result<hir::SourceId> {
-        let SourceOwner::QueryBlock(owner_block) = owner else {
-            return Err(crate::LimboError::InternalError(
-                "derived source must belong to a query block".to_string(),
-            ));
+        let parent = match owner {
+            SourceOwner::QueryBlock(block) => Some(block.query),
+            SourceOwner::Root => None,
+            SourceOwner::Cte(cte) => {
+                return Err(crate::LimboError::InternalError(format!(
+                    "derived source cannot be owned directly by CTE {cte}"
+                )));
+            }
         };
-        let query = self.analyze_select_with_parent(select, Some(owner_block.query))?;
+        let query = self.analyze_select_with_parent(select, parent)?;
         let columns = self.query_source_columns(query)?;
         let width = columns.len();
         let source = self.reserve_source();
