@@ -39,7 +39,8 @@ pub(crate) struct ExprPolicies {
 
 #[derive(Clone, Copy, Debug)]
 struct TriggerExprContext {
-    unavailable_row: Option<UnavailableTriggerRow>,
+    new_source: Option<hir::SourceId>,
+    old_source: Option<hir::SourceId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -53,12 +54,6 @@ enum AggregatePolicy {
 enum RaisePolicy {
     AbortOnly,
     Trigger,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UnavailableTriggerRow {
-    New,
-    Old,
 }
 
 struct ResolvedCustomMember {
@@ -223,15 +218,13 @@ impl ExprPolicies {
         }
     }
 
-    pub(super) fn trigger(dqs_dml: DoubleQuotedDml, event: &ast::TriggerEvent) -> Self {
-        let unavailable_row = match event {
-            ast::TriggerEvent::Insert => Some(UnavailableTriggerRow::Old),
-            ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => None,
-            ast::TriggerEvent::Delete => Some(UnavailableTriggerRow::New),
-        };
+    pub(super) fn trigger(dqs_dml: DoubleQuotedDml, environment: &hir::TriggerEnvironment) -> Self {
         Self {
             dqs_dml,
-            trigger: Some(TriggerExprContext { unavailable_row }),
+            trigger: Some(TriggerExprContext {
+                new_source: environment.new_source,
+                old_source: environment.old_source,
+            }),
         }
     }
 
@@ -1634,6 +1627,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
     }
 
+    fn resolve_trigger_qualified(
+        &self,
+        policy: ExprPolicy,
+        namespace: &str,
+        column: &str,
+    ) -> Result<Option<ResolvedScopeExpr>> {
+        let Some(source) = trigger_source(policy, namespace)? else {
+            return Ok(None);
+        };
+        let source = self.source(source).ok_or_else(|| {
+            LimboError::InternalError(format!("missing trigger row source {source}"))
+        })?;
+        let mut scope = Scope::default();
+        scope.add_source(source, false);
+        scope.resolve_qualified(namespace, column)
+    }
+
     fn build_expr_from_frames(
         &mut self,
         syntax: &ast::Expr,
@@ -1803,7 +1813,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::Qualified(table, column) => {
                 expect_no_expr_children(children)?;
-                reject_unavailable_trigger_row(policy, table.as_str())?;
+                if let Some(resolved) =
+                    self.resolve_trigger_qualified(policy, table.as_str(), column.as_str())?
+                {
+                    return Ok(resolved);
+                }
                 if let Some(resolved) = scope.resolve_qualified(table.as_str(), column.as_str())? {
                     return self.resolve_atomic_expr(resolved.expr, scope);
                 }
@@ -1822,7 +1836,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::DoublyQualified(database, table, column) => {
                 expect_no_expr_children(children)?;
-                reject_unavailable_trigger_row(policy, table.as_str())?;
+                if let Some(base) =
+                    self.resolve_trigger_qualified(policy, database.as_str(), table.as_str())?
+                {
+                    if custom_argument_type(&base, |definition| {
+                        definition.is_struct() || definition.is_union()
+                    })
+                    .is_some()
+                    {
+                        return self.build_field_access(base, column.as_str());
+                    }
+                    crate::bail_parse_error!(
+                        "column '{}' is not a STRUCT or UNION type; cannot access field '{}'",
+                        normalize_ident(table.as_str()),
+                        normalize_ident(column.as_str())
+                    );
+                }
+                if let Some(resolved) =
+                    self.resolve_trigger_qualified(policy, table.as_str(), column.as_str())?
+                {
+                    return Ok(resolved);
+                }
                 if let Some(database_id) = self.context().database(database.as_str()) {
                     if let Some(resolved) = scope.resolve_database_qualified(
                         database_id,
@@ -3794,20 +3828,23 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
     }
 }
 
-fn reject_unavailable_trigger_row(policy: ExprPolicy, namespace: &str) -> Result<()> {
+fn trigger_source(policy: ExprPolicy, namespace: &str) -> Result<Option<hir::SourceId>> {
+    let Some(trigger) = policy.policies.trigger else {
+        return Ok(None);
+    };
     let namespace = normalize_ident(namespace);
-    match policy
-        .policies
-        .trigger
-        .and_then(|trigger| trigger.unavailable_row)
-    {
-        Some(UnavailableTriggerRow::New) if namespace == "new" => {
-            crate::bail_parse_error!("NEW references are only valid in INSERT and UPDATE triggers");
-        }
-        Some(UnavailableTriggerRow::Old) if namespace == "old" => {
-            crate::bail_parse_error!("OLD references are only valid in UPDATE and DELETE triggers");
-        }
-        _ => Ok(()),
+    match namespace.as_str() {
+        "new" => trigger.new_source.map(Some).ok_or_else(|| {
+            LimboError::ParseError(
+                "NEW references are only valid in INSERT and UPDATE triggers".to_string(),
+            )
+        }),
+        "old" => trigger.old_source.map(Some).ok_or_else(|| {
+            LimboError::ParseError(
+                "OLD references are only valid in UPDATE and DELETE triggers".to_string(),
+            )
+        }),
+        _ => Ok(None),
     }
 }
 

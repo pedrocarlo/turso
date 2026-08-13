@@ -1,4 +1,4 @@
-//! Trigger predicate conversion into resolved HIR.
+//! Trigger expression and command conversion into resolved HIR.
 
 use turso_parser::ast;
 
@@ -40,6 +40,39 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         context: TriggerAnalysis,
         expression: &'ast ast::Expr,
     ) -> Result<hir::HirRoot> {
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let expression = self
+            .analyze_root_expr(
+                expression,
+                &scope,
+                ExprPolicies::trigger(self.context().dqs_dml(), &environment).where_clause(),
+            )?
+            .expr;
+
+        Ok(hir::HirRoot::TriggerPredicate(hir::TriggerPredicate {
+            expression,
+            environment,
+        }))
+    }
+
+    pub(super) fn analyze_trigger_select(
+        &mut self,
+        context: TriggerAnalysis,
+        select: &'ast ast::Select,
+    ) -> Result<hir::HirRoot> {
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+        let query = self.analyze_subquery(select, None, &scope, policies)?;
+        Ok(hir::HirRoot::Query(hir::QueryRoot {
+            query,
+            trigger: Some(environment),
+        }))
+    }
+
+    fn create_trigger_environment(
+        &mut self,
+        context: TriggerAnalysis,
+    ) -> Result<(hir::TriggerEnvironment, Scope)> {
         let table_name = normalize_ident(context.table.get_name());
         let table_id =
             self.catalog_object_id(Some(context.database), CatalogObjectKind::Table, table_name);
@@ -95,18 +128,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 false,
             );
         }
-        let expression = self
-            .analyze_root_expr(
-                expression,
-                &scope,
-                ExprPolicies::trigger(self.context().dqs_dml(), &context.event).where_clause(),
-            )?
-            .expr;
-
-        Ok(hir::HirRoot::TriggerPredicate(hir::TriggerPredicate {
-            expression,
-            environment,
-        }))
+        Ok((environment, scope))
     }
 
     fn create_trigger_row_source(

@@ -22,6 +22,10 @@ pub(crate) enum AnalyzeInput<'ast> {
         context: TriggerAnalysis,
         expression: &'ast turso_parser::ast::Expr,
     },
+    TriggerSelect {
+        context: TriggerAnalysis,
+        select: &'ast turso_parser::ast::Select,
+    },
 }
 
 pub(crate) struct TriggerAnalysis {
