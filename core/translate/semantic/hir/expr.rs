@@ -311,6 +311,9 @@ pub enum SubqueryExpr {
         query: QueryId,
         output: usize,
     },
+    Row {
+        query: QueryId,
+    },
     Exists(QueryId),
     In {
         lhs: Box<Expr>,
@@ -423,7 +426,9 @@ impl Expr {
             | Self::Column(_)
             | Self::RowId(_)
             | Self::Output(_)
-            | Self::Subquery(SubqueryExpr::Scalar { .. } | SubqueryExpr::Exists(_)) => {}
+            | Self::Subquery(
+                SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
+            ) => {}
             Self::MergedColumn(column) => column.left.walk(visitor),
             Self::Unary { expr, .. }
             | Self::IsNull(expr)

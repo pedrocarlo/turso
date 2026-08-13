@@ -193,6 +193,44 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     ) -> Result<Vec<hir::Assignment>> {
         let mut assignments = Vec::<hir::Assignment>::new();
         for set in sets {
+            if set.col_names.len() > 1 {
+                if let Some(select) = row_assignment_subquery(&set.expr) {
+                    let columns = set
+                        .col_names
+                        .iter()
+                        .map(|name| resolve_update_target(table, name))
+                        .collect::<Result<Vec<_>>>()?;
+                    let expected_outputs = columns
+                        .iter()
+                        .map(|column| self.write_target_type(table, *column))
+                        .collect::<Result<Vec<_>>>()?;
+                    let query = self.analyze_subquery_with_expected_outputs(
+                        select,
+                        None,
+                        scope,
+                        &expected_outputs,
+                    )?;
+                    let output_width = self
+                        .query(query)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "missing UPDATE assignment query {query}"
+                            ))
+                        })?
+                        .output
+                        .len();
+                    if columns.len() != output_width {
+                        crate::bail_parse_error!(
+                            "{} columns assigned {} values",
+                            columns.len(),
+                            output_width
+                        );
+                    }
+                    merge_update_row_assignment(&mut assignments, columns, query)?;
+                    continue;
+                }
+            }
+
             let values: Vec<&ast::Expr> = match set.expr.as_ref() {
                 ast::Expr::Parenthesized(values) => {
                     if set.col_names.len() != values.len() {
@@ -228,7 +266,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     )?
                     .expr
                 };
-                merge_update_assignment(&mut assignments, column, value);
+                merge_update_assignment(&mut assignments, column, value)?;
             }
         }
         Ok(assignments)
@@ -259,7 +297,8 @@ fn merge_update_assignment(
     assignments: &mut Vec<hir::Assignment>,
     column: hir::TargetColumn,
     mut value: hir::Expr,
-) {
+) -> Result<()> {
+    split_overlapping_row_assignment(assignments, column)?;
     let Some(existing) = assignments
         .iter_mut()
         .find(|assignment| assignment.columns == [column])
@@ -268,7 +307,7 @@ fn merge_update_assignment(
             columns: vec![column],
             value,
         });
-        return;
+        return Ok(());
     };
 
     if let hir::Expr::Function(call) = &mut value {
@@ -284,4 +323,81 @@ fn merge_update_assignment(
         }
     }
     existing.value = value;
+    Ok(())
+}
+
+fn merge_update_row_assignment(
+    assignments: &mut Vec<hir::Assignment>,
+    columns: Vec<hir::TargetColumn>,
+    query: hir::QueryId,
+) -> Result<()> {
+    if columns
+        .iter()
+        .enumerate()
+        .any(|(index, column)| columns[..index].contains(column))
+    {
+        for (output, column) in columns.into_iter().enumerate() {
+            merge_update_assignment(
+                assignments,
+                column,
+                hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
+            )?;
+        }
+        return Ok(());
+    }
+
+    for column in &columns {
+        split_overlapping_row_assignment(assignments, *column)?;
+    }
+    assignments.retain(|assignment| {
+        !assignment
+            .columns
+            .first()
+            .is_some_and(|column| columns.contains(column))
+    });
+    assignments.push(hir::Assignment {
+        columns,
+        value: hir::Expr::Subquery(hir::SubqueryExpr::Row { query }),
+    });
+    Ok(())
+}
+
+fn split_overlapping_row_assignment(
+    assignments: &mut Vec<hir::Assignment>,
+    column: hir::TargetColumn,
+) -> Result<()> {
+    let Some(index) = assignments.iter().position(|assignment| {
+        assignment.columns.len() > 1 && assignment.columns.contains(&column)
+    }) else {
+        return Ok(());
+    };
+    let assignment = assignments.remove(index);
+    let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = assignment.value else {
+        return Err(LimboError::InternalError(
+            "multi-column UPDATE assignment is not a row subquery".to_string(),
+        ));
+    };
+    for (output, column) in assignment.columns.into_iter().enumerate() {
+        assignments.insert(
+            index + output,
+            hir::Assignment {
+                columns: vec![column],
+                value: hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn row_assignment_subquery(mut expression: &ast::Expr) -> Option<&ast::Select> {
+    while let ast::Expr::Parenthesized(expressions) = expression {
+        let [inner] = expressions.as_slice() else {
+            break;
+        };
+        expression = inner;
+    }
+    match expression {
+        ast::Expr::Subquery(select) => Some(select),
+        _ => None,
+    }
 }

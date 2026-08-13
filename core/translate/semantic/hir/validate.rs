@@ -6,13 +6,6 @@ use super::*;
 
 type ValidationResult<T = ()> = std::result::Result<T, HirValidationError>;
 
-fn expression_width(expression: &Expr) -> usize {
-    match expression {
-        Expr::Row(values) => values.len(),
-        _ => 1,
-    }
-}
-
 /// A broken document-local identity, owner, shape, or reachability invariant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirValidationError {
@@ -512,6 +505,14 @@ impl<'document> HirValidator<'document> {
                 self.validate_target_column(target, *column)?;
             }
             self.visit_expr(&assignment.value)?;
+            let value_width = self.expression_width(&assignment.value)?;
+            self.require(
+                assignment.columns.len() == value_width,
+                format!(
+                    "assignment has {} target columns but value width {value_width}",
+                    assignment.columns.len()
+                ),
+            )?;
         }
         Ok(())
     }
@@ -1718,7 +1719,7 @@ impl<'document> HirValidator<'document> {
                 ..
             } => {
                 self.visit_catalog_object(function, "LIKE function")?;
-                let lhs_width = expression_width(lhs);
+                let lhs_width = self.expression_width(lhs)?;
                 self.require(
                     lhs_width == 1 || *operator == turso_parser::ast::LikeOperator::Match,
                     "only MATCH accepts a row-valued left expression",
@@ -1844,6 +1845,14 @@ impl<'document> HirValidator<'document> {
                     format!("scalar subquery {query} output {output} is out of range"),
                 )
             }
+            SubqueryExpr::Row { query } => {
+                self.visit_query(*query)?;
+                let width = self.query(*query)?.output.len();
+                self.require(
+                    width > 1,
+                    format!("row subquery {query} has scalar width {width}"),
+                )
+            }
             SubqueryExpr::Exists(query) => self.visit_query(*query),
             SubqueryExpr::In {
                 lhs,
@@ -1853,7 +1862,7 @@ impl<'document> HirValidator<'document> {
             } => {
                 self.visit_expr(lhs)?;
                 self.visit_query(*query)?;
-                let lhs_width = expression_width(lhs);
+                let lhs_width = self.expression_width(lhs)?;
                 let output_width = self.query(*query)?.output.len();
                 self.require(
                     output_width == lhs_width,
@@ -1871,13 +1880,21 @@ impl<'document> HirValidator<'document> {
         rhs: &Expr,
         context: &str,
     ) -> ValidationResult {
-        let lhs_width = expression_width(lhs);
-        let rhs_width = expression_width(rhs);
+        let lhs_width = self.expression_width(lhs)?;
+        let rhs_width = self.expression_width(rhs)?;
         self.require(
             lhs_width == rhs_width,
             format!("{context} compares widths {lhs_width} and {rhs_width}"),
         )?;
         self.visit_comparison(comparison, lhs_width, context)
+    }
+
+    fn expression_width(&self, expression: &Expr) -> ValidationResult<usize> {
+        match expression {
+            Expr::Row(values) => Ok(values.len()),
+            Expr::Subquery(SubqueryExpr::Row { query }) => Ok(self.query(*query)?.output.len()),
+            _ => Ok(1),
+        }
     }
 
     fn visit_comparison(

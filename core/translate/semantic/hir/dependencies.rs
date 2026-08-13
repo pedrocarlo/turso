@@ -366,7 +366,9 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::Subquery(SubqueryExpr::In { lhs, .. }) => {
             collect_expr_references(lhs, references);
         }
-        Expr::Subquery(SubqueryExpr::Scalar { .. } | SubqueryExpr::Exists(_)) => {}
+        Expr::Subquery(
+            SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
+        ) => {}
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
