@@ -82,6 +82,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         AnalyzeInput::TriggerInsert { context, insert } => {
             analyzer.analyze_trigger_insert(context, insert)?
         }
+        AnalyzeInput::TriggerUpdate { context, update } => {
+            analyzer.analyze_trigger_update(context, update)?
+        }
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -1696,6 +1699,49 @@ mod tests {
                     select,
                     upsert: upsert.as_deref(),
                     returning,
+                },
+            },
+        )
+    }
+
+    fn analyze_trigger_update_with_schema(
+        schema: &Schema,
+        event: ast::TriggerEvent,
+        command: &ast::TriggerCmd,
+        conflict_override: Option<ast::ResolveType>,
+    ) -> Result<HirDocument> {
+        let ast::TriggerCmd::Update {
+            or_conflict,
+            tbl_name,
+            sets,
+            from,
+            where_clause,
+        } = command
+        else {
+            panic!("trigger command is UPDATE");
+        };
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerUpdate {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
+                },
+                update: crate::translate::semantic::TriggerUpdate {
+                    command_conflict: *or_conflict,
+                    conflict_override,
+                    table: tbl_name,
+                    assignments: sets,
+                    from: from.as_ref(),
+                    predicate: where_clause.as_deref(),
                 },
             },
         )
@@ -5727,6 +5773,107 @@ mod tests {
         );
         let error =
             analyze_trigger_insert_with_schema(&schema, ast::TriggerEvent::Insert, &invalid, None)
+                .expect_err("INSERT trigger rejects OLD");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
+        );
+    }
+
+    #[test]
+    fn trigger_update_keeps_outer_and_changed_rows_distinct() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER change_row AFTER UPDATE ON writable BEGIN \
+             UPDATE OR IGNORE writable SET value = new.value \
+             WHERE writable.id = old.id AND new.id > 0; END",
+        );
+        let document = analyze_trigger_update_with_schema(
+            &schema,
+            ast::TriggerEvent::Update,
+            &command,
+            Some(ast::ResolveType::Replace),
+        )
+        .expect("trigger UPDATE binds");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("trigger UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.conflict, Some(ast::ResolveType::Replace));
+        let environment = update
+            .trigger
+            .as_ref()
+            .expect("trigger UPDATE carries its environment");
+        let outer_new = environment.new_source.expect("outer UPDATE has NEW");
+        let outer_old = environment.old_source.expect("outer UPDATE has OLD");
+        assert_ne!(update.target, outer_old);
+        assert_ne!(update.new_source, outer_new);
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Column(column) if column.source == outer_new
+        ));
+        let predicate = update.predicate.as_ref().expect("UPDATE has predicate");
+        let mut reads = Vec::new();
+        predicate.walk(&mut |expression| {
+            if let Expr::Column(column) = expression {
+                reads.push(column.source);
+            }
+        });
+        assert!(reads.contains(&update.target));
+        assert!(reads.contains(&outer_old));
+        assert!(reads.contains(&outer_new));
+        let target = document
+            .source(update.target)
+            .expect("target source exists");
+        assert_eq!(target.database, Some(DatabaseId::new(MAIN_DB_ID)));
+    }
+
+    #[test]
+    fn trigger_update_carries_rows_through_from_and_subqueries() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER change_row AFTER UPDATE ON writable BEGIN \
+             UPDATE writable SET value = (SELECT new.value) \
+             FROM (SELECT old.id AS id) AS chosen \
+             WHERE writable.id = chosen.id; END",
+        );
+        let document =
+            analyze_trigger_update_with_schema(&schema, ast::TriggerEvent::Update, &command, None)
+                .expect("trigger UPDATE FROM binds");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("trigger UPDATE produces UPDATE root");
+        };
+        let environment = update.trigger.as_ref().expect("environment exists");
+        let outer_new = environment.new_source.expect("UPDATE has NEW");
+        let outer_old = environment.old_source.expect("UPDATE has OLD");
+        let Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) = &update.assignments[0].value
+        else {
+            panic!("assignment is scalar subquery");
+        };
+        assert!(document
+            .query(*query)
+            .expect("assignment query exists")
+            .captures
+            .contains(&outer_new));
+        let from = update.from.as_ref().expect("UPDATE has FROM");
+        let SourceKind::Derived(query) = &document
+            .source(from.first)
+            .expect("derived source exists")
+            .kind
+        else {
+            panic!("FROM source is derived");
+        };
+        assert!(document
+            .query(*query)
+            .expect("derived query exists")
+            .captures
+            .contains(&outer_old));
+
+        let invalid = first_trigger_command(
+            "CREATE TRIGGER bad_row AFTER INSERT ON writable BEGIN \
+             UPDATE writable SET value = old.value; END",
+        );
+        let error =
+            analyze_trigger_update_with_schema(&schema, ast::TriggerEvent::Insert, &invalid, None)
                 .expect_err("INSERT trigger rejects OLD");
         assert_eq!(
             error.to_string(),

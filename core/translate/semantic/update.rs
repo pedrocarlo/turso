@@ -5,27 +5,61 @@ use turso_parser::ast;
 use super::{
     analyze::Analyzer,
     dml::{trigger_matches_update, trigger_targets_database},
-    expr::{ExprPolicies, ExprPolicy},
+    expr::ExprPolicies,
     hir::{self, HirRoot, SourceOwner},
     query::FromContext,
     scope::Scope,
 };
 use crate::{function::ScalarFunc, schema::Table, util::normalize_ident, LimboError, Result};
 
+#[derive(Clone, Copy)]
+pub(super) struct UpdateExprContext<'scope> {
+    pub(super) outer_scope: Option<&'scope Scope>,
+    pub(super) policies: ExprPolicies,
+}
+
+pub(super) struct UpdateBodySyntax<'ast> {
+    pub(super) conflict: Option<ast::ResolveType>,
+    pub(super) assignments: &'ast [ast::Set],
+    pub(super) from: Option<&'ast ast::FromClause>,
+    pub(super) predicate: Option<&'ast ast::Expr>,
+    pub(super) returning: &'ast [ast::ResultColumn],
+}
+
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_update(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
         self.with_cte_scope(syntax.with.as_ref(), |analyzer| {
-            analyzer.analyze_update_body(syntax)
+            let target = analyzer.analyze_base_table_source(
+                &syntax.tbl_name,
+                None,
+                syntax.indexed.as_ref(),
+                SourceOwner::Root,
+            )?;
+            analyzer.analyze_update_target(
+                target,
+                UpdateBodySyntax {
+                    conflict: syntax.or_conflict,
+                    assignments: &syntax.sets,
+                    from: syntax.from.as_ref(),
+                    predicate: syntax.where_clause.as_deref(),
+                    returning: &syntax.returning,
+                },
+                UpdateExprContext {
+                    outer_scope: None,
+                    policies: ExprPolicies::statement(analyzer.context().dqs_dml()),
+                },
+                None,
+            )
         })
     }
 
-    fn analyze_update_body(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
-        let target = self.analyze_base_table_source(
-            &syntax.tbl_name,
-            None,
-            syntax.indexed.as_ref(),
-            SourceOwner::Root,
-        )?;
+    pub(super) fn analyze_update_target(
+        &mut self,
+        target: hir::SourceId,
+        syntax: UpdateBodySyntax<'ast>,
+        expressions: UpdateExprContext<'_>,
+        trigger: Option<hir::TriggerEnvironment>,
+    ) -> Result<HirRoot> {
         let table = match &self
             .source(target)
             .ok_or_else(|| LimboError::InternalError(format!("missing UPDATE target {target}")))?
@@ -50,19 +84,31 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             self.analyze_btree_write_metadata(new_source, &table)?;
         }
 
-        let (from, from_scope) = match syntax.from.as_ref() {
+        let (from, from_scope) = match syntax.from {
             Some(syntax) => {
-                let (from, scope) = self.analyze_from_clause(syntax, FromContext::Root)?;
+                let (from, scope) = self.analyze_from_clause(
+                    syntax,
+                    FromContext::Dml {
+                        outer_scope: expressions.outer_scope,
+                        policies: expressions.policies,
+                    },
+                )?;
                 (Some(from), Some(scope))
             }
             None => (None, None),
         };
         let mut scope = self.update_read_scope(target)?;
         if let Some(from_scope) = from_scope {
-            scope.append_local(from_scope);
+            scope.append_local(from_scope.without_outer());
         }
-        let assignments =
-            self.analyze_update_assignments(&syntax.sets, new_source, table.value(), &scope)?;
+        scope.set_outer(expressions.outer_scope);
+        let assignments = self.analyze_update_assignments(
+            syntax.assignments,
+            new_source,
+            table.value(),
+            &scope,
+            expressions.policies,
+        )?;
         let target_kind = if virtual_target {
             hir::UpdateTargetKind::Virtual
         } else {
@@ -72,17 +118,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
             }
         };
-        let returning = self.analyze_dml_returning(&syntax.returning, new_source)?;
+        let returning = self.analyze_dml_returning_with_policies(
+            syntax.returning,
+            new_source,
+            expressions.policies,
+        )?;
         let predicate = syntax
-            .where_clause
-            .as_deref()
+            .predicate
             .map(|syntax| {
-                self.analyze_root_expr(
-                    syntax,
-                    &scope,
-                    ExprPolicy::where_clause(self.context().dqs_dml()),
-                )
-                .map(|resolved| resolved.expr)
+                self.analyze_root_expr(syntax, &scope, expressions.policies.where_clause())
+                    .map(|resolved| resolved.expr)
             })
             .transpose()?;
 
@@ -95,9 +140,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             predicate,
             order_by: Vec::new(),
             limit: None,
-            conflict: syntax.or_conflict,
+            conflict: syntax.conflict,
             returning,
-            trigger: None,
+            trigger,
             cdc_updates_override: None,
         }))
     }
@@ -190,6 +235,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         new_source: hir::SourceId,
         table: &Table,
         scope: &Scope,
+        policies: ExprPolicies,
     ) -> Result<Vec<hir::Assignment>> {
         let mut assignments = Vec::<hir::Assignment>::new();
         for set in sets {
@@ -209,7 +255,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         None,
                         scope,
                         &expected_outputs,
-                        ExprPolicies::statement(self.context().dqs_dml()),
+                        policies,
                     )?;
                     let output_width = self
                         .query(query)
@@ -262,7 +308,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     self.analyze_root_expr_with_expected_type(
                         syntax,
                         scope,
-                        ExprPolicy::update(self.context().dqs_dml()),
+                        policies.update(),
                         self.write_target_type(table, column)?,
                     )?
                     .expr

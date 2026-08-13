@@ -9,7 +9,8 @@ use super::{
     insert::{InsertBodySyntax, InsertExprContext},
     query::table_has_rowid,
     scope::Scope,
-    TriggerAnalysis, TriggerInsert,
+    update::{UpdateBodySyntax, UpdateExprContext},
+    TriggerAnalysis, TriggerInsert, TriggerUpdate,
 };
 use crate::{util::normalize_ident, LimboError, Result};
 
@@ -92,6 +93,33 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             target,
             InsertExprContext {
                 outer_scope: &scope,
+                policies,
+            },
+            Some(environment),
+        )
+    }
+
+    pub(super) fn analyze_trigger_update(
+        &mut self,
+        context: TriggerAnalysis,
+        update: TriggerUpdate<'ast>,
+    ) -> Result<hir::HirRoot> {
+        let database = context.database;
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+        let target =
+            self.analyze_base_table_source_in_database(update.table, database, SourceOwner::Root)?;
+        self.analyze_update_target(
+            target,
+            UpdateBodySyntax {
+                conflict: update.conflict_override.or(update.command_conflict),
+                assignments: update.assignments,
+                from: update.from,
+                predicate: update.predicate,
+                returning: &[],
+            },
+            UpdateExprContext {
+                outer_scope: Some(&scope),
                 policies,
             },
             Some(environment),

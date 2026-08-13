@@ -30,6 +30,10 @@ pub(crate) enum AnalyzeInput<'ast> {
         context: TriggerAnalysis,
         insert: TriggerInsert<'ast>,
     },
+    TriggerUpdate {
+        context: TriggerAnalysis,
+        update: TriggerUpdate<'ast>,
+    },
 }
 
 pub(crate) struct TriggerInsert<'ast> {
@@ -40,6 +44,15 @@ pub(crate) struct TriggerInsert<'ast> {
     pub(crate) select: &'ast turso_parser::ast::Select,
     pub(crate) upsert: Option<&'ast turso_parser::ast::Upsert>,
     pub(crate) returning: &'ast [turso_parser::ast::ResultColumn],
+}
+
+pub(crate) struct TriggerUpdate<'ast> {
+    pub(crate) command_conflict: Option<turso_parser::ast::ResolveType>,
+    pub(crate) conflict_override: Option<turso_parser::ast::ResolveType>,
+    pub(crate) table: &'ast turso_parser::ast::Name,
+    pub(crate) assignments: &'ast [turso_parser::ast::Set],
+    pub(crate) from: Option<&'ast turso_parser::ast::FromClause>,
+    pub(crate) predicate: Option<&'ast turso_parser::ast::Expr>,
 }
 
 pub(crate) struct TriggerAnalysis {

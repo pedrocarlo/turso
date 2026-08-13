@@ -30,6 +30,10 @@ pub(super) enum FromContext<'scope> {
         outer_scope: Option<&'scope Scope>,
         policies: ExprPolicies,
     },
+    Dml {
+        outer_scope: Option<&'scope Scope>,
+        policies: ExprPolicies,
+    },
     Root,
 }
 
@@ -37,20 +41,21 @@ impl<'scope> FromContext<'scope> {
     fn source_owner(self) -> SourceOwner {
         match self {
             Self::QueryBlock { block, .. } => SourceOwner::QueryBlock(block),
-            Self::Root => SourceOwner::Root,
+            Self::Dml { .. } | Self::Root => SourceOwner::Root,
         }
     }
 
     fn query_parent(self) -> Option<hir::QueryId> {
         match self {
             Self::QueryBlock { block, .. } => Some(block.query),
-            Self::Root => None,
+            Self::Dml { .. } | Self::Root => None,
         }
     }
 
     fn outer_scope(self) -> Option<&'scope Scope> {
         match self {
             Self::QueryBlock { outer_scope, .. } => outer_scope,
+            Self::Dml { outer_scope, .. } => outer_scope,
             Self::Root => None,
         }
     }
@@ -62,6 +67,7 @@ impl<'scope> FromContext<'scope> {
                 outer_scope,
                 policies,
             } => CteBindingContext::new(block.query, outer_scope, policies),
+            Self::Dml { policies, .. } => CteBindingContext::root(policies),
             Self::Root => CteBindingContext::root(ExprPolicies::statement(dqs_dml)),
         }
     }
@@ -69,6 +75,7 @@ impl<'scope> FromContext<'scope> {
     fn expr_policies(self, dqs_dml: super::context::DoubleQuotedDml) -> ExprPolicies {
         match self {
             Self::QueryBlock { policies, .. } => policies,
+            Self::Dml { policies, .. } => policies,
             Self::Root => ExprPolicies::statement(dqs_dml),
         }
     }
@@ -321,7 +328,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::SelectTable::TableCall(name, arguments, alias) => self
                 .analyze_table_function_source(name, arguments, alias.as_ref(), owner, cte_context),
             ast::SelectTable::Select(select, alias) => {
-                let id = self.analyze_derived_source(select, alias.as_ref(), owner, position)?;
+                let id = self.analyze_derived_source(select, alias.as_ref(), context, position)?;
                 Ok(AnalyzedTableSource {
                     id,
                     function_arguments: None,
@@ -589,9 +596,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         select: &'ast ast::Select,
         alias: Option<&ast::As>,
-        owner: SourceOwner,
+        context: FromContext<'_>,
         position: usize,
     ) -> Result<hir::SourceId> {
+        let owner = context.source_owner();
         let parent = match owner {
             SourceOwner::QueryBlock(block) => Some(block.query),
             SourceOwner::Root => None,
@@ -601,7 +609,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )));
             }
         };
-        let query = self.analyze_select_with_parent(select, parent)?;
+        let query = self.analyze_select_with_scope(
+            select,
+            parent,
+            context.outer_scope(),
+            None,
+            context.expr_policies(self.context().dqs_dml()),
+        )?;
         let columns = self.query_source_columns(query)?;
         let width = columns.len();
         let source = self.reserve_source();
