@@ -412,6 +412,27 @@ pub(super) enum CteResolution {
 }
 
 impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
+    pub(super) fn with_cte_scope<T>(
+        &mut self,
+        with: Option<&'ast ast::With>,
+        analyze: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let Some(with) = with else {
+            return analyze(self);
+        };
+
+        let depth = self.cte_scopes.len();
+        self.push_cte_scope(with)?;
+        let result = analyze(self);
+        assert_eq!(
+            self.cte_scopes.len(),
+            depth + 1,
+            "nested analysis leaked a CTE scope"
+        );
+        self.cte_scopes.pop().expect("CTE scope was pushed");
+        result
+    }
+
     pub(super) fn push_cte_scope(&mut self, with: &'ast ast::With) -> Result<()> {
         let mut entries = Vec::with_capacity(with.ctes.len());
         for cte in &with.ctes {
@@ -731,26 +752,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         compounds: &'ast [ast::CompoundSelect],
         context: CteBindingContext<'_>,
     ) -> Result<super::hir::QueryId> {
-        if let Some(with) = &whole.with {
-            self.push_cte_scope(with)?;
-        }
-        let result = self.analyze_select_parts(
-            first,
-            compounds,
-            &[],
-            None,
-            super::analyze::SelectContext {
-                parent: context.query_parent(),
-                outer_scope: context.outer_scope,
-                expected_outputs: None,
-            },
-        );
-        if whole.with.is_some() {
-            self.cte_scopes
-                .pop()
-                .expect("recursive CTE body WITH scope was pushed");
-        }
-        result
+        self.with_cte_scope(whole.with.as_ref(), |analyzer| {
+            analyzer.analyze_select_parts(
+                first,
+                compounds,
+                &[],
+                None,
+                super::analyze::SelectContext {
+                    parent: context.query_parent(),
+                    outer_scope: context.outer_scope,
+                    expected_outputs: None,
+                },
+            )
+        })
     }
 
     fn analyze_cte_select(

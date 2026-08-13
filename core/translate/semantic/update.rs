@@ -14,7 +14,12 @@ use crate::{function::ScalarFunc, schema::Table, util::normalize_ident, LimboErr
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_update(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
         reject_deferred_update_clauses(syntax)?;
+        self.with_cte_scope(syntax.with.as_ref(), |analyzer| {
+            analyzer.analyze_update_body(syntax)
+        })
+    }
 
+    fn analyze_update_body(&mut self, syntax: &'ast ast::Update) -> Result<HirRoot> {
         let target = self.analyze_base_table_source(
             &syntax.tbl_name,
             None,
@@ -216,9 +221,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 }
 
 fn reject_deferred_update_clauses(syntax: &ast::Update) -> Result<()> {
-    if syntax.with.is_some() {
-        return unsupported_update("WITH clauses");
-    }
     if syntax.from.is_some() {
         return unsupported_update("FROM clauses");
     }

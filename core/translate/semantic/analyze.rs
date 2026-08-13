@@ -478,16 +478,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
     ) -> Result<QueryId> {
-        if let Some(with) = &select.with {
-            self.push_cte_scope(with)?;
-        }
-        let result = self.analyze_select_body(select, parent, outer_scope, expected_outputs);
-        if select.with.is_some() {
-            self.cte_scopes
-                .pop()
-                .expect("a SELECT WITH clause must own one CTE scope");
-        }
-        result
+        self.with_cte_scope(select.with.as_ref(), |analyzer| {
+            analyzer.analyze_select_body(select, parent, outer_scope, expected_outputs)
+        })
     }
 
     fn analyze_select_body(
@@ -6350,7 +6343,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_insert_with_does_not_leak_its_cte_scope() {
+    fn failed_statements_do_not_leak_cte_scopes() {
         let schema = schema_with_writable_table();
         let symbols = SymbolTable::new();
         let context = SemanticContext::for_main_schema_object(
@@ -6359,7 +6352,18 @@ mod tests {
             true,
             Arc::new(SqliteDialect),
         );
-        let statement = parse_statement(
+        let mut analyzer = Analyzer::new(&context);
+
+        let select = parse_statement("WITH broken AS (SELECT missing) SELECT * FROM broken");
+        let ast::Stmt::Select(select) = &select else {
+            panic!("SQL contains SELECT");
+        };
+        analyzer
+            .analyze_select(select)
+            .expect_err("invalid CTE body fails SELECT analysis");
+        assert!(analyzer.cte_scopes.is_empty(), "SELECT scope is removed");
+
+        let insert = parse_statement(
             "WITH broken AS (SELECT missing) \
              INSERT INTO writable(id) VALUES ((SELECT * FROM broken))",
         );
@@ -6370,11 +6374,10 @@ mod tests {
             columns,
             body,
             returning,
-        } = &statement
+        } = &insert
         else {
             panic!("SQL contains INSERT");
         };
-        let mut analyzer = Analyzer::new(&context);
         analyzer
             .analyze_insert(
                 with.as_ref(),
@@ -6385,7 +6388,19 @@ mod tests {
                 returning,
             )
             .expect_err("invalid CTE body fails INSERT analysis");
-        assert!(analyzer.cte_scopes.is_empty());
+        assert!(analyzer.cte_scopes.is_empty(), "INSERT scope is removed");
+
+        let update = parse_statement(
+            "WITH broken AS (SELECT missing) \
+             UPDATE writable SET value = (SELECT * FROM broken)",
+        );
+        let ast::Stmt::Update(update) = &update else {
+            panic!("SQL contains UPDATE");
+        };
+        analyzer
+            .analyze_update(update)
+            .expect_err("invalid CTE body fails UPDATE analysis");
+        assert!(analyzer.cte_scopes.is_empty(), "UPDATE scope is removed");
     }
 
     #[test]
@@ -8520,24 +8535,107 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_deferred_clauses_before_binding_the_target() {
+    fn update_with_scope_reaches_set_where_and_returning_subqueries() {
         let schema = schema_with_writable_table();
-        for (sql, feature) in [
-            (
-                "WITH input(x) AS (VALUES(1)) UPDATE absent SET value = x",
-                "WITH clauses",
-            ),
-            (
-                "UPDATE absent SET value = other.value FROM writable AS other",
-                "FROM clauses",
-            ),
-        ] {
-            let error = analyze_sql_with_schema(&schema, sql)
-                .expect_err("deferred UPDATE clause fails first");
-            assert_eq!(
-                error.to_string(),
-                format!("Parse error: semantic UPDATE does not yet accept {feature}")
-            );
-        }
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH values_to_use(id, text) AS (VALUES(3, 'from cte')) \
+             UPDATE writable \
+             SET value = (SELECT text FROM values_to_use) \
+             WHERE id = (SELECT id FROM values_to_use) \
+             RETURNING (SELECT text FROM values_to_use)",
+        )
+        .expect("UPDATE clauses share the statement CTE scope");
+        document
+            .validate()
+            .expect("UPDATE WITH produces closed HIR");
+        assert_eq!(document.ctes.len(), 1);
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let mut query_ids = Vec::new();
+        update.assignments[0].value.walk(&mut |expression| {
+            if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                query_ids.push(*query);
+            }
+        });
+        update
+            .predicate
+            .as_ref()
+            .expect("WHERE is preserved")
+            .walk(&mut |expression| {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                    query_ids.push(*query);
+                }
+            });
+        update
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs[0]
+            .expr
+            .walk(&mut |expression| {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                    query_ids.push(*query);
+                }
+            });
+        assert_eq!(query_ids.len(), 3);
+        assert!(query_ids.iter().all(|query| {
+            document
+                .query(*query)
+                .expect("clause subquery exists")
+                .reachable_ctes
+                == [document.ctes[0].id]
+        }));
+    }
+
+    #[test]
+    fn update_with_is_lazy_recursive_and_does_not_shadow_target() {
+        let schema = schema_with_writable_table();
+        let lazy = analyze_sql_with_schema(
+            &schema,
+            "WITH broken AS (SELECT missing) UPDATE writable SET value = 'ok'",
+        )
+        .expect("unused invalid UPDATE CTE stays unbound");
+        assert!(lazy.ctes.is_empty());
+
+        let recursive = analyze_sql_with_schema(
+            &schema,
+            "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL \
+                 SELECT x + 1 FROM seq WHERE x < 2) \
+             UPDATE writable SET id = (SELECT max(x) FROM seq)",
+        )
+        .expect("recursive UPDATE CTE binds");
+        assert!(matches!(recursive.ctes[0].body, CteBody::Recursive(_)));
+
+        let shadowed = analyze_sql_with_schema(
+            &schema,
+            "WITH writable(id, value) AS (VALUES(9, 'cte')) \
+             UPDATE writable SET value = (SELECT value FROM writable)",
+        )
+        .expect("CTE name does not shadow UPDATE catalog target");
+        let HirRoot::Update(update) = &shadowed.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let target = shadowed
+            .source(update.target)
+            .expect("target source exists");
+        assert!(matches!(target.kind, SourceKind::Table(_)));
+        assert_eq!(shadowed.ctes.len(), 1);
+    }
+
+    #[test]
+    fn update_rejects_from_before_binding_the_target() {
+        let schema = schema_with_writable_table();
+        let error = analyze_sql_with_schema(
+            &schema,
+            "UPDATE absent SET value = other.value FROM writable AS other",
+        )
+        .expect_err("deferred UPDATE FROM fails first");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: semantic UPDATE does not yet accept FROM clauses"
+        );
     }
 }
