@@ -34,6 +34,10 @@ pub(crate) enum AnalyzeInput<'ast> {
         context: TriggerAnalysis,
         update: TriggerUpdate<'ast>,
     },
+    TriggerDelete {
+        context: TriggerAnalysis,
+        delete: TriggerDelete<'ast>,
+    },
 }
 
 pub(crate) struct TriggerInsert<'ast> {
@@ -52,6 +56,11 @@ pub(crate) struct TriggerUpdate<'ast> {
     pub(crate) table: &'ast turso_parser::ast::Name,
     pub(crate) assignments: &'ast [turso_parser::ast::Set],
     pub(crate) from: Option<&'ast turso_parser::ast::FromClause>,
+    pub(crate) predicate: Option<&'ast turso_parser::ast::Expr>,
+}
+
+pub(crate) struct TriggerDelete<'ast> {
+    pub(crate) table: &'ast turso_parser::ast::Name,
     pub(crate) predicate: Option<&'ast turso_parser::ast::Expr>,
 }
 

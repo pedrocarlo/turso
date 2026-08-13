@@ -5,11 +5,17 @@ use turso_parser::ast;
 use super::{
     analyze::Analyzer,
     dml::trigger_targets_database,
-    expr::ExprPolicy,
+    expr::ExprPolicies,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
 };
 use crate::{LimboError, Result};
+
+#[derive(Clone, Copy)]
+pub(super) struct DeleteExprContext<'scope> {
+    pub(super) outer_scope: Option<&'scope Scope>,
+    pub(super) policies: ExprPolicies,
+}
 
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn analyze_delete(
@@ -21,19 +27,29 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
         self.with_cte_scope(with, |analyzer| {
-            analyzer.analyze_delete_body(table_name, indexed, where_clause, returning)
+            let target =
+                analyzer.analyze_base_table_source(table_name, None, indexed, SourceOwner::Root)?;
+            analyzer.analyze_delete_target(
+                target,
+                where_clause,
+                returning,
+                DeleteExprContext {
+                    outer_scope: None,
+                    policies: ExprPolicies::statement(analyzer.context().dqs_dml()),
+                },
+                None,
+            )
         })
     }
 
-    fn analyze_delete_body(
+    pub(super) fn analyze_delete_target(
         &mut self,
-        table_name: &'ast ast::QualifiedName,
-        indexed: Option<&'ast ast::Indexed>,
+        target: hir::SourceId,
         where_clause: Option<&'ast ast::Expr>,
         returning: &'ast [ast::ResultColumn],
+        expressions: DeleteExprContext<'_>,
+        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
-        let target =
-            self.analyze_base_table_source(table_name, None, indexed, SourceOwner::Root)?;
         let table = match &self
             .source(target)
             .ok_or_else(|| LimboError::InternalError(format!("missing DELETE target {target}")))?
@@ -66,18 +82,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             )));
         };
 
-        let scope = self.delete_read_scope(target)?;
+        let mut scope = self.delete_read_scope(target)?;
+        scope.set_outer(expressions.outer_scope);
         let predicate = where_clause
             .map(|syntax| {
-                self.analyze_root_expr(
-                    syntax,
-                    &scope,
-                    ExprPolicy::where_clause(self.context().dqs_dml()),
-                )
-                .map(|resolved| resolved.expr)
+                self.analyze_root_expr(syntax, &scope, expressions.policies.where_clause())
+                    .map(|resolved| resolved.expr)
             })
             .transpose()?;
-        let returning = self.analyze_dml_returning(returning, target)?;
+        let returning =
+            self.analyze_dml_returning_with_policies(returning, target, expressions.policies)?;
 
         Ok(HirRoot::Delete(hir::Delete {
             target,
@@ -86,7 +100,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             order_by: Vec::new(),
             limit: None,
             returning,
-            trigger: None,
+            trigger,
         }))
     }
 
