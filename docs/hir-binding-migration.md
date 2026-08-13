@@ -275,9 +275,8 @@ Completed:
   and correlated subqueries. Generated-column reads and every ordinary,
   expression, and partial index close against that target; `INDEXED BY` keeps
   its resolved catalog identity. Target metadata is split between B-tree and
-  virtual variants from the start. Virtual targets remain an explicit later
-  checkpoint, while WITHOUT ROWID targets keep their existing unsupported
-  diagnostic.
+  virtual variants from the start. WITHOUT ROWID targets keep their existing
+  unsupported diagnostic.
 - DELETE trigger identities retain catalog order and include only DELETE
   triggers for the target database. Trigger programs and trigger environments
   remain later checkpoints.
@@ -294,6 +293,9 @@ Completed:
   and recursive definitions bind lazily, unused invalid definitions remain
   absent, and a CTE named like the target does not shadow the catalog DELETE
   destination. The statement scope is removed on success or error.
+- Virtual-table DELETE targets use the virtual metadata variant and cannot
+  carry B-tree indexes, CHECKs, triggers, or foreign keys. WHERE, RETURNING,
+  aliases, rowid, and WITH subqueries retain the ordinary DELETE binding rules.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

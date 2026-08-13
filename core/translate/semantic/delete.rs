@@ -46,16 +46,25 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 )));
             }
         };
-        let btree = table.value().btree().ok_or_else(|| {
-            LimboError::ParseError("semantic DELETE does not yet accept virtual tables".to_string())
-        })?;
-        if !btree.has_rowid {
-            return Err(LimboError::ParseError(
-                "DELETE from WITHOUT ROWID tables is not supported".to_string(),
-            ));
-        }
-        self.analyze_btree_delete_metadata(target, &table)?;
-        let foreign_keys = self.analyze_dml_foreign_keys(&table, target)?;
+        let target_kind = if let Some(btree) = table.value().btree() {
+            if !btree.has_rowid {
+                return Err(LimboError::ParseError(
+                    "DELETE from WITHOUT ROWID tables is not supported".to_string(),
+                ));
+            }
+            self.analyze_btree_delete_metadata(target, &table)?;
+            hir::DeleteTargetKind::BTree {
+                triggers: self.analyze_delete_triggers(&table),
+                foreign_keys: self.analyze_dml_foreign_keys(&table, target)?,
+            }
+        } else if table.value().virtual_table().is_some() {
+            hir::DeleteTargetKind::Virtual
+        } else {
+            return Err(LimboError::InternalError(format!(
+                "DELETE target {} is not writable",
+                table.value().get_name()
+            )));
+        };
 
         let scope = self.delete_read_scope(target)?;
         let predicate = where_clause
@@ -72,10 +81,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
 
         Ok(HirRoot::Delete(hir::Delete {
             target,
-            target_kind: hir::DeleteTargetKind::BTree {
-                triggers: self.analyze_delete_triggers(&table),
-                foreign_keys,
-            },
+            target_kind,
             predicate,
             order_by: Vec::new(),
             limit: None,
