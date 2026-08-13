@@ -76,7 +76,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (columns, source, upserts, excluded_source) = match body {
             ast::InsertBody::DefaultValues => {
                 if !column_names.is_empty() {
-                    return unsupported_insert("a column list with DEFAULT VALUES");
+                    crate::bail_parse_error!("0 values for {} columns", column_names.len());
                 }
                 (
                     Vec::new(),
