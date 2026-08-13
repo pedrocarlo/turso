@@ -518,6 +518,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.analyze_select_with_scope(select, parent, Some(outer_scope), None)
     }
 
+    pub(super) fn analyze_subquery_with_expected_outputs(
+        &mut self,
+        select: &'ast ast::Select,
+        parent: Option<QueryId>,
+        outer_scope: &Scope,
+        expected_outputs: &[Option<Arc<TypeDef>>],
+    ) -> Result<QueryId> {
+        self.analyze_select_with_scope(select, parent, Some(outer_scope), Some(expected_outputs))
+    }
+
     fn analyze_select_with_scope(
         &mut self,
         select: &'ast ast::Select,
@@ -8613,6 +8623,90 @@ mod tests {
         assert!(matches!(
             default.assignments[0].value,
             Expr::Literal(ast::Literal::String(ref value)) if value.contains("fallback")
+        ));
+    }
+
+    #[test]
+    fn update_binds_row_subquery_as_one_assignment() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET (value, id) = (SELECT value, id)",
+        )
+        .expect("row subquery assignment binds");
+        document
+            .validate()
+            .expect("row subquery assignment produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.assignments.len(), 1);
+        assert_eq!(
+            update.assignments[0].columns,
+            [TargetColumn::Column(1), TargetColumn::Column(0)]
+        );
+        let Expr::Subquery(SubqueryExpr::Row { query }) = update.assignments[0].value else {
+            panic!("multi-column SET keeps one row subquery");
+        };
+        let query = document.query(query).expect("assignment query exists");
+        assert_eq!(query.output.len(), 2);
+        assert_eq!(query.captures, [update.target]);
+        assert_eq!(
+            query.blocks[0].outputs[0].type_fact.storage,
+            Some(Type::Text)
+        );
+        assert_eq!(
+            query.blocks[0].outputs[1].type_fact.storage,
+            Some(Type::Integer)
+        );
+    }
+
+    #[test]
+    fn update_row_subquery_keeps_width_and_duplicate_rules() {
+        let schema = schema_with_writable_table();
+        let error =
+            analyze_sql_with_schema(&schema, "UPDATE writable SET (value, id) = (SELECT value)")
+                .expect_err("row subquery width mismatch fails");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: 2 columns assigned 1 values"
+        );
+
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable \
+             SET (value, id) = (SELECT 'first', 8), value = 'last'",
+        )
+        .expect("later scalar assignment replaces one row-subquery output");
+        document
+            .validate()
+            .expect("split row assignment produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.assignments.len(), 2);
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Literal(ast::Literal::String(ref value)) if value.contains("last")
+        ));
+        assert!(matches!(
+            update.assignments[1].value,
+            Expr::Subquery(SubqueryExpr::Scalar { output: 1, .. })
+        ));
+
+        let duplicate = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET (value, value) = (SELECT 'first', 'last')",
+        )
+        .expect("duplicate row targets keep the last output");
+        let HirRoot::Update(update) = &duplicate.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        assert_eq!(update.assignments.len(), 1);
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Subquery(SubqueryExpr::Scalar { output: 1, .. })
         ));
     }
 

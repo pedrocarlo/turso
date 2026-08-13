@@ -56,7 +56,7 @@ Missing HIR binding:
 
 | Surface | Evidence | Required work |
 |---|---|---|
-| Row-valued scalar subqueries and assignments | The current translator supports `(a, b) = (SELECT ...)`, and conformance coverage includes multi-column UPDATE subqueries. Semantic scalar subqueries require exactly one output; UPDATE splits only literal parenthesized RHS values. | Add a row-valued subquery HIR form, validate output width against the surrounding row, and allow one subquery to feed a multi-column assignment. |
+| Row-valued scalar subqueries in comparisons | The current translator supports `(a, b) = (SELECT ...)`. Semantic HIR now represents row subqueries for multi-column UPDATE assignments, but expression frames still require scalar subquery results. | Let supported row-operand positions consume all query outputs, validate width against the other operand, and freeze one comparison component per output. |
 | Parenthesized FROM groups | `SelectTable::Sub(FromClause, alias)` has an explicit archived-binder branch and is walked by recursive-CTE reference counting, but `analyze_table_source` falls through. This is distinct from `SelectTable::Select`, which already creates a derived query. | Represent a nested FROM group without inventing a query. Preserve group aliases, qualifier visibility, join nesting, and lexical column order. |
 | Scalar function modifiers | Production accepts and ignores `DISTINCT` on scalar calls; it currently also ignores scalar `FILTER`. Semantic analysis rejects every scalar call carrying `DISTINCT`, argument `ORDER BY`, `FILTER`, or `*` through one generic fallback. | Preserve current binding behavior deliberately, while retaining existing errors for scalar `OVER` and wrong arity. Do not silently conflate scalar and aggregate metadata. |
 | Custom CAST fallback | Production falls through to ordinary CAST when a resolved custom type has the wrong parameter count; semantic analysis emits a generic unsupported error. Custom array targets also take different paths. | Match production fallback and array behavior, then replace the generic catch-all with specific invariants or diagnostics. |
@@ -114,6 +114,10 @@ Completed:
   expression frames flatten only supported row positions; HIR keeps one
   comparison component per element with resolved affinity and collation, while
   width mismatches and scalar-only positions retain their existing errors.
+- Multi-column UPDATE subqueries bind as one row-subquery assignment. Query
+  output width is validated against target width, outputs receive destination
+  types, correlated captures stay document-owned, and duplicate targets retain
+  last-assignment-wins behavior through shared scalar output references.
 - Catalog-resolved custom `CAST` targets that need no stored program.
 - Simple custom `CAST` encoders bound against document-owned synthetic inputs.
 - Domain `NOT NULL` and `CHECK` rules frozen into custom `CAST` targets.
@@ -358,8 +362,8 @@ Completed:
 
 The completed standalone SELECT expression checkpoints cover scalar
 expressions, row operands in comparisons, `BETWEEN`, list and query `IN`, and
-`MATCH`. Row-valued scalar subqueries remain in the audit above. `union_value`
-is resolved only in destination-aware DML expressions.
+`MATCH`. Row-valued subqueries as comparison operands remain in the audit
+above. `union_value` is resolved only in destination-aware DML expressions.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
