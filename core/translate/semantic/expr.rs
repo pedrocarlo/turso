@@ -28,7 +28,18 @@ pub(crate) struct ExprPolicy {
     allow_windows: bool,
     raise: RaisePolicy,
     self_source: Option<hir::SourceId>,
-    unavailable_trigger_row: Option<UnavailableTriggerRow>,
+    policies: ExprPolicies,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExprPolicies {
+    dqs_dml: DoubleQuotedDml,
+    trigger: Option<TriggerExprContext>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TriggerExprContext {
+    unavailable_row: Option<UnavailableTriggerRow>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +88,7 @@ impl ExprPolicy {
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -89,7 +100,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -101,7 +112,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -113,7 +124,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -129,7 +140,7 @@ impl ExprPolicy {
             allow_windows: true,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -141,7 +152,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -153,7 +164,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -165,7 +176,7 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(dqs_dml),
         }
     }
 
@@ -181,17 +192,6 @@ impl ExprPolicy {
         Self::insert_values(dqs_dml)
     }
 
-    pub(super) fn trigger_predicate(dqs_dml: DoubleQuotedDml, event: &ast::TriggerEvent) -> Self {
-        let mut policy = Self::where_clause(dqs_dml);
-        policy.raise = RaisePolicy::Trigger;
-        policy.unavailable_trigger_row = match event {
-            ast::TriggerEvent::Insert => Some(UnavailableTriggerRow::Old),
-            ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => None,
-            ast::TriggerEvent::Delete => Some(UnavailableTriggerRow::New),
-        };
-        policy
-    }
-
     pub(crate) const fn without_dqs_fallback(mut self) -> Self {
         self.allow_dqs_fallback = false;
         self
@@ -205,13 +205,70 @@ impl ExprPolicy {
             allow_windows: false,
             raise: RaisePolicy::AbortOnly,
             self_source: None,
-            unavailable_trigger_row: None,
+            policies: ExprPolicies::statement(DoubleQuotedDml::Disabled),
         }
     }
 
     pub(super) const fn with_self_source(mut self, source: hir::SourceId) -> Self {
         self.self_source = Some(source);
         self
+    }
+}
+
+impl ExprPolicies {
+    pub(crate) const fn statement(dqs_dml: DoubleQuotedDml) -> Self {
+        Self {
+            dqs_dml,
+            trigger: None,
+        }
+    }
+
+    pub(super) fn trigger(dqs_dml: DoubleQuotedDml, event: &ast::TriggerEvent) -> Self {
+        let unavailable_row = match event {
+            ast::TriggerEvent::Insert => Some(UnavailableTriggerRow::Old),
+            ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => None,
+            ast::TriggerEvent::Delete => Some(UnavailableTriggerRow::New),
+        };
+        Self {
+            dqs_dml,
+            trigger: Some(TriggerExprContext { unavailable_row }),
+        }
+    }
+
+    fn apply(self, mut policy: ExprPolicy) -> ExprPolicy {
+        policy.policies = self;
+        if self.trigger.is_some() {
+            policy.raise = RaisePolicy::Trigger;
+        }
+        policy
+    }
+
+    pub(crate) fn select(self) -> ExprPolicy {
+        self.apply(ExprPolicy::select(self.dqs_dml))
+    }
+
+    pub(crate) fn where_clause(self) -> ExprPolicy {
+        self.apply(ExprPolicy::where_clause(self.dqs_dml))
+    }
+
+    pub(crate) fn group_by(self) -> ExprPolicy {
+        self.apply(ExprPolicy::group_by(self.dqs_dml))
+    }
+
+    pub(crate) fn having(self) -> ExprPolicy {
+        self.apply(ExprPolicy::having(self.dqs_dml))
+    }
+
+    pub(crate) fn order_by(self, aggregate_query: bool) -> ExprPolicy {
+        self.apply(ExprPolicy::order_by(self.dqs_dml, aggregate_query))
+    }
+
+    pub(crate) fn limit(self) -> ExprPolicy {
+        self.apply(ExprPolicy::limit(self.dqs_dml))
+    }
+
+    pub(crate) fn table_function(self) -> ExprPolicy {
+        self.apply(ExprPolicy::table_function(self.dqs_dml))
     }
 }
 
@@ -1202,9 +1259,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 ast::Expr::Subquery(_)
                 | ast::Expr::Exists(_)
                 | ast::Expr::InSelect { .. }
-                | ast::Expr::InTable { .. } => {
-                    self.build_subquery_expr(frame.syntax, frame.resolved_children, scope, owner)?
-                }
+                | ast::Expr::InTable { .. } => self.build_subquery_expr(
+                    frame.syntax,
+                    frame.resolved_children,
+                    scope,
+                    owner,
+                    policy.policies,
+                )?,
                 _ => FrameValue::Scalar(self.build_expr_from_frames(
                     frame.syntax,
                     frame.resolved_children,
@@ -1227,16 +1288,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         children: FrameChildren,
         scope: &Scope,
         owner: ExprOwner,
+        policies: ExprPolicies,
     ) -> Result<FrameValue> {
         match syntax {
             ast::Expr::Subquery(select) => {
                 expect_no_frame_children(children)?;
-                let query = self.analyze_subquery(select, owner.query(), scope)?;
+                let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
                 self.resolve_query_value(query)
             }
             ast::Expr::Exists(select) => {
                 expect_no_frame_children(children)?;
-                let query = self.analyze_subquery(select, owner.query(), scope)?;
+                let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
                 Ok(FrameValue::Scalar(computed_expr(
                     hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)),
                     hir::TypeFact::known(Type::Integer),
@@ -1246,10 +1308,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             ast::Expr::InSelect {
                 not, rhs: select, ..
             } => self
-                .build_in_subquery(scalar_frame_children(children)?, select, *not, scope, owner)
+                .build_in_subquery(
+                    scalar_frame_children(children)?,
+                    select,
+                    *not,
+                    scope,
+                    owner,
+                    policies,
+                )
                 .map(FrameValue::Scalar),
             ast::Expr::InTable { not, rhs, args, .. } => {
-                let query = self.analyze_named_relation_query(rhs, args, owner.query(), scope)?;
+                let query =
+                    self.analyze_named_relation_query(rhs, args, owner.query(), scope, policies)?;
                 self.build_in_query(scalar_frame_children(children)?, query, *not)
                     .map(FrameValue::Scalar)
             }
@@ -1266,8 +1336,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         negated: bool,
         scope: &Scope,
         owner: ExprOwner,
+        policies: ExprPolicies,
     ) -> Result<ResolvedScopeExpr> {
-        let query = self.analyze_subquery(select, owner.query(), scope)?;
+        let query = self.analyze_subquery(select, owner.query(), scope, policies)?;
         self.build_in_query(lhs, query, negated)
     }
 
@@ -3725,7 +3796,11 @@ fn validate_raise(action: ast::ResolveType, policy: RaisePolicy) -> Result<()> {
 
 fn reject_unavailable_trigger_row(policy: ExprPolicy, namespace: &str) -> Result<()> {
     let namespace = normalize_ident(namespace);
-    match policy.unavailable_trigger_row {
+    match policy
+        .policies
+        .trigger
+        .and_then(|trigger| trigger.unavailable_row)
+    {
         Some(UnavailableTriggerRow::New) if namespace == "new" => {
             crate::bail_parse_error!("NEW references are only valid in INSERT and UPDATE triggers");
         }

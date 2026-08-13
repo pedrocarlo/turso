@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
-    expr::ExprPolicy,
+    expr::ExprPolicies,
     hir::{self, CatalogObject, SourceOwner},
     query::table_has_rowid,
     scope::Scope,
@@ -99,7 +99,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .analyze_root_expr(
                 expression,
                 &scope,
-                ExprPolicy::trigger_predicate(self.context().dqs_dml(), &context.event),
+                ExprPolicies::trigger(self.context().dqs_dml(), &context.event).where_clause(),
             )?
             .expr;
 

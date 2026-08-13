@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     context::SemanticContext,
-    expr::{ExprPolicy, QueryFunctionState},
+    expr::{ExprPolicies, ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
         CteId, DatabaseId, DatabaseSnapshot, DeleteTargetKind, Expr, FunctionEvaluation,
@@ -100,6 +100,7 @@ pub(super) struct SelectContext<'scope> {
     pub(super) parent: Option<QueryId>,
     pub(super) outer_scope: Option<&'scope Scope>,
     pub(super) expected_outputs: Option<&'scope [Option<Arc<TypeDef>>]>,
+    pub(super) policies: ExprPolicies,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -494,7 +495,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     pub(super) fn analyze_select(&mut self, select: &'ast ast::Select) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, None, None, None)
+        self.analyze_select_with_scope(
+            select,
+            None,
+            None,
+            None,
+            ExprPolicies::statement(self.context.dqs_dml()),
+        )
     }
 
     pub(super) fn analyze_select_with_expected_outputs(
@@ -502,7 +509,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         expected_outputs: &[Option<Arc<TypeDef>>],
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, None, None, Some(expected_outputs))
+        self.analyze_select_with_scope(
+            select,
+            None,
+            None,
+            Some(expected_outputs),
+            ExprPolicies::statement(self.context.dqs_dml()),
+        )
     }
 
     pub(super) fn analyze_select_with_parent(
@@ -510,7 +523,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, parent, None, None)
+        self.analyze_select_with_scope(
+            select,
+            parent,
+            None,
+            None,
+            ExprPolicies::statement(self.context.dqs_dml()),
+        )
     }
 
     pub(super) fn analyze_subquery(
@@ -518,8 +537,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         parent: Option<QueryId>,
         outer_scope: &Scope,
+        policies: ExprPolicies,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, parent, Some(outer_scope), None)
+        self.analyze_select_with_scope(select, parent, Some(outer_scope), None, policies)
     }
 
     pub(super) fn analyze_subquery_with_expected_outputs(
@@ -528,19 +548,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: &Scope,
         expected_outputs: &[Option<Arc<TypeDef>>],
+        policies: ExprPolicies,
     ) -> Result<QueryId> {
-        self.analyze_select_with_scope(select, parent, Some(outer_scope), Some(expected_outputs))
+        self.analyze_select_with_scope(
+            select,
+            parent,
+            Some(outer_scope),
+            Some(expected_outputs),
+            policies,
+        )
     }
 
-    fn analyze_select_with_scope(
+    pub(super) fn analyze_select_with_scope(
         &mut self,
         select: &'ast ast::Select,
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<QueryId> {
         self.with_cte_scope(select.with.as_ref(), |analyzer| {
-            analyzer.analyze_select_body(select, parent, outer_scope, expected_outputs)
+            analyzer.analyze_select_body(select, parent, outer_scope, expected_outputs, policies)
         })
     }
 
@@ -550,6 +578,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         parent: Option<QueryId>,
         outer_scope: Option<&Scope>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<QueryId> {
         self.analyze_select_parts(
             &select.body.select,
@@ -560,6 +589,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 parent,
                 outer_scope,
                 expected_outputs,
+                policies,
             },
         )
     }
@@ -576,6 +606,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             parent,
             outer_scope,
             expected_outputs,
+            policies,
         } = context;
         let rightmost = compounds
             .last()
@@ -600,6 +631,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             outer_scope,
             ordinary_order_by,
             expected_outputs,
+            policies,
         )?;
         blocks.push(first_block);
         for (index, compound) in compounds.iter().enumerate() {
@@ -610,6 +642,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 None,
                 expected_outputs,
+                policies,
             )?;
             debug_assert!(block_order_by.is_empty());
             blocks.push(block);
@@ -633,7 +666,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             order_by = self.analyze_compound_order_by(order_by_syntax, &blocks)?;
         }
         let limit = limit_syntax
-            .map(|limit| self.analyze_limit(limit, query_id))
+            .map(|limit| self.analyze_limit(limit, query_id, policies))
             .transpose()?;
 
         let first = blocks[0].id;
@@ -711,6 +744,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         match select {
             ast::OneSelect::Select {
@@ -732,11 +766,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 outer_scope,
                 order_by,
                 expected_outputs,
+                policies,
             ),
             ast::OneSelect::Values(rows) => {
                 debug_assert!(order_by.is_none_or(<[_]>::is_empty));
-                self.analyze_values_block(rows, query, index, outer_scope, expected_outputs)
-                    .map(|block| (block, Vec::new()))
+                self.analyze_values_block(
+                    rows,
+                    query,
+                    index,
+                    outer_scope,
+                    expected_outputs,
+                    policies,
+                )
+                .map(|block| (block, Vec::new()))
             }
         }
     }
@@ -755,6 +797,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outer_scope: Option<&Scope>,
         order_by: Option<&'ast [ast::SortedColumn]>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<(QueryBlock, Vec<OrderTerm>)> {
         if from.is_none()
             && columns
@@ -772,6 +815,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     FromContext::QueryBlock {
                         block: block_id,
                         outer_scope,
+                        policies,
                     },
                 )?;
                 (Some(from), scope)
@@ -779,14 +823,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => (None, Scope::new(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
-        self.analyze_named_windows(
-            window_clause,
+        self.analyze_named_windows(window_clause, &scope, policies.select(), &mut functions)?;
+        let outputs = self.analyze_outputs(
+            block_id,
+            columns,
             &scope,
-            ExprPolicy::select(self.context.dqs_dml()),
             &mut functions,
+            expected_outputs,
+            policies,
         )?;
-        let outputs =
-            self.analyze_outputs(block_id, columns, &scope, &mut functions, expected_outputs)?;
         let filter = match where_clause {
             Some(syntax) => {
                 let mut clause_scope = scope.clone();
@@ -794,7 +839,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let resolved = self.analyze_query_expr(
                     syntax,
                     &clause_scope,
-                    ExprPolicy::where_clause(self.context.dqs_dml()),
+                    policies.where_clause(),
                     &mut functions,
                 )?;
                 reject_clause_alias_functions(&resolved.expr, block_id, &outputs, false)?;
@@ -804,7 +849,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         };
         let grouping = group_by
             .map(|group_by| {
-                self.analyze_grouping(group_by, &scope, &outputs, block_id, &mut functions)
+                self.analyze_grouping(
+                    group_by,
+                    &scope,
+                    &outputs,
+                    block_id,
+                    &mut functions,
+                    policies,
+                )
             })
             .transpose()?;
         let aggregate_query = grouping.is_some() || functions.aggregate_count() > 0;
@@ -817,6 +869,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     block_id,
                     aggregate_query,
                     &mut functions,
+                    policies,
                 )
             })
             .transpose()?
@@ -850,10 +903,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         index: usize,
         outer_scope: Option<&Scope>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
         let scope = Scope::new(outer_scope.cloned());
-        let policy = ExprPolicy::select(self.context.dqs_dml());
+        let policy = policies.select();
         let mut functions = QueryFunctionState::new(block);
         let mut resolved_rows = Vec::with_capacity(rows.len());
         for row in rows {
@@ -920,6 +974,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         outputs: &[Output],
         block: QueryBlockId,
         functions: &mut QueryFunctionState,
+        policies: ExprPolicies,
     ) -> Result<super::hir::Grouping> {
         let mut grouping_scope = scope.clone().without_outer_resolution();
         grouping_scope.set_outputs(outputs);
@@ -933,7 +988,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     None => self.analyze_query_expr(
                         syntax,
                         &grouping_scope,
-                        ExprPolicy::group_by(self.context.dqs_dml()),
+                        policies.group_by(),
                         functions,
                     )?,
                 };
@@ -947,12 +1002,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some(syntax) => {
                 let mut having_scope = scope.clone();
                 having_scope.set_outputs(outputs);
-                let resolved = self.analyze_query_expr(
-                    syntax,
-                    &having_scope,
-                    ExprPolicy::having(self.context.dqs_dml()),
-                    functions,
-                )?;
+                let resolved =
+                    self.analyze_query_expr(syntax, &having_scope, policies.having(), functions)?;
                 reject_clause_alias_functions(&resolved.expr, block, outputs, true)?;
                 reject_aliased_aggregates(&resolved.expr, block, outputs)?;
                 Some(resolved.expr)
@@ -975,6 +1026,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         block: QueryBlockId,
         aggregate_query: bool,
         functions: &mut QueryFunctionState,
+        policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let mut order_scope = scope.clone();
         order_scope.set_outputs(outputs);
@@ -990,7 +1042,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     None => self.analyze_query_expr(
                         &syntax.expr,
                         &order_scope,
-                        ExprPolicy::order_by(self.context.dqs_dml(), aggregate_query),
+                        policies.order_by(aggregate_query),
                         functions,
                     )?,
                 };
@@ -1004,9 +1056,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         &mut self,
         syntax: &'ast ast::Limit,
         parent: QueryId,
+        policies: ExprPolicies,
     ) -> Result<Limit> {
         let scope = Scope::default();
-        let policy = ExprPolicy::limit(self.context.dqs_dml());
+        let policy = policies.limit();
         let limit = self.analyze_query_scalar_expr(&syntax.expr, &scope, policy, parent)?;
         let offset = syntax
             .offset
@@ -1116,6 +1169,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         functions: &mut QueryFunctionState,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
+        policies: ExprPolicies,
     ) -> Result<Vec<Output>> {
         let mut outputs = Vec::with_capacity(columns.len());
         for column in columns {
@@ -1133,6 +1187,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         scope,
                         functions,
                         expected_type,
+                        policies,
                     )?);
                 }
                 ast::ResultColumn::Star => {
@@ -1175,12 +1230,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         functions: &mut QueryFunctionState,
         expected_type: Option<Arc<TypeDef>>,
+        policies: ExprPolicies,
     ) -> Result<Output> {
         let ast::ResultColumn::Expr(expression, alias) = column else {
             return unsupported_select();
         };
         let syntax = expression;
-        let policy = ExprPolicy::select(self.context.dqs_dml());
+        let policy = policies.select();
         let resolved = self.analyze_query_expr_with_expected_type(
             syntax,
             scope,
@@ -1574,6 +1630,19 @@ mod tests {
             ast::Name::exact(row.to_string()),
             ast::Name::exact(column.to_string()),
         )
+    }
+
+    fn first_result_expression(sql: &str) -> ast::Expr {
+        let ast::Stmt::Select(select) = parse_statement(sql) else {
+            panic!("statement is SELECT");
+        };
+        let ast::OneSelect::Select { columns, .. } = select.body.select else {
+            panic!("SELECT has projection body");
+        };
+        let ast::ResultColumn::Expr(expression, _) = &columns[0] else {
+            panic!("first result is an expression");
+        };
+        expression.as_ref().clone()
     }
 
     fn schema_with_items() -> Schema {
@@ -5401,6 +5470,25 @@ mod tests {
         assert_eq!(
             missing.to_string(),
             "Parse error: no such column: new.absent"
+        );
+    }
+
+    #[test]
+    fn trigger_expression_policies_reach_nested_select_clauses() {
+        let schema = schema_with_writable_table();
+        let expression = first_result_expression(
+            "SELECT EXISTS(SELECT RAISE(IGNORE) WHERE new.value IS NOT NULL ORDER BY new.id)",
+        );
+        analyze_trigger_predicate_with_schema(&schema, ast::TriggerEvent::Update, &expression)
+            .expect("nested SELECT inherits trigger rows and RAISE policy");
+
+        let unavailable = first_result_expression("SELECT EXISTS(SELECT old.value)");
+        let error =
+            analyze_trigger_predicate_with_schema(&schema, ast::TriggerEvent::Insert, &unavailable)
+                .expect_err("nested SELECT inherits unavailable OLD rule");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
         );
     }
 

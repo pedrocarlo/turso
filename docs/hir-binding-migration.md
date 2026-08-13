@@ -87,6 +87,10 @@ Completed:
   NEW/OLD pseudo-sources. Column types and rowid identity stay in HIR; invalid
   event-row references keep their existing diagnostics without rewriting AST
   nodes into positional variables.
+- SELECT analysis receives one expression-policy bundle for all clauses,
+  table-function arguments, CTEs, and nested queries. Trigger policy is applied
+  when the bundle creates each clause policy, so callers do not consult
+  semantic context again or lose NEW/OLD and RAISE rules in nested SELECTs.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,

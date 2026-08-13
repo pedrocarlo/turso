@@ -5,7 +5,7 @@ use turso_parser::ast;
 use super::{
     analyze::Analyzer,
     dml::{trigger_matches_update, trigger_targets_database},
-    expr::ExprPolicy,
+    expr::{ExprPolicies, ExprPolicy},
     hir::{self, HirRoot, SourceOwner},
     query::FromContext,
     scope::Scope,
@@ -209,6 +209,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         None,
                         scope,
                         &expected_outputs,
+                        ExprPolicies::statement(self.context().dqs_dml()),
                     )?;
                     let output_width = self
                         .query(query)
