@@ -14,26 +14,71 @@ mod scope;
 mod trigger;
 mod update;
 
-pub(crate) fn analyze_statement(
+pub(crate) struct SemanticOptions {
+    pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
+    pub(crate) custom_types_enabled: bool,
+    pub(crate) dqs_dml: crate::translate::emitter::DoubleQuotedDml,
+}
+
+pub(crate) enum SemanticRootInput<'ast> {
+    Statement(&'ast turso_parser::ast::Stmt),
+    TriggerProgram {
+        database: hir::DatabaseId,
+        table_name: &'ast str,
+        event: turso_parser::ast::TriggerEvent,
+        predicate: Option<&'ast turso_parser::ast::Expr>,
+        commands: &'ast [turso_parser::ast::TriggerCmd],
+        conflict_override: Option<turso_parser::ast::ResolveType>,
+    },
+}
+
+pub(crate) fn analyze_root(
     catalog: &crate::translate::emitter::SemanticCatalogSnapshot,
     symbols: &crate::SymbolTable,
-    dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
-    custom_types_enabled: bool,
-    dqs_dml: crate::translate::emitter::DoubleQuotedDml,
-    statement: &turso_parser::ast::Stmt,
+    options: SemanticOptions,
+    input: SemanticRootInput<'_>,
 ) -> crate::Result<hir::HirDocument> {
-    let dqs_dml = match dqs_dml {
+    let dqs_dml = match options.dqs_dml {
         crate::translate::emitter::DoubleQuotedDml::Enabled => context::DoubleQuotedDml::Enabled,
         crate::translate::emitter::DoubleQuotedDml::Disabled => context::DoubleQuotedDml::Disabled,
     };
     let context = context::SemanticContext::for_catalog_snapshot(
         catalog,
         symbols,
-        custom_types_enabled,
-        dialect,
+        options.custom_types_enabled,
+        options.dialect,
         dqs_dml,
     )?;
-    analyze::analyze(&context, AnalyzeInput::Statement(statement))
+    let input = match input {
+        SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
+        SemanticRootInput::TriggerProgram {
+            database,
+            table_name,
+            event,
+            predicate,
+            commands,
+            conflict_override,
+        } => {
+            let normalized_name = crate::util::normalize_ident(table_name);
+            let table = context
+                .schema(database)?
+                .get_table(&normalized_name)
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such table: {normalized_name}"))
+                })?;
+            AnalyzeInput::TriggerProgram(TriggerProgramInput {
+                context: TriggerAnalysis {
+                    database,
+                    table,
+                    event,
+                },
+                predicate,
+                commands,
+                conflict_override,
+            })
+        }
+    };
+    analyze::analyze(&context, input)
 }
 
 pub(crate) enum AnalyzeInput<'ast> {
@@ -150,13 +195,16 @@ mod tests {
             panic!("SQL contains ordinary statement");
         };
 
-        let document = analyze_statement(
+        let options = || SemanticOptions {
+            dialect: Arc::new(SqliteDialect),
+            custom_types_enabled: true,
+            dqs_dml: DoubleQuotedDml::Disabled,
+        };
+        let document = analyze_root(
             &snapshot,
             &symbols,
-            Arc::new(SqliteDialect),
-            true,
-            DoubleQuotedDml::Disabled,
-            &statement,
+            options(),
+            SemanticRootInput::Statement(&statement),
         )
         .expect("owned resolver snapshot produces HIR");
         assert_eq!(
@@ -168,5 +216,59 @@ mod tests {
             [MAIN_DB_ID, TEMP_DB_ID]
         );
         document.validate().expect("document validates again");
+
+        let ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
+            event,
+            when_clause,
+            commands,
+            ..
+        }) = Parser::new(
+            b"CREATE TRIGGER read_row AFTER UPDATE ON items \
+              WHEN new.value <> old.value BEGIN SELECT new.value; END",
+        )
+        .next_cmd()
+        .expect("trigger SQL parses")
+        .expect("trigger SQL contains statement")
+        else {
+            panic!("SQL contains CREATE TRIGGER");
+        };
+        let document = analyze_root(
+            &snapshot,
+            &symbols,
+            options(),
+            SemanticRootInput::TriggerProgram {
+                database: hir::DatabaseId::new(MAIN_DB_ID),
+                table_name: "items",
+                event,
+                predicate: when_clause.as_deref(),
+                commands: &commands,
+                conflict_override: None,
+            },
+        )
+        .expect("snapshot resolves trigger target and produces HIR");
+        let hir::HirRoot::Trigger(root) = &document.root else {
+            panic!("trigger program produces trigger root");
+        };
+        let hir::TriggerBody::Program(program) = &root.body else {
+            panic!("trigger root contains whole program");
+        };
+        assert!(program.predicate.is_some());
+        assert_eq!(program.commands.len(), 1);
+
+        let error = analyze_root(
+            &snapshot,
+            &symbols,
+            options(),
+            SemanticRootInput::TriggerProgram {
+                database: hir::DatabaseId::new(MAIN_DB_ID),
+                table_name: "missing",
+                event,
+                predicate: None,
+                commands: &commands,
+                conflict_override: None,
+            },
+        )
+        .expect_err("trigger target must belong to snapshot database");
+        assert_eq!(error.to_string(), "Parse error: no such table: missing");
     }
 }
