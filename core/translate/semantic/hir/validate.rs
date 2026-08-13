@@ -202,12 +202,16 @@ impl<'document> HirValidator<'document> {
                 self.visit_trigger_environment(&root.environment)?;
                 match &root.body {
                     TriggerBody::Predicate(expression) => self.visit_expr(expression),
-                    TriggerBody::Command(command) => match command {
-                        TriggerCommand::Select(query) => self.visit_query(*query),
-                        TriggerCommand::Insert(insert) => self.visit_insert(insert, true),
-                        TriggerCommand::Update(update) => self.visit_update(update, true),
-                        TriggerCommand::Delete(delete) => self.visit_delete(delete, true),
-                    },
+                    TriggerBody::Command(command) => self.visit_trigger_command(command),
+                    TriggerBody::Program(program) => {
+                        if let Some(predicate) = &program.predicate {
+                            self.visit_expr(predicate)?;
+                        }
+                        for command in &program.commands {
+                            self.visit_trigger_command(command)?;
+                        }
+                        Ok(())
+                    }
                 }
             }
             HirRoot::SchemaExpressions(root) => {
@@ -217,6 +221,15 @@ impl<'document> HirValidator<'document> {
                 }
                 Ok(())
             }
+        }
+    }
+
+    fn visit_trigger_command(&self, command: &TriggerCommand) -> ValidationResult {
+        match command {
+            TriggerCommand::Select(query) => self.visit_query(*query),
+            TriggerCommand::Insert(insert) => self.visit_insert(insert, true),
+            TriggerCommand::Update(update) => self.visit_update(update, true),
+            TriggerCommand::Delete(delete) => self.visit_delete(delete, true),
         }
     }
 

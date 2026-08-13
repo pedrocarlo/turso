@@ -38,6 +38,14 @@ pub(crate) enum AnalyzeInput<'ast> {
         context: TriggerAnalysis,
         delete: TriggerDelete<'ast>,
     },
+    TriggerProgram(TriggerProgramInput<'ast>),
+}
+
+pub(crate) struct TriggerProgramInput<'ast> {
+    pub(crate) context: TriggerAnalysis,
+    pub(crate) predicate: Option<&'ast turso_parser::ast::Expr>,
+    pub(crate) commands: &'ast [turso_parser::ast::TriggerCmd],
+    pub(crate) conflict_override: Option<turso_parser::ast::ResolveType>,
 }
 
 pub(crate) struct TriggerInsert<'ast> {

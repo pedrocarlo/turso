@@ -57,8 +57,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Trigger program assembly | Trigger predicates and every command shape bind independently against NEW/OLD HIR sources. One program-level HIR container for the ordered predicate and command documents remains before production entry wiring. |
-| Production entry point and lowering | The statement input intentionally accepts SELECT, INSERT, UPDATE, and DELETE; trigger predicates and SELECT commands use separate semantic-only inputs. Switching execution to HIR and lowering it remain later migration steps; physical lowering is explicitly out of scope for now. |
+| Production entry point and lowering | The statement input intentionally accepts SELECT, INSERT, UPDATE, and DELETE; triggers use a semantic-only program input. Switching execution to HIR and lowering it remain later migration steps; physical lowering is explicitly out of scope for now. |
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -111,6 +110,10 @@ Completed:
   SELECT, INSERT, UPDATE, and DELETE commands with enums. Ordinary query and
   DML nodes no longer carry optional trigger-only state; validation receives
   trigger-command context from the root shape.
+- Whole trigger programs bind their optional WHEN predicate and ordered command
+  list in one analyzer. Every command reuses one NEW/OLD environment, statement
+  conflict policy reaches INSERT and UPDATE without AST rewriting, and HIR
+  validation visits the complete program.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,

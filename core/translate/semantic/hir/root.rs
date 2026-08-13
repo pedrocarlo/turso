@@ -47,6 +47,13 @@ pub struct TriggerRoot {
 pub enum TriggerBody {
     Predicate(Expr),
     Command(TriggerCommand),
+    Program(TriggerProgram),
+}
+
+#[derive(Clone, Debug)]
+pub struct TriggerProgram {
+    pub predicate: Option<Expr>,
+    pub commands: Vec<TriggerCommand>,
 }
 
 #[derive(Clone, Debug)]
