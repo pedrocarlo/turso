@@ -57,7 +57,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and lowering | The statement input intentionally accepts SELECT, INSERT, UPDATE, and DELETE; triggers use a semantic-only program input. Switching execution to HIR and lowering it remain later migration steps; physical lowering is explicitly out of scope for now. |
+| Production entry point and lowering | Statement and trigger inputs produce HIR against a multi-database catalog snapshot. Adapting the live resolver/connection catalog into that input and switching execution to HIR remain later steps; physical lowering is explicitly out of scope for now. |
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -114,6 +114,10 @@ Completed:
   list in one analyzer. Every command reuses one NEW/OLD environment, statement
   conflict policy reaches INSERT and UPDATE without AST rewriting, and HIR
   validation visits the complete program.
+- Semantic context owns one normalized database-name map, database-ID map, and
+  explicit unqualified search path across main, temp, and attached schemas.
+  Qualified tables and indexes keep their database identity; DML metadata uses
+  the target database, and documents record sorted schema-version snapshots.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,

@@ -699,7 +699,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let table_name = crate::util::normalize_ident(name.as_str());
         let table = self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_table(&table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
         self.analyze_catalog_table_source(
@@ -764,7 +764,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
             Some(ast::Indexed::IndexedBy(name)) => {
                 let index_name = crate::util::normalize_ident(name.as_str());
-                let index = self.context().resolve_index(&table_name, name.as_str())?;
+                let index = self
+                    .context()
+                    .resolve_index(database, &table_name, name.as_str())?;
                 let index_id =
                     self.catalog_object_id(Some(database), CatalogObjectKind::Index, index_name);
                 hir::IndexHint::Indexed(CatalogObject::new(
@@ -811,11 +813,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         table: &hir::ResolvedTable,
     ) -> Result<Vec<AnalyzedSourceColumn>> {
         let is_strict = matches!(table.value(), Table::BTree(table) if table.is_strict);
+        let database = table.database().ok_or_else(|| {
+            LimboError::InternalError("table source has no owning database".to_string())
+        })?;
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
             let resolved_type = self
                 .context()
-                .main_schema()
+                .schema(database)?
                 .resolve_type(&column.ty_str, is_strict)?;
             let (type_fact, programs) = match resolved_type {
                 Some(resolved) => {

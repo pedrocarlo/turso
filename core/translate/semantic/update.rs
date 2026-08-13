@@ -112,7 +112,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         } else {
             hir::UpdateTargetKind::BTree {
                 defaults: Vec::new(),
-                triggers: self.analyze_update_triggers(&table, &assignments),
+                triggers: self.analyze_update_triggers(&table, &assignments)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
             }
         };
@@ -148,7 +148,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         table: &hir::ResolvedTable,
         assignments: &[hir::Assignment],
-    ) -> Vec<hir::ResolvedTrigger> {
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
         let database = table
             .database()
             .expect("an UPDATE target table must have an owning database");
@@ -162,7 +162,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .collect::<Vec<_>>();
         let triggers = self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_triggers_for_table(table.value().get_name())
             .filter(|trigger| {
                 trigger_targets_database(trigger, database)
@@ -170,10 +170,10 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             })
             .cloned()
             .collect::<Vec<_>>();
-        triggers
+        Ok(triggers
             .into_iter()
             .map(|trigger| self.freeze_trigger(database, trigger))
-            .collect()
+            .collect())
     }
 
     fn create_update_new_source(
@@ -245,7 +245,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .collect::<Result<Vec<_>>>()?;
                     let expected_outputs = columns
                         .iter()
-                        .map(|column| self.write_target_type(table, *column))
+                        .map(|column| self.write_target_type(new_source, table, *column))
                         .collect::<Result<Vec<_>>>()?;
                     let query = self.analyze_subquery_with_expected_outputs(
                         select,
@@ -306,7 +306,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         syntax,
                         scope,
                         policies.update(),
-                        self.write_target_type(table, column)?,
+                        self.write_target_type(new_source, table, column)?,
                     )?
                     .expr
                 };

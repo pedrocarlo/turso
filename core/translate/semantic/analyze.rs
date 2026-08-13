@@ -6,7 +6,7 @@ use crate::{
     schema::{Type, TypeDef},
     sync::Arc,
     util::parse_numeric_literal,
-    LimboError, Result, Value, MAIN_DB_ID,
+    LimboError, Result, Value,
 };
 
 use super::{
@@ -14,11 +14,11 @@ use super::{
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, DatabaseSnapshot, Delete, DeleteTargetKind, Expr, FunctionEvaluation,
-        HirDocument, HirRoot, Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId,
-        OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
-        QueryRoot, SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand,
-        TypeFact, Update, UpdateTargetKind,
+        CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
+        HirRoot, Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
+        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
+        SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand, TypeFact,
+        Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -338,10 +338,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn finish(self, root: HirRoot) -> Result<HirDocument> {
         Ok(HirDocument {
             snapshot: self.context.snapshot(),
-            databases: vec![DatabaseSnapshot {
-                database: DatabaseId::new(MAIN_DB_ID),
-                schema_version: self.context.main_schema().schema_version,
-            }],
+            databases: self.context.database_snapshots(),
             root,
             queries: Self::finish_arena(self.queries, "query")?,
             sources: Self::finish_arena(self.sources, "source")?,
@@ -1611,12 +1608,12 @@ mod tests {
         function::ScalarFunc,
         schema::{BTreeTable, Index, Schema, Sequence, Trigger, Type},
         sync::Arc,
-        Func, SymbolTable,
+        Func, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
     };
 
     use super::*;
     use crate::translate::semantic::{
-        context::DoubleQuotedDml,
+        context::{DoubleQuotedDml, SemanticDatabase},
         hir,
         hir::{
             BinaryOperand, ColumnReadExpression, CteBody, CustomTypeOperation, FieldAccessKind,
@@ -1651,6 +1648,23 @@ mod tests {
             true,
             Arc::new(SqliteDialect),
         );
+        let statement = parse_statement(sql);
+        analyze(&context, AnalyzeInput::Statement(&statement))
+    }
+
+    fn analyze_sql_with_databases(
+        databases: Vec<SemanticDatabase<'_>>,
+        search_path: Vec<DatabaseId>,
+        sql: &str,
+    ) -> Result<HirDocument> {
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_databases(
+            databases,
+            search_path,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        )?;
         let statement = parse_statement(sql);
         analyze(&context, AnalyzeInput::Statement(&statement))
     }
@@ -2577,6 +2591,109 @@ mod tests {
         assert!(matches!(
             &source.default_expressions[3],
             ColumnReadExpression::NotRequired
+        ));
+    }
+
+    #[test]
+    fn catalog_search_path_and_qualification_choose_database_schema() {
+        fn catalog_schema(schema_version: u32, with_index: bool) -> Schema {
+            let mut schema = Schema::new();
+            schema.schema_version = schema_version;
+            let table = Arc::new(
+                BTreeTable::from_sql("CREATE TABLE shared(value TEXT)", 2)
+                    .expect("catalog table parses"),
+            );
+            schema
+                .add_btree_table(table.clone())
+                .expect("catalog table name is unique");
+            if with_index {
+                let symbols = SymbolTable::new();
+                let index = Index::from_sql(
+                    &symbols,
+                    "CREATE INDEX shared_value ON shared(value)",
+                    3,
+                    &table,
+                )
+                .expect("catalog index parses");
+                schema
+                    .add_index(Arc::new(index))
+                    .expect("catalog index name is unique");
+            }
+            schema
+        }
+
+        fn first_source(document: &HirDocument) -> &Source {
+            let HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces query root");
+            };
+            let query = document.query(root.query).expect("query exists");
+            let source = query.blocks[0].from.as_ref().expect("query has FROM").first;
+            document.source(source).expect("source exists")
+        }
+
+        let main = catalog_schema(10, false);
+        let temp = catalog_schema(20, false);
+        let attached = catalog_schema(30, true);
+        let attached_id = DatabaseId::new(2);
+        let analyze_catalog = |sql| {
+            analyze_sql_with_databases(
+                vec![
+                    SemanticDatabase::new(DatabaseId::new(MAIN_DB_ID), "main", &main),
+                    SemanticDatabase::new(DatabaseId::new(TEMP_DB_ID), "temp", &temp),
+                    SemanticDatabase::new(attached_id, "aux", &attached),
+                ],
+                vec![
+                    DatabaseId::new(TEMP_DB_ID),
+                    attached_id,
+                    DatabaseId::new(MAIN_DB_ID),
+                ],
+                sql,
+            )
+        };
+
+        let unqualified = analyze_catalog("SELECT value FROM shared")
+            .expect("search path resolves unqualified table");
+        assert_eq!(
+            first_source(&unqualified).database,
+            Some(DatabaseId::new(TEMP_DB_ID))
+        );
+        assert_eq!(
+            unqualified
+                .databases
+                .iter()
+                .map(|snapshot| (snapshot.database.index(), snapshot.schema_version))
+                .collect::<Vec<_>>(),
+            [(MAIN_DB_ID, 10), (TEMP_DB_ID, 20), (2, 30)]
+        );
+
+        let qualified = analyze_catalog("SELECT value FROM aux.shared INDEXED BY shared_value")
+            .expect("qualified attached table and index resolve together");
+        let source = first_source(&qualified);
+        assert_eq!(source.database, Some(attached_id));
+        let hir::IndexHint::Indexed(index) = &source.index_hint else {
+            panic!("attached index hint is resolved");
+        };
+        assert_eq!(index.database(), Some(attached_id));
+
+        let main_qualified =
+            analyze_catalog("SELECT value FROM main.shared").expect("main qualifier resolves");
+        assert_eq!(
+            first_source(&main_qualified).database,
+            Some(DatabaseId::new(MAIN_DB_ID))
+        );
+
+        let insert = analyze_catalog("INSERT INTO aux.shared(value) VALUES ('kept')")
+            .expect("qualified attached INSERT resolves metadata in attached schema");
+        let HirRoot::Insert(insert_root) = &insert.root else {
+            panic!("INSERT produces INSERT root");
+        };
+        let target = insert
+            .source(insert_root.target)
+            .expect("INSERT target source exists");
+        assert_eq!(target.database, Some(attached_id));
+        assert!(matches!(
+            &target.index_coverage,
+            IndexCoverage::Complete { indexes } if indexes.len() == 1
         ));
     }
 
