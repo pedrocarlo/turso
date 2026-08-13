@@ -401,20 +401,50 @@ impl<'document> HirValidator<'document> {
             update.target != update.new_source,
             "UPDATE OLD and NEW rows must have distinct source identities",
         )?;
-        self.require_complete_row_image(update.target)?;
-        self.require_complete_row_image(update.new_source)?;
-        self.require_complete_index_metadata(update.target)?;
-        self.require_complete_index_metadata(update.new_source)?;
-        self.visit_dml_triggers(
-            update.target,
-            &update.triggers,
-            turso_parser::ast::TriggerEvent::Update,
-            &update.assignments,
-        )?;
-        self.visit_dml_foreign_keys(update.target, update.new_source, &update.foreign_keys)?;
-        for default in &update.defaults {
-            self.validate_column_position(update.new_source, default.column)?;
-            self.visit_expr(&default.value)?;
+        match &update.target_kind {
+            UpdateTargetKind::BTree {
+                defaults,
+                triggers,
+                foreign_keys,
+            } => {
+                self.require(
+                    target_table.value().btree().is_some(),
+                    "B-tree UPDATE metadata belongs to a non-B-tree target",
+                )?;
+                self.require_complete_row_image(update.target)?;
+                self.require_complete_row_image(update.new_source)?;
+                self.require_complete_index_metadata(update.target)?;
+                self.require_complete_index_metadata(update.new_source)?;
+                self.visit_dml_triggers(
+                    update.target,
+                    triggers,
+                    turso_parser::ast::TriggerEvent::Update,
+                    &update.assignments,
+                )?;
+                self.visit_dml_foreign_keys(update.target, update.new_source, foreign_keys)?;
+                for default in defaults {
+                    self.validate_column_position(update.new_source, default.column)?;
+                    self.visit_expr(&default.value)?;
+                }
+            }
+            UpdateTargetKind::Virtual => {
+                self.require(
+                    target_table.value().virtual_table().is_some(),
+                    "virtual UPDATE metadata belongs to a non-virtual target",
+                )?;
+                for source in [update.target, update.new_source] {
+                    let source = self.source(source)?;
+                    self.require(
+                        source.check_constraints.is_none()
+                            && matches!(source.index_coverage, IndexCoverage::Selective),
+                        "virtual-table UPDATE row carries B-tree constraint metadata",
+                    )?;
+                }
+                self.require(
+                    update.trigger.is_none(),
+                    "trigger command writes an unsafe virtual-table target",
+                )?;
+            }
         }
         if let Some(from) = &update.from {
             self.visit_from(from, SourceOwner::Root)?;

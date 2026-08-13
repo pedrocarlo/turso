@@ -168,7 +168,7 @@ pub struct Update {
     /// NEW row identity used by generated values, constraints, index insertion,
     /// and RETURNING.
     pub new_source: SourceId,
-    pub defaults: Vec<ResolvedDefault>,
+    pub target_kind: UpdateTargetKind,
     pub from: Option<From>,
     pub assignments: Vec<Assignment>,
     pub predicate: Option<Expr>,
@@ -177,11 +177,20 @@ pub struct Update {
     pub conflict: Option<ResolveType>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
-    pub triggers: Vec<ResolvedTrigger>,
-    pub foreign_keys: DmlForeignKeys,
     /// For an internal sqlite_schema update, CDC stores the user's DDL text in
     /// the changed `sql` field instead of the generated UPDATE statement.
     pub cdc_updates_override: Option<(usize, String)>,
+}
+
+/// Metadata required by the concrete kind of UPDATE destination.
+#[derive(Clone, Debug)]
+pub enum UpdateTargetKind {
+    BTree {
+        defaults: Vec<ResolvedDefault>,
+        triggers: Vec<ResolvedTrigger>,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
 }
 
 #[derive(Clone, Debug)]
