@@ -196,13 +196,22 @@ pub enum UpdateTargetKind {
 #[derive(Clone, Debug)]
 pub struct Delete {
     pub target: SourceId,
+    pub target_kind: DeleteTargetKind,
     pub predicate: Option<Expr>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<Limit>,
     pub returning: Option<Returning>,
     pub trigger: Option<TriggerEnvironment>,
-    pub triggers: Vec<ResolvedTrigger>,
-    pub foreign_keys: DmlForeignKeys,
+}
+
+/// Metadata required by the concrete kind of DELETE destination.
+#[derive(Clone, Debug)]
+pub enum DeleteTargetKind {
+    BTree {
+        triggers: Vec<ResolvedTrigger>,
+        foreign_keys: DmlForeignKeys,
+    },
+    Virtual,
 }
 
 /// Foreign-key identities and positions frozen for one DML target.

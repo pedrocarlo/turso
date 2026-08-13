@@ -270,6 +270,14 @@ Completed:
   triggers, foreign keys, CHECKs, and complete index metadata; virtual targets
   cannot represent those fields. Virtual SET, WHERE, FROM, RETURNING, aliases,
   and rowid expressions use the ordinary UPDATE binding rules.
+- Basic B-tree DELETE statements become DELETE HIR with one resolved target
+  source. WHERE expressions use the target scope, including aliases, rowid,
+  and correlated subqueries. Generated-column reads and every ordinary,
+  expression, and partial index close against that target; `INDEXED BY` keeps
+  its resolved catalog identity. Target metadata is split between B-tree and
+  virtual variants from the start. WITH, RETURNING, virtual targets, triggers,
+  and foreign keys remain explicit later checkpoints, while WITHOUT ROWID
+  targets keep their existing unsupported diagnostic.
 
 The standalone SELECT expression checkpoints are complete. `union_value` is
 resolved only in destination-aware DML expressions.

@@ -14,10 +14,10 @@ use super::{
     expr::{ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, DatabaseSnapshot, Expr, FunctionEvaluation, HirDocument, HirRoot,
-        InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind, OutputOwner, Query,
-        QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source,
-        SourceId, SourceKind, TypeFact, UpdateTargetKind,
+        CteId, DatabaseId, DatabaseSnapshot, DeleteTargetKind, Expr, FunctionEvaluation,
+        HirDocument, HirRoot, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
+        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
+        SchemaProgramId, Source, SourceId, SourceKind, TypeFact, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -53,9 +53,23 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             returning,
         )?,
         AnalyzeInput::Statement(ast::Stmt::Update(update)) => analyzer.analyze_update(update)?,
+        AnalyzeInput::Statement(ast::Stmt::Delete {
+            with,
+            tbl_name,
+            indexed,
+            where_clause,
+            returning,
+        }) => analyzer.analyze_delete(
+            with.as_ref(),
+            tbl_name,
+            indexed.as_ref(),
+            where_clause.as_deref(),
+            returning,
+        )?,
         AnalyzeInput::Statement(_) => {
             return Err(LimboError::ParseError(
-                "semantic analysis accepts SELECT, INSERT, and UPDATE statements".to_string(),
+                "semantic analysis accepts SELECT, INSERT, UPDATE, and DELETE statements"
+                    .to_string(),
             ));
         }
     };
@@ -338,6 +352,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             source: foreign_key.child_source,
                             column,
                         })
+                }));
+            }
+        }
+        if let HirRoot::Delete(delete) = root {
+            pending.extend(delete.direct_column_reads());
+            if matches!(delete.target_kind, DeleteTargetKind::BTree { .. }) {
+                let width = self
+                    .source(delete.target)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "missing DELETE target source {}",
+                            delete.target
+                        ))
+                    })?
+                    .columns
+                    .len();
+                pending.extend((0..width).map(|column| ColumnRef {
+                    source: delete.target,
+                    column,
                 }));
             }
         }
@@ -8858,6 +8891,178 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Parse error: UPDATE of WITHOUT ROWID tables is not supported"
+        );
+    }
+
+    #[test]
+    fn delete_binds_target_predicate_and_complete_write_metadata() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "DELETE FROM writable AS doomed \
+             WHERE doomed.rowid = 7 AND EXISTS (SELECT value)",
+        )
+        .expect("basic DELETE binds");
+        document.validate().expect("DELETE produces closed HIR");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let hir::DeleteTargetKind::BTree {
+            triggers,
+            foreign_keys,
+        } = &delete.target_kind
+        else {
+            panic!("catalog table DELETE has B-tree metadata");
+        };
+        assert!(triggers.is_empty());
+        assert!(foreign_keys.outgoing.is_empty());
+        assert!(foreign_keys.incoming.is_empty());
+
+        let source = document
+            .source(delete.target)
+            .expect("DELETE target exists");
+        assert_eq!(source.alias.as_deref(), Some("doomed"));
+        assert!(source.check_constraints.is_none());
+        assert!(matches!(
+            source.index_coverage,
+            IndexCoverage::Complete { ref indexes } if indexes.is_empty()
+        ));
+        assert!(matches!(
+            source.generated_expressions[2],
+            ColumnReadExpression::Planned(Expr::Binary { ref lhs, .. })
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == delete.target && column.column == 0)
+        ));
+
+        let predicate = delete.predicate.as_ref().expect("WHERE is preserved");
+        assert!(matches!(
+            predicate,
+            Expr::Binary { lhs, .. }
+                if matches!(lhs.as_ref(), Expr::Binary { lhs, .. }
+                    if matches!(lhs.as_ref(), Expr::RowId(source) if *source == delete.target))
+        ));
+        let mut query = None;
+        predicate.walk(&mut |expression| {
+            if let Expr::Subquery(SubqueryExpr::Exists(id)) = expression {
+                query = Some(*id);
+            }
+        });
+        assert_eq!(
+            document
+                .query(query.expect("WHERE contains EXISTS query"))
+                .expect("EXISTS query exists")
+                .captures,
+            [delete.target]
+        );
+
+        let mut invalid = document.clone();
+        let HirRoot::Delete(delete) = &mut invalid.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        delete.target_kind = hir::DeleteTargetKind::Virtual;
+        assert_eq!(
+            invalid
+                .validate()
+                .expect_err("target kind must match table")
+                .to_string(),
+            "virtual DELETE metadata belongs to a non-virtual target"
+        );
+    }
+
+    #[test]
+    fn delete_resolves_index_hint_and_closes_every_index() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "DELETE FROM guarded INDEXED BY guarded_expression WHERE score = 2",
+        )
+        .expect("indexed DELETE binds");
+        document
+            .validate()
+            .expect("indexed DELETE produces closed HIR");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let source = document
+            .source(delete.target)
+            .expect("DELETE target exists");
+        let hir::IndexHint::Indexed(hint) = &source.index_hint else {
+            panic!("INDEXED BY remains explicit");
+        };
+        assert_eq!(hint.value().name, "guarded_expression");
+        let IndexCoverage::Complete { indexes } = &source.index_coverage else {
+            panic!("DELETE owns complete index metadata");
+        };
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(source.index_expressions.len(), 2);
+        assert!(source.index_expressions.iter().any(|index| {
+            index.index.value().name == "guarded_expression"
+                && index.columns[0].is_some()
+                && index.predicate.is_some()
+        }));
+    }
+
+    #[test]
+    fn basic_delete_rejects_deferred_and_unsupported_targets() {
+        let schema = schema_with_writable_table();
+        for (sql, expected) in [
+            (
+                "WITH chosen AS (SELECT 1) DELETE FROM writable WHERE id = 1",
+                "Parse error: semantic DELETE does not yet support WITH clauses",
+            ),
+            (
+                "DELETE FROM writable RETURNING value",
+                "Parse error: semantic DELETE does not yet support RETURNING clauses",
+            ),
+        ] {
+            let error = analyze_sql_with_schema(&schema, sql).expect_err("clause is deferred");
+            assert_eq!(error.to_string(), expected);
+        }
+
+        let virtual_schema = schema_with_virtual_insert_target();
+        let virtual_error = analyze_sql_with_schema(
+            &virtual_schema,
+            "DELETE FROM pragma_table_info WHERE rowid = 1",
+        )
+        .expect_err("virtual DELETE is deferred");
+        assert_eq!(
+            virtual_error.to_string(),
+            "Parse error: semantic DELETE does not yet accept virtual tables"
+        );
+
+        let trigger_schema = schema_with_insert_triggers();
+        let trigger_error = analyze_sql_with_schema(&trigger_schema, "DELETE FROM writable")
+            .expect_err("DELETE triggers are deferred");
+        assert_eq!(
+            trigger_error.to_string(),
+            "Parse error: semantic DELETE does not yet support targets with triggers"
+        );
+
+        let foreign_key_schema = schema_with_insert_foreign_keys();
+        let foreign_key_error = analyze_sql_with_schema(&foreign_key_schema, "DELETE FROM parents")
+            .expect_err("DELETE foreign keys are deferred");
+        assert_eq!(
+            foreign_key_error.to_string(),
+            "Parse error: semantic DELETE does not yet support targets with foreign keys"
+        );
+
+        let mut without_rowid_schema = Schema::new();
+        let table = BTreeTable::from_sql(
+            "CREATE TABLE no_rowid(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
+            2,
+        )
+        .expect("WITHOUT ROWID table parses");
+        without_rowid_schema
+            .add_btree_table(Arc::new(table))
+            .expect("WITHOUT ROWID table name is unique");
+        let without_rowid_error =
+            analyze_sql_with_schema(&without_rowid_schema, "DELETE FROM no_rowid")
+                .expect_err("WITHOUT ROWID DELETE remains unsupported");
+        assert_eq!(
+            without_rowid_error.to_string(),
+            "Parse error: DELETE from WITHOUT ROWID tables is not supported"
         );
     }
 }
