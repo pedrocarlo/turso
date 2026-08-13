@@ -68,7 +68,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
             self.analyze_btree_delete_metadata(target, &table)?;
             hir::DeleteTargetKind::BTree {
-                triggers: self.analyze_delete_triggers(&table),
+                triggers: self.analyze_delete_triggers(&table)?,
                 foreign_keys: self.analyze_dml_foreign_keys(&table, target)?,
             }
         } else if table.value().virtual_table().is_some() {
@@ -110,13 +110,16 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(scope)
     }
 
-    fn analyze_delete_triggers(&mut self, table: &hir::ResolvedTable) -> Vec<hir::ResolvedTrigger> {
+    fn analyze_delete_triggers(
+        &mut self,
+        table: &hir::ResolvedTable,
+    ) -> Result<Vec<hir::ResolvedTrigger>> {
         let database = table
             .database()
             .expect("a DELETE target table must have an owning database");
         let triggers = self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_triggers_for_table(table.value().get_name())
             .filter(|trigger| {
                 trigger_targets_database(trigger, database)
@@ -124,9 +127,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             })
             .cloned()
             .collect::<Vec<_>>();
-        triggers
+        Ok(triggers
             .into_iter()
             .map(|trigger| self.freeze_trigger(database, trigger))
-            .collect()
+            .collect())
     }
 }

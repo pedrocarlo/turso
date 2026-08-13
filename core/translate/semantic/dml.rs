@@ -33,7 +33,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             LimboError::InternalError("DML target has no owning database".to_string())
         })?;
         let (outgoing, incoming) = {
-            let schema = self.context().main_schema();
+            let schema = self.context().schema(database)?;
             (
                 schema.resolved_fks_for_child(target.value().get_name())?,
                 schema.resolved_fks_referencing(target.value().get_name())?,
@@ -188,7 +188,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let normalized = normalize_ident(name);
         let table = self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_table(&normalized)
             .ok_or_else(|| {
                 LimboError::InternalError(format!(

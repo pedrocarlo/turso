@@ -2953,7 +2953,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&normalized_name);
         let (backing_table, sequence, sqlite_sequence) = {
-            let schema = self.context().main_schema();
+            let schema = self.context().schema(database)?;
             let backing_table = schema.get_table(&backing_table_name).ok_or_else(|| {
                 LimboError::ParseError(format!("sequence \"{user_name}\" does not exist"))
             })?;

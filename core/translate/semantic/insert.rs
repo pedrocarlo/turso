@@ -178,7 +178,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     ast::OneSelect::Select { .. } | ast::OneSelect::Values(_) => {
                         let expected_outputs = columns
                             .iter()
-                            .map(|target| self.write_target_type(table.value(), target.column))
+                            .map(|target_column| {
+                                self.write_target_type(target, table.value(), target_column.column)
+                            })
                             .collect::<Result<Vec<_>>>()?;
                         let query =
                             self.analyze_insert_select(select, &expected_outputs, expressions)?;
@@ -213,7 +215,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::InsertTargetKind::BTree {
                 autoincrement,
                 defaults: self.analyze_insert_defaults(target, table.value(), &columns)?,
-                triggers: self.analyze_insert_triggers(table, &upserts),
+                triggers: self.analyze_insert_triggers(table, &upserts)?,
                 foreign_keys: self.analyze_dml_foreign_keys(table, target)?,
             }
         };
@@ -263,7 +265,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&sequence_name);
         let (sqlite_sequence, sequence, backing_table) = {
-            let schema = self.context().main_schema();
+            let schema = self.context().schema(database)?;
             let sqlite_sequence = schema
                 .get_table(SQLITE_SEQUENCE_TABLE_NAME)
                 .ok_or_else(|| LimboError::Corrupt("missing sqlite_sequence table".to_string()))?;
@@ -327,7 +329,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         table: &hir::ResolvedTable,
         upserts: &[hir::Upsert],
-    ) -> hir::InsertTriggers {
+    ) -> Result<hir::InsertTriggers> {
         let database = table
             .database()
             .expect("an INSERT target table must have an owning database");
@@ -345,7 +347,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
         }
         let (insert, upsert_update) = {
-            let schema = self.context().main_schema();
+            let schema = self.context().schema(database)?;
             let triggers = schema.get_triggers_for_table(table.value().get_name());
             let insert = triggers
                 .clone()
@@ -368,7 +370,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             };
             (insert, upsert_update)
         };
-        hir::InsertTriggers {
+        Ok(hir::InsertTriggers {
             insert: insert
                 .into_iter()
                 .map(|trigger| self.freeze_trigger(database, trigger))
@@ -377,7 +379,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 .into_iter()
                 .map(|trigger| self.freeze_trigger(database, trigger))
                 .collect(),
-        }
+        })
     }
 
     pub(super) fn analyze_btree_write_metadata(
@@ -451,9 +453,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
     ) -> Result<()> {
+        let database = table.database().ok_or_else(|| {
+            LimboError::InternalError("B-tree target has no owning database".to_string())
+        })?;
         let indexes = self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_indices(table.value().get_name())
             .cloned()
             .collect::<Vec<_>>();
@@ -521,7 +526,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 syntax,
                 expressions.outer_scope,
                 expressions.policies.insert_values(),
-                self.write_target_type(table, column)?,
+                self.write_target_type(target, table, column)?,
             )?
             .expr)
     }
@@ -579,9 +584,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 match &definition.default {
                     Some(default) => default.as_ref().clone(),
                     None => {
+                        let database = self
+                            .source(target)
+                            .and_then(|source| source.database)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "write target source {target} has no owning database"
+                                ))
+                            })?;
                         let type_default = self
                             .context()
-                            .main_schema()
+                            .schema(database)?
                             .resolve_type(&definition.ty_str, table.is_strict())?
                             .and_then(|resolved| resolved.default_expr().cloned());
                         type_default.unwrap_or(ast::Expr::Literal(ast::Literal::Null))
@@ -598,12 +611,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             &syntax,
             &scope,
             ExprPolicy::schema_expression().with_self_source(target),
-            self.write_target_type(table, column)?,
+            self.write_target_type(target, table, column)?,
         )
     }
 
     pub(super) fn write_target_type(
         &self,
+        target: hir::SourceId,
         table: &Table,
         column: hir::TargetColumn,
     ) -> Result<Option<Arc<TypeDef>>> {
@@ -616,9 +630,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 table.get_name()
             ))
         })?;
+        let database = self
+            .source(target)
+            .and_then(|source| source.database)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "write target source {target} has no owning database"
+                ))
+            })?;
         Ok(self
             .context()
-            .main_schema()
+            .schema(database)?
             .get_type_def_unchecked(&definition.ty_str)
             .cloned())
     }
@@ -669,7 +691,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .map(|predicate| self.analyze_expr(predicate, &scope, policy))
                         .transpose()?;
                     let matched_index = match crate::translate::upsert::resolve_upsert_target(
-                        self.context().main_schema(),
+                        self.context().schema(table.database().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "UPSERT target has no owning database".to_string(),
+                            )
+                        })?)?,
                         table.value(),
                         upsert,
                     )? {
@@ -788,7 +814,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     value,
                     &scope,
                     policy,
-                    self.write_target_type(table.value(), hir::TargetColumn::Column(column))?,
+                    self.write_target_type(
+                        target,
+                        table.value(),
+                        hir::TargetColumn::Column(column),
+                    )?,
                 )?;
                 match assignments
                     .iter_mut()
