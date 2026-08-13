@@ -44,8 +44,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 "DELETE from WITHOUT ROWID tables is not supported".to_string(),
             ));
         }
-        self.reject_delete_foreign_keys(table.value())?;
         self.analyze_btree_delete_metadata(target, &table)?;
+        let foreign_keys = self.analyze_dml_foreign_keys(&table, target)?;
 
         let scope = self.delete_read_scope(target)?;
         let predicate = where_clause
@@ -63,7 +63,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             target,
             target_kind: hir::DeleteTargetKind::BTree {
                 triggers: self.analyze_delete_triggers(&table),
-                foreign_keys: hir::DmlForeignKeys::default(),
+                foreign_keys,
             },
             predicate,
             order_by: Vec::new(),
@@ -100,15 +100,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .into_iter()
             .map(|trigger| self.freeze_trigger(database, trigger))
             .collect()
-    }
-
-    fn reject_delete_foreign_keys(&self, table: &crate::schema::Table) -> Result<()> {
-        let name = table.get_name();
-        let schema = self.context().main_schema();
-        if schema.has_child_fks(name) || schema.any_resolved_fks_referencing(name) {
-            return unsupported_delete("targets with foreign keys");
-        }
-        Ok(())
     }
 }
 

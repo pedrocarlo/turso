@@ -357,7 +357,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         if let HirRoot::Delete(delete) = root {
             pending.extend(delete.direct_column_reads());
-            if matches!(delete.target_kind, DeleteTargetKind::BTree { .. }) {
+            if let DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind {
                 let width = self
                     .source(delete.target)
                     .ok_or_else(|| {
@@ -371,6 +371,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 pending.extend((0..width).map(|column| ColumnRef {
                     source: delete.target,
                     column,
+                }));
+                pending.extend(foreign_keys.incoming.iter().flat_map(|foreign_key| {
+                    foreign_key
+                        .child_positions
+                        .iter()
+                        .copied()
+                        .map(|column| ColumnRef {
+                            source: foreign_key.child_source,
+                            column,
+                        })
                 }));
             }
         }
@@ -9038,6 +9048,65 @@ mod tests {
     }
 
     #[test]
+    fn delete_freezes_foreign_keys_against_old_and_child_rows() {
+        let schema = schema_with_insert_foreign_keys();
+        let document = analyze_sql_with_schema(&schema, "DELETE FROM fk_items WHERE id = 1")
+            .expect("foreign-key DELETE binds");
+        document
+            .validate()
+            .expect("foreign-key DELETE produces closed HIR");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let hir::DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind else {
+            panic!("catalog table DELETE has B-tree metadata");
+        };
+        assert_eq!(foreign_keys.outgoing.len(), 2);
+        assert_eq!(foreign_keys.incoming.len(), 1);
+        assert!(foreign_keys.outgoing.iter().all(|foreign_key| {
+            foreign_key.child_source == delete.target
+                && foreign_key.child_table.value().get_name() == "fk_items"
+                && foreign_key.parent_table.value().get_name() == "parents"
+                && !foreign_key.parent_action_guarantees_new_parent
+        }));
+
+        let parent_code = foreign_keys
+            .outgoing
+            .iter()
+            .find(|foreign_key| foreign_key.declaration.child_columns[0] == "parent_code")
+            .expect("indexed parent foreign key is present");
+        assert_eq!(parent_code.child_positions.as_ref(), [2]);
+        assert_eq!(parent_code.parent_positions.as_ref(), [1]);
+        assert_eq!(
+            parent_code
+                .parent_unique_index
+                .as_ref()
+                .expect("non-rowid parent key uses a UNIQUE index")
+                .value()
+                .name,
+            "parents_code"
+        );
+
+        let incoming = &foreign_keys.incoming[0];
+        assert_ne!(incoming.child_source, delete.target);
+        assert_eq!(incoming.child_table.value().get_name(), "item_notes");
+        assert_eq!(incoming.parent_table.value().get_name(), "fk_items");
+        assert_eq!(incoming.child_positions.as_ref(), [1]);
+        assert_eq!(incoming.parent_positions.as_ref(), [0]);
+        let child_source = document
+            .source(incoming.child_source)
+            .expect("incoming child scan source exists");
+        assert!(matches!(child_source.kind, SourceKind::Table(_)));
+        assert!(matches!(
+            &child_source.generated_expressions[1],
+            ColumnReadExpression::Planned(Expr::Binary { lhs, .. })
+                if matches!(lhs.as_ref(), Expr::Column(column)
+                    if column.source == incoming.child_source && column.column == 0)
+        ));
+    }
+
+    #[test]
     fn basic_delete_rejects_deferred_and_unsupported_targets() {
         let schema = schema_with_writable_table();
         for (sql, expected) in [
@@ -9063,14 +9132,6 @@ mod tests {
         assert_eq!(
             virtual_error.to_string(),
             "Parse error: semantic DELETE does not yet accept virtual tables"
-        );
-
-        let foreign_key_schema = schema_with_insert_foreign_keys();
-        let foreign_key_error = analyze_sql_with_schema(&foreign_key_schema, "DELETE FROM parents")
-            .expect_err("DELETE foreign keys are deferred");
-        assert_eq!(
-            foreign_key_error.to_string(),
-            "Parse error: semantic DELETE does not yet support targets with foreign keys"
         );
 
         let mut without_rowid_schema = Schema::new();
