@@ -197,6 +197,20 @@ impl Scope {
         });
     }
 
+    /// Add another root-level source namespace at the same resolution level.
+    pub(crate) fn append_local(&mut self, other: Self) {
+        assert!(self.outer.is_none(), "destination scope must be root-level");
+        assert!(other.outer.is_none(), "appended scope must be root-level");
+        assert!(self.outputs.is_empty(), "destination scope has outputs");
+        assert!(other.outputs.is_empty(), "appended scope has outputs");
+        assert!(
+            !self.outer_resolution_blocked && !other.outer_resolution_blocked,
+            "root-level source scopes must allow ordinary resolution"
+        );
+        self.sources.extend(other.sources);
+        self.visible_columns.extend(other.visible_columns);
+    }
+
     pub(crate) fn set_outputs(&mut self, outputs: &[hir::Output]) {
         self.outputs = outputs
             .iter()

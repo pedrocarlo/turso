@@ -19,6 +19,7 @@ use super::{
         QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SchemaProgramId, Source,
         SourceId, SourceKind, TypeFact,
     },
+    query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
     AnalyzeInput,
 };
@@ -316,6 +317,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
         if let HirRoot::Update(update) = root {
+            pending.extend(update.direct_column_reads(|source| self.source(source)));
             for source in [update.target, update.new_source] {
                 let width = self
                     .source(source)
@@ -693,7 +695,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let block_id = QueryBlockId::new(query, index);
         let (from, scope) = match from {
             Some(from) => {
-                let (from, scope) = self.analyze_from_clause(from, block_id, outer_scope)?;
+                let (from, scope) = self.analyze_from_clause(
+                    from,
+                    FromContext::QueryBlock {
+                        block: block_id,
+                        outer_scope,
+                    },
+                )?;
                 (Some(from), scope)
             }
             None => (None, Scope::new(outer_scope.cloned())),
@@ -8626,16 +8634,137 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_from_before_binding_the_target() {
+    fn update_from_sources_are_root_owned_and_visible_to_set_and_where() {
         let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable AS target \
+             SET value = source.value \
+             FROM writable AS source \
+             WHERE target.id = source.id",
+        )
+        .expect("UPDATE FROM binds");
+        document
+            .validate()
+            .expect("UPDATE FROM produces closed HIR");
+
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let from = update.from.as_ref().expect("FROM is preserved");
+        let source = document.source(from.first).expect("FROM source exists");
+        assert_eq!(source.owner, SourceOwner::Root);
+        assert_eq!(source.alias.as_deref(), Some("source"));
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Column(column) if column.source == source.id && column.column == 1
+        ));
+        assert!(matches!(
+            update.predicate,
+            Some(Expr::Binary { ref lhs, ref rhs, .. })
+                if matches!(lhs.as_ref(), Expr::Column(column) if column.source == update.target && column.column == 0)
+                    && matches!(rhs.as_ref(), Expr::Column(column) if column.source == source.id && column.column == 0)
+        ));
+    }
+
+    #[test]
+    fn update_from_join_constraints_exclude_the_target() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable AS target \
+             SET value = right_side.value \
+             FROM writable AS left_side \
+             JOIN writable AS right_side ON left_side.id = right_side.id \
+             WHERE target.id = left_side.id",
+        )
+        .expect("JOIN constraints see UPDATE FROM sources");
+        document
+            .validate()
+            .expect("joined UPDATE FROM produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let from = update.from.as_ref().expect("FROM is preserved");
+        assert_eq!(from.joins.len(), 1);
+        assert!(matches!(
+            from.joins[0].constraint,
+            hir::JoinConstraint::On(Expr::Binary { .. })
+        ));
+
         let error = analyze_sql_with_schema(
             &schema,
-            "UPDATE absent SET value = other.value FROM writable AS other",
+            "UPDATE writable AS target SET value = right_side.value \
+             FROM writable AS left_side \
+             JOIN writable AS right_side ON target.id = right_side.id",
         )
-        .expect_err("deferred UPDATE FROM fails first");
+        .expect_err("JOIN constraints cannot see the UPDATE target");
+        assert_eq!(error.to_string(), "Parse error: no such table: target");
+    }
+
+    #[test]
+    fn update_from_keeps_cte_ambiguity_and_returning_rules() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH input(id, value) AS (VALUES(1, 'from cte')) \
+             UPDATE writable SET value = input.value \
+             FROM input WHERE writable.id = input.id",
+        )
+        .expect("UPDATE FROM resolves statement CTEs");
+        document
+            .validate()
+            .expect("CTE UPDATE FROM produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let from = update.from.as_ref().expect("FROM is preserved");
+        assert!(matches!(
+            document.source(from.first).expect("CTE source exists").kind,
+            SourceKind::Cte(_)
+        ));
+
+        let derived = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = input.value \
+             FROM (SELECT 1 AS id, 'derived' AS value) AS input \
+             WHERE writable.id = input.id",
+        )
+        .expect("UPDATE FROM resolves derived sources");
+        derived
+            .validate()
+            .expect("derived UPDATE FROM produces closed HIR");
+        let HirRoot::Update(update) = &derived.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let source = derived
+            .source(update.from.as_ref().expect("FROM is preserved").first)
+            .expect("derived source exists");
+        let SourceKind::Derived(query) = source.kind else {
+            panic!("FROM source remains derived");
+        };
+        assert_eq!(source.owner, SourceOwner::Root);
         assert_eq!(
-            error.to_string(),
-            "Parse error: semantic UPDATE does not yet accept FROM clauses"
+            derived.query(query).expect("derived query exists").parent,
+            None
         );
+
+        let ambiguous = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = 'x' FROM writable AS source WHERE id = source.id",
+        )
+        .expect_err("target and FROM sources share one resolution level");
+        assert_eq!(
+            ambiguous.to_string(),
+            "Parse error: ambiguous column name: id"
+        );
+
+        let returning = analyze_sql_with_schema(
+            &schema,
+            "UPDATE writable SET value = source.value \
+             FROM writable AS source RETURNING source.value",
+        )
+        .expect_err("RETURNING cannot see UPDATE FROM sources");
+        assert_eq!(returning.to_string(), "Parse error: no such table: source");
     }
 }
