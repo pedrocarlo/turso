@@ -7505,6 +7505,90 @@ mod tests {
     }
 
     #[test]
+    fn custom_cast_parameter_mismatch_uses_ordinary_cast_rules() {
+        let mut schema = schema_with_items();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE positive(value INTEGER, minimum INTEGER) BASE INTEGER \
+                 ENCODE CASE WHEN value > minimum THEN value ELSE NULL END",
+            )
+            .expect("custom type definition parses");
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT CAST(value AS positive), CAST(value AS positive(0, 1)) FROM items",
+        )
+        .expect("custom parameter mismatch falls back to ordinary CAST");
+        document
+            .validate()
+            .expect("fallback CAST targets produce closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        for (output, parameter_count) in outputs.iter().zip([0, 2]) {
+            let Expr::Cast { target, .. } = &output.expr else {
+                panic!("CAST becomes resolved HIR");
+            };
+            assert_eq!(target.name, "positive");
+            assert_eq!(target.parameters.len(), parameter_count);
+            assert!(
+                target
+                    .type_fact
+                    .declared
+                    .as_ref()
+                    .expect("ordinary target keeps declared spelling")
+                    .custom_chain
+                    .is_empty()
+            );
+            assert!(target.programs.encode.is_empty());
+            assert!(target.programs.domain.is_none());
+            assert!(target.programs.apply_builtin_affinity);
+            assert_eq!(target.affinity, crate::vdbe::affinity::Affinity::Numeric);
+            assert_eq!(target.type_fact.storage, Some(Type::Numeric));
+        }
+    }
+
+    #[test]
+    fn parameterized_custom_array_cast_keeps_custom_type_identity() {
+        let mut schema = schema_with_items();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE positive(value INTEGER, minimum INTEGER) BASE INTEGER \
+                 ENCODE CASE WHEN value > minimum THEN value ELSE NULL END",
+            )
+            .expect("custom type definition parses");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT CAST(value AS positive(0)[]) FROM items")
+                .expect("parameterized custom array CAST binds");
+        document
+            .validate()
+            .expect("custom array CAST produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let output = &document.query(root.query).expect("query exists").blocks[0].outputs[0];
+        let Expr::Cast { target, .. } = &output.expr else {
+            panic!("CAST becomes resolved HIR");
+        };
+        assert_eq!(target.name, "positive");
+        assert_eq!(target.parameters.len(), 1);
+        assert_eq!(target.array_dimensions, 1);
+        assert_eq!(target.type_fact.array_dimensions, 1);
+        assert!(target.type_fact.is_array());
+        let declared = target
+            .type_fact
+            .declared
+            .as_ref()
+            .expect("custom array keeps its declaration");
+        assert_eq!(declared.custom_chain.len(), 1);
+        assert_eq!(declared.custom_chain[0].value().name, "positive");
+        assert_eq!(target.programs.encode.len(), 1);
+        assert!(!target.programs.apply_builtin_affinity);
+    }
+
+    #[test]
     fn scalar_functions_keep_resolved_identity_and_result_type() {
         let schema = schema_with_items();
         let document =

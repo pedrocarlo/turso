@@ -40,9 +40,9 @@ documents.
 
 ## Current status
 
-Core SELECT and top-level DML binding are present. The coverage audit below
-lists the remaining user-visible binding gaps before either path can be called
-complete.
+Core SELECT and top-level DML binding are present. The user-visible SELECT
+coverage audit is complete; deferred migration work and two generic diagnostic
+cleanups remain below.
 
 ### Remaining binding coverage audit
 
@@ -52,11 +52,7 @@ planner and expression translator, and existing conformance tests. A generic
 `unsupported SELECT statement` error is not evidence that the old path rejects
 the same SQL.
 
-Missing HIR binding:
-
-| Surface | Evidence | Required work |
-|---|---|---|
-| Custom CAST fallback | Production falls through to ordinary CAST when a resolved custom type has the wrong parameter count; semantic analysis emits a generic unsupported error. Custom array targets also take different paths. | Match production fallback and array behavior, then replace the generic catch-all with specific invariants or diagnostics. |
+No audited user-visible SELECT binding gaps remain.
 
 Deferred migration surfaces:
 
@@ -383,6 +379,11 @@ expression is bound but does not change scalar evaluation. Supported nullary
 expand to name/value arguments from the visible source columns. Argument
 `ORDER BY`, scalar `OVER`, unsupported star syntax, and wrong arity retain
 their existing diagnostics. Aggregate and window metadata are unchanged.
+
+Custom CAST targets now use ordinary affinity CAST rules when their supplied
+parameter count does not match the resolved custom type. Correctly
+parameterized custom array targets retain their frozen custom type chain,
+schema programs, and array dimensions in HIR.
 
 ## Working rules
 

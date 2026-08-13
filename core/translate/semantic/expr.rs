@@ -2993,12 +2993,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .main_schema()
                 .resolve_type_unchecked(&syntax.name)?
             {
-                if syntax.array_dimensions > 0
-                    || resolved.leaf().user_params().count() != parameters.len()
-                {
-                    return super::analyze::unsupported_select();
+                if resolved.leaf().user_params().count() != parameters.len() {
+                    return Ok(builtin_cast_target(syntax, parameter_expressions));
                 }
-                let (type_fact, affinity) = self.freeze_type_fact(&syntax.name, resolved, 0);
+                let (type_fact, affinity) =
+                    self.freeze_type_fact(&syntax.name, resolved, syntax.array_dimensions);
                 let custom_chain = type_fact
                     .declared
                     .as_ref()
@@ -3019,7 +3018,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 return Ok(hir::TypeName {
                     name: syntax.name.clone(),
                     parameters: parameter_expressions,
-                    array_dimensions: 0,
+                    array_dimensions: syntax.array_dimensions,
                     type_fact,
                     affinity,
                     programs: hir::BoundCastPrograms {
@@ -3030,21 +3029,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 });
             }
         }
-        let affinity = Affinity::affinity(&syntax.name);
-        let type_fact = hir::TypeFact::declared(hir::DeclaredType {
-            name: syntax.name.clone(),
-            storage: affinity.to_type(),
-            custom_chain: Vec::new(),
-            array_dimensions: syntax.array_dimensions,
-        });
-        Ok(hir::TypeName {
-            name: syntax.name.clone(),
-            parameters: parameter_expressions,
-            array_dimensions: syntax.array_dimensions,
-            type_fact,
-            affinity,
-            programs: builtin_cast_programs(),
-        })
+        Ok(builtin_cast_target(syntax, parameter_expressions))
     }
 
     pub(super) fn freeze_type_fact(
@@ -3076,6 +3061,24 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }),
             affinity,
         )
+    }
+}
+
+fn builtin_cast_target(syntax: &ast::Type, parameters: Vec<hir::Expr>) -> hir::TypeName {
+    let affinity = Affinity::affinity(&syntax.name);
+    let type_fact = hir::TypeFact::declared(hir::DeclaredType {
+        name: syntax.name.clone(),
+        storage: affinity.to_type(),
+        custom_chain: Vec::new(),
+        array_dimensions: syntax.array_dimensions,
+    });
+    hir::TypeName {
+        name: syntax.name.clone(),
+        parameters,
+        array_dimensions: syntax.array_dimensions,
+        type_fact,
+        affinity,
+        programs: builtin_cast_programs(),
     }
 }
 
