@@ -21,7 +21,7 @@ pub enum HirRoot {
     Insert(Insert),
     Update(Update),
     Delete(Delete),
-    TriggerPredicate(TriggerPredicate),
+    Trigger(TriggerRoot),
     SchemaExpressions(SchemaExpressionRoot),
 }
 
@@ -35,13 +35,26 @@ pub struct SchemaExpressionRoot {
 #[derive(Clone, Debug)]
 pub struct QueryRoot {
     pub query: QueryId,
-    pub trigger: Option<TriggerEnvironment>,
 }
 
 #[derive(Clone, Debug)]
-pub struct TriggerPredicate {
-    pub expression: Expr,
+pub struct TriggerRoot {
     pub environment: TriggerEnvironment,
+    pub body: TriggerBody,
+}
+
+#[derive(Clone, Debug)]
+pub enum TriggerBody {
+    Predicate(Expr),
+    Command(TriggerCommand),
+}
+
+#[derive(Clone, Debug)]
+pub enum TriggerCommand {
+    Select(QueryId),
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
 }
 
 /// Pseudo-sources visible while analyzing one trigger command or predicate.
@@ -62,7 +75,6 @@ pub struct Insert {
     pub upserts: Vec<Upsert>,
     pub excluded_source: Option<SourceId>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
 }
 
 /// Metadata required by the concrete kind of INSERT destination.
@@ -176,7 +188,6 @@ pub struct Update {
     pub limit: Option<Limit>,
     pub conflict: Option<ResolveType>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
     /// For an internal sqlite_schema update, CDC stores the user's DDL text in
     /// the changed `sql` field instead of the generated UPDATE statement.
     pub cdc_updates_override: Option<(usize, String)>,
@@ -201,7 +212,6 @@ pub struct Delete {
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<Limit>,
     pub returning: Option<Returning>,
-    pub trigger: Option<TriggerEnvironment>,
 }
 
 /// Metadata required by the concrete kind of DELETE destination.

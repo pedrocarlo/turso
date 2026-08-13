@@ -193,14 +193,22 @@ impl<'document> HirValidator<'document> {
         match root {
             HirRoot::Query(root) => {
                 self.visit_query(root.query)?;
-                self.visit_optional_trigger_environment(root.trigger.as_ref())
+                Ok(())
             }
-            HirRoot::Insert(insert) => self.visit_insert(insert),
-            HirRoot::Update(update) => self.visit_update(update),
-            HirRoot::Delete(delete) => self.visit_delete(delete),
-            HirRoot::TriggerPredicate(predicate) => {
-                self.visit_trigger_environment(&predicate.environment)?;
-                self.visit_expr(&predicate.expression)
+            HirRoot::Insert(insert) => self.visit_insert(insert, false),
+            HirRoot::Update(update) => self.visit_update(update, false),
+            HirRoot::Delete(delete) => self.visit_delete(delete, false),
+            HirRoot::Trigger(root) => {
+                self.visit_trigger_environment(&root.environment)?;
+                match &root.body {
+                    TriggerBody::Predicate(expression) => self.visit_expr(expression),
+                    TriggerBody::Command(command) => match command {
+                        TriggerCommand::Select(query) => self.visit_query(*query),
+                        TriggerCommand::Insert(insert) => self.visit_insert(insert, true),
+                        TriggerCommand::Update(update) => self.visit_update(update, true),
+                        TriggerCommand::Delete(delete) => self.visit_delete(delete, true),
+                    },
+                }
             }
             HirRoot::SchemaExpressions(root) => {
                 self.visit_source(root.source, Some(SourceOwner::Root))?;
@@ -212,7 +220,7 @@ impl<'document> HirValidator<'document> {
         }
     }
 
-    fn visit_insert(&self, insert: &Insert) -> ValidationResult {
+    fn visit_insert(&self, insert: &Insert, trigger_command: bool) -> ValidationResult {
         self.visit_source(insert.target, Some(SourceOwner::Root))?;
         let target = self.source(insert.target)?;
         let SourceKind::Table(target_table) = &target.kind else {
@@ -314,7 +322,7 @@ impl<'document> HirValidator<'document> {
                     "virtual-table INSERT carries a query source",
                 )?;
                 self.require(
-                    insert.trigger.is_none(),
+                    !trigger_command,
                     "trigger command writes an unsafe virtual-table target",
                 )?;
             }
@@ -377,11 +385,10 @@ impl<'document> HirValidator<'document> {
             self.visit_source(excluded, Some(SourceOwner::Root))?;
             self.require_pseudo_source(excluded, PseudoSource::Excluded)?;
         }
-        self.visit_optional_returning(insert.returning.as_ref())?;
-        self.visit_optional_trigger_environment(insert.trigger.as_ref())
+        self.visit_optional_returning(insert.returning.as_ref())
     }
 
-    fn visit_update(&self, update: &Update) -> ValidationResult {
+    fn visit_update(&self, update: &Update, trigger_command: bool) -> ValidationResult {
         self.visit_source(update.target, Some(SourceOwner::Root))?;
         self.visit_source(update.new_source, Some(SourceOwner::Root))?;
         let target_table = match &self.source(update.target)?.kind {
@@ -434,7 +441,7 @@ impl<'document> HirValidator<'document> {
                     )?;
                 }
                 self.require(
-                    update.trigger.is_none(),
+                    !trigger_command,
                     "trigger command writes an unsafe virtual-table target",
                 )?;
             }
@@ -446,11 +453,10 @@ impl<'document> HirValidator<'document> {
         self.visit_optional_expr(update.predicate.as_ref())?;
         self.visit_order_terms(&update.order_by)?;
         self.visit_optional_limit(update.limit.as_ref())?;
-        self.visit_optional_returning(update.returning.as_ref())?;
-        self.visit_optional_trigger_environment(update.trigger.as_ref())
+        self.visit_optional_returning(update.returning.as_ref())
     }
 
-    fn visit_delete(&self, delete: &Delete) -> ValidationResult {
+    fn visit_delete(&self, delete: &Delete, trigger_command: bool) -> ValidationResult {
         self.visit_source(delete.target, Some(SourceOwner::Root))?;
         let target_table = match &self.source(delete.target)?.kind {
             SourceKind::Table(table) => table,
@@ -487,7 +493,7 @@ impl<'document> HirValidator<'document> {
                     "virtual-table DELETE row carries B-tree constraint metadata",
                 )?;
                 self.require(
-                    delete.trigger.is_none(),
+                    !trigger_command,
                     "trigger command writes an unsafe virtual-table target",
                 )?;
             }
@@ -495,8 +501,7 @@ impl<'document> HirValidator<'document> {
         self.visit_optional_expr(delete.predicate.as_ref())?;
         self.visit_order_terms(&delete.order_by)?;
         self.visit_optional_limit(delete.limit.as_ref())?;
-        self.visit_optional_returning(delete.returning.as_ref())?;
-        self.visit_optional_trigger_environment(delete.trigger.as_ref())
+        self.visit_optional_returning(delete.returning.as_ref())
     }
 
     fn visit_assignments(&self, target: SourceId, assignments: &[Assignment]) -> ValidationResult {
@@ -538,15 +543,6 @@ impl<'document> HirValidator<'document> {
             self.visit_output(output, OutputId::root(index))?;
         }
         Ok(())
-    }
-
-    fn visit_optional_trigger_environment(
-        &self,
-        environment: Option<&TriggerEnvironment>,
-    ) -> ValidationResult {
-        environment.map_or(Ok(()), |environment| {
-            self.visit_trigger_environment(environment)
-        })
     }
 
     fn visit_trigger_environment(&self, environment: &TriggerEnvironment) -> ValidationResult {
@@ -2038,6 +2034,12 @@ impl<'document> HirValidator<'document> {
             let require_complete = matches!(
                 &self.document.root,
                 HirRoot::Insert(insert) if insert.target == source.id
+            ) || matches!(
+                &self.document.root,
+                HirRoot::Trigger(TriggerRoot {
+                    body: TriggerBody::Command(TriggerCommand::Insert(insert)),
+                    ..
+                }) if insert.target == source.id
             );
             if require_complete {
                 self.require(

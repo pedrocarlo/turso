@@ -52,9 +52,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             )?
             .expr;
 
-        Ok(hir::HirRoot::TriggerPredicate(hir::TriggerPredicate {
-            expression,
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
             environment,
+            body: hir::TriggerBody::Predicate(expression),
         }))
     }
 
@@ -66,9 +66,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (environment, scope) = self.create_trigger_environment(context)?;
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
         let query = self.analyze_subquery(select, None, &scope, policies)?;
-        Ok(hir::HirRoot::Query(hir::QueryRoot {
-            query,
-            trigger: Some(environment),
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(hir::TriggerCommand::Select(query)),
         }))
     }
 
@@ -82,7 +82,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
         let target =
             self.analyze_base_table_source_in_database(insert.table, database, SourceOwner::Root)?;
-        self.analyze_insert_target(
+        let root = self.analyze_insert_target(
             None,
             insert.conflict_override.or(insert.command_conflict),
             insert.columns,
@@ -96,8 +96,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 outer_scope: &scope,
                 policies,
             },
-            Some(environment),
-        )
+        )?;
+        let hir::HirRoot::Insert(insert) = root else {
+            unreachable!("INSERT analyzer returns an INSERT root");
+        };
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(hir::TriggerCommand::Insert(insert)),
+        }))
     }
 
     pub(super) fn analyze_trigger_update(
@@ -110,7 +116,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
         let target =
             self.analyze_base_table_source_in_database(update.table, database, SourceOwner::Root)?;
-        self.analyze_update_target(
+        let root = self.analyze_update_target(
             target,
             UpdateBodySyntax {
                 conflict: update.conflict_override.or(update.command_conflict),
@@ -123,8 +129,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 outer_scope: Some(&scope),
                 policies,
             },
-            Some(environment),
-        )
+        )?;
+        let hir::HirRoot::Update(update) = root else {
+            unreachable!("UPDATE analyzer returns an UPDATE root");
+        };
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(hir::TriggerCommand::Update(update)),
+        }))
     }
 
     pub(super) fn analyze_trigger_delete(
@@ -137,7 +149,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
         let target =
             self.analyze_base_table_source_in_database(delete.table, database, SourceOwner::Root)?;
-        self.analyze_delete_target(
+        let root = self.analyze_delete_target(
             target,
             delete.predicate,
             &[],
@@ -145,8 +157,14 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 outer_scope: Some(&scope),
                 policies,
             },
-            Some(environment),
-        )
+        )?;
+        let hir::HirRoot::Delete(delete) = root else {
+            unreachable!("DELETE analyzer returns a DELETE root");
+        };
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(hir::TriggerCommand::Delete(delete)),
+        }))
     }
 
     fn create_trigger_environment(

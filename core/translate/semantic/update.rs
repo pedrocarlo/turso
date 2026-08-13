@@ -48,7 +48,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     outer_scope: None,
                     policies: ExprPolicies::statement(analyzer.context().dqs_dml()),
                 },
-                None,
             )
         })
     }
@@ -58,7 +57,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         syntax: UpdateBodySyntax<'ast>,
         expressions: UpdateExprContext<'_>,
-        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
         let table = match &self
             .source(target)
@@ -142,7 +140,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             limit: None,
             conflict: syntax.conflict,
             returning,
-            trigger,
             cdc_updates_override: None,
         }))
     }
