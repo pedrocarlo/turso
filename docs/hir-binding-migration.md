@@ -57,7 +57,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from a live resolver's owned multi-database snapshot. Calling that semantic entry point from preparation and switching execution to HIR remain later steps; physical lowering is explicitly out of scope for now. |
+| Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Preparation can capture that catalog from the same schema inputs used to create the legacy resolver, but does not call the semantic entry point yet. Switching execution to HIR remains a later step; physical lowering is explicitly out of scope for now. |
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -118,14 +118,15 @@ Completed:
   explicit unqualified search path across main, temp, and attached schemas.
   Qualified tables and indexes keep their database identity; DML metadata uses
   the target database, and documents record sorted schema-version snapshots.
-- The live resolver can freeze its main, temp, attached, and connection-local
-  staged schemas into one owned catalog snapshot. The snapshot also freezes the
-  exact unqualified lookup order without holding catalog locks.
-- A standalone semantic entry point consumes that owned resolver snapshot and
+- A neutral semantic catalog captures `Arc` references to main, temp, attached,
+  and connection-local staged schemas from the same inputs used to create the
+  legacy resolver. It also captures the exact unqualified lookup order without
+  holding catalog locks; the resolver neither creates nor owns this catalog.
+- A standalone semantic entry point consumes that owned catalog and
   produces a validated statement or whole-trigger-program `HirDocument`.
-  Trigger targets resolve inside the snapshot from database ID and table name,
+  Trigger targets resolve inside the catalog from database ID and table name,
   so callers cannot inject an unrelated catalog table. Analysis borrows only
-  snapshot schemas, symbols, and dialect; live resolver and locks are not needed.
+  catalog schemas, symbols, and dialect; live resolver and locks are not needed.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,
