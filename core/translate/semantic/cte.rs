@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
+    expr::ExprPolicies,
     hir::{
         Cte, CteBody, CteColumn, CteId, QueryId, RecursiveArm, RecursiveCte, RecursiveOrderTerm,
     },
@@ -25,20 +26,28 @@ pub(super) enum CteBindingContext<'scope> {
     Query {
         parent: QueryId,
         outer_scope: Option<&'scope Scope>,
+        policies: ExprPolicies,
     },
-    Root,
+    Root {
+        policies: ExprPolicies,
+    },
 }
 
 impl<'scope> CteBindingContext<'scope> {
-    pub(super) fn new(parent: QueryId, outer_scope: Option<&'scope Scope>) -> Self {
+    pub(super) fn new(
+        parent: QueryId,
+        outer_scope: Option<&'scope Scope>,
+        policies: ExprPolicies,
+    ) -> Self {
         Self::Query {
             parent,
             outer_scope,
+            policies,
         }
     }
 
-    pub(super) const fn root() -> Self {
-        Self::Root
+    pub(super) const fn root(policies: ExprPolicies) -> Self {
+        Self::Root { policies }
     }
 
     fn query_parent(self) -> Option<QueryId> {
@@ -46,18 +55,25 @@ impl<'scope> CteBindingContext<'scope> {
             Self::Query {
                 parent,
                 outer_scope: Some(_),
+                ..
             } => Some(parent),
             Self::Query {
                 outer_scope: None, ..
             }
-            | Self::Root => None,
+            | Self::Root { .. } => None,
         }
     }
 
     fn outer_scope(self) -> Option<&'scope Scope> {
         match self {
             Self::Query { outer_scope, .. } => outer_scope,
-            Self::Root => None,
+            Self::Root { .. } => None,
+        }
+    }
+
+    fn policies(self) -> ExprPolicies {
+        match self {
+            Self::Query { policies, .. } | Self::Root { policies } => policies,
         }
     }
 }
@@ -697,7 +713,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .select
             .limit
             .as_ref()
-            .map(|limit| self.analyze_limit(limit, seed))
+            .map(|limit| self.analyze_limit(limit, seed, context.policies()))
             .transpose()?;
         self.insert_cte(
             id,
@@ -785,6 +801,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     parent: context.query_parent(),
                     outer_scope: context.outer_scope(),
                     expected_outputs: None,
+                    policies: context.policies(),
                 },
             )
         })
@@ -795,16 +812,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         select: &'ast ast::Select,
         context: CteBindingContext<'_>,
     ) -> Result<QueryId> {
-        match context {
-            CteBindingContext::Query {
-                parent,
-                outer_scope: Some(scope),
-            } => self.analyze_subquery(select, Some(parent), scope),
-            CteBindingContext::Query {
-                outer_scope: None, ..
-            }
-            | CteBindingContext::Root => self.analyze_select(select),
-        }
+        self.analyze_select_with_scope(
+            select,
+            context.query_parent(),
+            context.outer_scope(),
+            None,
+            context.policies(),
+        )
     }
 
     pub(super) fn record_recursive_input(

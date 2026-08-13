@@ -5,7 +5,7 @@ use turso_parser::ast;
 use super::{
     analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
     cte::{CteBindingContext, CteResolution},
-    expr::{build_using_column, ExprPolicy},
+    expr::{build_using_column, ExprPolicies, ExprPolicy},
     hir::{self, CatalogObject, DeclaredType, SourceOwner, TypeFact},
     schema_program::TypeTransform,
     scope::{resolve_source_column, Scope},
@@ -28,6 +28,7 @@ pub(super) enum FromContext<'scope> {
     QueryBlock {
         block: hir::QueryBlockId,
         outer_scope: Option<&'scope Scope>,
+        policies: ExprPolicies,
     },
     Root,
 }
@@ -54,12 +55,21 @@ impl<'scope> FromContext<'scope> {
         }
     }
 
-    fn cte_context(self) -> CteBindingContext<'scope> {
+    fn cte_context(self, dqs_dml: super::context::DoubleQuotedDml) -> CteBindingContext<'scope> {
         match self {
-            Self::QueryBlock { block, outer_scope } => {
-                CteBindingContext::new(block.query, outer_scope)
-            }
-            Self::Root => CteBindingContext::root(),
+            Self::QueryBlock {
+                block,
+                outer_scope,
+                policies,
+            } => CteBindingContext::new(block.query, outer_scope, policies),
+            Self::Root => CteBindingContext::root(ExprPolicies::statement(dqs_dml)),
+        }
+    }
+
+    fn expr_policies(self, dqs_dml: super::context::DoubleQuotedDml) -> ExprPolicies {
+        match self {
+            Self::QueryBlock { policies, .. } => policies,
+            Self::Root => ExprPolicies::statement(dqs_dml),
         }
     }
 }
@@ -77,6 +87,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         arguments: &'ast [Box<ast::Expr>],
         parent: Option<hir::QueryId>,
         outer_scope: &Scope,
+        policies: ExprPolicies,
     ) -> Result<hir::QueryId> {
         let query = self.reserve_query();
         let block_id = hir::QueryBlockId::new(query, 0);
@@ -85,7 +96,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             arguments,
             None,
             SourceOwner::QueryBlock(block_id),
-            CteBindingContext::new(query, Some(outer_scope)),
+            CteBindingContext::new(query, Some(outer_scope), policies),
         )?;
         if let Some(arguments) = analyzed.function_arguments {
             self.analyze_table_function_arguments(
@@ -93,6 +104,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 arguments,
                 outer_scope,
                 Some(query),
+                policies,
             )?;
         }
 
@@ -241,10 +253,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 arguments,
                 &scope,
                 context.query_parent(),
+                context.expr_policies(self.context().dqs_dml()),
             )?;
         }
 
-        let policy = ExprPolicy::select(self.context().dqs_dml());
+        let policy = context.expr_policies(self.context().dqs_dml()).select();
         for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
             if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
                 join.constraint = hir::JoinConstraint::On(self.analyze_source_scalar_expr(
@@ -272,7 +285,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         position: usize,
     ) -> Result<AnalyzedTableSource<'ast>> {
         let owner = context.source_owner();
-        let cte_context = context.cte_context();
+        let cte_context = context.cte_context(self.context().dqs_dml());
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
@@ -456,8 +469,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast [Box<ast::Expr>],
         scope: &Scope,
         parent: Option<hir::QueryId>,
+        policies: ExprPolicies,
     ) -> Result<()> {
-        let policy = ExprPolicy::table_function(self.context().dqs_dml());
+        let policy = policies.table_function();
         let mut arguments = Vec::with_capacity(syntax.len());
         for argument in syntax {
             arguments.push(self.analyze_source_scalar_expr(argument, scope, policy, parent)?);
