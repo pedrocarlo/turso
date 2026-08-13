@@ -10,7 +10,7 @@ use super::{
     schema_program::TypeTransform,
     scope::{resolve_source_column, Scope},
 };
-use crate::{schema::Table, sync::Arc, Result};
+use crate::{schema::Table, sync::Arc, LimboError, Result};
 
 struct AnalyzedTableSource<'ast> {
     id: hir::SourceId,
@@ -391,8 +391,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             CatalogSourceKind::Table
         };
-        let id =
-            self.analyze_catalog_table_source(name, alias, None, owner, database, table, kind)?;
+        let id = self.analyze_catalog_table_source(
+            &name.name,
+            alias.map(ast::As::name).or(name.alias.as_ref()),
+            None,
+            owner,
+            database,
+            table,
+            kind,
+        )?;
         Ok(AnalyzedTableSource {
             id,
             function_arguments: matches!(kind, CatalogSourceKind::TableFunction)
@@ -659,9 +666,32 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     ) -> Result<hir::SourceId> {
         let (database, table) = self.context().resolve_table(name)?;
         self.analyze_catalog_table_source(
-            name,
-            alias,
+            &name.name,
+            alias.map(ast::As::name).or(name.alias.as_ref()),
             indexed,
+            owner,
+            database,
+            table,
+            CatalogSourceKind::Table,
+        )
+    }
+
+    pub(super) fn analyze_base_table_source_in_database(
+        &mut self,
+        name: &ast::Name,
+        database: hir::DatabaseId,
+        owner: SourceOwner,
+    ) -> Result<hir::SourceId> {
+        let table_name = crate::util::normalize_ident(name.as_str());
+        let table = self
+            .context()
+            .main_schema()
+            .get_table(&table_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
+        self.analyze_catalog_table_source(
+            name,
+            None,
+            None,
             owner,
             database,
             table,
@@ -672,15 +702,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     #[allow(clippy::too_many_arguments)]
     fn analyze_catalog_table_source(
         &mut self,
-        name: &ast::QualifiedName,
-        alias: Option<&ast::As>,
+        name: &ast::Name,
+        alias: Option<&ast::Name>,
         indexed: Option<&ast::Indexed>,
         owner: SourceOwner,
         database: hir::DatabaseId,
         table: Arc<Table>,
         source_kind: CatalogSourceKind,
     ) -> Result<hir::SourceId> {
-        let table_name = crate::util::normalize_ident(name.name.as_str());
+        let table_name = crate::util::normalize_ident(name.as_str());
         let table_id =
             self.catalog_object_id(Some(database), CatalogObjectKind::Table, table_name.clone());
         let table = CatalogObject::new(table_id, self.context().snapshot(), Some(database), table);
@@ -739,10 +769,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 owner,
                 database: Some(database),
                 name: table_name,
-                alias: alias
-                    .map(ast::As::name)
-                    .or(name.alias.as_ref())
-                    .map(|name| crate::util::normalize_ident(name.as_str())),
+                alias: alias.map(|name| crate::util::normalize_ident(name.as_str())),
                 kind: match source_kind {
                     CatalogSourceKind::Table => hir::SourceKind::Table(table.clone()),
                     CatalogSourceKind::TableFunction => hir::SourceKind::TableFunction {
