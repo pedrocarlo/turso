@@ -5,10 +5,24 @@ use turso_parser::ast;
 use super::{
     analyze::{Analyzer, CatalogObjectKind},
     dml::{trigger_matches_update, trigger_targets_database},
-    expr::ExprPolicy,
+    expr::{ExprPolicies, ExprPolicy},
     hir::{self, HirRoot, SourceOwner},
     scope::{ExprCollation, Scope},
 };
+
+#[derive(Clone, Copy)]
+pub(super) struct InsertExprContext<'scope> {
+    pub(super) outer_scope: &'scope Scope,
+    pub(super) policies: ExprPolicies,
+}
+
+pub(super) enum InsertBodySyntax<'ast> {
+    DefaultValues,
+    Select {
+        select: &'ast ast::Select,
+        upsert: Option<&'ast ast::Upsert>,
+    },
+}
 use crate::{
     schema::{autoincrement_sequence_name, Table, TypeDef, SQLITE_SEQUENCE_TABLE_NAME},
     sync::Arc,
@@ -28,6 +42,42 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
         let target = self.analyze_base_table_source(table_name, None, None, SourceOwner::Root)?;
+        let body = match body {
+            ast::InsertBody::DefaultValues => InsertBodySyntax::DefaultValues,
+            ast::InsertBody::Select(select, upsert) => InsertBodySyntax::Select {
+                select,
+                upsert: upsert.as_deref(),
+            },
+        };
+        let empty_scope = Scope::default();
+        let expressions = InsertExprContext {
+            outer_scope: &empty_scope,
+            policies: ExprPolicies::statement(self.context().dqs_dml()),
+        };
+        self.analyze_insert_target(
+            with,
+            conflict,
+            column_names,
+            body,
+            returning,
+            target,
+            expressions,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn analyze_insert_target(
+        &mut self,
+        with: Option<&'ast ast::With>,
+        conflict: Option<ast::ResolveType>,
+        column_names: &[ast::Name],
+        body: InsertBodySyntax<'ast>,
+        returning: &'ast [ast::ResultColumn],
+        target: hir::SourceId,
+        expressions: InsertExprContext<'_>,
+        trigger: Option<hir::TriggerEnvironment>,
+    ) -> Result<HirRoot> {
         let table = match &self
             .source(target)
             .ok_or_else(|| {
@@ -58,6 +108,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 target,
                 &table,
                 autoincrement,
+                expressions,
+                trigger,
             )
         })
     }
@@ -66,15 +118,17 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         conflict: Option<ast::ResolveType>,
         column_names: &[ast::Name],
-        body: &'ast ast::InsertBody,
+        body: InsertBodySyntax<'ast>,
         returning: &'ast [ast::ResultColumn],
         target: hir::SourceId,
         table: &hir::ResolvedTable,
         autoincrement: Option<hir::ResolvedAutoincrement>,
+        expressions: InsertExprContext<'_>,
+        trigger: Option<hir::TriggerEnvironment>,
     ) -> Result<HirRoot> {
         let virtual_target = table.value().virtual_table().is_some();
         let (columns, source, upserts, excluded_source) = match body {
-            ast::InsertBody::DefaultValues => {
+            InsertBodySyntax::DefaultValues => {
                 if !column_names.is_empty() {
                     crate::bail_parse_error!("0 values for {} columns", column_names.len());
                 }
@@ -85,7 +139,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     None,
                 )
             }
-            ast::InsertBody::Select(select, upsert) => {
+            InsertBodySyntax::Select { select, upsert } => {
                 if virtual_target
                     && (upsert.is_some()
                         || !is_simple_values(select)
@@ -118,6 +172,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     target,
                                     table.value(),
                                     target_column.column,
+                                    expressions,
                                 )?);
                             }
                             bound_rows.push(bound);
@@ -129,7 +184,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             .iter()
                             .map(|target| self.write_target_type(table.value(), target.column))
                             .collect::<Result<Vec<_>>>()?;
-                        let query = self.analyze_insert_select(select, &expected_outputs)?;
+                        let query =
+                            self.analyze_insert_select(select, &expected_outputs, expressions)?;
                         let actual = self
                             .query(query)
                             .ok_or_else(|| {
@@ -149,11 +205,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     }
                 };
                 let (upserts, excluded_source) =
-                    self.analyze_upserts(upsert.as_deref(), target, table)?;
+                    self.analyze_upserts(upsert, target, table, expressions.policies)?;
                 (columns, source, upserts, excluded_source)
             }
         };
-        let returning = self.analyze_dml_returning(returning, target)?;
+        let returning =
+            self.analyze_dml_returning_with_policies(returning, target, expressions.policies)?;
         let target_kind = if virtual_target {
             hir::InsertTargetKind::Virtual
         } else {
@@ -174,7 +231,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             upserts,
             excluded_source,
             returning,
-            trigger: None,
+            trigger,
         }))
     }
 
@@ -182,8 +239,15 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         &mut self,
         select: &'ast ast::Select,
         expected_outputs: &[Option<Arc<TypeDef>>],
+        expressions: InsertExprContext<'_>,
     ) -> Result<hir::QueryId> {
-        self.analyze_select_with_expected_outputs(select, expected_outputs)
+        self.analyze_subquery_with_expected_outputs(
+            select,
+            None,
+            expressions.outer_scope,
+            expected_outputs,
+            expressions.policies,
+        )
     }
 
     fn analyze_insert_autoincrement(
@@ -452,6 +516,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         table: &Table,
         column: hir::TargetColumn,
+        expressions: InsertExprContext<'_>,
     ) -> Result<hir::Expr> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_write_default(target, table, column);
@@ -459,8 +524,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(self
             .analyze_root_expr_with_expected_type(
                 syntax,
-                &Scope::default(),
-                ExprPolicy::insert_values(self.context().dqs_dml()),
+                expressions.outer_scope,
+                expressions.policies.insert_values(),
                 self.write_target_type(table, column)?,
             )?
             .expr)
@@ -568,6 +633,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         mut syntax: Option<&'ast ast::Upsert>,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
+        policies: ExprPolicies,
     ) -> Result<(Vec<hir::Upsert>, Option<hir::SourceId>)> {
         let scope = {
             let source = self.source(target).ok_or_else(|| {
@@ -577,7 +643,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             scope.add_source(source, true);
             scope
         };
-        let policy = ExprPolicy::schema_expression().with_self_source(target);
+        let policy = policies.schema_expression().with_self_source(target);
         let mut upserts = Vec::new();
         let mut excluded_source = None;
         while let Some(upsert) = syntax {
@@ -637,8 +703,13 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     })
                 })
                 .transpose()?;
-            let action =
-                self.analyze_upsert_action(&upsert.do_clause, target, table, &mut excluded_source)?;
+            let action = self.analyze_upsert_action(
+                &upsert.do_clause,
+                target,
+                table,
+                &mut excluded_source,
+                policies,
+            )?;
             upserts.push(hir::Upsert {
                 target: conflict_target,
                 action,
@@ -654,6 +725,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         target: hir::SourceId,
         table: &hir::ResolvedTable,
         excluded_source: &mut Option<hir::SourceId>,
+        policies: ExprPolicies,
     ) -> Result<hir::UpsertAction> {
         let ast::UpsertDo::Set { sets, where_clause } = syntax else {
             return Ok(hir::UpsertAction::Nothing);
@@ -683,7 +755,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             );
             scope
         };
-        let policy = ExprPolicy::upsert_update(self.context().dqs_dml());
+        let policy = policies.upsert_update();
         let mut assignments = Vec::<hir::Assignment>::new();
         for set in sets {
             let values: Vec<&ast::Expr> = match set.expr.as_ref() {

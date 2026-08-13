@@ -6,9 +6,10 @@ use super::{
     analyze::{Analyzer, CatalogObjectKind},
     expr::ExprPolicies,
     hir::{self, CatalogObject, SourceOwner},
+    insert::{InsertBodySyntax, InsertExprContext},
     query::table_has_rowid,
     scope::Scope,
-    TriggerAnalysis,
+    TriggerAnalysis, TriggerInsert,
 };
 use crate::{util::normalize_ident, LimboError, Result};
 
@@ -67,6 +68,34 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             query,
             trigger: Some(environment),
         }))
+    }
+
+    pub(super) fn analyze_trigger_insert(
+        &mut self,
+        context: TriggerAnalysis,
+        insert: TriggerInsert<'ast>,
+    ) -> Result<hir::HirRoot> {
+        let database = context.database;
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+        let target =
+            self.analyze_base_table_source_in_database(insert.table, database, SourceOwner::Root)?;
+        self.analyze_insert_target(
+            None,
+            insert.conflict_override.or(insert.command_conflict),
+            insert.columns,
+            InsertBodySyntax::Select {
+                select: insert.select,
+                upsert: insert.upsert,
+            },
+            insert.returning,
+            target,
+            InsertExprContext {
+                outer_scope: &scope,
+                policies,
+            },
+            Some(environment),
+        )
     }
 
     fn create_trigger_environment(

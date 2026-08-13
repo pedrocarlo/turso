@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::{output_from_resolved, Analyzer, CatalogObjectKind},
-    expr::ExprPolicy,
+    expr::ExprPolicies,
     hir,
     scope::{ExpandedColumn, Scope},
 };
@@ -102,6 +102,19 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         columns: &'ast [ast::ResultColumn],
         row_source: hir::SourceId,
     ) -> Result<Option<hir::Returning>> {
+        self.analyze_dml_returning_with_policies(
+            columns,
+            row_source,
+            ExprPolicies::statement(self.context().dqs_dml()),
+        )
+    }
+
+    pub(super) fn analyze_dml_returning_with_policies(
+        &mut self,
+        columns: &'ast [ast::ResultColumn],
+        row_source: hir::SourceId,
+        policies: ExprPolicies,
+    ) -> Result<Option<hir::Returning>> {
         if columns.is_empty() {
             return Ok(None);
         }
@@ -110,7 +123,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })?;
         let mut scope = Scope::default();
         scope.add_source(source, true);
-        let policy = ExprPolicy::returning(self.context().dqs_dml());
+        let policy = policies.returning();
         let mut outputs = Vec::with_capacity(columns.len());
 
         for column in columns {

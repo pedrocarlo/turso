@@ -263,6 +263,22 @@ impl ExprPolicies {
     pub(crate) fn table_function(self) -> ExprPolicy {
         self.apply(ExprPolicy::table_function(self.dqs_dml))
     }
+
+    pub(super) fn insert_values(self) -> ExprPolicy {
+        self.apply(ExprPolicy::insert_values(self.dqs_dml))
+    }
+
+    pub(super) fn returning(self) -> ExprPolicy {
+        self.apply(ExprPolicy::returning(self.dqs_dml))
+    }
+
+    pub(super) fn upsert_update(self) -> ExprPolicy {
+        self.apply(ExprPolicy::upsert_update(self.dqs_dml))
+    }
+
+    pub(super) fn schema_expression(self) -> ExprPolicy {
+        self.apply(ExprPolicy::schema_expression())
+    }
 }
 
 type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;

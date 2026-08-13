@@ -79,6 +79,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         AnalyzeInput::TriggerSelect { context, select } => {
             analyzer.analyze_trigger_select(context, select)?
         }
+        AnalyzeInput::TriggerInsert { context, insert } => {
+            analyzer.analyze_trigger_insert(context, insert)?
+        }
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -1651,6 +1654,59 @@ mod tests {
                 select,
             },
         )
+    }
+
+    fn analyze_trigger_insert_with_schema(
+        schema: &Schema,
+        event: ast::TriggerEvent,
+        command: &ast::TriggerCmd,
+        conflict_override: Option<ast::ResolveType>,
+    ) -> Result<HirDocument> {
+        let ast::TriggerCmd::Insert {
+            or_conflict,
+            tbl_name,
+            col_names,
+            select,
+            upsert,
+            returning,
+        } = command
+        else {
+            panic!("trigger command is INSERT");
+        };
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerInsert {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
+                },
+                insert: crate::translate::semantic::TriggerInsert {
+                    command_conflict: *or_conflict,
+                    conflict_override,
+                    table: tbl_name,
+                    columns: col_names,
+                    select,
+                    upsert: upsert.as_deref(),
+                    returning,
+                },
+            },
+        )
+    }
+
+    fn first_trigger_command(sql: &str) -> ast::TriggerCmd {
+        let ast::Stmt::CreateTrigger { mut commands, .. } = parse_statement(sql) else {
+            panic!("statement is CREATE TRIGGER");
+        };
+        assert_eq!(commands.len(), 1);
+        commands.pop().expect("trigger contains one command")
     }
 
     fn trigger_column(row: &str, column: &str) -> ast::Expr {
@@ -5593,6 +5649,92 @@ mod tests {
     }
 
     #[test]
+    fn trigger_insert_binds_source_query_and_conflict_policy() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER copy_row AFTER UPDATE ON writable BEGIN \
+             INSERT OR IGNORE INTO writable(id, value) \
+             SELECT new.id, old.value; END",
+        );
+        let document = analyze_trigger_insert_with_schema(
+            &schema,
+            ast::TriggerEvent::Update,
+            &command,
+            Some(ast::ResolveType::Replace),
+        )
+        .expect("trigger INSERT binds");
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("trigger INSERT produces INSERT root");
+        };
+        assert_eq!(insert.conflict, Some(ast::ResolveType::Replace));
+        let environment = insert
+            .trigger
+            .as_ref()
+            .expect("trigger INSERT carries its environment");
+        let new_source = environment.new_source.expect("UPDATE has NEW");
+        let old_source = environment.old_source.expect("UPDATE has OLD");
+        let InsertSource::Query(query) = insert.source else {
+            panic!("trigger INSERT uses a query source");
+        };
+        let query = document.query(query).expect("source query exists");
+        assert_eq!(query.captures, [new_source, old_source]);
+        let target = document
+            .source(insert.target)
+            .expect("target source exists");
+        assert_eq!(target.database, Some(DatabaseId::new(MAIN_DB_ID)));
+        assert_eq!(target.name, "writable");
+    }
+
+    #[test]
+    fn trigger_insert_binds_values_and_upsert_against_trigger_rows() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER copy_row AFTER UPDATE ON writable BEGIN \
+             INSERT INTO writable(id, value) VALUES (new.id, old.value) \
+             ON CONFLICT(id) DO UPDATE SET value = new.value WHERE old.id > 0; END",
+        );
+        let document =
+            analyze_trigger_insert_with_schema(&schema, ast::TriggerEvent::Update, &command, None)
+                .expect("trigger VALUES and UPSERT bind");
+        let HirRoot::Insert(insert) = &document.root else {
+            panic!("trigger INSERT produces INSERT root");
+        };
+        let environment = insert.trigger.as_ref().expect("environment exists");
+        let new_source = environment.new_source.expect("UPDATE has NEW");
+        let old_source = environment.old_source.expect("UPDATE has OLD");
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("trigger INSERT uses VALUES");
+        };
+        assert!(matches!(rows[0][0], Expr::Column(column) if column.source == new_source));
+        assert!(matches!(rows[0][1], Expr::Column(column) if column.source == old_source));
+        let hir::UpsertAction::Update {
+            assignments,
+            predicate,
+        } = &insert.upserts[0].action
+        else {
+            panic!("UPSERT updates");
+        };
+        assert!(
+            matches!(assignments[0].value, Expr::Column(column) if column.source == new_source)
+        );
+        assert!(
+            matches!(predicate, Some(Expr::Binary { lhs, .. }) if matches!(lhs.as_ref(), Expr::Column(column) if column.source == old_source))
+        );
+
+        let invalid = first_trigger_command(
+            "CREATE TRIGGER bad_row AFTER INSERT ON writable BEGIN \
+             INSERT INTO writable(id) VALUES (old.id); END",
+        );
+        let error =
+            analyze_trigger_insert_with_schema(&schema, ast::TriggerEvent::Insert, &invalid, None)
+                .expect_err("INSERT trigger rejects OLD");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
+        );
+    }
+
+    #[test]
     fn insert_freezes_matching_insert_and_upsert_update_triggers() {
         let schema = schema_with_insert_triggers();
         let document = analyze_sql_with_schema(
@@ -7390,11 +7532,9 @@ mod tests {
             panic!("row list IN becomes HIR");
         };
         assert!(matches!(lhs.as_ref(), Expr::Row(values) if values.len() == 2));
-        assert!(
-            values
-                .iter()
-                .all(|value| matches!(value, Expr::Row(values) if values.len() == 2))
-        );
+        assert!(values
+            .iter()
+            .all(|value| matches!(value, Expr::Row(values) if values.len() == 2)));
         assert_eq!(comparisons.len(), 2);
         for comparison in comparisons {
             assert_row_comparison_facts(comparison);
@@ -7880,15 +8020,13 @@ mod tests {
             };
             assert_eq!(target.name, "positive");
             assert_eq!(target.parameters.len(), parameter_count);
-            assert!(
-                target
-                    .type_fact
-                    .declared
-                    .as_ref()
-                    .expect("ordinary target keeps declared spelling")
-                    .custom_chain
-                    .is_empty()
-            );
+            assert!(target
+                .type_fact
+                .declared
+                .as_ref()
+                .expect("ordinary target keeps declared spelling")
+                .custom_chain
+                .is_empty());
             assert!(target.programs.encode.is_empty());
             assert!(target.programs.domain.is_none());
             assert!(target.programs.apply_builtin_affinity);
@@ -8118,7 +8256,10 @@ mod tests {
         };
         assert!(order_by.is_empty());
         assert_eq!(values.len(), 6);
-        for (column, pair) in ["id", "value", "score"].into_iter().zip(values.chunks_exact(2)) {
+        for (column, pair) in ["id", "value", "score"]
+            .into_iter()
+            .zip(values.chunks_exact(2))
+        {
             assert!(matches!(
                 &pair[0],
                 Expr::Literal(ast::Literal::String(name)) if name == &format!("'{column}'")
