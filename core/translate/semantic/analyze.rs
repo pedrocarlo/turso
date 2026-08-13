@@ -1732,6 +1732,12 @@ mod tests {
                 None,
             ),
             (
+                "delete_other_database",
+                ast::TriggerTime::After,
+                ast::TriggerEvent::Delete,
+                Some(99),
+            ),
+            (
                 "other_database",
                 ast::TriggerTime::Before,
                 ast::TriggerEvent::Insert,
@@ -9005,6 +9011,33 @@ mod tests {
     }
 
     #[test]
+    fn delete_freezes_only_target_database_delete_triggers() {
+        let schema = schema_with_insert_triggers();
+        let document = analyze_sql_with_schema(&schema, "DELETE FROM writable WHERE id = 1")
+            .expect("triggered DELETE binds");
+        document
+            .validate()
+            .expect("triggered DELETE produces closed HIR");
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let hir::DeleteTargetKind::BTree { triggers, .. } = &delete.target_kind else {
+            panic!("catalog table DELETE has B-tree metadata");
+        };
+        assert_eq!(
+            triggers
+                .iter()
+                .map(|trigger| trigger.value().name.as_str())
+                .collect::<Vec<_>>(),
+            ["delete_only"]
+        );
+        assert!(triggers
+            .iter()
+            .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
+    }
+
+    #[test]
     fn basic_delete_rejects_deferred_and_unsupported_targets() {
         let schema = schema_with_writable_table();
         for (sql, expected) in [
@@ -9030,14 +9063,6 @@ mod tests {
         assert_eq!(
             virtual_error.to_string(),
             "Parse error: semantic DELETE does not yet accept virtual tables"
-        );
-
-        let trigger_schema = schema_with_insert_triggers();
-        let trigger_error = analyze_sql_with_schema(&trigger_schema, "DELETE FROM writable")
-            .expect_err("DELETE triggers are deferred");
-        assert_eq!(
-            trigger_error.to_string(),
-            "Parse error: semantic DELETE does not yet support targets with triggers"
         );
 
         let foreign_key_schema = schema_with_insert_foreign_keys();

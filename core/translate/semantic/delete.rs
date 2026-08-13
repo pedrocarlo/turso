@@ -4,6 +4,7 @@ use turso_parser::ast;
 
 use super::{
     analyze::Analyzer,
+    dml::trigger_targets_database,
     expr::ExprPolicy,
     hir::{self, HirRoot, SourceOwner},
     scope::Scope,
@@ -43,7 +44,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 "DELETE from WITHOUT ROWID tables is not supported".to_string(),
             ));
         }
-        self.reject_delete_write_sidecars(table.value())?;
+        self.reject_delete_foreign_keys(table.value())?;
         self.analyze_btree_delete_metadata(target, &table)?;
 
         let scope = self.delete_read_scope(target)?;
@@ -61,7 +62,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(HirRoot::Delete(hir::Delete {
             target,
             target_kind: hir::DeleteTargetKind::BTree {
-                triggers: Vec::new(),
+                triggers: self.analyze_delete_triggers(&table),
                 foreign_keys: hir::DmlForeignKeys::default(),
             },
             predicate,
@@ -81,12 +82,29 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(scope)
     }
 
-    fn reject_delete_write_sidecars(&self, table: &crate::schema::Table) -> Result<()> {
+    fn analyze_delete_triggers(&mut self, table: &hir::ResolvedTable) -> Vec<hir::ResolvedTrigger> {
+        let database = table
+            .database()
+            .expect("a DELETE target table must have an owning database");
+        let triggers = self
+            .context()
+            .main_schema()
+            .get_triggers_for_table(table.value().get_name())
+            .filter(|trigger| {
+                trigger_targets_database(trigger, database)
+                    && matches!(trigger.event, ast::TriggerEvent::Delete)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        triggers
+            .into_iter()
+            .map(|trigger| self.freeze_trigger(database, trigger))
+            .collect()
+    }
+
+    fn reject_delete_foreign_keys(&self, table: &crate::schema::Table) -> Result<()> {
         let name = table.get_name();
         let schema = self.context().main_schema();
-        if schema.get_triggers_for_table(name).next().is_some() {
-            return unsupported_delete("targets with triggers");
-        }
         if schema.has_child_fks(name) || schema.any_resolved_fks_referencing(name) {
             return unsupported_delete("targets with foreign keys");
         }
