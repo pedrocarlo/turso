@@ -18,7 +18,7 @@ mod update;
 pub(crate) struct SemanticOptions {
     pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
     pub(crate) custom_types_enabled: bool,
-    pub(crate) dqs_dml: crate::translate::emitter::DoubleQuotedDml,
+    pub(crate) dqs_dml: context::DoubleQuotedDml,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
@@ -39,16 +39,12 @@ pub(crate) fn analyze_root(
     options: SemanticOptions,
     input: SemanticRootInput<'_>,
 ) -> crate::Result<hir::HirDocument> {
-    let dqs_dml = match options.dqs_dml {
-        crate::translate::emitter::DoubleQuotedDml::Enabled => context::DoubleQuotedDml::Enabled,
-        crate::translate::emitter::DoubleQuotedDml::Disabled => context::DoubleQuotedDml::Disabled,
-    };
     let context = context::SemanticContext::for_catalog(
         catalog,
         symbols,
         options.custom_types_enabled,
         options.dialect,
-        dqs_dml,
+        options.dqs_dml,
     )?;
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
@@ -151,7 +147,7 @@ mod tests {
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
         sync::Arc,
-        translate::emitter::DoubleQuotedDml,
+        translate::semantic::context::DoubleQuotedDml,
         DatabaseCatalog, RwLock, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
     };
     use rustc_hash::FxHashMap as HashMap;

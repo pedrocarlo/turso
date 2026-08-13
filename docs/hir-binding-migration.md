@@ -126,7 +126,8 @@ Completed:
   produces a validated statement or whole-trigger-program `HirDocument`.
   Trigger targets resolve inside the catalog from database ID and table name,
   so callers cannot inject an unrelated catalog table. Analysis borrows only
-  catalog schemas, symbols, and dialect; live resolver and locks are not needed.
+  catalog schemas, symbols, dialect, and semantic options; it imports no
+  resolver or emitter types, and live resolver and locks are not needed.
 - The defensive semantic path for parser-rejected `INSERT INTO t(a) DEFAULT
   VALUES` preserves the parser's `0 values for N columns` diagnostic.
 - HIR scope with source, output-alias, database-qualified, outer-scope, rowid,
