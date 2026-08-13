@@ -511,6 +511,61 @@ impl FunctionInput {
     }
 }
 
+fn normalize_scalar_input(
+    name: &ast::Name,
+    function: &Func,
+    input: FunctionInput,
+    scope: &Scope,
+) -> Result<FunctionInput> {
+    match input {
+        FunctionInput::Expressions {
+            values, order_by, ..
+        } => {
+            if !order_by.is_empty() {
+                crate::bail_parse_error!(
+                    "ORDER BY clause is not supported yet in aggregate functions"
+                );
+            }
+            Ok(FunctionInput::Expressions {
+                distinctness: None,
+                values,
+                order_by: Vec::new(),
+            })
+        }
+        FunctionInput::Star if function.needs_star_expansion() => {
+            if !scope.has_sources() {
+                crate::bail_parse_error!("{}(*) requires a FROM clause", name.as_str());
+            }
+            let expanded = scope.expand_star()?;
+            let mut values = ExprChildren::with_capacity(expanded.len() * 2);
+            for column in expanded {
+                values.push(computed_expr(
+                    hir::Expr::Literal(ast::Literal::String(format!("'{}'", column.name))),
+                    hir::TypeFact::known(Type::Text),
+                    ExprCollation::Absent,
+                ));
+                values.push(column.resolved);
+            }
+            Ok(FunctionInput::Expressions {
+                distinctness: None,
+                values,
+                order_by: Vec::new(),
+            })
+        }
+        FunctionInput::Star if function.supports_star_syntax() => Ok(FunctionInput::Expressions {
+            distinctness: None,
+            values: ExprChildren::new(),
+            order_by: Vec::new(),
+        }),
+        FunctionInput::Star => {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", name.as_str())
+        }
+        FunctionInput::OrderedSet { .. } => {
+            unreachable!("ordered-set functions are aggregate functions")
+        }
+    }
+}
+
 struct ExprFrame<'a> {
     syntax: &'a ast::Expr,
     expected_type: Option<Arc<TypeDef>>,
@@ -2205,27 +2260,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         functions: &mut FunctionContext<'_>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
-        let argument_count = input.argument_count();
+        let parsed_argument_count = input.argument_count();
         let function_name = normalize_ident(name.as_str());
         let function = match &input {
             FunctionInput::OrderedSet { function, .. } => Func::Agg(function.clone()),
             _ => {
                 let Some(function) = self
                     .context()
-                    .resolve_function(&function_name, argument_count)?
+                    .resolve_function(&function_name, parsed_argument_count)?
                 else {
                     crate::bail_parse_error!("no such function: {function_name}");
                 };
                 function
             }
         };
-        let special_operation =
-            match self.resolve_custom_type_operation(&function, &input, expected_type)? {
-                Some((operation, result_type)) => {
-                    Some((hir::FunctionOperation::CustomType(operation), result_type))
-                }
-                None => self.resolve_sequence_operation(&function, &input)?,
-            };
         let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
@@ -2252,15 +2300,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 "FILTER clause may only be used with aggregate window functions"
             );
         }
-        if (input.distinctness().is_some()
-            || !input.order_terms().is_empty()
-            || filter.is_some()
-            || matches!(&input, FunctionInput::Star))
-            && !aggregate
-            && !window_evaluation
-        {
-            return super::analyze::unsupported_select();
-        }
+        let (input, filter) = if matches!(binding, FunctionBinding::Scalar) {
+            (normalize_scalar_input(name, &function, input, scope)?, None)
+        } else {
+            (input, filter)
+        };
+        let special_operation =
+            match self.resolve_custom_type_operation(&function, &input, expected_type)? {
+                Some((operation, result_type)) => {
+                    Some((hir::FunctionOperation::CustomType(operation), result_type))
+                }
+                None => self.resolve_sequence_operation(&function, &input)?,
+            };
         if aggregate || window_evaluation {
             if let Some(nested) = nested_function_iter(input.facts())
                 .or_else(|| {
@@ -2310,6 +2361,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             },
             |resolved| resolved,
         );
+        let argument_count = input.argument_count();
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function { argument_count },
