@@ -14,15 +14,15 @@ use super::{
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, DatabaseSnapshot, DeleteTargetKind, Expr, FunctionEvaluation,
-        HirDocument, HirRoot, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
-        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-        SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand, TriggerRoot,
-        TypeFact, UpdateTargetKind,
+        CteId, DatabaseId, DatabaseSnapshot, Delete, DeleteTargetKind, Expr, FunctionEvaluation,
+        HirDocument, HirRoot, Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId,
+        OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
+        QueryRoot, SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand,
+        TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
-    AnalyzeInput, TriggerAnalysis,
+    AnalyzeInput,
 };
 
 pub(crate) fn analyze<'context, 'catalog, 'ast>(
@@ -85,6 +85,7 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         AnalyzeInput::TriggerDelete { context, delete } => {
             analyzer.analyze_trigger_delete(context, delete)?
         }
+        AnalyzeInput::TriggerProgram(input) => analyzer.analyze_trigger_program(input)?,
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -92,6 +93,45 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         LimboError::InternalError(format!("semantic analysis produced invalid HIR: {error}"))
     })?;
     Ok(document)
+}
+
+fn collect_root_dml<'a>(
+    root: &'a HirRoot,
+    inserts: &mut Vec<&'a Insert>,
+    updates: &mut Vec<&'a Update>,
+    deletes: &mut Vec<&'a Delete>,
+) {
+    match root {
+        HirRoot::Insert(insert) => inserts.push(insert),
+        HirRoot::Update(update) => updates.push(update),
+        HirRoot::Delete(delete) => deletes.push(delete),
+        HirRoot::Trigger(root) => match &root.body {
+            TriggerBody::Predicate(_) => {}
+            TriggerBody::Command(command) => {
+                collect_trigger_command_dml(command, inserts, updates, deletes);
+            }
+            TriggerBody::Program(program) => {
+                for command in &program.commands {
+                    collect_trigger_command_dml(command, inserts, updates, deletes);
+                }
+            }
+        },
+        HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => {}
+    }
+}
+
+fn collect_trigger_command_dml<'a>(
+    command: &'a TriggerCommand,
+    inserts: &mut Vec<&'a Insert>,
+    updates: &mut Vec<&'a Update>,
+    deletes: &mut Vec<&'a Delete>,
+) {
+    match command {
+        TriggerCommand::Select(_) => {}
+        TriggerCommand::Insert(insert) => inserts.push(insert),
+        TriggerCommand::Update(update) => updates.push(update),
+        TriggerCommand::Delete(delete) => deletes.push(delete),
+    }
 }
 
 pub(super) struct Analyzer<'context, 'catalog, 'ast> {
@@ -316,15 +356,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         for query in self.queries.iter().flatten() {
             pending.extend(query.direct_column_reads(|source| self.source(source)));
         }
-        let insert = match root {
-            HirRoot::Insert(insert) => Some(insert),
-            HirRoot::Trigger(TriggerRoot {
-                body: TriggerBody::Command(TriggerCommand::Insert(insert)),
-                ..
-            }) => Some(insert),
-            _ => None,
-        };
-        if let Some(insert) = insert {
+        let mut inserts = Vec::new();
+        let mut updates = Vec::new();
+        let mut deletes = Vec::new();
+        collect_root_dml(root, &mut inserts, &mut updates, &mut deletes);
+
+        for insert in inserts {
             if let InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind {
                 let width = self
                     .source(insert.target)
@@ -352,15 +389,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
-        let update = match root {
-            HirRoot::Update(update) => Some(update),
-            HirRoot::Trigger(TriggerRoot {
-                body: TriggerBody::Command(TriggerCommand::Update(update)),
-                ..
-            }) => Some(update),
-            _ => None,
-        };
-        if let Some(update) = update {
+        for update in updates {
             pending.extend(update.direct_column_reads(|source| self.source(source)));
             if let UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind {
                 for source in [update.target, update.new_source] {
@@ -385,15 +414,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 }));
             }
         }
-        let delete = match root {
-            HirRoot::Delete(delete) => Some(delete),
-            HirRoot::Trigger(TriggerRoot {
-                body: TriggerBody::Command(TriggerCommand::Delete(delete)),
-                ..
-            }) => Some(delete),
-            _ => None,
-        };
-        if let Some(delete) = delete {
+        for delete in deletes {
             pending.extend(delete.direct_column_reads());
             if let DeleteTargetKind::BTree { foreign_keys, .. } = &delete.target_kind {
                 let width = self
@@ -1603,6 +1624,7 @@ mod tests {
             InsertSource, JoinConstraint, JoinKind, MergedColumnValue, OutputNameKind,
             PseudoSource, ResolvedDefault, SourceKind, SourceOwner, SubqueryExpr, TargetColumn,
         },
+        TriggerAnalysis,
     };
 
     fn parse_statement(sql: &str) -> ast::Stmt {
@@ -1812,6 +1834,44 @@ mod tests {
         };
         assert_eq!(commands.len(), 1);
         commands.pop().expect("trigger contains one command")
+    }
+
+    fn analyze_trigger_program_with_schema(
+        schema: &Schema,
+        sql: &str,
+        conflict_override: Option<ast::ResolveType>,
+    ) -> Result<HirDocument> {
+        let ast::Stmt::CreateTrigger {
+            event,
+            when_clause,
+            commands,
+            ..
+        } = parse_statement(sql)
+        else {
+            panic!("statement is CREATE TRIGGER");
+        };
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerProgram(
+                crate::translate::semantic::TriggerProgramInput {
+                    context: TriggerAnalysis {
+                        database: DatabaseId::new(MAIN_DB_ID),
+                        table: schema.get_table("writable").expect("writable table exists"),
+                        event,
+                    },
+                    predicate: when_clause.as_deref(),
+                    commands: &commands,
+                    conflict_override,
+                },
+            ),
+        )
     }
 
     fn trigger_root(document: &HirDocument) -> &hir::TriggerRoot {
@@ -6023,6 +6083,86 @@ mod tests {
             error.to_string(),
             "Parse error: NEW references are only valid in INSERT and UPDATE triggers"
         );
+    }
+
+    #[test]
+    fn trigger_program_binds_predicate_and_ordered_commands_once() {
+        let schema = schema_with_writable_table();
+        let document = analyze_trigger_program_with_schema(
+            &schema,
+            "CREATE TRIGGER change_row AFTER UPDATE ON writable \
+             WHEN new.id > old.id BEGIN \
+             SELECT new.value; \
+             INSERT OR IGNORE INTO writable(id, value) VALUES(new.id, old.value); \
+             UPDATE OR FAIL writable SET value = new.value WHERE writable.id = old.id; \
+             DELETE FROM writable WHERE writable.id = old.id; \
+             END",
+            Some(ast::ResolveType::Replace),
+        )
+        .expect("whole trigger program binds");
+        let root = trigger_root(&document);
+        let hir::TriggerBody::Program(program) = &root.body else {
+            panic!("trigger root contains whole program");
+        };
+        let new_source = root.environment.new_source.expect("UPDATE has NEW");
+        let old_source = root.environment.old_source.expect("UPDATE has OLD");
+
+        let mut predicate_reads = Vec::new();
+        program
+            .predicate
+            .as_ref()
+            .expect("trigger has WHEN predicate")
+            .walk(&mut |expression| {
+                if let Expr::Column(column) = expression {
+                    predicate_reads.push(column.source);
+                }
+            });
+        assert!(predicate_reads.contains(&new_source));
+        assert!(predicate_reads.contains(&old_source));
+
+        let [
+            hir::TriggerCommand::Select(query_id),
+            hir::TriggerCommand::Insert(insert),
+            hir::TriggerCommand::Update(update),
+            hir::TriggerCommand::Delete(delete),
+        ] = program.commands.as_slice()
+        else {
+            panic!("trigger commands preserve source order and shape");
+        };
+
+        let query = document.query(*query_id).expect("SELECT query exists");
+        assert!(matches!(
+            query.blocks[0].outputs[0].expr,
+            Expr::Column(column) if column.source == new_source
+        ));
+
+        assert_eq!(insert.conflict, Some(ast::ResolveType::Replace));
+        let InsertSource::Values(rows) = &insert.source else {
+            panic!("INSERT command uses VALUES");
+        };
+        assert!(matches!(rows[0][0], Expr::Column(column) if column.source == new_source));
+        assert!(matches!(rows[0][1], Expr::Column(column) if column.source == old_source));
+
+        assert_eq!(update.conflict, Some(ast::ResolveType::Replace));
+        assert!(matches!(
+            update.assignments[0].value,
+            Expr::Column(column) if column.source == new_source
+        ));
+        assert_ne!(update.target, old_source);
+
+        assert_ne!(delete.target, old_source);
+        let mut delete_reads = Vec::new();
+        delete
+            .predicate
+            .as_ref()
+            .expect("DELETE has predicate")
+            .walk(&mut |expression| {
+                if let Expr::Column(column) = expression {
+                    delete_reads.push(column.source);
+                }
+            });
+        assert!(delete_reads.contains(&delete.target));
+        assert!(delete_reads.contains(&old_source));
     }
 
     #[test]

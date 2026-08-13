@@ -11,7 +11,7 @@ use super::{
     query::table_has_rowid,
     scope::Scope,
     update::{UpdateBodySyntax, UpdateExprContext},
-    TriggerAnalysis, TriggerDelete, TriggerInsert, TriggerUpdate,
+    TriggerAnalysis, TriggerDelete, TriggerInsert, TriggerProgramInput, TriggerUpdate,
 };
 use crate::{util::normalize_ident, LimboError, Result};
 
@@ -38,19 +38,46 @@ impl TriggerRow {
 }
 
 impl<'ast> Analyzer<'_, '_, 'ast> {
+    pub(super) fn analyze_trigger_program(
+        &mut self,
+        input: TriggerProgramInput<'ast>,
+    ) -> Result<hir::HirRoot> {
+        let database = input.context.database;
+        let (environment, scope) = self.create_trigger_environment(input.context)?;
+        let predicate = input
+            .predicate
+            .map(|expression| self.analyze_trigger_predicate_in(&environment, &scope, expression))
+            .transpose()?;
+        let commands = input
+            .commands
+            .iter()
+            .map(|command| {
+                self.analyze_trigger_command_in(
+                    database,
+                    &environment,
+                    &scope,
+                    command,
+                    input.conflict_override,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Program(hir::TriggerProgram {
+                predicate,
+                commands,
+            }),
+        }))
+    }
+
     pub(super) fn analyze_trigger_predicate(
         &mut self,
         context: TriggerAnalysis,
         expression: &'ast ast::Expr,
     ) -> Result<hir::HirRoot> {
         let (environment, scope) = self.create_trigger_environment(context)?;
-        let expression = self
-            .analyze_root_expr(
-                expression,
-                &scope,
-                ExprPolicies::trigger(self.context().dqs_dml(), &environment).where_clause(),
-            )?
-            .expr;
+        let expression = self.analyze_trigger_predicate_in(&environment, &scope, expression)?;
 
         Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
             environment,
@@ -64,11 +91,10 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         select: &'ast ast::Select,
     ) -> Result<hir::HirRoot> {
         let (environment, scope) = self.create_trigger_environment(context)?;
-        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
-        let query = self.analyze_subquery(select, None, &scope, policies)?;
+        let command = self.analyze_trigger_select_in(&environment, &scope, select)?;
         Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
             environment,
-            body: hir::TriggerBody::Command(hir::TriggerCommand::Select(query)),
+            body: hir::TriggerBody::Command(command),
         }))
     }
 
@@ -79,7 +105,75 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     ) -> Result<hir::HirRoot> {
         let database = context.database;
         let (environment, scope) = self.create_trigger_environment(context)?;
-        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+        let command = self.analyze_trigger_insert_in(database, &environment, &scope, insert)?;
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(command),
+        }))
+    }
+
+    pub(super) fn analyze_trigger_update(
+        &mut self,
+        context: TriggerAnalysis,
+        update: TriggerUpdate<'ast>,
+    ) -> Result<hir::HirRoot> {
+        let database = context.database;
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let command = self.analyze_trigger_update_in(database, &environment, &scope, update)?;
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(command),
+        }))
+    }
+
+    pub(super) fn analyze_trigger_delete(
+        &mut self,
+        context: TriggerAnalysis,
+        delete: TriggerDelete<'ast>,
+    ) -> Result<hir::HirRoot> {
+        let database = context.database;
+        let (environment, scope) = self.create_trigger_environment(context)?;
+        let command = self.analyze_trigger_delete_in(database, &environment, &scope, delete)?;
+        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
+            environment,
+            body: hir::TriggerBody::Command(command),
+        }))
+    }
+
+    fn analyze_trigger_predicate_in(
+        &mut self,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
+        expression: &'ast ast::Expr,
+    ) -> Result<hir::Expr> {
+        Ok(self
+            .analyze_root_expr(
+                expression,
+                scope,
+                ExprPolicies::trigger(self.context().dqs_dml(), environment).where_clause(),
+            )?
+            .expr)
+    }
+
+    fn analyze_trigger_select_in(
+        &mut self,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
+        select: &'ast ast::Select,
+    ) -> Result<hir::TriggerCommand> {
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
+        let query = self.analyze_subquery(select, None, scope, policies)?;
+        Ok(hir::TriggerCommand::Select(query))
+    }
+
+    fn analyze_trigger_insert_in(
+        &mut self,
+        database: hir::DatabaseId,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
+        insert: TriggerInsert<'ast>,
+    ) -> Result<hir::TriggerCommand> {
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
         let target =
             self.analyze_base_table_source_in_database(insert.table, database, SourceOwner::Root)?;
         let root = self.analyze_insert_target(
@@ -93,27 +187,24 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             insert.returning,
             target,
             InsertExprContext {
-                outer_scope: &scope,
+                outer_scope: scope,
                 policies,
             },
         )?;
         let hir::HirRoot::Insert(insert) = root else {
             unreachable!("INSERT analyzer returns an INSERT root");
         };
-        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
-            environment,
-            body: hir::TriggerBody::Command(hir::TriggerCommand::Insert(insert)),
-        }))
+        Ok(hir::TriggerCommand::Insert(insert))
     }
 
-    pub(super) fn analyze_trigger_update(
+    fn analyze_trigger_update_in(
         &mut self,
-        context: TriggerAnalysis,
+        database: hir::DatabaseId,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
         update: TriggerUpdate<'ast>,
-    ) -> Result<hir::HirRoot> {
-        let database = context.database;
-        let (environment, scope) = self.create_trigger_environment(context)?;
-        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+    ) -> Result<hir::TriggerCommand> {
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
         let target =
             self.analyze_base_table_source_in_database(update.table, database, SourceOwner::Root)?;
         let root = self.analyze_update_target(
@@ -126,27 +217,24 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 returning: &[],
             },
             UpdateExprContext {
-                outer_scope: Some(&scope),
+                outer_scope: Some(scope),
                 policies,
             },
         )?;
         let hir::HirRoot::Update(update) = root else {
             unreachable!("UPDATE analyzer returns an UPDATE root");
         };
-        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
-            environment,
-            body: hir::TriggerBody::Command(hir::TriggerCommand::Update(update)),
-        }))
+        Ok(hir::TriggerCommand::Update(update))
     }
 
-    pub(super) fn analyze_trigger_delete(
+    fn analyze_trigger_delete_in(
         &mut self,
-        context: TriggerAnalysis,
+        database: hir::DatabaseId,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
         delete: TriggerDelete<'ast>,
-    ) -> Result<hir::HirRoot> {
-        let database = context.database;
-        let (environment, scope) = self.create_trigger_environment(context)?;
-        let policies = ExprPolicies::trigger(self.context().dqs_dml(), &environment);
+    ) -> Result<hir::TriggerCommand> {
+        let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
         let target =
             self.analyze_base_table_source_in_database(delete.table, database, SourceOwner::Root)?;
         let root = self.analyze_delete_target(
@@ -154,17 +242,81 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             delete.predicate,
             &[],
             DeleteExprContext {
-                outer_scope: Some(&scope),
+                outer_scope: Some(scope),
                 policies,
             },
         )?;
         let hir::HirRoot::Delete(delete) = root else {
             unreachable!("DELETE analyzer returns a DELETE root");
         };
-        Ok(hir::HirRoot::Trigger(hir::TriggerRoot {
-            environment,
-            body: hir::TriggerBody::Command(hir::TriggerCommand::Delete(delete)),
-        }))
+        Ok(hir::TriggerCommand::Delete(delete))
+    }
+
+    fn analyze_trigger_command_in(
+        &mut self,
+        database: hir::DatabaseId,
+        environment: &hir::TriggerEnvironment,
+        scope: &Scope,
+        command: &'ast ast::TriggerCmd,
+        conflict_override: Option<ast::ResolveType>,
+    ) -> Result<hir::TriggerCommand> {
+        match command {
+            ast::TriggerCmd::Select(select) => {
+                self.analyze_trigger_select_in(environment, scope, select)
+            }
+            ast::TriggerCmd::Insert {
+                or_conflict,
+                tbl_name,
+                col_names,
+                select,
+                upsert,
+                returning,
+            } => self.analyze_trigger_insert_in(
+                database,
+                environment,
+                scope,
+                TriggerInsert {
+                    command_conflict: *or_conflict,
+                    conflict_override,
+                    table: tbl_name,
+                    columns: col_names,
+                    select,
+                    upsert: upsert.as_deref(),
+                    returning,
+                },
+            ),
+            ast::TriggerCmd::Update {
+                or_conflict,
+                tbl_name,
+                sets,
+                from,
+                where_clause,
+            } => self.analyze_trigger_update_in(
+                database,
+                environment,
+                scope,
+                TriggerUpdate {
+                    command_conflict: *or_conflict,
+                    conflict_override,
+                    table: tbl_name,
+                    assignments: sets,
+                    from: from.as_ref(),
+                    predicate: where_clause.as_deref(),
+                },
+            ),
+            ast::TriggerCmd::Delete {
+                tbl_name,
+                where_clause,
+            } => self.analyze_trigger_delete_in(
+                database,
+                environment,
+                scope,
+                TriggerDelete {
+                    table: tbl_name,
+                    predicate: where_clause.as_deref(),
+                },
+            ),
+        }
     }
 
     fn create_trigger_environment(

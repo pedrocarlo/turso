@@ -688,7 +688,9 @@ impl HirDocument {
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
-                    TriggerBody::Predicate(_) | TriggerBody::Command(TriggerCommand::Select(_)) => {
+                    TriggerBody::Predicate(_)
+                    | TriggerBody::Command(TriggerCommand::Select(_))
+                    | TriggerBody::Program(_) => {
                         None
                     }
                 },
