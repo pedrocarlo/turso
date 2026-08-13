@@ -76,6 +76,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             context,
             expression,
         } => analyzer.analyze_trigger_predicate(context, expression)?,
+        AnalyzeInput::TriggerSelect { context, select } => {
+            analyzer.analyze_trigger_select(context, select)?
+        }
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -1621,6 +1624,31 @@ mod tests {
                     event,
                 },
                 expression,
+            },
+        )
+    }
+
+    fn analyze_trigger_select_with_schema(
+        schema: &Schema,
+        event: ast::TriggerEvent,
+        select: &ast::Select,
+    ) -> Result<HirDocument> {
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerSelect {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
+                },
+                select,
             },
         )
     }
@@ -5486,6 +5514,78 @@ mod tests {
         let error =
             analyze_trigger_predicate_with_schema(&schema, ast::TriggerEvent::Insert, &unavailable)
                 .expect_err("nested SELECT inherits unavailable OLD rule");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
+        );
+    }
+
+    #[test]
+    fn trigger_select_binds_all_clauses_with_one_environment() {
+        let schema = schema_with_writable_table();
+        let ast::Stmt::Select(select) = parse_statement(
+            "WITH c(v) AS (SELECT new.value) \
+             SELECT v, old.rowid, RAISE(IGNORE), \
+                    row_number() OVER (ORDER BY new.id) \
+             FROM c \
+             WHERE new.id IS NOT NULL \
+             GROUP BY v \
+             HAVING old.id IS NOT NULL \
+             ORDER BY old.value \
+             LIMIT new.id",
+        ) else {
+            panic!("statement is SELECT");
+        };
+        let document =
+            analyze_trigger_select_with_schema(&schema, ast::TriggerEvent::Update, &select)
+                .expect("trigger SELECT binds");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("trigger SELECT produces query root");
+        };
+        let environment = root
+            .trigger
+            .as_ref()
+            .expect("trigger SELECT carries its environment");
+        let new_source = environment.new_source.expect("UPDATE has NEW");
+        let old_source = environment.old_source.expect("UPDATE has OLD");
+        let query = document.query(root.query).expect("trigger query exists");
+        assert!(query.captures.contains(&new_source));
+        assert!(query.captures.contains(&old_source));
+        assert!(matches!(
+            query.limit.as_ref().map(|limit| &limit.limit),
+            Some(Expr::Column(column)) if column.source == new_source && column.column == 0
+        ));
+    }
+
+    #[test]
+    fn trigger_rows_are_reserved_inside_select_commands() {
+        let schema = schema_with_writable_table();
+        let ast::Stmt::Select(select) = parse_statement("SELECT new.value FROM writable AS new")
+        else {
+            panic!("statement is SELECT");
+        };
+        let document =
+            analyze_trigger_select_with_schema(&schema, ast::TriggerEvent::Insert, &select)
+                .expect("trigger NEW shadows a table alias");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("trigger SELECT produces query root");
+        };
+        let new_source = root
+            .trigger
+            .as_ref()
+            .and_then(|environment| environment.new_source)
+            .expect("INSERT has NEW");
+        let query = document.query(root.query).expect("trigger query exists");
+        assert!(matches!(
+            query.blocks[0].outputs[0].expr,
+            Expr::Column(column) if column.source == new_source && column.column == 1
+        ));
+
+        let ast::Stmt::Select(select) = parse_statement("SELECT 1 LIMIT old.id") else {
+            panic!("statement is SELECT");
+        };
+        let error = analyze_trigger_select_with_schema(&schema, ast::TriggerEvent::Insert, &select)
+            .expect_err("INSERT trigger SELECT rejects OLD in LIMIT");
         assert_eq!(
             error.to_string(),
             "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
