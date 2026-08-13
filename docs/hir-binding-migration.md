@@ -41,8 +41,8 @@ documents.
 ## Current status
 
 Core SELECT and top-level DML binding are present. The user-visible SELECT
-coverage audit is complete; deferred migration work and two generic diagnostic
-cleanups remain below.
+coverage audit is complete; deferred migration work and one generic diagnostic
+cleanup remain below.
 
 ### Remaining binding coverage audit
 
@@ -81,14 +81,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
-Two generic fallbacks still need cleanup even though they do not add a feature:
+One generic fallback still needs cleanup even though it does not add a feature:
 
 - `INSERT INTO t(a) DEFAULT VALUES` reaches a specific old-path width error
   (`0 values for 1 columns`), while semantic analysis reports unsupported
   INSERT.
-- A stored custom-type program whose catalog parameter count disagrees with its
-  bound arguments currently reports unsupported SELECT. This should become a
-  catalog/invariant error after custom CAST fallback is matched.
 
 Completed:
 
@@ -384,6 +381,11 @@ Custom CAST targets now use ordinary affinity CAST rules when their supplied
 parameter count does not match the resolved custom type. Correctly
 parameterized custom array targets retain their frozen custom type chain,
 schema programs, and array dimensions in HIR.
+
+Stored custom-type programs now treat parameter disagreement inside a resolved
+type chain as a catalog invariant error. User-visible CAST arity fallback is
+handled before schema-program binding, so this internal path no longer reports
+unsupported SELECT.
 
 ## Working rules
 
