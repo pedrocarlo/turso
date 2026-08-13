@@ -85,6 +85,9 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
         AnalyzeInput::TriggerUpdate { context, update } => {
             analyzer.analyze_trigger_update(context, update)?
         }
+        AnalyzeInput::TriggerDelete { context, delete } => {
+            analyzer.analyze_trigger_delete(context, delete)?
+        }
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -1741,6 +1744,41 @@ mod tests {
                     table: tbl_name,
                     assignments: sets,
                     from: from.as_ref(),
+                    predicate: where_clause.as_deref(),
+                },
+            },
+        )
+    }
+
+    fn analyze_trigger_delete_with_schema(
+        schema: &Schema,
+        event: ast::TriggerEvent,
+        command: &ast::TriggerCmd,
+    ) -> Result<HirDocument> {
+        let ast::TriggerCmd::Delete {
+            tbl_name,
+            where_clause,
+        } = command
+        else {
+            panic!("trigger command is DELETE");
+        };
+        let symbols = SymbolTable::new();
+        let context = SemanticContext::for_main_schema_object(
+            schema,
+            &symbols,
+            true,
+            Arc::new(SqliteDialect),
+        );
+        analyze(
+            &context,
+            AnalyzeInput::TriggerDelete {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
+                },
+                delete: crate::translate::semantic::TriggerDelete {
+                    table: tbl_name,
                     predicate: where_clause.as_deref(),
                 },
             },
@@ -5878,6 +5916,94 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Parse error: OLD references are only valid in UPDATE and DELETE triggers"
+        );
+    }
+
+    #[test]
+    fn trigger_delete_keeps_target_and_outer_rows_distinct() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER remove_row AFTER UPDATE ON writable BEGIN \
+             DELETE FROM writable \
+             WHERE writable.id = old.id AND new.value IS NOT NULL; END",
+        );
+        let document =
+            analyze_trigger_delete_with_schema(&schema, ast::TriggerEvent::Update, &command)
+                .expect("trigger DELETE binds");
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("trigger DELETE produces DELETE root");
+        };
+        let environment = delete
+            .trigger
+            .as_ref()
+            .expect("trigger DELETE carries its environment");
+        let outer_new = environment.new_source.expect("outer UPDATE has NEW");
+        let outer_old = environment.old_source.expect("outer UPDATE has OLD");
+        assert_ne!(delete.target, outer_old);
+        let mut reads = Vec::new();
+        delete
+            .predicate
+            .as_ref()
+            .expect("DELETE has predicate")
+            .walk(&mut |expression| {
+                if let Expr::Column(column) = expression {
+                    reads.push(column.source);
+                }
+            });
+        assert!(reads.contains(&delete.target));
+        assert!(reads.contains(&outer_old));
+        assert!(reads.contains(&outer_new));
+        let target = document
+            .source(delete.target)
+            .expect("target source exists");
+        assert_eq!(target.database, Some(DatabaseId::new(MAIN_DB_ID)));
+    }
+
+    #[test]
+    fn trigger_delete_predicate_subqueries_keep_trigger_policy() {
+        let schema = schema_with_writable_table();
+        let command = first_trigger_command(
+            "CREATE TRIGGER remove_row AFTER DELETE ON writable BEGIN \
+             DELETE FROM writable WHERE id IN (SELECT old.id); END",
+        );
+        let document =
+            analyze_trigger_delete_with_schema(&schema, ast::TriggerEvent::Delete, &command)
+                .expect("trigger DELETE subquery binds");
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("trigger DELETE produces DELETE root");
+        };
+        let outer_old = delete
+            .trigger
+            .as_ref()
+            .and_then(|environment| environment.old_source)
+            .expect("DELETE trigger has OLD");
+        let mut queries = Vec::new();
+        delete
+            .predicate
+            .as_ref()
+            .expect("DELETE has predicate")
+            .walk(&mut |expression| {
+                if let Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression {
+                    queries.push(*query);
+                }
+            });
+        assert_eq!(queries.len(), 1);
+        assert!(document
+            .query(queries[0])
+            .expect("predicate query exists")
+            .captures
+            .contains(&outer_old));
+
+        let invalid = first_trigger_command(
+            "CREATE TRIGGER bad_row AFTER DELETE ON writable BEGIN \
+             DELETE FROM writable WHERE new.id > 0; END",
+        );
+        let error =
+            analyze_trigger_delete_with_schema(&schema, ast::TriggerEvent::Delete, &invalid)
+                .expect_err("DELETE trigger rejects NEW");
+        assert_eq!(
+            error.to_string(),
+            "Parse error: NEW references are only valid in INSERT and UPDATE triggers"
         );
     }
 
