@@ -20,8 +20,18 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         where_clause: Option<&'ast ast::Expr>,
         returning: &'ast [ast::ResultColumn],
     ) -> Result<HirRoot> {
-        reject_deferred_delete_clauses(with)?;
+        self.with_cte_scope(with, |analyzer| {
+            analyzer.analyze_delete_body(table_name, indexed, where_clause, returning)
+        })
+    }
 
+    fn analyze_delete_body(
+        &mut self,
+        table_name: &'ast ast::QualifiedName,
+        indexed: Option<&'ast ast::Indexed>,
+        where_clause: Option<&'ast ast::Expr>,
+        returning: &'ast [ast::ResultColumn],
+    ) -> Result<HirRoot> {
         let target =
             self.analyze_base_table_source(table_name, None, indexed, SourceOwner::Root)?;
         let table = match &self
@@ -102,17 +112,4 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .map(|trigger| self.freeze_trigger(database, trigger))
             .collect()
     }
-}
-
-fn reject_deferred_delete_clauses(with: Option<&ast::With>) -> Result<()> {
-    if with.is_some() {
-        return unsupported_delete("WITH clauses");
-    }
-    Ok(())
-}
-
-fn unsupported_delete<T>(feature: &str) -> Result<T> {
-    Err(LimboError::ParseError(format!(
-        "semantic DELETE does not yet support {feature}"
-    )))
 }

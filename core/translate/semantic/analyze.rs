@@ -6460,6 +6460,31 @@ mod tests {
             .analyze_update(update)
             .expect_err("invalid CTE body fails UPDATE analysis");
         assert!(analyzer.cte_scopes.is_empty(), "UPDATE scope is removed");
+
+        let delete = parse_statement(
+            "WITH broken AS (SELECT missing) \
+             DELETE FROM writable WHERE id = (SELECT * FROM broken)",
+        );
+        let ast::Stmt::Delete {
+            with,
+            tbl_name,
+            indexed,
+            where_clause,
+            returning,
+        } = &delete
+        else {
+            panic!("SQL contains DELETE");
+        };
+        analyzer
+            .analyze_delete(
+                with.as_ref(),
+                tbl_name,
+                indexed.as_ref(),
+                where_clause.as_deref(),
+                returning,
+            )
+            .expect_err("invalid CTE body fails DELETE analysis");
+        assert!(analyzer.cte_scopes.is_empty(), "DELETE scope is removed");
     }
 
     #[test]
@@ -9203,18 +9228,93 @@ mod tests {
     }
 
     #[test]
+    fn delete_with_scope_reaches_where_and_returning_subqueries() {
+        let schema = schema_with_writable_table();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "WITH values_to_use(id, text) AS (VALUES(3, 'from cte')) \
+             DELETE FROM writable \
+             WHERE id = (SELECT id FROM values_to_use) \
+             RETURNING (SELECT text FROM values_to_use)",
+        )
+        .expect("DELETE clauses share the statement CTE scope");
+        document
+            .validate()
+            .expect("DELETE WITH produces closed HIR");
+        assert_eq!(document.ctes.len(), 1);
+
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let mut query_ids = Vec::new();
+        delete
+            .predicate
+            .as_ref()
+            .expect("WHERE is preserved")
+            .walk(&mut |expression| {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                    query_ids.push(*query);
+                }
+            });
+        delete
+            .returning
+            .as_ref()
+            .expect("RETURNING is preserved")
+            .outputs[0]
+            .expr
+            .walk(&mut |expression| {
+                if let Expr::Subquery(SubqueryExpr::Scalar { query, .. }) = expression {
+                    query_ids.push(*query);
+                }
+            });
+        assert_eq!(query_ids.len(), 2);
+        assert!(query_ids.iter().all(|query| {
+            document
+                .query(*query)
+                .expect("clause subquery exists")
+                .reachable_ctes
+                == [document.ctes[0].id]
+        }));
+    }
+
+    #[test]
+    fn delete_with_is_lazy_recursive_and_does_not_shadow_target() {
+        let schema = schema_with_writable_table();
+        let lazy = analyze_sql_with_schema(
+            &schema,
+            "WITH broken AS (SELECT missing) DELETE FROM writable WHERE id = 1",
+        )
+        .expect("unused invalid DELETE CTE stays unbound");
+        assert!(lazy.ctes.is_empty());
+
+        let recursive = analyze_sql_with_schema(
+            &schema,
+            "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL \
+                 SELECT x + 1 FROM seq WHERE x < 2) \
+             DELETE FROM writable WHERE id = (SELECT max(x) FROM seq)",
+        )
+        .expect("recursive DELETE CTE binds");
+        assert!(matches!(recursive.ctes[0].body, CteBody::Recursive(_)));
+
+        let shadowed = analyze_sql_with_schema(
+            &schema,
+            "WITH writable(id, value) AS (VALUES(9, 'cte')) \
+             DELETE FROM writable WHERE id = (SELECT id FROM writable)",
+        )
+        .expect("CTE name does not shadow DELETE catalog target");
+        let HirRoot::Delete(delete) = &shadowed.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let target = shadowed
+            .source(delete.target)
+            .expect("target source exists");
+        assert!(matches!(target.kind, SourceKind::Table(_)));
+        assert_eq!(shadowed.ctes.len(), 1);
+    }
+
+    #[test]
     fn basic_delete_rejects_deferred_and_unsupported_targets() {
         let schema = schema_with_writable_table();
-        let error = analyze_sql_with_schema(
-            &schema,
-            "WITH chosen AS (SELECT 1) DELETE FROM writable WHERE id = 1",
-        )
-        .expect_err("WITH is deferred");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: semantic DELETE does not yet support WITH clauses"
-        );
-
         let virtual_schema = schema_with_virtual_insert_target();
         let virtual_error = analyze_sql_with_schema(
             &virtual_schema,
