@@ -56,7 +56,6 @@ Missing HIR binding:
 
 | Surface | Evidence | Required work |
 |---|---|---|
-| General row-value expressions | The parser represents `(a, b)` as multi-item `Expr::Parenthesized`. The current translator validates and emits row comparisons, while semantic expression frames only expand row values for `IN` queries and `MATCH`. | Bind `Expr::Row` in supported row-operand positions, preserve row arity checks, and freeze one comparison component per element for binary comparisons, `BETWEEN`, and list `IN`. |
 | Row-valued scalar subqueries and assignments | The current translator supports `(a, b) = (SELECT ...)`, and conformance coverage includes multi-column UPDATE subqueries. Semantic scalar subqueries require exactly one output; UPDATE splits only literal parenthesized RHS values. | Add a row-valued subquery HIR form, validate output width against the surrounding row, and allow one subquery to feed a multi-column assignment. |
 | Parenthesized FROM groups | `SelectTable::Sub(FromClause, alias)` has an explicit archived-binder branch and is walked by recursive-CTE reference counting, but `analyze_table_source` falls through. This is distinct from `SelectTable::Select`, which already creates a derived query. | Represent a nested FROM group without inventing a query. Preserve group aliases, qualifier visibility, join nesting, and lexical column order. |
 | Scalar function modifiers | Production accepts and ignores `DISTINCT` on scalar calls; it currently also ignores scalar `FILTER`. Semantic analysis rejects every scalar call carrying `DISTINCT`, argument `ORDER BY`, `FILTER`, or `*` through one generic fallback. | Preserve current binding behavior deliberately, while retaining existing errors for scalar `OVER` and wrong arity. Do not silently conflate scalar and aggregate metadata. |
@@ -111,6 +110,10 @@ Completed:
   sides remain limited to `MATCH`.
 - Iterative expression analysis, including deep-expression coverage.
 - `BETWEEN`, list `IN`, `CASE`, and built-in `CAST` expressions.
+- Row operands in binary comparisons, `BETWEEN`, and list `IN`. Iterative
+  expression frames flatten only supported row positions; HIR keeps one
+  comparison component per element with resolved affinity and collation, while
+  width mismatches and scalar-only positions retain their existing errors.
 - Catalog-resolved custom `CAST` targets that need no stored program.
 - Simple custom `CAST` encoders bound against document-owned synthetic inputs.
 - Domain `NOT NULL` and `CHECK` rules frozen into custom `CAST` targets.
@@ -354,9 +357,9 @@ Completed:
   aliases, rowid, and WITH subqueries retain the ordinary DELETE binding rules.
 
 The completed standalone SELECT expression checkpoints cover scalar
-expressions plus row-valued `IN` queries and `MATCH`. General row expressions and
-row-valued scalar subqueries remain in the audit above. `union_value` is
-resolved only in destination-aware DML expressions.
+expressions, row operands in comparisons, `BETWEEN`, list and query `IN`, and
+`MATCH`. Row-valued scalar subqueries remain in the audit above. `union_value`
+is resolved only in destination-aware DML expressions.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs and derived
 `FROM` sources, plus correlated scalar, `EXISTS`, and `IN` query expressions.
