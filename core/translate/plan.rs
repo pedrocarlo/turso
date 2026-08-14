@@ -1226,19 +1226,19 @@ pub enum JoinType {
     Anti,
 }
 
-/// Join information for a table reference.
+/// Join information for a planned source.
 #[derive(Debug, Clone)]
-pub struct JoinInfo {
+pub struct JoinInfo<N = ast::Name> {
     /// The type of join.
     pub join_type: JoinType,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
-    pub using: Vec<ast::Name>,
+    pub using: Vec<N>,
     /// When true, the optimizer must not reorder this table relative to its
     /// neighbors. Set for CROSS JOIN to match SQLite semantics.
     pub no_reorder: bool,
 }
 
-impl JoinInfo {
+impl<N> JoinInfo<N> {
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
@@ -1270,28 +1270,28 @@ impl JoinInfo {
     }
 }
 
-/// A joined table in the query plan.
+/// A source participating in a query plan.
 /// For example,
 /// ```sql
 /// SELECT * FROM users u JOIN products p JOIN (SELECT * FROM users) sub;
 /// ```
-/// has three table references where
+/// has three sources where
 /// - all have [Operation::Scan]
 /// - identifiers are `t`, `p`, `sub`
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct JoinedTable {
-    /// The operation that this table reference performs.
+pub struct PlannedSource<I, H, E, N> {
+    /// The operation that this source performs.
     pub op: Operation,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
     pub identifier: String,
-    /// Internal ID of the table reference, used in e.g. [Expr::Column] to refer to this table.
-    pub internal_id: TableInternalId,
-    /// The join info for this table reference, if it is the right side of a join (which all except the first table reference have)
-    pub join_info: Option<JoinInfo>,
+    /// Identity used by expressions and planner metadata.
+    pub internal_id: I,
+    /// Join info when this source is the right side of a join.
+    pub join_info: Option<JoinInfo<N>>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
@@ -1308,14 +1308,27 @@ pub struct JoinedTable {
     /// needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
-    pub expression_index_usages: Vec<ExpressionIndexUsage>,
+    pub expression_index_usages: Vec<ExpressionIndexUsage<E>>,
     /// The index of the database. "main" is always zero.
     pub database_id: usize,
-    /// INDEXED BY / NOT INDEXED hint from the SQL statement.
-    pub indexed: Option<ast::Indexed>,
+    /// Index-selection hint already represented for this planning path.
+    pub indexed: H,
 }
 
-impl JoinedTable {
+/// Source used by the parser-expression planning path.
+pub type JoinedTable = PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name>;
+
+pub(crate) type HirJoinInfo = JoinInfo<String>;
+
+/// Source used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirPlannedSource = PlannedSource<
+    crate::translate::semantic::hir::SourceId,
+    crate::translate::semantic::hir::IndexHint,
+    crate::translate::semantic::hir::Expr,
+    String,
+>;
+
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name> {
     pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
         let Some(join_info) = self.join_info.as_ref() else {
             return Ok(ColumnMask::default());
@@ -2266,10 +2279,10 @@ impl<T> TryFrom<u128> for BitSet<T> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ExpressionIndexUsage {
-    /// Normalized (non-bound) ast of the expression as stored on an index column.
+pub struct ExpressionIndexUsage<E = ast::Expr> {
+    /// Normalized expression as stored on an index column.
     /// Example: `lower(name)` for INDEX ON t(lower(name)).
-    pub normalized_expr: Box<ast::Expr>,
+    pub normalized_expr: Box<E>,
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
@@ -2587,7 +2600,7 @@ fn query_output_columns(
     Ok(columns)
 }
 
-impl JoinedTable {
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name> {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match &self.table {

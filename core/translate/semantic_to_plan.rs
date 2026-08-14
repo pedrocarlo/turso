@@ -1,64 +1,44 @@
-//! Adapts resolved semantic sources to existing planner structures.
-
-use turso_parser::ast::{self, TableInternalId};
+//! Adapts resolved semantic sources to planner structures.
 
 use super::{
-    plan::{ColumnUsedMask, JoinInfo, JoinedTable, Operation},
+    plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, Operation},
     semantic::hir::{self, ColumnUsage, HirDocument, SourceId},
 };
-use crate::{
-    vdbe::builder::{ProgramBuilder, TableRefIdCounter},
-    LimboError, Result,
-};
+use crate::{LimboError, Result};
 
-/// State shared while one HIR document is converted into existing plan nodes.
-///
-/// Planner table IDs remain necessary until plan and emitter column references
-/// use [`SourceId`] directly. Allocating every source up front keeps captures
-/// and nested queries on one stable mapping without changing planner logic.
+/// State shared while one HIR document is converted into plan nodes.
 pub(crate) struct HirPlanContext<'a> {
     document: &'a HirDocument,
-    table_ids: Vec<TableInternalId>,
 }
 
 impl<'a> HirPlanContext<'a> {
-    pub(crate) fn new(document: &'a HirDocument, program: &mut ProgramBuilder) -> Self {
-        let table_ids =
-            allocate_table_ids(document.sources.len(), &mut program.table_reference_counter);
-        Self {
-            document,
-            table_ids,
-        }
+    pub(crate) fn new(document: &'a HirDocument) -> Self {
+        Self { document }
     }
 
-    pub(crate) fn source(&self, id: SourceId) -> &'a hir::Source {
+    fn definition(&self, id: SourceId) -> &'a hir::Source {
         self.document
             .source(id)
             .expect("validated HIR contains referenced source")
     }
 
-    pub(crate) fn table_id(&self, source: SourceId) -> TableInternalId {
-        self.table_ids[source.index()]
-    }
-
-    /// Build the existing planner representation without resolving names or
-    /// reading the catalog again.
-    pub(crate) fn joined_table(
+    /// Build planner source metadata without resolving names, allocating a
+    /// second identity, or reading the catalog again.
+    pub(crate) fn source(
         &self,
         source: SourceId,
-        join_info: Option<JoinInfo>,
+        join_info: Option<HirJoinInfo>,
         usage: &[ColumnUsage],
-    ) -> Result<JoinedTable> {
-        joined_table_from_source(self.source(source), self.table_id(source), join_info, usage)
+    ) -> Result<HirPlannedSource> {
+        planned_source_from_definition(self.definition(source), join_info, usage)
     }
 }
 
-fn joined_table_from_source(
+fn planned_source_from_definition(
     source: &hir::Source,
-    internal_id: TableInternalId,
-    join_info: Option<JoinInfo>,
+    join_info: Option<HirJoinInfo>,
     usage: &[ColumnUsage],
-) -> Result<JoinedTable> {
+) -> Result<HirPlannedSource> {
     let hir::SourceKind::Table(table) = &source.kind else {
         return Err(LimboError::InternalError(format!(
             "source {} is not a table source",
@@ -70,17 +50,17 @@ fn joined_table_from_source(
     })?;
     let (col_used_mask, column_use_counts) = column_usage(source.id, usage)?;
 
-    Ok(JoinedTable {
+    Ok(HirPlannedSource {
         op: Operation::default_scan_for(table.value()),
         table: table.value().clone(),
         identifier: source.alias.as_ref().unwrap_or(&source.name).clone(),
-        internal_id,
+        internal_id: source.id,
         join_info,
         col_used_mask,
         column_use_counts,
         expression_index_usages: Vec::new(),
         database_id: database.index(),
-        indexed: planner_index_hint(&source.index_hint),
+        indexed: source.index_hint.clone(),
     })
 }
 
@@ -98,23 +78,6 @@ fn column_usage(source: SourceId, usage: &[ColumnUsage]) -> Result<(ColumnUsedMa
         counts[usage.reference.column] = usage.count;
     }
     Ok((mask, counts))
-}
-
-fn planner_index_hint(index_hint: &hir::IndexHint) -> Option<ast::Indexed> {
-    match index_hint {
-        hir::IndexHint::None => None,
-        hir::IndexHint::NotIndexed => Some(ast::Indexed::NotIndexed),
-        hir::IndexHint::Indexed(index) => Some(ast::Indexed::IndexedBy(ast::Name::exact(
-            index.value().name.clone(),
-        ))),
-    }
-}
-
-fn allocate_table_ids(
-    source_count: usize,
-    counter: &mut TableRefIdCounter,
-) -> Vec<TableInternalId> {
-    (0..source_count).map(|_| counter.next()).collect()
 }
 
 #[cfg(test)]
@@ -211,36 +174,40 @@ mod tests {
     }
 
     #[test]
-    fn source_ids_receive_stable_unique_planner_ids() {
-        let mut counter = TableRefIdCounter::new();
-        let table_ids = allocate_table_ids(3, &mut counter);
-
-        assert_eq!(table_ids[0], TableInternalId::from(1));
-        assert_eq!(table_ids[1], TableInternalId::from(2));
-        assert_eq!(table_ids[2], TableInternalId::from(3));
-    }
-
-    #[test]
-    fn planner_ids_allocated_after_sources_do_not_collide() {
-        let mut counter = TableRefIdCounter::new();
-        let table_ids = allocate_table_ids(3, &mut counter);
-        let synthetic_id = counter.next();
-
-        assert!(!table_ids.contains(&synthetic_id));
-        assert_eq!(synthetic_id, TableInternalId::from(4));
-    }
-
-    #[test]
-    fn table_source_reuses_resolved_metadata_and_alias() {
+    fn hir_source_reuses_identity_metadata_and_alias() {
         let source = source();
         let SourceKind::Table(resolved) = &source.kind else {
             unreachable!();
         };
-        let joined = joined_table_from_source(&source, TableInternalId::from(7), None, &[])
+        let document = hir::HirDocument {
+            snapshot: CatalogSnapshot::from_id(1),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: source.id,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![source.clone()],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let context = HirPlanContext::new(&document);
+        let joined = context
+            .source(
+                source.id,
+                Some(HirJoinInfo {
+                    join_type: crate::translate::plan::JoinType::Inner,
+                    using: vec!["first".into()],
+                    no_reorder: false,
+                }),
+                &[],
+            )
             .expect("table source converts");
 
         assert_eq!(joined.identifier, "i");
-        assert_eq!(joined.internal_id, TableInternalId::from(7));
+        assert_eq!(joined.internal_id, source.id);
+        assert_eq!(joined.join_info.as_ref().unwrap().using[0], "first");
         assert_eq!(joined.database_id, 0);
         let (Table::BTree(expected), Table::BTree(actual)) = (resolved.value(), &joined.table)
         else {
@@ -250,7 +217,7 @@ mod tests {
 
         let mut unaliased = source;
         unaliased.alias = None;
-        let joined = joined_table_from_source(&unaliased, TableInternalId::from(8), None, &[])
+        let joined = planned_source_from_definition(&unaliased, None, &[])
             .expect("unaliased table source converts");
         assert_eq!(joined.identifier, "items");
     }
@@ -265,8 +232,8 @@ mod tests {
             },
             count: 3,
         }];
-        let joined = joined_table_from_source(&source, TableInternalId::from(7), None, &usage)
-            .expect("table source converts");
+        let joined =
+            planned_source_from_definition(&source, None, &usage).expect("table source converts");
 
         assert_eq!(
             (&joined.col_used_mask).into_iter().collect::<Vec<_>>(),
@@ -279,9 +246,9 @@ mod tests {
     fn table_source_preserves_index_hints_without_lookup() {
         let mut source = source();
         source.index_hint = hir::IndexHint::NotIndexed;
-        let joined = joined_table_from_source(&source, TableInternalId::from(7), None, &[])
-            .expect("table source converts");
-        assert_eq!(joined.indexed, Some(ast::Indexed::NotIndexed));
+        let joined =
+            planned_source_from_definition(&source, None, &[]).expect("table source converts");
+        assert!(matches!(joined.indexed, hir::IndexHint::NotIndexed));
 
         let index = Index {
             name: "items_second".to_string(),
@@ -301,11 +268,11 @@ mod tests {
             Some(DatabaseId::new(0)),
             Arc::new(index),
         ));
-        let joined = joined_table_from_source(&source, TableInternalId::from(7), None, &[])
-            .expect("table source converts");
+        let joined =
+            planned_source_from_definition(&source, None, &[]).expect("table source converts");
         assert!(matches!(
             joined.indexed,
-            Some(ast::Indexed::IndexedBy(name)) if name.as_str() == "items_second"
+            hir::IndexHint::Indexed(index) if index.value().name == "items_second"
         ));
     }
 
@@ -313,7 +280,7 @@ mod tests {
     fn non_table_source_is_rejected() {
         let mut source = source();
         source.kind = SourceKind::SchemaExpression;
-        let error = joined_table_from_source(&source, TableInternalId::from(7), None, &[])
+        let error = planned_source_from_definition(&source, None, &[])
             .expect_err("schema namespace has no planner table");
         assert_eq!(
             error.to_string(),
