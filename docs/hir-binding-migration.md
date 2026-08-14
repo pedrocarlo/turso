@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR ORDER BY terms now build planner order targets directly from resolved
+  source, output, collation, direction, and NULL-order facts. Output references
+  are followed inside the frozen document and computed expressions stay
+  borrowed; planning performs no name lookup, catalog lookup, AST conversion,
+  or expression clone.
 - Order-target storage is generic over source identity and expression
   representation. The legacy planner keeps its existing table IDs and AST
   pointers, while HIR can borrow resolved expressions keyed by `SourceId`

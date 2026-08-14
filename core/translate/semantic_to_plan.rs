@@ -3,6 +3,7 @@
 use super::{
     optimizer::{
         constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
         CostModelParams,
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, Operation, PredicateExpr},
@@ -154,6 +155,57 @@ impl<'a> HirPlanContext<'a> {
             .collect()
     }
 
+    /// Build an ordering requirement from resolved HIR terms without reopening
+    /// name resolution or copying expressions out of the document.
+    pub(crate) fn order_target<'term>(
+        &self,
+        terms: &'term [hir::OrderTerm],
+        purpose: OrderTargetPurpose,
+    ) -> Option<HirOrderTarget<'term>>
+    where
+        'a: 'term,
+    {
+        let columns = terms
+            .iter()
+            .map(|term| self.order_column(term))
+            .collect::<Option<Vec<_>>>()?;
+        (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
+    }
+
+    fn order_column<'term>(
+        &self,
+        term: &'term hir::OrderTerm,
+    ) -> Option<ColumnOrder<SourceId, &'term hir::Expr>>
+    where
+        'a: 'term,
+    {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(output) = expression {
+            expression = &self.document.output(*output)?.expr;
+        }
+
+        let (source, target) = match expression {
+            hir::Expr::Column(column) => (column.source, ColumnTarget::Column(column.column)),
+            hir::Expr::RowId(source) => (*source, ColumnTarget::RowId),
+            expression => {
+                let (source, _) = expression.single_source_column_usage()?;
+                (source, ColumnTarget::Expr(expression))
+            }
+        };
+
+        Some(ColumnOrder {
+            source,
+            target,
+            order: term.order,
+            collation: term
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default(),
+            nulls_order: term.nulls,
+        })
+    }
+
     fn register_expression_index_usage(
         &self,
         sources: &mut [HirPlannedSource],
@@ -263,6 +315,7 @@ mod tests {
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Schema, Table, Type},
         stats::AnalyzeStats,
         sync::Arc,
+        translate::collate::CollationSeq,
         translate::{
             optimizer::{
                 cost::RowCountEstimate, hir_base_row_estimates, join::hir_best_starting_source,
@@ -270,13 +323,14 @@ mod tests {
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
                 ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
-                JoinConstraint, JoinKind, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
-                SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
+                JoinConstraint, JoinKind, OrderTerm, Output, OutputId, Query, QueryBlock,
+                QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SourceColumn, SourceKind,
+                SourceOwner, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
     };
-    use turso_parser::ast::Operator;
+    use turso_parser::ast::{NullsOrder, Operator, SortOrder};
 
     fn resolved_table(name: &str) -> hir::ResolvedTable {
         let columns = vec![
@@ -392,6 +446,94 @@ mod tests {
             custom: None,
             comparison: None,
         }
+    }
+
+    #[test]
+    fn hir_order_target_resolves_outputs_and_borrows_expressions() {
+        let source = SourceId::new(0);
+        let query = QueryId::new(0);
+        let block_id = QueryBlockId::new(query, 0);
+        let output_id = OutputId::query(block_id, 0);
+        let mut block = QueryBlock::new(
+            block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.outputs.push(Output {
+            id: output_id,
+            name: "first".to_string(),
+            expr: hir::Expr::column(source, 0),
+            type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
+            schema_affinity: Affinity::Integer,
+            has_affinity: true,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        });
+        let mut document = document(vec![source_with_id(0, "items")]);
+        document.root = hir::HirRoot::Query(QueryRoot { query });
+        document.queries.push(Query {
+            id: query,
+            parent: None,
+            captures: Vec::new(),
+            reachable_ctes: Vec::new(),
+            blocks: vec![block],
+            first: block_id,
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: vec![output_id],
+        });
+
+        let computed = binary(
+            hir::Expr::column(source, 0),
+            Operator::Add,
+            hir::Expr::column(source, 1),
+        );
+        let collation = CatalogObject::new(
+            CatalogObjectId::new(20),
+            CatalogSnapshot::from_id(1),
+            Some(DatabaseId::new(0)),
+            Arc::new(CollationSeq::NoCase),
+        );
+        let terms = [
+            OrderTerm {
+                expr: hir::Expr::output(output_id),
+                order: SortOrder::Desc,
+                nulls: Some(NullsOrder::First),
+                type_fact: TypeFact::known(Type::Integer),
+                collation: None,
+            },
+            OrderTerm {
+                expr: computed,
+                order: SortOrder::Asc,
+                nulls: None,
+                type_fact: TypeFact::known(Type::Integer),
+                collation: Some(collation),
+            },
+        ];
+        let target = HirPlanContext::new(&document)
+            .order_target(
+                &terms,
+                OrderTargetPurpose::EliminatesSort(
+                    crate::translate::optimizer::order::EliminatesSortBy::Order,
+                ),
+            )
+            .expect("resolved terms form one-source order target");
+
+        assert!(matches!(target.columns[0].target, ColumnTarget::Column(0)));
+        assert_eq!(target.columns[0].source, source);
+        assert_eq!(target.columns[0].order, SortOrder::Desc);
+        assert_eq!(target.columns[0].nulls_order, Some(NullsOrder::First));
+        let ColumnTarget::Expr(expression) = target.columns[1].target else {
+            panic!("computed HIR order term remains an expression");
+        };
+        assert!(std::ptr::eq(expression, &terms[1].expr));
+        assert_eq!(target.columns[1].collation, CollationSeq::NoCase);
     }
 
     #[test]
