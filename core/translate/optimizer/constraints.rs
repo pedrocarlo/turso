@@ -11,10 +11,13 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
-            PredicateExpr, SubqueryState, TableReferences, WhereTerm,
+            is_non_null_literal, HirWhereTerm, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
+            Plan, PredicateExpr, SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{rewrite_between_exprs, table_mask_from_expr, TableMask, ROWID_STRS},
+        planner::{
+            rewrite_between_exprs, table_mask_from_expr, table_mask_from_hir_expr, TableMask,
+            ROWID_STRS,
+        },
         semantic::hir,
         Resolver,
     },
@@ -354,6 +357,105 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
             affinity,
         )
     })
+}
+
+fn hir_truth_test_rhs(expr: &hir::Expr) -> Option<bool> {
+    match expr {
+        hir::Expr::Literal(ast::Literal::True) => Some(true),
+        hir::Expr::Literal(ast::Literal::False) => Some(false),
+        hir::Expr::Collate { expr, .. } => hir_truth_test_rhs(expr),
+        _ => None,
+    }
+}
+
+fn hir_is_non_null_literal(expr: &hir::Expr) -> bool {
+    matches!(
+        expr,
+        hir::Expr::Literal(
+            ast::Literal::Numeric(_)
+                | ast::Literal::String(_)
+                | ast::Literal::Blob(_)
+                | ast::Literal::True
+                | ast::Literal::False
+        )
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hir_binary_constraint(
+    document: &hir::HirDocument,
+    from: &hir::From,
+    term_position: usize,
+    term: &HirWhereTerm,
+    source: hir::SourceId,
+    table: &JoinedTable,
+    schema: &Schema,
+    indexes: &AvailableIndexes,
+    params: &CostModelParams,
+) -> Result<Option<HirConstraint>> {
+    let hir::Expr::Binary { operator, rhs, .. } = &term.expr else {
+        return Ok(None);
+    };
+    if *operator == ast::Operator::Is && hir_truth_test_rhs(rhs).is_some() {
+        return Ok(None);
+    }
+    if term
+        .from_outer_join
+        .is_some_and(|outer_source| outer_source != source)
+    {
+        return Ok(None);
+    }
+
+    let Some((target, operator, side, constraining_expr, comparison_affinity)) =
+        hir_binary_constraint_parts(&term.expr, source)
+    else {
+        return Ok(None);
+    };
+    let is_op = operator.as_ast_operator() == Some(ast::Operator::Is);
+    let null_matching = is_op && !hir_is_non_null_literal(constraining_expr);
+    let usable = term.from_outer_join == Some(source)
+        || if is_op {
+            !from.outer_join_may_null_extend(source)
+        } else {
+            !from.full_join_may_null_extend(source)
+        };
+
+    let (table_col_pos, column, index) = if target.is_rowid {
+        (None, None, None)
+    } else {
+        let column_position = target
+            .column
+            .expect("non-rowid HIR constraint target has a column");
+        (
+            Some(column_position),
+            Some(&table.columns()[column_position]),
+            selectivity_index_for_column(schema, table, indexes, column_position),
+        )
+    };
+    let selectivity = estimate_constraint_selectivity(
+        schema,
+        table,
+        column,
+        operator,
+        null_matching,
+        index,
+        params,
+        target.is_rowid,
+    );
+
+    Ok(Some(HirConstraint {
+        where_clause_pos: (term_position, side),
+        operator,
+        table_col_pos,
+        expr: None,
+        constraining_expr: None,
+        lhs_mask: table_mask_from_hir_expr(document, Some(from), constraining_expr)?,
+        selectivity,
+        usable,
+        is_rowid: target.is_rowid,
+        comparison_affinity,
+        null_matching,
+    }))
 }
 
 /// Build the search terms for an automatic index.
@@ -2288,6 +2390,48 @@ fn find_best_index_for_constraint(
 mod tests {
     use super::*;
 
+    fn empty_hir_document(source: hir::SourceId) -> hir::HirDocument {
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
+    fn rowid_table() -> JoinedTable {
+        let table = crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
+            1,
+            "items".into(),
+            Vec::new(),
+            Vec::new(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        )));
+        JoinedTable {
+            op: crate::translate::plan::Operation::default_scan_for(&table),
+            table,
+            identifier: "items".into(),
+            internal_id: TableInternalId::default(),
+            join_info: None,
+            col_used_mask: crate::translate::plan::ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: crate::MAIN_DB_ID,
+            indexed: None,
+        }
+    }
+
     fn hir_comparison(
         lhs: hir::Expr,
         operator: ast::Operator,
@@ -2389,5 +2533,51 @@ mod tests {
             hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
         ));
         assert_eq!(affinity, Some(Affinity::Integer));
+    }
+
+    #[test]
+    fn hir_binary_constraint_uses_resolved_masks_and_outer_join_rules() -> Result<()> {
+        let left_source = hir::SourceId::new(8);
+        let source = hir::SourceId::new(7);
+        let from = hir::From {
+            first: left_source,
+            joins: vec![hir::Join {
+                right: source,
+                kind: hir::JoinKind::Left,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let term = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::rowid(source),
+                ast::Operator::Is,
+                hir::Expr::column(left_source, 0),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let constraint = hir_binary_constraint(
+            &empty_hir_document(source),
+            &from,
+            3,
+            &term,
+            source,
+            &rowid_table(),
+            &Schema::new(),
+            &AvailableIndexes::default(),
+            &CostModelParams::default(),
+        )?
+        .expect("rowid comparison becomes a constraint");
+
+        assert_eq!(constraint.where_clause_pos, (3, BinaryExprSide::Rhs));
+        assert_eq!(constraint.table_col_pos, None);
+        assert!(constraint.is_rowid);
+        assert!(constraint.null_matching);
+        assert!(!constraint.usable);
+        assert!(constraint.lhs_mask.get(0));
+        assert!(!constraint.lhs_mask.get(1));
+        assert_eq!(constraint.comparison_affinity, Some(Affinity::Integer));
+        Ok(())
     }
 }
