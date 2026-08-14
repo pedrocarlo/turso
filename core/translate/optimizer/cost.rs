@@ -282,9 +282,9 @@ pub struct AnalyzeCtx<'a> {
     pub stats: &'a AnalyzeStats,
 }
 
-pub(crate) fn estimate_rows_per_seek(
+pub(crate) fn estimate_rows_per_seek<E>(
     index_info: IndexInfo,
-    constraints: &[Constraint],
+    constraints: &[Constraint<E>],
     usable_constraint_refs: &[RangeConstraintRef],
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,

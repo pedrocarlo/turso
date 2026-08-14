@@ -68,8 +68,8 @@ const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
 /// Some callers skip a term because they need the count before that term runs.
-fn constraint_output_multipliers(
-    rhs_constraints: &TableConstraints,
+fn constraint_output_multipliers<E, S>(
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &BitSet<usize>,
@@ -1000,8 +1000,8 @@ fn build_prior_constraint_selectivity(
 }
 
 /// Estimates selectivity from build-side constraints that reference only the build table.
-fn build_self_constraint_selectivity(
-    build_constraints: &TableConstraints,
+fn build_self_constraint_selectivity<E, S>(
+    build_constraints: &TableConstraints<E, S>,
     build_table_idx: usize,
 ) -> f64 {
     let build_only_mask: TableMask = [build_table_idx]
@@ -2292,14 +2292,17 @@ mod tests {
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
-                constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                constraints::{
+                    constraints_from_where_clause, BinaryExprSide, Constraint, ConstraintOperator,
+                    RangeConstraintRef, TableConstraints,
+                },
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
                 ColumnUsedMask, HirJoinInfo, HirPlannedSource, IterationDirection, JoinInfo,
                 JoinType, Operation, TableReferences, WhereTerm,
             },
-            semantic::hir::{IndexHint, JoinKind, SourceId},
+            semantic::hir::{self, IndexHint, JoinKind, SourceId},
         },
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
@@ -3960,6 +3963,106 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: IndexHint::None,
         }
+    }
+
+    fn costing_constraints<E, S>(table_id: S) -> TableConstraints<E, S> {
+        let constraint = |position, operator, selectivity| Constraint {
+            where_clause_pos: (position, BinaryExprSide::Rhs),
+            operator: ConstraintOperator::from(operator),
+            table_col_pos: Some(0),
+            expr: None,
+            constraining_expr: None,
+            lhs_mask: TableMask::default(),
+            selectivity,
+            usable: true,
+            is_rowid: false,
+            comparison_affinity: None,
+            comparison_collation: None,
+            null_matching: false,
+        };
+        TableConstraints {
+            table_id,
+            constraints: vec![
+                constraint(0, Operator::Equals, 0.1),
+                constraint(1, Operator::Greater, 0.2),
+                constraint(2, Operator::Less, 0.3),
+            ],
+            candidates: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
+        }
+    }
+
+    #[test]
+    fn ast_and_hir_constraints_share_cost_formulas() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let ast_constraints: TableConstraints<ast::Expr, TableInternalId> =
+            costing_constraints(table_id_counter.next());
+        let hir_constraints: TableConstraints<hir::Expr, SourceId> =
+            costing_constraints(SourceId::new(0));
+        let mut rhs_mask = TableMask::default();
+        rhs_mask.set(0)?;
+
+        let ast_multiplier = constraint_output_multipliers(
+            &ast_constraints,
+            &TableMask::default(),
+            rhs_mask.clone(),
+            &BitSet::default(),
+            &BitSet::default(),
+            &DEFAULT_PARAMS,
+        );
+        let hir_multiplier = constraint_output_multipliers(
+            &hir_constraints,
+            &TableMask::default(),
+            rhs_mask,
+            &BitSet::default(),
+            &BitSet::default(),
+            &DEFAULT_PARAMS,
+        );
+        assert_eq!(ast_multiplier, hir_multiplier);
+        assert_eq!(
+            ast_multiplier,
+            0.1 * 0.2 * 0.3 * DEFAULT_PARAMS.closed_range_selectivity_factor
+        );
+
+        let ast_self = build_self_constraint_selectivity(&ast_constraints, 0);
+        let hir_self = build_self_constraint_selectivity(&hir_constraints, 0);
+        assert_eq!(ast_self, hir_self);
+        assert_eq!(ast_self, 0.1 * 0.2 * 0.3);
+
+        let range = RangeConstraintRef {
+            table_col_pos: Some(0),
+            index_col_pos: 0,
+            sort_order: ast::SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
+            eq: None,
+            lower_bound: Some(1),
+            upper_bound: Some(2),
+        };
+        let index = IndexInfo {
+            unique: false,
+            covering: false,
+            column_count: 1,
+            rows_per_leaf_page: DEFAULT_PARAMS.rows_per_table_page,
+        };
+        let rows = RowCountEstimate::HardcodedFallback(1_000.0);
+        let ast_rows = estimate_rows_per_seek(
+            index,
+            &ast_constraints.constraints,
+            std::slice::from_ref(&range),
+            rows,
+            None,
+        );
+        let hir_rows = estimate_rows_per_seek(
+            index,
+            &hir_constraints.constraints,
+            std::slice::from_ref(&range),
+            rows,
+            None,
+        );
+        assert_eq!(ast_rows, hir_rows);
+        assert_eq!(ast_rows, 0.2 * 0.3 * 1_000.0);
+
+        Ok(())
     }
 
     #[test]

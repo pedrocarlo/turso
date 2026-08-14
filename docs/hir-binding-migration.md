@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Filter multipliers, self-filter selectivity, and rows-per-seek costing now
+  consume generic constraint records. AST and HIR constraints therefore use
+  the same formulas rather than parallel cost implementations.
 - Legacy and HIR join planning now share one builder for CROSS and outer-join
   ordering restrictions. Preserved HIR RIGHT JOIN is constrained directly;
   the HIR path does not need the parser-era source swap.
