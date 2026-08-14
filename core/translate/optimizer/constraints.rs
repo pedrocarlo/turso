@@ -15,6 +15,7 @@ use crate::{
             PredicateExpr, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{rewrite_between_exprs, table_mask_from_expr, TableMask, ROWID_STRS},
+        semantic::hir,
         Resolver,
     },
     util::exprs_are_equivalent,
@@ -38,7 +39,7 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 /// relative to the table. Expression indexes are represented by leaving `table_col_pos` empty
 /// and storing the indexed expression in `expr`.
 #[derive(Debug, Clone)]
-pub struct Constraint {
+pub struct Constraint<E = ast::Expr> {
     /// The position of the original `WHERE` clause term this constraint derives from,
     /// and which side of the [ast::Expr::Binary] comparison contains the expression
     /// that constrains the column.
@@ -56,12 +57,12 @@ pub struct Constraint {
     /// None for expression-index constraints.
     pub table_col_pos: Option<usize>,
     /// The expression constrained by this constraint, if it is not a simple column reference.
-    pub expr: Option<ast::Expr>,
+    pub expr: Option<E>,
     /// For multi-index scan branches: the constraining expression and its affinity.
     /// When set, `get_constraining_expr` uses this instead of looking up in where_clause.
     /// This is needed because multi-index branches come from sub-expressions of an OR/AND,
     /// not directly from a top-level WHERE term.
-    pub constraining_expr: Option<(ast::Operator, ast::Expr, Affinity)>,
+    pub constraining_expr: Option<(ast::Operator, E, Affinity)>,
     /// A bitmask representing the set of tables that appear on the *constraining* side
     /// of the comparison expression. For example, in SELECT * FROM t1,t2,t3 WHERE t1.x = t2.x + t3.x,
     /// the lhs_mask contains t2 and t3. Thus, this constraint can only be used if t2 and t3
@@ -128,7 +129,7 @@ pub enum BinaryExprSide {
     Rhs,
 }
 
-impl Constraint {
+impl Constraint<ast::Expr> {
     /// Get the constraining expression and operator, e.g. ('>=', '2+3') from 't.x >= 2+3'
     pub fn get_constraining_expr(
         &self,
@@ -192,7 +193,9 @@ impl Constraint {
             rhs
         }
     }
+}
 
+impl<E> Constraint<E> {
     /// Returns true when an index column with affinity `idx_aff` can satisfy
     /// this constraint per SQLite's `sqlite3IndexAffinityOk`. Constraints
     /// whose form has no SQLite-defined comparison affinity (FTS MATCH,
@@ -273,27 +276,30 @@ pub struct ConstraintUseCandidate {
 
 #[derive(Debug)]
 /// A collection of [Constraint]s and their potential [ConstraintUseCandidate]s for a given table.
-pub struct TableConstraints {
+pub struct TableConstraints<E = ast::Expr> {
     /// The internal ID of the [TableReference] that these constraints are for.
     pub table_id: TableInternalId,
     /// The constraints for the table, i.e. any [WhereTerm]s that reference columns from this table.
-    pub constraints: Vec<Constraint>,
+    pub constraints: Vec<Constraint<E>>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
     /// Conditions that a temporary index may use for a lookup.
     pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
 }
 
+pub(crate) type HirConstraint = Constraint<hir::Expr>;
+pub(crate) type HirTableConstraints = TableConstraints<hir::Expr>;
+
 /// Build the search terms for an automatic index.
 ///
 /// Terms for the same table column use the same index column.
-pub(super) fn automatic_index_terms(
+pub(super) fn automatic_index_terms<E>(
     table: &JoinedTable,
-    constraints: &TableConstraints,
+    constraints: &TableConstraints<E>,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
     let is_strict = table.table.is_strict();
-    let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
+    let usable_constraints: SmallVec<[&Constraint<E>; 4]> = constraints
         .constraints
         .iter()
         .filter(|term| term.can_drive_index_seek(columns, is_strict))
@@ -1283,8 +1289,8 @@ impl RangeConstraintRef {
 /// Multiple constraints on the same index column are merged into a single
 /// [RangeConstraintRef]. Equality wins over range constraints; otherwise we keep
 /// at most one lower bound and one upper bound for that column.
-pub fn usable_constraints_for_lhs_mask(
-    constraints: &[Constraint],
+pub fn usable_constraints_for_lhs_mask<E>(
+    constraints: &[Constraint<E>],
     refs: &[ConstraintRef],
     lhs_mask: &TableMask,
     table_idx: usize,
@@ -1404,9 +1410,9 @@ pub fn usable_constraints_for_lhs_mask(
     usable
 }
 
-pub fn usable_constraints_for_join_order<'a>(
-    constraints: &'a [Constraint],
-    refs: &'a [ConstraintRef],
+pub fn usable_constraints_for_join_order<E>(
+    constraints: &[Constraint<E>],
+    refs: &[ConstraintRef],
     join_order: &[JoinOrderMember],
 ) -> Result<Vec<RangeConstraintRef>> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
@@ -1424,7 +1430,7 @@ pub fn usable_constraints_for_join_order<'a>(
 ///
 /// Equalities come first because an index cannot use a column after a range.
 /// A column with both an equality and a range stays in the equality part.
-pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[usize; 4]> {
+pub fn ordered_ephemeral_key_columns<E>(constraints: &[&Constraint<E>]) -> SmallVec<[usize; 4]> {
     let mut equality_cols = SmallVec::<[usize; 4]>::new();
     let mut range_only_cols = SmallVec::<[usize; 4]>::new();
 
@@ -1758,8 +1764,8 @@ fn estimate_bound_expr_selectivity(
     }
 }
 
-pub fn convert_to_vtab_constraint(
-    constraints: &[Constraint],
+pub fn convert_to_vtab_constraint<E>(
+    constraints: &[Constraint<E>],
     join_order: &[JoinOrderMember],
 ) -> Result<Vec<ConstraintInfo>> {
     let table_idx = join_order.last().unwrap().original_idx;
@@ -2210,4 +2216,36 @@ fn find_best_index_for_constraint(
     }
 
     (None, vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hir_constraints_use_shared_index_rules() {
+        let constraint = HirConstraint {
+            where_clause_pos: (0, BinaryExprSide::Rhs),
+            operator: ast::Operator::Equals.into(),
+            table_col_pos: Some(2),
+            expr: Some(hir::Expr::Literal(ast::Literal::Numeric("1".into()))),
+            constraining_expr: None,
+            lhs_mask: TableMask::default(),
+            selectivity: 0.1,
+            usable: true,
+            is_rowid: false,
+            comparison_affinity: Some(Affinity::Integer),
+            null_matching: false,
+        };
+        let table_constraints = HirTableConstraints {
+            table_id: TableInternalId::default(),
+            constraints: vec![constraint],
+            candidates: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
+        };
+
+        assert!(table_constraints.constraints[0].satisfies_index_affinity(Affinity::Integer));
+        let key_columns = ordered_ephemeral_key_columns(&[&table_constraints.constraints[0]]);
+        assert_eq!(key_columns.as_slice(), [2]);
+    }
 }
