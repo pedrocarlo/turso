@@ -56,9 +56,8 @@ Do not convert HIR expressions back into parser AST. That would discard
 resolved function, type, collation, and comparison choices, forcing later
 stages to repeat semantic work.
 
-During migration, one document-local map gives every HIR `SourceId` a stable
-planner `TableInternalId`. This map is compatibility glue, not the final model.
-Once plan and emitter column references use `SourceId`, delete the map. IDs for
+HIR planned sources keep their document-local `SourceId` directly. They do not
+allocate a `TableInternalId` or maintain a compatibility map. IDs for
 planner-created runtime objects may remain separate.
 
 ## Current status
@@ -104,6 +103,14 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR planned sources retain `SourceId`, resolved index hints, HIR expressions,
+  and string join names. Their construction no longer depends on
+  `ProgramBuilder`, planner table-ID allocation, or parser index-hint nodes.
+- HIR constraint collection consumes `HirPlannedSource` and the complete index
+  metadata frozen on its HIR source. It no longer accepts `JoinedTable`,
+  `AvailableIndexes`, or a separate source ID; existing candidate,
+  expression-index, partial-index, selectivity, and automatic-index rules are
+  shared with the legacy planner where they remain physical planning work.
 - SELECT B-tree sources freeze every resolved ordinary, expression, and
   partial index in catalog order. Expression keys and predicates close over
   the exact `SourceId`; complete coverage lets HIR planning avoid rebinding

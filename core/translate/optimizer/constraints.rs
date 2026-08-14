@@ -11,8 +11,8 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, HirWhereTerm, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            Plan, PredicateExpr, SubqueryState, TableReferences, WhereTerm,
+            is_non_null_literal, HirPlannedSource, HirWhereTerm, JoinOrderMember, JoinedTable,
+            NonFromClauseSubquery, Plan, PredicateExpr, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
             rewrite_between_exprs, table_mask_from_expr, table_mask_from_hir_expr, TableMask,
@@ -424,12 +424,12 @@ fn hir_binary_constraints_for_term(
     from: &hir::From,
     term_position: usize,
     term: &HirWhereTerm,
-    source: hir::SourceId,
-    table: &JoinedTable,
+    source_definition: &hir::Source,
+    table: &HirPlannedSource,
     schema: &Schema,
-    indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> Result<SmallVec<[HirConstraint; 2]>> {
+    let source = source_definition.id;
     let mut constraints = SmallVec::new();
     let hir::Expr::Binary { operator, rhs, .. } = &term.expr else {
         return Ok(constraints);
@@ -470,14 +470,14 @@ fn hir_binary_constraints_for_term(
         let (table_col_pos, column, index, is_rowid) = match part.target {
             HirConstraintTarget::Column(column) => (
                 Some(column.column),
-                Some(&table.columns()[column.column]),
-                selectivity_index_for_column(schema, table, indexes, column.column),
+                Some(&table.table.columns()[column.column]),
+                hir_selectivity_index_for_column(schema, table, source_definition, column.column),
                 false,
             ),
             HirConstraintTarget::RowId(_) => (None, None, None, true),
             HirConstraintTarget::Expression(_) => (None, None, None, false),
         };
-        let selectivity = estimate_constraint_selectivity(
+        let selectivity = hir_estimate_constraint_selectivity(
             schema,
             table,
             column,
@@ -504,6 +504,85 @@ fn hir_binary_constraints_for_term(
         });
     }
     Ok(constraints)
+}
+
+fn hir_estimate_constraint_selectivity(
+    schema: &Schema,
+    table: &HirPlannedSource,
+    column: Option<&Column>,
+    operator: ConstraintOperator,
+    null_matching: bool,
+    index: Option<&Index>,
+    params: &CostModelParams,
+    is_rowid: bool,
+) -> f64 {
+    estimate_constraint_selectivity_for_table(
+        schema,
+        table.table.get_name(),
+        column,
+        operator,
+        null_matching,
+        index,
+        params,
+        is_rowid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn estimate_constraint_selectivity_for_table(
+    schema: &Schema,
+    table_name: &str,
+    column: Option<&Column>,
+    operator: ConstraintOperator,
+    null_matching: bool,
+    index: Option<&Index>,
+    params: &CostModelParams,
+    is_rowid: bool,
+) -> f64 {
+    // `a IS 5` filters exactly like `a = 5` because the key is never NULL.
+    // Only NULL-matching `IS` keeps its less-selective estimate.
+    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
+        ConstraintOperator::from(ast::Operator::Equals)
+    } else {
+        operator
+    };
+    estimate_selectivity(
+        schema, table_name, column, index, operator, params, is_rowid,
+    )
+}
+
+fn hir_selectivity_index_for_column<'a>(
+    schema: &Schema,
+    table: &HirPlannedSource,
+    source: &'a hir::Source,
+    column_pos: usize,
+) -> Option<&'a Index> {
+    let table_stats = schema.analyze_stats.table_stats(table.table.get_name());
+    source
+        .index_expressions
+        .iter()
+        .map(|metadata| metadata.index.value())
+        .filter(|index| {
+            index.index_method.is_none()
+                && index.column_table_pos_to_index_pos(column_pos) == Some(0)
+        })
+        .find(|index| {
+            if index.unique && index.columns.len() == 1 {
+                return true;
+            }
+            let Some(table_stats) = table_stats else {
+                return true;
+            };
+            table_stats
+                .index_stats
+                .get(&index.name)
+                .is_some_and(|stats| {
+                    matches!(
+                        (stats.total_rows, stats.avg_rows_per_distinct_prefix.first()),
+                        (Some(total), Some(&average)) if total > 0 && average > 0
+                    )
+                })
+        })
 }
 
 fn hir_constrained_expr<'a>(
@@ -572,12 +651,16 @@ pub(crate) fn hir_binary_constraints_for_source(
     document: &hir::HirDocument,
     from: &hir::From,
     where_clause: &[HirWhereTerm],
-    source: hir::SourceId,
-    table: &JoinedTable,
+    table: &HirPlannedSource,
     schema: &Schema,
-    indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> Result<Vec<HirConstraint>> {
+    let source = document.source(table.internal_id).ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "missing HIR source {} for constraint planning",
+            table.internal_id
+        ))
+    })?;
     let mut constraints = Vec::new();
     for (term_position, term) in where_clause.iter().enumerate() {
         constraints.extend(hir_binary_constraints_for_term(
@@ -588,7 +671,6 @@ pub(crate) fn hir_binary_constraints_for_source(
             source,
             table,
             schema,
-            indexes,
             params,
         )?);
     }
@@ -640,11 +722,11 @@ fn hir_in_list_constraint_for_term(
     from: &hir::From,
     term_position: usize,
     term: &HirWhereTerm,
-    source: hir::SourceId,
-    table: &JoinedTable,
+    table: &HirPlannedSource,
     schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Option<HirConstraint>> {
+    let source = table.internal_id;
     if term
         .from_outer_join
         .is_some_and(|outer_source| outer_source != source)
@@ -666,7 +748,11 @@ fn hir_in_list_constraint_for_term(
         return Ok(None);
     };
 
-    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    let rowid_alias_column = table
+        .table
+        .columns()
+        .iter()
+        .position(Column::is_rowid_alias);
     let (table_col_pos, is_rowid) = match lhs.as_ref() {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
@@ -711,12 +797,12 @@ fn hir_in_query_constraint_for_term(
     document: &hir::HirDocument,
     term_position: usize,
     term: &HirWhereTerm,
-    source: hir::SourceId,
-    table: &JoinedTable,
+    table: &HirPlannedSource,
     schema: &Schema,
     params: &CostModelParams,
     query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<Option<HirConstraint>> {
+    let source = table.internal_id;
     if term
         .from_outer_join
         .is_some_and(|outer_source| outer_source != source)
@@ -745,7 +831,11 @@ fn hir_in_query_constraint_for_term(
         return Ok(None);
     };
 
-    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    let rowid_alias_column = table
+        .table
+        .columns()
+        .iter()
+        .position(Column::is_rowid_alias);
     let (table_col_pos, is_rowid) = match lhs.as_ref() {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
@@ -790,30 +880,25 @@ pub(crate) fn hir_table_constraints_for_source(
     document: &hir::HirDocument,
     from: &hir::From,
     where_clause: &[HirWhereTerm],
-    source: hir::SourceId,
-    table: &JoinedTable,
+    table: &HirPlannedSource,
     schema: &Schema,
-    indexes: &AvailableIndexes,
     params: &CostModelParams,
     query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<HirTableConstraints> {
-    let mut constraints = hir_binary_constraints_for_source(
-        document,
-        from,
-        where_clause,
-        source,
-        table,
-        schema,
-        indexes,
-        params,
-    )?;
+    let source = table.internal_id;
+    let source_definition = document.source(source).ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "missing HIR source {source} for constraint planning"
+        ))
+    })?;
+    let mut constraints =
+        hir_binary_constraints_for_source(document, from, where_clause, table, schema, params)?;
     for (term_position, term) in where_clause.iter().enumerate() {
         if let Some(constraint) = hir_in_list_constraint_for_term(
             document,
             from,
             term_position,
             term,
-            source,
             table,
             schema,
             params,
@@ -824,7 +909,6 @@ pub(crate) fn hir_table_constraints_for_source(
             document,
             term_position,
             term,
-            source,
             table,
             schema,
             params,
@@ -834,22 +918,12 @@ pub(crate) fn hir_table_constraints_for_source(
         }
     }
     let mut candidates = Vec::new();
-    for index in indexes
-        .indexes_for_table(table.internal_id)
-        .into_iter()
-        .flat_map(|indexes| indexes.iter())
-        .filter(|index| index.index_method.is_none())
-    {
+    for expressions in &source_definition.index_expressions {
+        let index = expressions.index.value();
+        if index.index_method.is_some() {
+            continue;
+        }
         if index.where_clause.is_some() {
-            let source_definition = document.source(source).ok_or_else(|| {
-                crate::LimboError::InternalError(format!(
-                    "missing HIR source {source} for partial-index matching"
-                ))
-            })?;
-            let Some(expressions) = hir_index_expressions(source_definition, index.as_ref())?
-            else {
-                continue;
-            };
             let predicate = expressions.predicate.as_ref().ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "HIR metadata for partial index {} has no predicate",
@@ -861,7 +935,7 @@ pub(crate) fn hir_table_constraints_for_source(
             }
         }
         candidates.push(ConstraintUseCandidate {
-            index: Some(index.clone()),
+            index: Some(expressions.index.handle()),
             refs: Vec::new(),
         });
     }
@@ -876,14 +950,18 @@ pub(crate) fn hir_table_constraints_for_source(
         refs: Vec::new(),
     });
 
-    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    let rowid_alias_column = table
+        .table
+        .columns()
+        .iter()
+        .position(Column::is_rowid_alias);
     for (constraint_position, constraint) in table_constraints.constraints.iter_mut().enumerate() {
         if !constraint.usable {
             continue;
         }
         let constrained_column = constraint
             .table_col_pos
-            .and_then(|position| table.columns().get(position));
+            .and_then(|position| table.table.columns().get(position));
         if matches!(
             (constraint.comparison_collation, constrained_column),
             (Some(comparison), Some(column)) if comparison != column.collation()
@@ -944,7 +1022,7 @@ pub(crate) fn hir_table_constraints_for_source(
             };
             let index_column = &index.columns[index_column_position];
             if let Some(table_column_position) = constraint.table_col_pos {
-                let constrained_column = &table.columns()[table_column_position];
+                let constrained_column = &table.table.columns()[table_column_position];
                 if constrained_column.collation() != index_column.collation.unwrap_or_default() {
                     continue;
                 }
@@ -979,15 +1057,17 @@ pub(crate) fn hir_table_constraints_for_source(
             .refs
             .sort_by_key(|reference| reference.index_col_pos);
     }
-    table_constraints.temporary_index_terms = automatic_index_terms(table, &table_constraints)
-        .into_iter()
-        .filter(|reference| {
-            !matches!(
-                table_constraints.constraints[reference.constraint_vec_pos].comparison_collation,
-                Some(CollationSeq::Custom(_))
-            )
-        })
-        .collect();
+    table_constraints.temporary_index_terms =
+        automatic_index_terms(&table.table, &table_constraints)
+            .into_iter()
+            .filter(|reference| {
+                !matches!(
+                    table_constraints.constraints[reference.constraint_vec_pos]
+                        .comparison_collation,
+                    Some(CollationSeq::Custom(_))
+                )
+            })
+            .collect();
     Ok(table_constraints)
 }
 
@@ -995,11 +1075,11 @@ pub(crate) fn hir_table_constraints_for_source(
 ///
 /// Terms for the same table column use the same index column.
 pub(super) fn automatic_index_terms<E, S>(
-    table: &JoinedTable,
+    table: &crate::schema::Table,
     constraints: &TableConstraints<E, S>,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let is_strict = table.table.is_strict();
+    let is_strict = table.is_strict();
     let usable_constraints: SmallVec<[&Constraint<E>; 4]> = constraints
         .constraints
         .iter()
@@ -1154,20 +1234,13 @@ fn estimate_constraint_selectivity(
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
-    // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
-    // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
-    // selective, estimate (see [Constraint::null_matching]).
-    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
-        ConstraintOperator::from(ast::Operator::Equals)
-    } else {
-        operator
-    };
-    estimate_selectivity(
+    estimate_constraint_selectivity_for_table(
         schema,
         table_reference.table.get_name(),
         column,
-        index,
         operator,
+        null_matching,
+        index,
         params,
         is_rowid,
     )
@@ -1857,7 +1930,7 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
+        cs.temporary_index_terms = automatic_index_terms(&table_reference.table, &cs)
             .into_iter()
             .filter(|term| {
                 let constraint = &cs.constraints[term.constraint_vec_pos];
@@ -2935,6 +3008,26 @@ mod tests {
     use super::*;
 
     fn empty_hir_document(source: hir::SourceId) -> hir::HirDocument {
+        let sources = (0..=source.index())
+            .map(|index| hir::Source {
+                id: hir::SourceId::new(index),
+                owner: hir::SourceOwner::Root,
+                database: None,
+                name: format!("source_{index}"),
+                alias: None,
+                kind: hir::SourceKind::SchemaExpression,
+                columns: Vec::new(),
+                generated_expressions: Vec::new(),
+                default_expressions: Vec::new(),
+                column_type_programs: Vec::new(),
+                check_constraints: None,
+                rowid_available: true,
+                index_hint: hir::IndexHint::None,
+                index_expressions: Vec::new(),
+                index_coverage: hir::IndexCoverage::Selective,
+                index_method_patterns: Vec::new(),
+            })
+            .collect();
         hir::HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
@@ -2943,23 +3036,7 @@ mod tests {
                 expressions: Vec::new(),
             }),
             queries: Vec::new(),
-            sources: Vec::new(),
-            ctes: Vec::new(),
-            schema_programs: Vec::new(),
-            cdc: None,
-        }
-    }
-
-    fn hir_document_with_source(source: hir::Source) -> hir::HirDocument {
-        hir::HirDocument {
-            snapshot: hir::CatalogSnapshot::from_id(0),
-            databases: Vec::new(),
-            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
-                source: source.id,
-                expressions: Vec::new(),
-            }),
-            queries: Vec::new(),
-            sources: vec![source],
+            sources,
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
@@ -2988,12 +3065,12 @@ mod tests {
     }
 
     fn hir_document_with_index(
+        source: hir::SourceId,
         table: &JoinedTable,
         index: Arc<Index>,
         columns: Vec<Option<hir::Expr>>,
         predicate: Option<hir::Expr>,
     ) -> hir::HirDocument {
-        let source = hir::SourceId::new(0);
         let index_id = hir::CatalogObjectId::new(2);
         let resolved_index = hir::CatalogObject::new(
             index_id,
@@ -3008,7 +3085,11 @@ mod tests {
             Arc::new(table.table.clone()),
         );
         let width = table.columns().len();
-        hir_document_with_source(hir::Source {
+        let mut document = empty_hir_document(source);
+        *document
+            .sources
+            .get_mut(source.index())
+            .expect("test source slot exists") = hir::Source {
             id: source,
             owner: hir::SourceOwner::Root,
             database: Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
@@ -3043,7 +3124,8 @@ mod tests {
                 indexes: vec![index_id],
             },
             index_method_patterns: Vec::new(),
-        })
+        };
+        document
     }
 
     fn table_with_columns(columns: Vec<Column>) -> JoinedTable {
@@ -3074,6 +3156,21 @@ mod tests {
 
     fn rowid_table() -> JoinedTable {
         table_with_columns(Vec::new())
+    }
+
+    fn hir_planned_source(source: hir::SourceId, table: &JoinedTable) -> HirPlannedSource {
+        HirPlannedSource {
+            op: table.op.clone(),
+            table: table.table.clone(),
+            identifier: table.identifier.clone(),
+            internal_id: source,
+            join_info: None,
+            col_used_mask: table.col_used_mask.clone(),
+            column_use_counts: table.column_use_counts.clone(),
+            expression_index_usages: Vec::new(),
+            database_id: table.database_id,
+            indexed: hir::IndexHint::None,
+        }
     }
 
     fn hir_comparison(
@@ -3304,14 +3401,14 @@ mod tests {
             from_outer_join: None,
             consumed: false,
         };
+        let table = rowid_table();
+        let table = hir_planned_source(source, &table);
         let constraints = hir_binary_constraints_for_source(
             &empty_hir_document(source),
             &from,
             &[term],
-            source,
-            &rowid_table(),
+            &table,
             &Schema::new(),
-            &AvailableIndexes::default(),
             &CostModelParams::default(),
         )?;
         let [constraint] = constraints.as_slice() else {
@@ -3361,15 +3458,14 @@ mod tests {
             Column::new_default_integer(Some("a".into()), "INTEGER".into(), None),
             Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
         ]);
+        let table = hir_planned_source(source, &table);
 
         let constraints = hir_binary_constraints_for_source(
             &empty_hir_document(source),
             &from,
             &[range, equality],
-            source,
             &table,
             &Schema::new(),
-            &AvailableIndexes::default(),
             &CostModelParams::default(),
         )?;
 
@@ -3414,15 +3510,14 @@ mod tests {
             "INTEGER".into(),
             None,
         )]);
+        let table = hir_planned_source(source, &table);
 
         let constraints = hir_table_constraints_for_source(
             &empty_hir_document(source),
             &from,
             &[term],
-            source,
             &table,
             &Schema::new(),
-            &AvailableIndexes::default(),
             &CostModelParams::default(),
             &|_| None,
         )?;
@@ -3469,6 +3564,7 @@ mod tests {
             Column::new_default_integer(Some("id".into()), "INTEGER".into(), None);
         rowid_alias.set_rowid_alias(true);
         let table = table_with_columns(vec![rowid_alias]);
+        let table = hir_planned_source(source, &table);
         let term = |expr| HirWhereTerm {
             expr,
             from_outer_join: None,
@@ -3480,7 +3576,6 @@ mod tests {
             &from,
             0,
             &term(expression.clone()),
-            source,
             &table,
             &Schema::new(),
             &CostModelParams::default(),
@@ -3502,7 +3597,6 @@ mod tests {
             &from,
             0,
             &term(expression),
-            source,
             &table,
             &Schema::new(),
             &CostModelParams::default(),
@@ -3542,6 +3636,7 @@ mod tests {
             "TEXT".into(),
             None,
         )]);
+        let table = hir_planned_source(source, &table);
         let params = CostModelParams::default();
         let row_count = params.rows_per_table_fallback;
         let document = hir_document_with_query(source, query, Vec::new());
@@ -3550,10 +3645,8 @@ mod tests {
             &document,
             &from,
             std::slice::from_ref(&term),
-            source,
             &table,
             &Schema::new(),
-            &AvailableIndexes::default(),
             &params,
             &|planned_query| {
                 assert_eq!(planned_query, query);
@@ -3578,7 +3671,6 @@ mod tests {
             &document,
             0,
             &term,
-            source,
             &table,
             &Schema::new(),
             &params,
@@ -3602,7 +3694,6 @@ mod tests {
                 from_outer_join: None,
                 consumed: false,
             },
-            source,
             &table,
             &Schema::new(),
             &params,
@@ -3657,21 +3748,15 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let mut indexes = AvailableIndexes::default();
-        indexes.insert_for_table_name(
-            std::slice::from_ref(&table),
-            "items",
-            VecDeque::from([index.clone()]),
-        );
+        let document = hir_document_with_index(source, &table, index.clone(), vec![None], None);
+        let table = hir_planned_source(source, &table);
 
         let constraints = hir_table_constraints_for_source(
-            &empty_hir_document(source),
+            &document,
             &from,
             &[compatible, incompatible],
-            source,
             &table,
             &Schema::new(),
-            &indexes,
             &CostModelParams::default(),
             &|_| None,
         )?;
@@ -3743,6 +3828,7 @@ mod tests {
             on_conflict: None,
         });
         let document = hir_document_with_index(
+            source,
             &table,
             index.clone(),
             vec![Some(hir_binary(
@@ -3752,21 +3838,14 @@ mod tests {
             ))],
             None,
         );
-        let mut indexes = AvailableIndexes::default();
-        indexes.insert_for_table_name(
-            std::slice::from_ref(&table),
-            "items",
-            VecDeque::from([index.clone()]),
-        );
+        let table = hir_planned_source(source, &table);
 
         let constraints = hir_table_constraints_for_source(
             &document,
             &from,
             &[term],
-            source,
             &table,
             &Schema::new(),
-            &indexes,
             &CostModelParams::default(),
             &|_| None,
         )?;
@@ -3842,22 +3921,16 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let document = hir_document_with_index(&table, index.clone(), vec![None], Some(predicate));
-        let mut indexes = AvailableIndexes::default();
-        indexes.insert_for_table_name(
-            std::slice::from_ref(&table),
-            "items",
-            VecDeque::from([index.clone()]),
-        );
+        let document =
+            hir_document_with_index(source, &table, index.clone(), vec![None], Some(predicate));
+        let table = hir_planned_source(source, &table);
 
         let accepted = hir_table_constraints_for_source(
             &document,
             &from,
             &[seek.clone(), lower.clone(), upper],
-            source,
             &table,
             &Schema::new(),
-            &indexes,
             &CostModelParams::default(),
             &|_| None,
         )?;
@@ -3872,10 +3945,8 @@ mod tests {
             &document,
             &from,
             &[seek, lower],
-            source,
             &table,
             &Schema::new(),
-            &indexes,
             &CostModelParams::default(),
             &|_| None,
         )?;
