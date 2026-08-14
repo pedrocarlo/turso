@@ -300,20 +300,25 @@ pub(crate) struct HirConstraintTarget {
     pub(crate) is_rowid: bool,
 }
 
-/// Read the resolved comparison facts needed to constrain one HIR source.
+#[derive(Debug)]
+pub(crate) struct HirBinaryConstraintPart<'a> {
+    pub(crate) target: HirConstraintTarget,
+    pub(crate) operator: ConstraintOperator,
+    pub(crate) side: BinaryExprSide,
+    pub(crate) constraining_expr: &'a hir::Expr,
+    pub(crate) comparison_affinity: Option<Affinity>,
+}
+
+/// Read every resolved comparison target for one HIR source.
 ///
-/// The returned side points at the constraining expression. For example,
-/// `1 > items.value` returns `Lhs` and normalizes the operator to `<`.
+/// The side points at the constraining expression. For example,
+/// `1 > items.value` returns `Lhs` and normalizes the operator to `<`. Both
+/// sides are returned when both directly reference the source.
 pub(crate) fn hir_binary_constraint_parts<'a>(
     expr: &'a hir::Expr,
     source: hir::SourceId,
-) -> Option<(
-    HirConstraintTarget,
-    ConstraintOperator,
-    BinaryExprSide,
-    &'a hir::Expr,
-    Option<Affinity>,
-)> {
+) -> SmallVec<[HirBinaryConstraintPart<'a>; 2]> {
+    let mut parts = SmallVec::new();
     let hir::Expr::Binary {
         lhs,
         operator,
@@ -322,7 +327,7 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
         ..
     } = expr
     else {
-        return None;
+        return parts;
     };
 
     let target = |expr: &hir::Expr| match expr {
@@ -346,17 +351,24 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
     let operator = ConstraintOperator::from(*operator);
 
     if let Some(target) = target(lhs) {
-        return Some((target, operator, BinaryExprSide::Rhs, rhs, affinity));
-    }
-    target(rhs).map(|target| {
-        (
+        parts.push(HirBinaryConstraintPart {
             target,
-            opposite_cmp_op(operator),
-            BinaryExprSide::Lhs,
-            lhs.as_ref(),
-            affinity,
-        )
-    })
+            operator,
+            side: BinaryExprSide::Rhs,
+            constraining_expr: rhs,
+            comparison_affinity: affinity,
+        });
+    }
+    if let Some(target) = target(rhs) {
+        parts.push(HirBinaryConstraintPart {
+            target,
+            operator: opposite_cmp_op(operator),
+            side: BinaryExprSide::Lhs,
+            constraining_expr: lhs,
+            comparison_affinity: affinity,
+        });
+    }
+    parts
 }
 
 fn hir_truth_test_rhs(expr: &hir::Expr) -> Option<bool> {
@@ -382,7 +394,7 @@ fn hir_is_non_null_literal(expr: &hir::Expr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn hir_binary_constraint(
+fn hir_binary_constraints_for_term(
     document: &hir::HirDocument,
     from: &hir::From,
     term_position: usize,
@@ -392,70 +404,99 @@ pub(crate) fn hir_binary_constraint(
     schema: &Schema,
     indexes: &AvailableIndexes,
     params: &CostModelParams,
-) -> Result<Option<HirConstraint>> {
+) -> Result<SmallVec<[HirConstraint; 2]>> {
+    let mut constraints = SmallVec::new();
     let hir::Expr::Binary { operator, rhs, .. } = &term.expr else {
-        return Ok(None);
+        return Ok(constraints);
     };
     if *operator == ast::Operator::Is && hir_truth_test_rhs(rhs).is_some() {
-        return Ok(None);
+        return Ok(constraints);
     }
     if term
         .from_outer_join
         .is_some_and(|outer_source| outer_source != source)
     {
-        return Ok(None);
+        return Ok(constraints);
     }
 
-    let Some((target, operator, side, constraining_expr, comparison_affinity)) =
-        hir_binary_constraint_parts(&term.expr, source)
-    else {
-        return Ok(None);
-    };
-    let is_op = operator.as_ast_operator() == Some(ast::Operator::Is);
-    let null_matching = is_op && !hir_is_non_null_literal(constraining_expr);
-    let usable = term.from_outer_join == Some(source)
-        || if is_op {
-            !from.outer_join_may_null_extend(source)
+    for part in hir_binary_constraint_parts(&term.expr, source) {
+        let is_op = part.operator.as_ast_operator() == Some(ast::Operator::Is);
+        let null_matching = is_op && !hir_is_non_null_literal(part.constraining_expr);
+        let usable = term.from_outer_join == Some(source)
+            || if is_op {
+                !from.outer_join_may_null_extend(source)
+            } else {
+                !from.full_join_may_null_extend(source)
+            };
+
+        let (table_col_pos, column, index) = if part.target.is_rowid {
+            (None, None, None)
         } else {
-            !from.full_join_may_null_extend(source)
+            let column_position = part
+                .target
+                .column
+                .expect("non-rowid HIR constraint target has a column");
+            (
+                Some(column_position),
+                Some(&table.columns()[column_position]),
+                selectivity_index_for_column(schema, table, indexes, column_position),
+            )
         };
+        let selectivity = estimate_constraint_selectivity(
+            schema,
+            table,
+            column,
+            part.operator,
+            null_matching,
+            index,
+            params,
+            part.target.is_rowid,
+        );
 
-    let (table_col_pos, column, index) = if target.is_rowid {
-        (None, None, None)
-    } else {
-        let column_position = target
-            .column
-            .expect("non-rowid HIR constraint target has a column");
-        (
-            Some(column_position),
-            Some(&table.columns()[column_position]),
-            selectivity_index_for_column(schema, table, indexes, column_position),
-        )
-    };
-    let selectivity = estimate_constraint_selectivity(
-        schema,
-        table,
-        column,
-        operator,
-        null_matching,
-        index,
-        params,
-        target.is_rowid,
-    );
+        constraints.push(HirConstraint {
+            where_clause_pos: (term_position, part.side),
+            operator: part.operator,
+            table_col_pos,
+            expr: None,
+            constraining_expr: None,
+            lhs_mask: table_mask_from_hir_expr(document, Some(from), part.constraining_expr)?,
+            selectivity,
+            usable,
+            is_rowid: part.target.is_rowid,
+            comparison_affinity: part.comparison_affinity,
+            null_matching,
+        });
+    }
+    Ok(constraints)
+}
 
-    Ok(Some(HirConstraint {
-        where_clause_pos: (term_position, side),
-        operator,
-        table_col_pos,
-        expr: None,
-        constraining_expr: None,
-        lhs_mask: table_mask_from_hir_expr(document, Some(from), constraining_expr)?,
-        selectivity,
-        usable,
-        is_rowid: target.is_rowid,
-        comparison_affinity,
-        null_matching,
-    }))
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hir_binary_constraints_for_source(
+    document: &hir::HirDocument,
+    from: &hir::From,
+    where_clause: &[HirWhereTerm],
+    source: hir::SourceId,
+    table: &JoinedTable,
+    schema: &Schema,
+    indexes: &AvailableIndexes,
+    params: &CostModelParams,
+) -> Result<Vec<HirConstraint>> {
+    let mut constraints = Vec::new();
+    for (term_position, term) in where_clause.iter().enumerate() {
+        constraints.extend(hir_binary_constraints_for_term(
+            document,
+            from,
+            term_position,
+            term,
+            source,
+            table,
+            schema,
+            indexes,
+            params,
+        )?);
+    }
+    constraints.sort_by_key(|constraint| !is_equality_operator(constraint.operator));
+    Ok(constraints)
 }
 
 /// Build the search terms for an automatic index.
@@ -2406,12 +2447,12 @@ mod tests {
         }
     }
 
-    fn rowid_table() -> JoinedTable {
+    fn table_with_columns(columns: Vec<Column>) -> JoinedTable {
         let table = crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
             1,
             "items".into(),
             Vec::new(),
-            Vec::new(),
+            columns,
             crate::schema::BTreeCharacteristics::HAS_ROWID,
             Vec::new(),
             Vec::new(),
@@ -2430,6 +2471,10 @@ mod tests {
             database_id: crate::MAIN_DB_ID,
             indexed: None,
         }
+    }
+
+    fn rowid_table() -> JoinedTable {
+        table_with_columns(Vec::new())
     }
 
     fn hir_comparison(
@@ -2491,21 +2536,23 @@ mod tests {
             hir::Expr::Literal(ast::Literal::Numeric("10".into())),
             Affinity::Integer,
         );
-        let (target, operator, side, constraining, affinity) =
-            hir_binary_constraint_parts(&left, source).expect("left column constrains source");
-        assert_eq!(target.source, source);
-        assert_eq!(target.column, Some(2));
-        assert!(!target.is_rowid);
+        let left_parts = hir_binary_constraint_parts(&left, source);
+        let [left_part] = left_parts.as_slice() else {
+            panic!("left column produces one constraint part");
+        };
+        assert_eq!(left_part.target.source, source);
+        assert_eq!(left_part.target.column, Some(2));
+        assert!(!left_part.target.is_rowid);
         assert_eq!(
-            operator,
+            left_part.operator,
             ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
         );
-        assert_eq!(side, BinaryExprSide::Rhs);
+        assert_eq!(left_part.side, BinaryExprSide::Rhs);
         assert!(matches!(
-            constraining,
+            left_part.constraining_expr,
             hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "10"
         ));
-        assert_eq!(affinity, Some(Affinity::Integer));
+        assert_eq!(left_part.comparison_affinity, Some(Affinity::Integer));
 
         let right = hir_comparison(
             hir::Expr::Literal(ast::Literal::Numeric("1".into())),
@@ -2513,10 +2560,12 @@ mod tests {
             hir::Expr::rowid(source),
             Affinity::Integer,
         );
-        let (target, operator, side, constraining, affinity) =
-            hir_binary_constraint_parts(&right, source).expect("right rowid constrains source");
+        let right_parts = hir_binary_constraint_parts(&right, source);
+        let [right_part] = right_parts.as_slice() else {
+            panic!("right rowid produces one constraint part");
+        };
         assert_eq!(
-            target,
+            right_part.target,
             HirConstraintTarget {
                 source,
                 column: None,
@@ -2524,15 +2573,15 @@ mod tests {
             }
         );
         assert_eq!(
-            operator,
+            right_part.operator,
             ConstraintOperator::AstNativeOperator(ast::Operator::Less)
         );
-        assert_eq!(side, BinaryExprSide::Lhs);
+        assert_eq!(right_part.side, BinaryExprSide::Lhs);
         assert!(matches!(
-            constraining,
+            right_part.constraining_expr,
             hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
         ));
-        assert_eq!(affinity, Some(Affinity::Integer));
+        assert_eq!(right_part.comparison_affinity, Some(Affinity::Integer));
     }
 
     #[test]
@@ -2557,20 +2606,21 @@ mod tests {
             from_outer_join: None,
             consumed: false,
         };
-        let constraint = hir_binary_constraint(
+        let constraints = hir_binary_constraints_for_source(
             &empty_hir_document(source),
             &from,
-            3,
-            &term,
+            &[term],
             source,
             &rowid_table(),
             &Schema::new(),
             &AvailableIndexes::default(),
             &CostModelParams::default(),
-        )?
-        .expect("rowid comparison becomes a constraint");
+        )?;
+        let [constraint] = constraints.as_slice() else {
+            panic!("rowid comparison becomes one constraint");
+        };
 
-        assert_eq!(constraint.where_clause_pos, (3, BinaryExprSide::Rhs));
+        assert_eq!(constraint.where_clause_pos, (0, BinaryExprSide::Rhs));
         assert_eq!(constraint.table_col_pos, None);
         assert!(constraint.is_rowid);
         assert!(constraint.null_matching);
@@ -2578,6 +2628,59 @@ mod tests {
         assert!(constraint.lhs_mask.get(0));
         assert!(!constraint.lhs_mask.get(1));
         assert_eq!(constraint.comparison_affinity, Some(Affinity::Integer));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_binary_constraint_collection_keeps_both_sides_and_sorts_equalities() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let range = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 0),
+                ast::Operator::Greater,
+                hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let equality = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 0),
+                ast::Operator::Equals,
+                hir::Expr::column(source, 1),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let table = table_with_columns(vec![
+            Column::new_default_integer(Some("a".into()), "INTEGER".into(), None),
+            Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
+        ]);
+
+        let constraints = hir_binary_constraints_for_source(
+            &empty_hir_document(source),
+            &from,
+            &[range, equality],
+            source,
+            &table,
+            &Schema::new(),
+            &AvailableIndexes::default(),
+            &CostModelParams::default(),
+        )?;
+
+        assert_eq!(constraints.len(), 3);
+        assert_eq!(constraints[0].operator, ast::Operator::Equals.into());
+        assert_eq!(constraints[0].table_col_pos, Some(0));
+        assert_eq!(constraints[1].operator, ast::Operator::Equals.into());
+        assert_eq!(constraints[1].table_col_pos, Some(1));
+        assert_eq!(constraints[2].operator, ast::Operator::Greater.into());
+        assert_eq!(constraints[2].table_col_pos, Some(0));
         Ok(())
     }
 }
