@@ -1098,6 +1098,13 @@ pub(crate) struct JoinOrderingRestrictions {
 }
 
 impl JoinOrderingRestrictions {
+    fn required_lhs(&self, table: usize) -> Option<&TableMask> {
+        self.required_lhs_by_table
+            .as_ref()
+            .map(|required| &required[table])
+            .filter(|required| !required.is_empty())
+    }
+
     pub(crate) fn allows_subset(&self, subset: &TableMask) -> bool {
         self.required_lhs_by_table.as_ref().is_none_or(|required| {
             !required.iter().enumerate().any(|(table, required)| {
@@ -1694,23 +1701,7 @@ fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_ordering_constrained())
-        })
-        .map(|(j, _)| {
-            let mut required = TableMask::default();
-            for k in 0..j {
-                required.set(k)?;
-            }
-            Ok((j, required))
-        })
-        .collect::<Result<_>>()?;
+    let ordering_restrictions = legacy_join_ordering_restrictions(joined_tables)?;
 
     let mut remaining: TableMask = (0..num_tables).try_collect()?;
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
@@ -1721,7 +1712,7 @@ fn compute_greedy_join_order<'a>(
         joined_tables,
         constraints,
         base_table_rows,
-        &left_join_deps,
+        &ordering_restrictions,
         analyze_stats,
         params,
     )?;
@@ -1774,7 +1765,7 @@ fn compute_greedy_join_order<'a>(
         let mut has_connected_candidate = false;
         for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = ordering_restrictions.required_lhs(idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
@@ -1790,7 +1781,7 @@ fn compute_greedy_join_order<'a>(
 
         for idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = ordering_restrictions.required_lhs(idx) {
                 if !current_mask.contains_all_set_bits_of(required) {
                     continue;
                 }
@@ -1877,7 +1868,7 @@ fn find_best_starting_table(
     joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<usize> {
@@ -1886,14 +1877,14 @@ fn find_best_starting_table(
         joined_tables,
         constraints,
         base_table_rows,
-        left_join_deps,
+        ordering_restrictions,
         analyze_stats,
         params,
     )?;
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
-        if left_join_deps.contains_key(&t) {
+        if ordering_restrictions.required_lhs(t).is_some() {
             continue; // Outer join RHS - cannot be first
         }
 
@@ -1952,7 +1943,7 @@ fn compute_indexed_seek_benefits(
     joined_tables: &[JoinedTable],
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<Vec<f64>> {
@@ -1967,7 +1958,7 @@ fn compute_indexed_seek_benefits(
         let rhs_table = &joined_tables[rhs];
         let rhs_base_rows = base_table_rows[rhs];
 
-        if let Some(deps) = left_join_deps.get(&rhs) {
+        if let Some(deps) = ordering_restrictions.required_lhs(rhs) {
             if deps.count() > 1 {
                 continue;
             }

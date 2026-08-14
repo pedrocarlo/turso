@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Greedy join ordering now consumes the same `JoinOrderingRestrictions` used
+  by exhaustive legacy and HIR planning. Starting-source eligibility,
+  indexed-seek benefits, and later-source eligibility no longer rebuild a
+  separate LEFT-only dependency map.
 - Indexed-seek scoring consumes one borrowed source view for its physical
   table and covering-index decision. Legacy sources and HIR sources therefore
   use the same scoring call without per-call callbacks; HIR covering reads its
