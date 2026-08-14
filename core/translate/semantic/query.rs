@@ -805,6 +805,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 index_method_patterns: Vec::new(),
             },
         )?;
+        if matches!(source_kind, CatalogSourceKind::Table)
+            && matches!(owner, SourceOwner::QueryBlock(_))
+            && table.value().btree().is_some()
+        {
+            let scope = {
+                let definition = self.source(source).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "missing SELECT table source {source} for index metadata"
+                    ))
+                })?;
+                let mut scope = Scope::default();
+                scope.add_source(definition, true);
+                scope
+            };
+            self.analyze_btree_index_metadata(
+                source,
+                &table,
+                &scope,
+                ExprPolicy::schema_expression().with_self_source(source),
+            )?;
+        }
         Ok(source)
     }
 

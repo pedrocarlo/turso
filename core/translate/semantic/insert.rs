@@ -446,7 +446,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         self.analyze_btree_index_metadata(target, table, &scope, policy)
     }
 
-    fn analyze_btree_index_metadata(
+    pub(super) fn analyze_btree_index_metadata(
         &mut self,
         target: hir::SourceId,
         table: &hir::ResolvedTable,
@@ -503,7 +503,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }
 
         let source = self.source_mut(target).ok_or_else(|| {
-            LimboError::InternalError(format!("missing write target source {target}"))
+            LimboError::InternalError(format!("missing index-metadata source {target}"))
         })?;
         source.index_expressions = index_expressions;
         source.index_coverage = hir::IndexCoverage::Complete { indexes: index_ids };

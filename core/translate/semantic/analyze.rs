@@ -2742,6 +2742,66 @@ mod tests {
     }
 
     #[test]
+    fn select_freezes_all_index_expressions() {
+        let schema = schema_with_insert_metadata();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "SELECT value FROM guarded WHERE lower(value) = 'kept' AND score > 1",
+        )
+        .expect("indexed SELECT binds");
+        document
+            .validate()
+            .expect("SELECT index metadata produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = document
+            .source(block.from.as_ref().expect("query has FROM").first)
+            .expect("source exists");
+        assert_eq!(source.index_expressions.len(), 2);
+        let expression_index = source
+            .index_expressions
+            .iter()
+            .find(|metadata| metadata.index.value().name == "guarded_expression")
+            .expect("expression index metadata exists");
+        assert!(matches!(expression_index.columns.as_slice(), [Some(_)]));
+        assert!(expression_index.predicate.is_some());
+        assert!(expression_index
+            .columns
+            .iter()
+            .flatten()
+            .chain(expression_index.predicate.iter())
+            .all(|expression| {
+                let mut reads_only_source = true;
+                expression.walk(&mut |part| {
+                    if let Expr::Column(column) = part {
+                        reads_only_source &= column.source == source.id;
+                    }
+                });
+                reads_only_source
+            }));
+
+        let ordinary_index = source
+            .index_expressions
+            .iter()
+            .find(|metadata| metadata.index.value().name == "guarded_value")
+            .expect("ordinary index metadata exists");
+        assert!(matches!(ordinary_index.columns.as_slice(), [None]));
+        assert!(ordinary_index.predicate.is_none());
+        assert!(matches!(
+            &source.index_coverage,
+            IndexCoverage::Complete { indexes } if indexes
+                == &source
+                    .index_expressions
+                    .iter()
+                    .map(|metadata| metadata.index.id())
+                    .collect::<Vec<_>>()
+        ));
+    }
+
+    #[test]
     fn indexed_by_rejects_missing_or_other_table_indexes() {
         let schema = schema_with_indexes();
         for (sql, expected_name) in [

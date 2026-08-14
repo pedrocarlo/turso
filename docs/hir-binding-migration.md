@@ -81,6 +81,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- SELECT B-tree sources freeze every resolved ordinary, expression, and
+  partial index in catalog order. Expression keys and predicates close over
+  the exact `SourceId`; complete coverage lets HIR planning avoid rebinding
+  schema AST when matching indexes.
 - Analyzer-owned HIR arenas and mandatory document validation.
 - Trigger `WHEN` predicates bind directly against event-shaped, qualified-only
   NEW/OLD pseudo-sources. Column types and rowid identity stay in HIR; invalid
