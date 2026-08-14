@@ -31,8 +31,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
-            SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, HirPlannedSource, JoinOrderMember, JoinedTable,
+            NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
     },
@@ -1045,6 +1045,134 @@ pub struct BestJoinOrderResult {
     pub best_ordered_plan: Option<JoinN>,
 }
 
+#[derive(Clone, Copy)]
+struct JoinOrderingFacts {
+    constrained: bool,
+    full_outer: bool,
+}
+
+/// Join-order dependencies shared by parser-expression and HIR planning.
+pub(crate) struct JoinOrderingRestrictions {
+    illegal_lhs_by_rhs: Option<HashMap<usize, TableMask>>,
+    required_lhs_by_table: Option<Vec<TableMask>>,
+}
+
+impl JoinOrderingRestrictions {
+    pub(crate) fn allows_subset(&self, subset: &TableMask) -> bool {
+        self.required_lhs_by_table.as_ref().is_none_or(|required| {
+            !required.iter().enumerate().any(|(table, required)| {
+                subset.get(table) && !subset.contains_all_set_bits_of(required)
+            })
+        })
+    }
+
+    pub(crate) fn allows_rhs(&self, rhs: usize, lhs: &TableMask) -> bool {
+        self.illegal_lhs_by_rhs
+            .as_ref()
+            .and_then(|dependencies| dependencies.get(&rhs))
+            .is_none_or(|illegal_lhs| !lhs.intersects(illegal_lhs))
+    }
+
+    #[cfg(test)]
+    fn allows_order(&self, order: &[usize]) -> Result<bool> {
+        let mut prefix = TableMask::default();
+        for &rhs in order {
+            let mut subset = prefix.try_clone()?;
+            subset.set(rhs)?;
+            if !self.allows_subset(&subset) || !self.allows_rhs(rhs, &prefix) {
+                return Ok(false);
+            }
+            prefix = subset;
+        }
+        Ok(true)
+    }
+}
+
+fn join_ordering_restrictions<T>(
+    sources: &[T],
+    facts: impl Fn(&T) -> JoinOrderingFacts,
+) -> Result<JoinOrderingRestrictions> {
+    let source_count = sources.len();
+    let ordering_constrained_count = sources
+        .iter()
+        .filter(|source| facts(source).constrained)
+        .count();
+    let has_full_outer = sources.iter().any(|source| facts(source).full_outer);
+    if ordering_constrained_count == 0 && !has_full_outer {
+        return Ok(JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        });
+    }
+
+    let mut illegal_lhs_by_rhs: HashMap<usize, TableMask> =
+        HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
+    let mut required_lhs_by_table = vec![TableMask::default(); source_count];
+    // Every ordering-constrained join requires its RHS source to remain after
+    // every source originally on its left. The reverse map lets the dynamic
+    // program reject a source that would place one of those RHS sources first.
+    for (left, _) in sources.iter().enumerate() {
+        for (right, source) in sources.iter().enumerate().skip(left + 1) {
+            if facts(source).constrained {
+                required_lhs_by_table[right].set(left)?;
+                illegal_lhs_by_rhs.entry(left).or_default().set(right)?;
+            }
+        }
+    }
+
+    // FULL OUTER is a barrier in both directions. Later sources cannot move
+    // before it: `(t1 INNER t3) FULL OUTER t2` is not equivalent to the
+    // requested `(t1 FULL OUTER t2) INNER t3`, because NULL-extended probe rows
+    // can survive differently.
+    for (full, source) in sources.iter().enumerate() {
+        if !facts(source).full_outer {
+            continue;
+        }
+        for (later, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(full + 1) {
+            required_lhs.set(full)?;
+            illegal_lhs_by_rhs.entry(full).or_default().set(later)?;
+        }
+    }
+
+    Ok(JoinOrderingRestrictions {
+        illegal_lhs_by_rhs: Some(illegal_lhs_by_rhs),
+        required_lhs_by_table: Some(required_lhs_by_table),
+    })
+}
+
+fn legacy_join_ordering_restrictions(
+    joined_tables: &[JoinedTable],
+) -> Result<JoinOrderingRestrictions> {
+    join_ordering_restrictions(joined_tables, |table| {
+        let join = table.join_info.as_ref();
+        JoinOrderingFacts {
+            constrained: join.is_some_and(|join| join.is_ordering_constrained()),
+            full_outer: join.is_some_and(|join| join.is_full_outer()),
+        }
+    })
+}
+
+/// Build HIR restrictions with the same code used by the legacy join planner.
+pub(crate) fn hir_join_ordering_restrictions(
+    sources: &[HirPlannedSource],
+) -> Result<JoinOrderingRestrictions> {
+    join_ordering_restrictions(sources, |source| {
+        let kind = source.join_info.as_ref().map(|join| join.kind);
+        JoinOrderingFacts {
+            constrained: matches!(
+                kind,
+                Some(
+                    crate::translate::semantic::hir::JoinKind::Cross
+                        | crate::translate::semantic::hir::JoinKind::Left
+                        | crate::translate::semantic::hir::JoinKind::Right
+                        | crate::translate::semantic::hir::JoinKind::Full
+                )
+            ),
+            full_outer: kind == Some(crate::translate::semantic::hir::JoinKind::Full),
+        }
+    })
+}
+
 /// Compute the best way to join a given set of tables.
 /// Returns the best [JoinN] if one exists, otherwise returns None.
 #[allow(clippy::too_many_arguments)]
@@ -1259,80 +1387,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // Example:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // If there are outer joins in the plan, ensure correct ordering.
-    let (left_join_illegal_map, required_lhs_by_table) = {
-        let ordering_constrained_count = joined_tables
-            .iter()
-            .filter(|t| {
-                t.join_info
-                    .as_ref()
-                    .is_some_and(|j| j.is_ordering_constrained())
-            })
-            .count();
-        let has_full_outer = joined_tables
-            .iter()
-            .any(|t| t.join_info.as_ref().is_some_and(|j| j.is_full_outer()));
-        if ordering_constrained_count == 0 && !has_full_outer {
-            (None, None)
-        } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(ordering_constrained_count, Default::default());
-            let mut required_lhs_by_table = vec![TableMask::default(); num_tables];
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    // LEFT/FULL OUTER, SEMI, and ANTI joins all require the RHS table
-                    // to appear after the LHS table in the join order.
-                    if joined_table
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|j| j.is_ordering_constrained())
-                    {
-                        required_lhs_by_table[j].set(i)?;
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.set(j)?;
-                        } else {
-                            let mut mask = TableMask::default();
-                            mask.set(j)?;
-                            left_join_illegal_map.insert(i, mask);
-                        }
-                    }
-                }
-            }
-            // FULL OUTER acts as a reordering barrier in both directions: tables
-            // originally after a FULL OUTER table cannot be moved before it, or
-            // the planner produces e.g. `(t1 INNER t3) FULL OUTER t2` instead of
-            // the requested `(t1 FULL OUTER t2) INNER t3`, which can leak
-            // NULL-filled probe rows past the inner join.
-            for (k, t) in joined_tables.iter().enumerate() {
-                if !t.join_info.as_ref().is_some_and(|j| j.is_full_outer()) {
-                    continue;
-                }
-                for (j, required_lhs) in required_lhs_by_table.iter_mut().enumerate().skip(k + 1) {
-                    required_lhs.set(k)?;
-                    if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&k) {
-                        illegal_lhs.set(j)?;
-                    } else {
-                        let mut mask = TableMask::default();
-                        mask.set(j)?;
-                        left_join_illegal_map.insert(k, mask);
-                    }
-                }
-            }
-            (Some(left_join_illegal_map), Some(required_lhs_by_table))
-        }
-    };
+    let ordering_restrictions = legacy_join_ordering_restrictions(joined_tables)?;
 
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
         for mask in generate_join_bitmasks(num_tables, subset_size) {
             let mask = mask?;
-            if required_lhs_by_table.as_ref().is_some_and(|required| {
-                required.iter().enumerate().any(|(table, required)| {
-                    mask.get(table) && !mask.contains_all_set_bits_of(required)
-                })
-            }) {
+            if !ordering_restrictions.allows_subset(&mask) {
                 continue;
             }
             // Keep track of the best way to join this subset of tables per possible last table.
@@ -1362,14 +1424,8 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 }
 
                 // If this join ordering would violate LEFT JOIN ordering restrictions, skip.
-                if let Some(illegal_lhs) = left_join_illegal_map
-                    .as_ref()
-                    .and_then(|deps| deps.get(&rhs_idx))
-                {
-                    let legal = !lhs_mask.intersects(illegal_lhs);
-                    if !legal {
-                        continue; // Don't allow RHS before its LEFT in LEFT JOIN
-                    }
+                if !ordering_restrictions.allows_rhs(rhs_idx, &lhs_mask) {
+                    continue;
                 }
 
                 let Some(lhs_variants) = best_plan_memo.get(&lhs_mask) else {
@@ -2240,9 +2296,10 @@ mod tests {
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
-                ColumnUsedMask, IterationDirection, JoinInfo, JoinType, Operation, TableReferences,
-                WhereTerm,
+                ColumnUsedMask, HirJoinInfo, HirPlannedSource, IterationDirection, JoinInfo,
+                JoinType, Operation, TableReferences, WhereTerm,
             },
+            semantic::hir::{IndexHint, JoinKind, SourceId},
         },
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
@@ -3879,6 +3936,141 @@ mod tests {
             database_id: MAIN_DB_ID,
             indexed: None,
         }
+    }
+
+    fn _create_hir_source(
+        table: Arc<BTreeTable>,
+        join_kind: Option<JoinKind>,
+        internal_id: SourceId,
+    ) -> HirPlannedSource {
+        let name = table.name.clone();
+        let table = Table::BTree(table);
+        HirPlannedSource {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier: name,
+            internal_id,
+            join_info: join_kind.map(|kind| HirJoinInfo {
+                kind,
+                using: Vec::new(),
+            }),
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: MAIN_DB_ID,
+            indexed: IndexHint::None,
+        }
+    }
+
+    #[test]
+    fn hir_and_legacy_joins_share_ordering_restrictions() -> Result<()> {
+        let join_cases = [
+            (
+                JoinInfo {
+                    join_type: JoinType::Inner,
+                    using: Vec::new(),
+                    no_reorder: true,
+                },
+                JoinKind::Cross,
+            ),
+            (
+                JoinInfo {
+                    join_type: JoinType::LeftOuter,
+                    using: Vec::new(),
+                    no_reorder: false,
+                },
+                JoinKind::Left,
+            ),
+            (
+                JoinInfo {
+                    join_type: JoinType::FullOuter,
+                    using: Vec::new(),
+                    no_reorder: false,
+                },
+                JoinKind::Full,
+            ),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        for (legacy_join, hir_join) in join_cases {
+            let columns = _create_column_list(&["value"], Type::Integer);
+            let mut table_id_counter = TableRefIdCounter::new();
+            let legacy_sources = vec![
+                _create_table_reference(
+                    _create_btree_table("first", columns.clone()),
+                    None,
+                    table_id_counter.next(),
+                ),
+                _create_table_reference(
+                    _create_btree_table("joined", columns.clone()),
+                    Some(legacy_join),
+                    table_id_counter.next(),
+                ),
+                _create_table_reference(
+                    _create_btree_table("later", columns.clone()),
+                    Some(JoinInfo {
+                        join_type: JoinType::Inner,
+                        using: Vec::new(),
+                        no_reorder: false,
+                    }),
+                    table_id_counter.next(),
+                ),
+            ];
+            let hir_sources = vec![
+                _create_hir_source(
+                    _create_btree_table("first", columns.clone()),
+                    None,
+                    SourceId::new(0),
+                ),
+                _create_hir_source(
+                    _create_btree_table("joined", columns.clone()),
+                    Some(hir_join),
+                    SourceId::new(1),
+                ),
+                _create_hir_source(
+                    _create_btree_table("later", columns.clone()),
+                    Some(JoinKind::Inner),
+                    SourceId::new(2),
+                ),
+            ];
+
+            let legacy = legacy_join_ordering_restrictions(&legacy_sources)?;
+            let hir = hir_join_ordering_restrictions(&hir_sources)?;
+            for order in orders {
+                assert_eq!(legacy.allows_order(&order)?, hir.allows_order(&order)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn preserved_hir_right_join_keeps_its_left_source_first() -> Result<()> {
+        let columns = _create_column_list(&["value"], Type::Integer);
+        let sources = vec![
+            _create_hir_source(
+                _create_btree_table("left", columns.clone()),
+                None,
+                SourceId::new(0),
+            ),
+            _create_hir_source(
+                _create_btree_table("right", columns),
+                Some(JoinKind::Right),
+                SourceId::new(1),
+            ),
+        ];
+        let restrictions = hir_join_ordering_restrictions(&sources)?;
+
+        assert!(restrictions.allows_order(&[0, 1])?);
+        assert!(!restrictions.allows_order(&[1, 0])?);
+        Ok(())
     }
 
     /// Creates a column expression

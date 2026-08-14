@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Legacy and HIR join planning now share one builder for CROSS and outer-join
+  ordering restrictions. Preserved HIR RIGHT JOIN is constrained directly;
+  the HIR path does not need the parser-era source swap.
 - Query-block planning input now comes directly from HIR. It preserves lexical
   source order and exact join kinds, splits resolved ON and WHERE conjunctions,
   and builds USING/NATURAL equality predicates from frozen column references
