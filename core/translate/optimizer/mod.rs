@@ -2229,9 +2229,14 @@ fn enforce_indexed_by_hints(
                 // If no candidate survived (no WHERE constraints matched), add an empty one
                 // so the optimizer can still scan the index.
                 if cs.candidates.is_empty() {
+                    assert!(
+                        forced_index.where_clause.is_none(),
+                        "a usable forced partial index candidate must survive constraint collection"
+                    );
                     cs.candidates.push(ConstraintUseCandidate {
                         index: Some(forced_index),
                         refs: Vec::new(),
+                        partial_index_selectivity: None,
                     });
                 }
             }

@@ -281,6 +281,8 @@ pub struct ConstraintUseCandidate {
     /// References to the constraints that may be used as an access path for the index.
     /// Refs are sorted by [ConstraintRef::index_col_pos]
     pub refs: Vec<ConstraintRef>,
+    /// Fraction of table rows stored in this partial index.
+    pub partial_index_selectivity: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -583,6 +585,149 @@ fn hir_selectivity_index_for_column<'a>(
                     )
                 })
         })
+}
+
+fn hir_partial_index_selectivity(
+    predicate: &hir::Expr,
+    table: &HirPlannedSource,
+    source: &hir::Source,
+    schema: &Schema,
+    params: &CostModelParams,
+) -> f64 {
+    enum Task<'a> {
+        Visit(&'a hir::Expr),
+        And,
+        Or,
+        Not,
+    }
+
+    let resolve_side = |expression: &hir::Expr| {
+        let (column, is_rowid) = match expression {
+            hir::Expr::Column(column) if column.source == source.id => {
+                (Some(column.column), false)
+            }
+            hir::Expr::RowId(row_source) if *row_source == source.id => (None, true),
+            _ => return None,
+        };
+        let physical_column = column.map(|position| &table.table.columns()[position]);
+        Some((physical_column, column, is_rowid))
+    };
+    let leaf = |lhs: &hir::Expr, rhs: &hir::Expr, operator: ConstraintOperator| {
+        let (column, column_position, is_rowid) = resolve_side(lhs)
+            .or_else(|| resolve_side(rhs))
+            .unwrap_or((None, None, false));
+        let index = column_position
+            .and_then(|position| hir_selectivity_index_for_column(schema, table, source, position));
+        let null_matching = operator.as_ast_operator() == Some(ast::Operator::Is)
+            && !(hir_is_non_null_literal(lhs) || hir_is_non_null_literal(rhs));
+        hir_estimate_constraint_selectivity(
+            schema,
+            table,
+            column,
+            operator,
+            null_matching,
+            index,
+            params,
+            is_rowid,
+        )
+    };
+
+    let mut tasks = vec![Task::Visit(predicate)];
+    let mut values = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Visit(expression) => match expression {
+                hir::Expr::Binary {
+                    lhs,
+                    operator: ast::Operator::And,
+                    rhs,
+                    ..
+                } => {
+                    tasks.push(Task::And);
+                    tasks.push(Task::Visit(rhs));
+                    tasks.push(Task::Visit(lhs));
+                }
+                hir::Expr::Binary {
+                    lhs,
+                    operator: ast::Operator::Or,
+                    rhs,
+                    ..
+                } => {
+                    tasks.push(Task::Or);
+                    tasks.push(Task::Visit(rhs));
+                    tasks.push(Task::Visit(lhs));
+                }
+                hir::Expr::Binary {
+                    operator: ast::Operator::Is,
+                    rhs,
+                    ..
+                } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
+                    values.push(params.sel_is_null);
+                }
+                hir::Expr::Binary {
+                    operator: ast::Operator::IsNot,
+                    rhs,
+                    ..
+                } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
+                    values.push(params.sel_is_not_null);
+                }
+                hir::Expr::Binary {
+                    lhs, operator, rhs, ..
+                } => values.push(leaf(lhs, rhs, (*operator).into())),
+                hir::Expr::IsNull(_) => values.push(params.sel_is_null),
+                hir::Expr::NotNull(_) => values.push(params.sel_is_not_null),
+                hir::Expr::Between { negated, .. } => values.push(if *negated {
+                    1.0 - params.sel_range
+                } else {
+                    params.sel_range
+                }),
+                hir::Expr::InList {
+                    lhs,
+                    negated,
+                    values: items,
+                    ..
+                } => values.push(leaf(
+                    lhs,
+                    lhs,
+                    ConstraintOperator::In {
+                        not: *negated,
+                        estimated_values: items.len() as f64,
+                    },
+                )),
+                hir::Expr::Like { negated, .. } => values.push(if *negated {
+                    params.sel_not_like
+                } else {
+                    params.sel_like
+                }),
+                hir::Expr::Unary {
+                    operator: ast::UnaryOperator::Not,
+                    expr,
+                } => {
+                    tasks.push(Task::Not);
+                    tasks.push(Task::Visit(expr));
+                }
+                _ => values.push(params.sel_other),
+            },
+            Task::And => {
+                let right = values.pop().expect("AND right selectivity was evaluated");
+                let left = values.pop().expect("AND left selectivity was evaluated");
+                values.push(left * right);
+            }
+            Task::Or => {
+                let right = values.pop().expect("OR right selectivity was evaluated");
+                let left = values.pop().expect("OR left selectivity was evaluated");
+                values.push((left + right - left * right).min(1.0));
+            }
+            Task::Not => {
+                let value = values.pop().expect("NOT selectivity was evaluated");
+                values.push(1.0 - value);
+            }
+        }
+    }
+    let [selectivity] = values.as_slice() else {
+        unreachable!("one predicate produces one selectivity")
+    };
+    *selectivity
 }
 
 fn hir_constrained_expr<'a>(
@@ -923,7 +1068,7 @@ pub(crate) fn hir_table_constraints_for_source(
         if index.index_method.is_some() {
             continue;
         }
-        if index.where_clause.is_some() {
+        let partial_index_selectivity = if index.where_clause.is_some() {
             let predicate = expressions.predicate.as_ref().ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "HIR metadata for partial index {} has no predicate",
@@ -933,10 +1078,20 @@ pub(crate) fn hir_table_constraints_for_source(
             if hir_partial_index_predicate_terms(from, source, predicate, where_clause).is_none() {
                 continue;
             }
-        }
+            Some(hir_partial_index_selectivity(
+                predicate,
+                table,
+                source_definition,
+                schema,
+                params,
+            ))
+        } else {
+            None
+        };
         candidates.push(ConstraintUseCandidate {
             index: Some(expressions.index.handle()),
             refs: Vec::new(),
+            partial_index_selectivity,
         });
     }
     let mut table_constraints = HirTableConstraints {
@@ -948,6 +1103,7 @@ pub(crate) fn hir_table_constraints_for_source(
     table_constraints.candidates.push(ConstraintUseCandidate {
         index: None,
         refs: Vec::new(),
+        partial_index_selectivity: None,
     });
 
     let rowid_alias_column = table
@@ -1332,6 +1488,17 @@ pub fn constraints_from_where_clause(
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
+                            partial_index_selectivity: index.where_clause.as_deref().map(
+                                |predicate| {
+                                    estimate_partial_index_where_selectivity(
+                                        predicate,
+                                        table_reference,
+                                        schema,
+                                        available_indexes,
+                                        params,
+                                    )
+                                },
+                            ),
                         })
                         .collect()
                 }),
@@ -1340,6 +1507,7 @@ pub fn constraints_from_where_clause(
         cs.candidates.push(ConstraintUseCandidate {
             index: None,
             refs: Vec::new(),
+            partial_index_selectivity: None,
         });
 
         let index_for_column = |column_pos| {
@@ -3304,6 +3472,7 @@ mod tests {
             candidates: vec![ConstraintUseCandidate {
                 index: None,
                 refs: Vec::new(),
+                partial_index_selectivity: None,
             }],
             temporary_index_terms: SmallVec::new(),
         };
@@ -3933,6 +4102,7 @@ mod tests {
         let document =
             hir_document_with_index(source, &table, index.clone(), vec![None], Some(predicate));
         let table = hir_planned_source(source, &table);
+        let params = CostModelParams::default();
 
         let accepted = hir_table_constraints_for_source(
             &document,
@@ -3940,15 +4110,23 @@ mod tests {
             &[seek.clone(), lower.clone(), upper],
             &table,
             &Schema::new(),
-            &CostModelParams::default(),
+            &params,
             &|_| None,
         )?;
-        assert!(accepted.candidates.iter().any(|candidate| {
-            candidate
-                .index
-                .as_ref()
-                .is_some_and(|value| Arc::ptr_eq(value, &index))
-        }));
+        let accepted_partial = accepted
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .index
+                    .as_ref()
+                    .is_some_and(|value| Arc::ptr_eq(value, &index))
+            })
+            .expect("implied partial index remains a candidate");
+        assert_eq!(
+            accepted_partial.partial_index_selectivity,
+            Some(params.sel_range * params.sel_range)
+        );
 
         let rejected = hir_table_constraints_for_source(
             &document,
@@ -3956,7 +4134,7 @@ mod tests {
             &[seek, lower],
             &table,
             &Schema::new(),
-            &CostModelParams::default(),
+            &params,
             &|_| None,
         )?;
         assert!(!rejected.candidates.iter().any(|candidate| {

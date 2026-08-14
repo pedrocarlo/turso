@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Partial-index candidates now carry their estimated stored-row fraction.
+  Legacy collection runs its existing bound-AST estimator once; HIR collection
+  applies the same formulas iteratively to the frozen resolved predicate.
+  Repeated candidate scoring no longer binds partial-index expressions or
+  needs `AvailableIndexes` for this estimate.
 - B-tree order matching now shares one source-generic algorithm across legacy
   and HIR planning. HIR compares computed order terms against frozen resolved
   index expressions, while preserving the existing equality-prefix,
