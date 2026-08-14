@@ -596,6 +596,115 @@ pub(crate) fn hir_binary_constraints_for_source(
     Ok(constraints)
 }
 
+fn hir_in_list_comparison(
+    values: &[hir::Expr],
+    comparisons: &[hir::ComparisonSemantics],
+) -> Result<Option<(Affinity, Option<CollationSeq>)>> {
+    if comparisons.len() != values.len() {
+        return Err(crate::LimboError::InternalError(format!(
+            "HIR IN list has {} values but {} comparisons",
+            values.len(),
+            comparisons.len()
+        )));
+    }
+    let Some(first) = comparisons.first() else {
+        return Ok(None);
+    };
+    let [first] = first.components.as_slice() else {
+        return Ok(None);
+    };
+    if first.array {
+        return Ok(None);
+    }
+    let affinity = first.affinity;
+    let collation = first.collation.as_ref().map(|collation| *collation.value());
+    let same_comparison = comparisons.iter().all(|comparison| {
+        let [component] = comparison.components.as_slice() else {
+            return false;
+        };
+        !component.array
+            && component.affinity == affinity
+            && component
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                == collation
+    });
+    Ok(same_comparison.then_some((affinity, collation)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hir_in_list_constraint_for_term(
+    document: &hir::HirDocument,
+    from: &hir::From,
+    term_position: usize,
+    term: &HirWhereTerm,
+    source: hir::SourceId,
+    table: &JoinedTable,
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Result<Option<HirConstraint>> {
+    if term
+        .from_outer_join
+        .is_some_and(|outer_source| outer_source != source)
+    {
+        return Ok(None);
+    }
+    let hir::Expr::InList {
+        lhs,
+        negated,
+        values,
+        comparisons,
+    } = &term.expr
+    else {
+        return Ok(None);
+    };
+    let Some((comparison_affinity, comparison_collation)) =
+        hir_in_list_comparison(values, comparisons)?
+    else {
+        return Ok(None);
+    };
+
+    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    let (table_col_pos, is_rowid) = match lhs.as_ref() {
+        hir::Expr::Column(column) if column.source == source => (
+            Some(column.column),
+            rowid_alias_column == Some(column.column),
+        ),
+        hir::Expr::RowId(rowid_source) if *rowid_source == source => (rowid_alias_column, true),
+        _ => return Ok(None),
+    };
+
+    let mut rhs_mask = TableMask::default();
+    for value in values {
+        rhs_mask.union_with(&table_mask_from_hir_expr(document, Some(from), value)?)?;
+    }
+    let estimated_values = values.len() as f64;
+    let row_count = schema
+        .analyze_stats
+        .table_stats(table.table.get_name())
+        .and_then(|stats| stats.row_count)
+        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
+
+    Ok(Some(HirConstraint {
+        where_clause_pos: (term_position, BinaryExprSide::Rhs),
+        operator: ConstraintOperator::In {
+            not: *negated,
+            estimated_values,
+        },
+        table_col_pos,
+        expr: None,
+        constraining_expr: None,
+        lhs_mask: rhs_mask,
+        selectivity: estimate_in_selectivity(estimated_values, row_count, *negated),
+        usable: false,
+        is_rowid,
+        comparison_affinity: Some(comparison_affinity),
+        comparison_collation,
+        null_matching: false,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_table_constraints_for_source(
     document: &hir::HirDocument,
@@ -607,7 +716,7 @@ pub(crate) fn hir_table_constraints_for_source(
     indexes: &AvailableIndexes,
     params: &CostModelParams,
 ) -> Result<HirTableConstraints> {
-    let constraints = hir_binary_constraints_for_source(
+    let mut constraints = hir_binary_constraints_for_source(
         document,
         from,
         where_clause,
@@ -617,6 +726,20 @@ pub(crate) fn hir_table_constraints_for_source(
         indexes,
         params,
     )?;
+    for (term_position, term) in where_clause.iter().enumerate() {
+        if let Some(constraint) = hir_in_list_constraint_for_term(
+            document,
+            from,
+            term_position,
+            term,
+            source,
+            table,
+            schema,
+            params,
+        )? {
+            constraints.push(constraint);
+        }
+    }
     let mut candidates = Vec::new();
     for index in indexes
         .indexes_for_table(table.internal_id)
@@ -2891,6 +3014,31 @@ mod tests {
         )
     }
 
+    fn hir_in_list(
+        lhs: hir::Expr,
+        negated: bool,
+        values: Vec<hir::Expr>,
+        affinity: Affinity,
+        collation: Option<CollationSeq>,
+    ) -> hir::Expr {
+        let comparisons = values
+            .iter()
+            .map(|_| hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity,
+                    collation: collation.map(resolved_collation),
+                    array: false,
+                }],
+            })
+            .collect();
+        hir::Expr::InList {
+            lhs: Box::new(lhs),
+            negated,
+            values,
+            comparisons,
+        }
+    }
+
     #[test]
     fn hir_constraints_use_shared_index_rules() {
         let constraint = HirConstraint {
@@ -3070,6 +3218,133 @@ mod tests {
         assert_eq!(constraints[1].table_col_pos, Some(1));
         assert_eq!(constraints[2].operator, ast::Operator::Greater.into());
         assert_eq!(constraints[2].table_col_pos, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_in_list_constraint_uses_frozen_comparison_and_rhs_mask() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let rhs_source = hir::SourceId::new(8);
+        let from = hir::From {
+            first: source,
+            joins: vec![hir::Join {
+                right: rhs_source,
+                kind: hir::JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let term = HirWhereTerm {
+            expr: hir_in_list(
+                hir::Expr::column(source, 0),
+                false,
+                vec![
+                    hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+                    hir::Expr::column(rhs_source, 0),
+                ],
+                Affinity::Integer,
+                Some(CollationSeq::NoCase),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let table = table_with_columns(vec![Column::new_default_integer(
+            Some("a".into()),
+            "INTEGER".into(),
+            None,
+        )]);
+
+        let constraints = hir_table_constraints_for_source(
+            &empty_hir_document(source),
+            &from,
+            &[term],
+            source,
+            &table,
+            &Schema::new(),
+            &AvailableIndexes::default(),
+            &CostModelParams::default(),
+        )?;
+        let [constraint] = constraints.constraints.as_slice() else {
+            panic!("scalar IN list becomes one constraint");
+        };
+
+        assert_eq!(constraint.where_clause_pos, (0, BinaryExprSide::Rhs));
+        assert_eq!(constraint.table_col_pos, Some(0));
+        assert!(!constraint.is_rowid);
+        assert!(!constraint.usable);
+        assert_eq!(
+            constraint.operator,
+            ConstraintOperator::In {
+                not: false,
+                estimated_values: 2.0,
+            }
+        );
+        assert!(!constraint.lhs_mask.get(0));
+        assert!(constraint.lhs_mask.get(1));
+        assert_eq!(constraint.comparison_affinity, Some(Affinity::Integer));
+        assert_eq!(constraint.comparison_collation, Some(CollationSeq::NoCase));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_in_list_constraint_keeps_rowid_alias_and_rejects_mixed_comparisons() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let mut expression = hir_in_list(
+            hir::Expr::column(source, 0),
+            true,
+            vec![
+                hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+                hir::Expr::Literal(ast::Literal::Numeric("2".into())),
+            ],
+            Affinity::Integer,
+            None,
+        );
+        let mut rowid_alias =
+            Column::new_default_integer(Some("id".into()), "INTEGER".into(), None);
+        rowid_alias.set_rowid_alias(true);
+        let table = table_with_columns(vec![rowid_alias]);
+        let term = |expr| HirWhereTerm {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        };
+
+        let constraint = hir_in_list_constraint_for_term(
+            &empty_hir_document(source),
+            &from,
+            0,
+            &term(expression.clone()),
+            source,
+            &table,
+            &Schema::new(),
+            &CostModelParams::default(),
+        )?
+        .expect("rowid-alias IN list becomes a constraint");
+        assert_eq!(constraint.table_col_pos, Some(0));
+        assert!(constraint.is_rowid);
+        assert!(matches!(
+            constraint.operator,
+            ConstraintOperator::In { not: true, .. }
+        ));
+
+        let hir::Expr::InList { comparisons, .. } = &mut expression else {
+            unreachable!();
+        };
+        comparisons[1].components[0].collation = Some(resolved_collation(CollationSeq::NoCase));
+        assert!(hir_in_list_constraint_for_term(
+            &empty_hir_document(source),
+            &from,
+            0,
+            &term(expression),
+            source,
+            &table,
+            &Schema::new(),
+            &CostModelParams::default(),
+        )?
+        .is_none());
         Ok(())
     }
 
