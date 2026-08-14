@@ -264,7 +264,9 @@ mod tests {
         stats::AnalyzeStats,
         sync::Arc,
         translate::{
-            optimizer::{cost::RowCountEstimate, join::hir_best_starting_source},
+            optimizer::{
+                cost::RowCountEstimate, hir_base_row_estimates, join::hir_best_starting_source,
+            },
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
                 ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -766,11 +768,17 @@ mod tests {
         assert_eq!(actual_comparison.as_ref(), Some(&comparison));
 
         let params = CostModelParams::default();
+        let mut schema = Schema::default();
+        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut("right_items")
+            .row_count = Some(1);
         let constraints = context
             .constraints(
                 block.from.as_ref().expect("test block has FROM"),
                 &input,
-                &Schema::default(),
+                &schema,
                 &params,
                 &|_| None,
             )
@@ -780,7 +788,14 @@ mod tests {
         assert_eq!(constraints[1].table_id, right);
         assert!(!constraints[1].constraints.is_empty());
 
-        let base_rows = vec![RowCountEstimate::hardcoded_fallback(&params); 2];
+        let base_rows = hir_base_row_estimates(&input.sources, &schema, &params);
+        assert_eq!(
+            base_rows,
+            [
+                RowCountEstimate::AnalyzeStats(1_000.0),
+                RowCountEstimate::AnalyzeStats(1.0),
+            ]
+        );
         let first = hir_best_starting_source(
             &document,
             &input.sources,

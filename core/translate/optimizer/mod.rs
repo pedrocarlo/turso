@@ -2,10 +2,10 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
-        JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        DeletePlan, GroupBy, HirPlannedSource, InSeekSource, IterationDirection, JoinInfo,
+        JoinOrderMember, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
+        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
+        TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -1924,10 +1924,10 @@ fn register_index_expression_usages_for_plan(
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
 fn base_row_estimate(
     schema: &Schema,
-    table: &JoinedTable,
+    table: &Table,
     params: &cost_params::CostModelParams,
 ) -> RowCountEstimate {
-    match &table.table {
+    match table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
                 if let Some(rows) = stats.row_count.or_else(|| {
@@ -1982,6 +1982,17 @@ fn base_row_estimate(
         },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
+}
+
+pub(crate) fn hir_base_row_estimates(
+    sources: &[HirPlannedSource],
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Vec<RowCountEstimate> {
+    sources
+        .iter()
+        .map(|source| base_row_estimate(schema, &source.table, params))
+        .collect()
 }
 
 /// Read a group count from ANALYZE for a simple list of table columns.
@@ -2092,7 +2103,7 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
             .joined_tables()
             .iter()
             .find(|table| table.internal_id == *table_id)?;
-        Some(rows * *base_row_estimate(schema, table, params))
+        Some(rows * *base_row_estimate(schema, &table.table, params))
     });
     rows_per_call.map_or(input_rows, |rows| input_rows.min(calls * rows))
 }
@@ -2368,7 +2379,7 @@ fn find_table_access_plan(
     let base_table_rows_for_candidates = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, &t.table, params))
         .collect::<Vec<_>>();
 
     let index_method_candidates = if !is_single_table {
@@ -2401,7 +2412,7 @@ fn find_table_access_plan(
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, &t.table, params))
         .collect::<Vec<_>>();
 
     // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
