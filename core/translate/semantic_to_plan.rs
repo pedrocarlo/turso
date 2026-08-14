@@ -179,6 +179,7 @@ mod tests {
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Table, Type},
         sync::Arc,
+        translate::plan::ExpressionIndexUsage,
         translate::semantic::hir::{
             CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
             ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -405,6 +406,70 @@ mod tests {
             joined.indexed,
             hir::IndexHint::Indexed(index) if index.value().name == "items_second"
         ));
+    }
+
+    #[test]
+    fn hir_covering_index_matches_frozen_expression_keys() {
+        let mut source = source();
+        let indexed_expression = binary(
+            hir::Expr::column(source.id, 0),
+            Operator::Add,
+            hir::Expr::column(source.id, 1),
+        );
+        let index = CatalogObject::new(
+            CatalogObjectId::new(11),
+            CatalogSnapshot::from_id(1),
+            Some(DatabaseId::new(0)),
+            Arc::new(Index {
+                name: "items_sum".to_string(),
+                table_name: "items".to_string(),
+                root_page: 3,
+                columns: Vec::new(),
+                unique: false,
+                ephemeral: false,
+                has_rowid: true,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            }),
+        );
+        source.index_expressions.push(hir::IndexExpressions {
+            index: index.clone(),
+            columns: vec![Some(indexed_expression.clone())],
+            predicate: None,
+        });
+
+        let usage = [
+            ColumnUsage {
+                reference: hir::ColumnRef {
+                    source: source.id,
+                    column: 0,
+                },
+                count: 1,
+            },
+            ColumnUsage {
+                reference: hir::ColumnRef {
+                    source: source.id,
+                    column: 1,
+                },
+                count: 1,
+            },
+        ];
+        let mut planned =
+            planned_source_from_definition(&source, None, &usage).expect("table source converts");
+        let mut columns_mask = ColumnUsedMask::default();
+        columns_mask.set(0).expect("column mask grows");
+        columns_mask.set(1).expect("column mask grows");
+        planned.expression_index_usages.push(ExpressionIndexUsage {
+            normalized_expr: Box::new(indexed_expression),
+            columns_mask,
+        });
+
+        assert!(planned.index_is_covering(&source, index.value()));
+
+        planned.expression_index_usages[0].normalized_expr =
+            Box::new(hir::Expr::column(source.id, 0));
+        assert!(!planned.index_is_covering(&source, index.value()));
     }
 
     #[test]

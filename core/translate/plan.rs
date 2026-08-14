@@ -1304,8 +1304,8 @@ pub struct PlannedSource<I, H, E, J> {
     pub column_use_counts: Vec<usize>,
     /// Expressions referencing this table that may be satisfied by an expression index.
     ///
-    /// Each entry stores the normalized expression text and the columns it
-    /// needs. During covering checks we ask: does an index contain this
+    /// Each entry stores the expression shape used by this planning path and
+    /// the columns it needs. During covering checks we ask: does an index contain this
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
     pub expression_index_usages: Vec<ExpressionIndexUsage<E>>,
@@ -1333,6 +1333,163 @@ pub(crate) type HirPlannedSource = PlannedSource<
     crate::translate::semantic::hir::Expr,
     HirJoinInfo,
 >;
+
+impl<I, H, E, J> PlannedSource<I, H, E, J> {
+    /// Apply shared covering-index rules while letting each expression
+    /// representation decide whether an expression key matches.
+    fn index_is_covering_with(
+        &self,
+        index: &Index,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            // With no referenced columns, a complete index can provide the row-producing
+            // scan without opening the table. Partial-index completeness depends on the
+            // query predicate, so keep this path conservative.
+            return index.where_clause.is_none();
+        }
+
+        if self.expression_index_usages.is_empty() {
+            Self::index_covers_columns(index, btree, &self.col_used_mask)
+        } else {
+            let mut required_columns = self.col_used_mask.clone();
+            self.apply_expression_index_coverage(index, &mut required_columns, expression_in_index);
+            if required_columns.is_empty() {
+                return true;
+            }
+            Self::index_covers_columns(index, btree, &required_columns)
+        }
+    }
+
+    /// Remove columns fully supplied by expression keys in this index.
+    fn apply_expression_index_coverage(
+        &self,
+        index: &Index,
+        required_columns: &mut ColumnUsedMask,
+        expression_in_index: impl Fn(&E, &Index) -> bool,
+    ) {
+        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
+        let mut any_covered = false;
+        for usage in &self.expression_index_usages {
+            // If the index stores the expression (e.g. idx on lower(name)), all
+            // columns needed *solely* for that expression can be treated as
+            // covered by the index key. Example:
+            //   CREATE INDEX idx ON t(lower(name));
+            //   SELECT lower(name) FROM t;
+            // Column `name` is not otherwise needed, so we can rely on the
+            // expression value from the index and drop the table cursor.
+            if expression_in_index(&usage.normalized_expr, index) {
+                any_covered = true;
+                for col_idx in usage.columns_mask.iter() {
+                    if col_idx >= coverage_counts.len() {
+                        coverage_counts.resize(col_idx + 1, 0);
+                    }
+                    coverage_counts[col_idx] += 1;
+                }
+            }
+        }
+        if !any_covered {
+            return;
+        }
+        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
+            if covered == 0 {
+                continue;
+            }
+            // Only drop the requirement if *all* references to this column are
+            // satisfied by expression-index values. If the column is also
+            // selected or filtered directly, the table data is still needed.
+            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
+                required_columns.clear(col_idx);
+            }
+        }
+    }
+
+    fn index_covers_columns(
+        index: &Index,
+        btree: &BTreeTable,
+        required_columns: &ColumnUsedMask,
+    ) -> bool {
+        // If a table has a rowid, the index is guaranteed to contain it as well.
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+
+        if let Some(pos) = rowid_alias_pos {
+            if required_columns.is_only(pos) {
+                // If the index would be ONLY used for the rowid, don't bother.
+                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
+                return false;
+            }
+        }
+
+        // Check that every required column is covered by the index
+        for required_col in required_columns.iter() {
+            if rowid_alias_pos == Some(required_col) {
+                // rowid is always implicitly covered by the index
+                continue;
+            }
+            let covered_by_index = index
+                .columns
+                .iter()
+                .filter(|c| c.pos_in_table == required_col)
+                .any(|c| {
+                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
+                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
+                    // in the future, but for now we do this to ensure correctness.
+                    !btree
+                        .columns()
+                        .get(c.pos_in_table)
+                        .expect("column should be in table")
+                        .is_virtual_generated()
+                });
+            if !covered_by_index {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl
+    PlannedSource<
+        crate::translate::semantic::hir::SourceId,
+        crate::translate::semantic::hir::IndexHint,
+        crate::translate::semantic::hir::Expr,
+        HirJoinInfo,
+    >
+{
+    pub(crate) fn index_is_covering(
+        &self,
+        source: &crate::translate::semantic::hir::Source,
+        index: &Index,
+    ) -> bool {
+        self.index_is_covering_with(index, |expression, index| {
+            source
+                .index_expressions
+                .iter()
+                .find(|expressions| std::ptr::eq(expressions.index.value(), index))
+                .is_some_and(|expressions| {
+                    expressions
+                        .columns
+                        .iter()
+                        .flatten()
+                        .any(|indexed| expression.equivalent_for_index(indexed))
+                        || expressions
+                            .predicate
+                            .as_ref()
+                            .is_some_and(|predicate| expression.equivalent_for_index(predicate))
+                })
+        })
+    }
+}
 
 impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>> {
     pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
@@ -2812,59 +2969,6 @@ impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<as
         });
     }
 
-    /// Provided an index that may contain expression keys, remove any
-    /// columns from `required_columns` that are fully covered by expression index values.
-    fn apply_expression_index_coverage(
-        &self,
-        index: &Index,
-        required_columns: &mut ColumnUsedMask,
-    ) {
-        let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
-        let mut any_covered = false;
-        for usage in &self.expression_index_usages {
-            // If the index stores the expression (e.g. idx on lower(name)), all
-            // columns needed *solely* for that expression can be treated as
-            // covered by the index key. Example:
-            //   CREATE INDEX idx ON t(lower(name));
-            //   SELECT lower(name) FROM t;
-            // Column `name` is not otherwise needed, so we can rely on the
-            // expression value from the index and drop the table cursor.
-            let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
-            } else {
-                false
-            };
-
-            if index
-                .expression_to_index_pos(&usage.normalized_expr)
-                .is_some()
-                || matches_where_clause
-            {
-                any_covered = true;
-                for col_idx in usage.columns_mask.iter() {
-                    if col_idx >= coverage_counts.len() {
-                        coverage_counts.resize(col_idx + 1, 0);
-                    }
-                    coverage_counts[col_idx] += 1;
-                }
-            }
-        }
-        if !any_covered {
-            return;
-        }
-        for (col_idx, &covered) in coverage_counts.iter().enumerate() {
-            if covered == 0 {
-                continue;
-            }
-            // Only drop the requirement if *all* references to this column are
-            // satisfied by expression-index values. If the column is also
-            // selected or filtered directly, the table data is still needed.
-            if self.column_use_counts.get(col_idx).copied().unwrap_or(0) == covered {
-                required_columns.clear(col_idx);
-            }
-        }
-    }
-
     /// Open the necessary cursors for this table reference.
     /// Generally a table cursor is always opened unless a SELECT query can use a covering index.
     /// An index cursor is opened if an index is used in any way for reading data from the table.
@@ -2980,76 +3084,13 @@ impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<as
 
     /// Returns true if a given index is a covering index for this [TableReference].
     pub fn index_is_covering(&self, index: &Index) -> bool {
-        let Table::BTree(btree) = &self.table else {
-            return false;
-        };
-        if index.index_method.is_some() {
-            return false;
-        }
-        if self.col_used_mask.is_empty() {
-            // With no referenced columns, a complete index can provide the row-producing
-            // scan without opening the table. Partial-index completeness depends on the
-            // query predicate, so keep this path conservative.
-            return index.where_clause.is_none();
-        }
-
-        if self.expression_index_usages.is_empty() {
-            Self::index_covers_columns(index, btree, &self.col_used_mask)
-        } else {
-            let mut required_columns = self.col_used_mask.clone();
-            self.apply_expression_index_coverage(index, &mut required_columns);
-            if required_columns.is_empty() {
-                return true;
-            }
-            Self::index_covers_columns(index, btree, &required_columns)
-        }
-    }
-
-    fn index_covers_columns(
-        index: &Index,
-        btree: &BTreeTable,
-        required_columns: &ColumnUsedMask,
-    ) -> bool {
-        // If a table has a rowid, the index is guaranteed to contain it as well.
-        let rowid_alias_pos = if btree.has_rowid {
-            btree.get_rowid_alias_column().map(|(pos, _)| pos)
-        } else {
-            None
-        };
-
-        if let Some(pos) = rowid_alias_pos {
-            if required_columns.is_only(pos) {
-                // If the index would be ONLY used for the rowid, don't bother.
-                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
-                return false;
-            }
-        }
-
-        // Check that every required column is covered by the index
-        for required_col in required_columns.iter() {
-            if rowid_alias_pos == Some(required_col) {
-                // rowid is always implicitly covered by the index
-                continue;
-            }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .filter(|c| c.pos_in_table == required_col)
-                .any(|c| {
-                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
-                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
-                    // in the future, but for now we do this to ensure correctness.
-                    !btree
-                        .columns()
-                        .get(c.pos_in_table)
-                        .expect("column should be in table")
-                        .is_virtual_generated()
-                });
-            if !covered_by_index {
-                return false;
-            }
-        }
-        true
+        self.index_is_covering_with(index, |expression, index| {
+            index.expression_to_index_pos(expression).is_some()
+                || index
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|predicate| exprs_are_equivalent(predicate, expression))
+        })
     }
 
     /// Returns true if the index selected for use with this [TableReference] is a covering index,
