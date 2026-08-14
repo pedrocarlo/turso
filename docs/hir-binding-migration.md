@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Indexed-seek scoring consumes one borrowed source view for its physical
+  table and covering-index decision. Legacy sources and HIR sources therefore
+  use the same scoring call without per-call callbacks; HIR covering reads its
+  frozen source definition.
 - Covering-index required-column rules are shared by legacy and HIR planned
   sources. HIR expression-key matching reads frozen resolved index expressions;
   output, grouping, HAVING, and ORDER BY usage is registered directly from

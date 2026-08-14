@@ -35,6 +35,7 @@ use crate::{
             NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
+        semantic::hir,
     },
     LimboError, Result,
 };
@@ -64,6 +65,45 @@ impl<'a> JoinPlanningContext<'a> {
 // Upper bound on rowids to materialize for a hash build input.
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
+
+trait SeekSource {
+    fn table(&self) -> &Table;
+    fn index_is_covering(&self, index: &Index) -> bool;
+}
+
+impl SeekSource for JoinedTable {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        JoinedTable::index_is_covering(self, index)
+    }
+}
+
+pub(crate) struct HirSeekSource<'a> {
+    planned: &'a HirPlannedSource,
+    definition: &'a hir::Source,
+}
+
+impl<'a> HirSeekSource<'a> {
+    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+        Self {
+            planned,
+            definition,
+        }
+    }
+}
+
+impl SeekSource for HirSeekSource<'_> {
+    fn table(&self) -> &Table {
+        &self.planned.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        self.planned.index_is_covering(self.definition, index)
+    }
+}
 
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
@@ -1938,8 +1978,7 @@ fn compute_indexed_seek_benefits(
                     rhs_constraints,
                     &lhs_mask,
                     rhs,
-                    &rhs_table.table,
-                    |index| rhs_table.index_is_covering(index),
+                    rhs_table,
                     rhs_base_rows,
                     analyze_stats,
                     params,
@@ -1975,8 +2014,7 @@ fn compute_indexed_seek_benefits(
             rhs_constraints,
             &empty_lhs_mask,
             rhs,
-            &rhs_table.table,
-            |index| rhs_table.index_is_covering(index),
+            rhs_table,
             rhs_base_rows,
             analyze_stats,
             params,
@@ -1997,8 +2035,7 @@ fn compute_indexed_seek_benefits(
                 rhs_constraints,
                 &lhs_mask,
                 rhs,
-                &rhs_table.table,
-                |index| rhs_table.index_is_covering(index),
+                rhs_table,
                 rhs_base_rows,
                 analyze_stats,
                 params,
@@ -2027,12 +2064,12 @@ fn get_best_seek_score<E, S>(
     rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs: usize,
-    rhs_table: &Table,
-    index_is_covering: impl Fn(&Index) -> bool,
+    rhs_source: &impl SeekSource,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> f64 {
+    let rhs_table = rhs_source.table();
     let mut best_score = 0.0;
     for candidate in &rhs_constraints.candidates {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
@@ -2048,7 +2085,7 @@ fn get_best_seek_score<E, S>(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: index_is_covering(index),
+                covering: rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
@@ -3969,6 +4006,27 @@ mod tests {
         }
     }
 
+    fn _create_hir_definition(name: &str, internal_id: SourceId) -> hir::Source {
+        hir::Source {
+            id: internal_id,
+            owner: hir::SourceOwner::Root,
+            database: None,
+            name: name.to_string(),
+            alias: None,
+            kind: hir::SourceKind::SchemaExpression,
+            columns: Vec::new(),
+            generated_expressions: Vec::new(),
+            default_expressions: Vec::new(),
+            column_type_programs: Vec::new(),
+            check_constraints: None,
+            rowid_available: true,
+            index_hint: IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: hir::IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        }
+    }
+
     fn costing_constraints<E, S>(table_id: S) -> TableConstraints<E, S> {
         let constraint = |position, operator, selectivity| Constraint {
             where_clause_pos: (position, BinaryExprSide::Rhs),
@@ -4082,16 +4140,17 @@ mod tests {
         assert_eq!(ast_rows, hir_rows);
         assert_eq!(ast_rows, 0.2 * 0.3 * 1_000.0);
 
-        let table = Table::BTree(_create_btree_table(
-            "items",
-            _create_column_list(&["value"], Type::Integer),
-        ));
+        let table = _create_btree_table("items", _create_column_list(&["value"], Type::Integer));
+        let ast_source = _create_table_reference(table.clone(), None, table_id_counter.next());
+        let hir_id = SourceId::new(0);
+        let hir_planned = _create_hir_source(table, None, hir_id);
+        let hir_definition = _create_hir_definition("items", hir_id);
+        let hir_source = HirSeekSource::new(&hir_planned, &hir_definition);
         let ast_score = get_best_seek_score(
             &ast_constraints,
             &TableMask::default(),
             0,
-            &table,
-            |_| false,
+            &ast_source,
             rows,
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
@@ -4100,8 +4159,7 @@ mod tests {
             &hir_constraints,
             &TableMask::default(),
             0,
-            &table,
-            |_| false,
+            &hir_source,
             rows,
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
@@ -4271,8 +4329,7 @@ mod tests {
             &constraints[1],
             &lhs_mask,
             1,
-            &joined_tables[1].table,
-            |index| joined_tables[1].index_is_covering(index),
+            &joined_tables[1],
             RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
