@@ -13,6 +13,7 @@ use super::{
     TypeFact, WindowId,
 };
 use crate::sync::Arc;
+use crate::util::check_literal_equivalency;
 use crate::vdbe::affinity::Affinity;
 
 #[derive(Clone, Debug)]
@@ -415,6 +416,263 @@ impl Expr {
         Self::Output(output)
     }
 
+    /// Compare resolved expression shapes for expression-index matching.
+    ///
+    /// Work stays on explicit stacks because index expressions can be deeply
+    /// nested. Commutative operators retain the existing planner rule that
+    /// permits their operands to appear in either order.
+    pub(crate) fn equivalent_for_index(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        let mut alternatives = Vec::new();
+
+        'search: loop {
+            while let Some((left, right)) = pending.pop() {
+                let equivalent = match (left, right) {
+                    (Self::Literal(left), Self::Literal(right)) => {
+                        check_literal_equivalency(left, right)
+                    }
+                    (Self::Column(left), Self::Column(right)) => left == right,
+                    (Self::RowId(left), Self::RowId(right)) => left == right,
+                    (
+                        Self::Unary {
+                            operator: left_operator,
+                            expr: left,
+                        },
+                        Self::Unary {
+                            operator: right_operator,
+                            expr: right,
+                        },
+                    ) => {
+                        pending.push((left, right));
+                        left_operator == right_operator
+                    }
+                    (
+                        Self::Binary {
+                            lhs: left_lhs,
+                            operator: left_operator,
+                            rhs: left_rhs,
+                            array_concat: left_array_concat,
+                            custom: left_custom,
+                            comparison: left_comparison,
+                        },
+                        Self::Binary {
+                            lhs: right_lhs,
+                            operator: right_operator,
+                            rhs: right_rhs,
+                            array_concat: right_array_concat,
+                            custom: right_custom,
+                            comparison: right_comparison,
+                        },
+                    ) => {
+                        let metadata_matches = left_operator == right_operator
+                            && left_array_concat == right_array_concat
+                            && custom_binary_operators_match(left_custom, right_custom)
+                            && left_comparison == right_comparison;
+                        if metadata_matches && left_operator.is_commutative() {
+                            let mut swapped = pending.clone();
+                            swapped.push((left_lhs, right_rhs));
+                            swapped.push((left_rhs, right_lhs));
+                            alternatives.push(swapped);
+                        }
+                        pending.push((left_lhs, right_lhs));
+                        pending.push((left_rhs, right_rhs));
+                        metadata_matches
+                    }
+                    (
+                        Self::Between {
+                            expr: left_expr,
+                            negated: left_negated,
+                            start: left_start,
+                            end: left_end,
+                            start_comparison: left_start_comparison,
+                            end_comparison: left_end_comparison,
+                        },
+                        Self::Between {
+                            expr: right_expr,
+                            negated: right_negated,
+                            start: right_start,
+                            end: right_end,
+                            start_comparison: right_start_comparison,
+                            end_comparison: right_end_comparison,
+                        },
+                    ) => {
+                        pending.push((left_expr, right_expr));
+                        pending.push((left_start, right_start));
+                        pending.push((left_end, right_end));
+                        left_negated == right_negated
+                            && left_start_comparison == right_start_comparison
+                            && left_end_comparison == right_end_comparison
+                    }
+                    (
+                        Self::Case {
+                            base: left_base,
+                            when_then: left_when_then,
+                            else_expr: left_else,
+                            base_comparisons: left_comparisons,
+                        },
+                        Self::Case {
+                            base: right_base,
+                            when_then: right_when_then,
+                            else_expr: right_else,
+                            base_comparisons: right_comparisons,
+                        },
+                    ) => {
+                        let shapes_match = push_optional_pair(
+                            &mut pending,
+                            left_base.as_deref(),
+                            right_base.as_deref(),
+                        ) && push_optional_pair(
+                            &mut pending,
+                            left_else.as_deref(),
+                            right_else.as_deref(),
+                        ) && left_when_then.len() == right_when_then.len();
+                        if shapes_match {
+                            for ((left_when, left_then), (right_when, right_then)) in
+                                left_when_then.iter().zip(right_when_then)
+                            {
+                                pending.push((left_when, right_when));
+                                pending.push((left_then, right_then));
+                            }
+                        }
+                        shapes_match && left_comparisons == right_comparisons
+                    }
+                    (
+                        Self::Cast {
+                            expr: left_expr,
+                            target: left_target,
+                        },
+                        Self::Cast {
+                            expr: right_expr,
+                            target: right_target,
+                        },
+                    ) => {
+                        pending.push((left_expr, right_expr));
+                        push_pairs(
+                            &mut pending,
+                            &left_target.parameters,
+                            &right_target.parameters,
+                        ) && left_target.name.eq_ignore_ascii_case(&right_target.name)
+                            && left_target.array_dimensions == right_target.array_dimensions
+                            && left_target.type_fact == right_target.type_fact
+                            && left_target.affinity == right_target.affinity
+                            && left_target.programs.encode.is_empty()
+                            && right_target.programs.encode.is_empty()
+                            && left_target.programs.domain.is_none()
+                            && right_target.programs.domain.is_none()
+                            && left_target.programs.apply_builtin_affinity
+                                == right_target.programs.apply_builtin_affinity
+                    }
+                    (
+                        Self::Collate {
+                            expr: left_expr,
+                            collation: left_collation,
+                        },
+                        Self::Collate {
+                            expr: right_expr,
+                            collation: right_collation,
+                        },
+                    ) => {
+                        pending.push((left_expr, right_expr));
+                        left_collation == right_collation
+                    }
+                    (Self::Function(left), Self::Function(right)) => {
+                        function_calls_match(left, right, &mut pending)
+                    }
+                    (Self::IsNull(left), Self::IsNull(right))
+                    | (Self::NotNull(left), Self::NotNull(right)) => {
+                        pending.push((left, right));
+                        true
+                    }
+                    (
+                        Self::InList {
+                            lhs: left_lhs,
+                            negated: left_negated,
+                            values: left_values,
+                            comparisons: left_comparisons,
+                        },
+                        Self::InList {
+                            lhs: right_lhs,
+                            negated: right_negated,
+                            values: right_values,
+                            comparisons: right_comparisons,
+                        },
+                    ) => {
+                        pending.push((left_lhs, right_lhs));
+                        push_pairs(&mut pending, left_values, right_values)
+                            && left_negated == right_negated
+                            && left_comparisons == right_comparisons
+                    }
+                    (
+                        Self::Like {
+                            lhs: left_lhs,
+                            negated: left_negated,
+                            operator: left_operator,
+                            function: left_function,
+                            argument_count: left_argument_count,
+                            rhs: left_rhs,
+                            escape: left_escape,
+                        },
+                        Self::Like {
+                            lhs: right_lhs,
+                            negated: right_negated,
+                            operator: right_operator,
+                            function: right_function,
+                            argument_count: right_argument_count,
+                            rhs: right_rhs,
+                            escape: right_escape,
+                        },
+                    ) => {
+                        pending.push((left_lhs, right_lhs));
+                        pending.push((left_rhs, right_rhs));
+                        push_optional_pair(
+                            &mut pending,
+                            left_escape.as_deref(),
+                            right_escape.as_deref(),
+                        ) && left_negated == right_negated
+                            && left_operator == right_operator
+                            && left_function == right_function
+                            && left_argument_count == right_argument_count
+                    }
+                    (Self::Row(left), Self::Row(right))
+                    | (Self::Array(left), Self::Array(right)) => {
+                        push_pairs(&mut pending, left, right)
+                    }
+                    (
+                        Self::Subscript {
+                            base: left_base,
+                            index: left_index,
+                        },
+                        Self::Subscript {
+                            base: right_base,
+                            index: right_index,
+                        },
+                    ) => {
+                        pending.push((left_base, right_base));
+                        pending.push((left_index, right_index));
+                        true
+                    }
+                    (Self::FieldAccess(left), Self::FieldAccess(right)) => {
+                        pending.push((&left.base, &right.base));
+                        left.field_name.eq_ignore_ascii_case(&right.field_name)
+                            && left.kind == right.kind
+                            && left.container_type == right.container_type
+                            && left.result_type == right.result_type
+                    }
+                    _ => false,
+                };
+
+                if !equivalent {
+                    let Some(alternative) = alternatives.pop() else {
+                        return false;
+                    };
+                    pending = alternative;
+                    continue 'search;
+                }
+            }
+            return true;
+        }
+    }
+
     /// Visit this expression and every expression it owns. References to
     /// outputs and subqueries remain references; their definitions are walked
     /// by the query that owns them.
@@ -507,6 +765,190 @@ impl Expr {
             Self::Raise { message, .. } => walk_optional_expr(message.as_deref(), visitor),
         }
     }
+}
+
+fn push_pairs<'expr>(
+    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+    left: &'expr [Expr],
+    right: &'expr [Expr],
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    pending.extend(left.iter().zip(right));
+    true
+}
+
+fn push_optional_pair<'expr>(
+    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+    left: Option<&'expr Expr>,
+    right: Option<&'expr Expr>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            pending.push((left, right));
+            true
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn custom_binary_operators_match(
+    left: &Option<CustomBinaryOperator>,
+    right: &Option<CustomBinaryOperator>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.function == right.function
+                && left.swap_args == right.swap_args
+                && left.negate == right.negate
+                && match (&left.literal_encoding, &right.literal_encoding) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => {
+                        left.operand == right.operand
+                            && left.encoder.is_none()
+                            && right.encoder.is_none()
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+fn function_calls_match<'expr>(
+    left: &'expr FunctionCall,
+    right: &'expr FunctionCall,
+    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+) -> bool {
+    left.function == right.function
+        && matches!(
+            (&left.evaluation, &right.evaluation),
+            (FunctionEvaluation::Scalar, FunctionEvaluation::Scalar)
+        )
+        && left.result_type == right.result_type
+        && function_operations_match(&left.operation, &right.operation)
+        && function_arguments_match(&left.arguments, &right.arguments, pending)
+}
+
+fn function_operations_match(left: &FunctionOperation, right: &FunctionOperation) -> bool {
+    match (left, right) {
+        (FunctionOperation::Ordinary, FunctionOperation::Ordinary) => true,
+        (FunctionOperation::CustomType(left), FunctionOperation::CustomType(right)) => {
+            match (left, right) {
+                (
+                    CustomTypeOperation::UnionValue {
+                        union_type: left_type,
+                        tag_index: left_tag,
+                    },
+                    CustomTypeOperation::UnionValue {
+                        union_type: right_type,
+                        tag_index: right_tag,
+                    },
+                )
+                | (
+                    CustomTypeOperation::UnionExtract {
+                        union_type: left_type,
+                        tag_index: left_tag,
+                    },
+                    CustomTypeOperation::UnionExtract {
+                        union_type: right_type,
+                        tag_index: right_tag,
+                    },
+                ) => left_type == right_type && left_tag == right_tag,
+                (
+                    CustomTypeOperation::UnionTag {
+                        union_type: left_type,
+                        tag_names: left_names,
+                    },
+                    CustomTypeOperation::UnionTag {
+                        union_type: right_type,
+                        tag_names: right_names,
+                    },
+                ) => left_type == right_type && left_names == right_names,
+                (
+                    CustomTypeOperation::StructExtract {
+                        struct_type: left_type,
+                        field_index: left_field,
+                    },
+                    CustomTypeOperation::StructExtract {
+                        struct_type: right_type,
+                        field_index: right_field,
+                    },
+                ) => left_type == right_type && left_field == right_field,
+                _ => false,
+            }
+        }
+        (FunctionOperation::Sequence(_), FunctionOperation::Sequence(_)) => false,
+        _ => false,
+    }
+}
+
+fn function_arguments_match<'expr>(
+    left: &'expr FunctionArguments,
+    right: &'expr FunctionArguments,
+    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+) -> bool {
+    match (left, right) {
+        (FunctionArguments::Star, FunctionArguments::Star) => true,
+        (
+            FunctionArguments::Expressions {
+                values: left_values,
+                distinctness: left_distinctness,
+                order_by: left_order,
+            },
+            FunctionArguments::Expressions {
+                values: right_values,
+                distinctness: right_distinctness,
+                order_by: right_order,
+            },
+        ) => {
+            push_pairs(pending, left_values, right_values)
+                && left_distinctness == right_distinctness
+                && order_terms_match(left_order, right_order, pending)
+        }
+        (
+            FunctionArguments::OrderedSet {
+                direct: left_direct,
+                order_by: left_order,
+            },
+            FunctionArguments::OrderedSet {
+                direct: right_direct,
+                order_by: right_order,
+            },
+        ) => {
+            push_pairs(pending, left_direct, right_direct)
+                && order_terms_match(
+                    std::slice::from_ref(left_order.as_ref()),
+                    std::slice::from_ref(right_order.as_ref()),
+                    pending,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn order_terms_match<'expr>(
+    left: &'expr [OrderTerm],
+    right: &'expr [OrderTerm],
+    pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    for (left, right) in left.iter().zip(right) {
+        if left.order != right.order
+            || left.nulls != right.nulls
+            || left.type_fact != right.type_fact
+            || left.collation != right.collation
+        {
+            return false;
+        }
+        pending.push((&left.expr, &right.expr));
+    }
+    true
 }
 
 fn walk_exprs<'expr>(expressions: &'expr [Expr], visitor: &mut impl FnMut(&'expr Expr)) {

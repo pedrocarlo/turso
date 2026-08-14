@@ -300,10 +300,19 @@ pub(crate) type HirConstraint = Constraint<hir::Expr>;
 pub(crate) type HirTableConstraints = TableConstraints<hir::Expr, hir::SourceId>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HirConstraintTarget {
-    pub(crate) source: hir::SourceId,
-    pub(crate) column: Option<usize>,
-    pub(crate) is_rowid: bool,
+pub(crate) enum HirConstraintTarget {
+    Column(hir::ColumnRef),
+    RowId(hir::SourceId),
+    Expression(hir::SourceId),
+}
+
+impl HirConstraintTarget {
+    fn source(self) -> hir::SourceId {
+        match self {
+            Self::Column(column) => column.source,
+            Self::RowId(source) | Self::Expression(source) => source,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -311,6 +320,7 @@ pub(crate) struct HirBinaryConstraintPart<'a> {
     pub(crate) target: HirConstraintTarget,
     pub(crate) operator: ConstraintOperator,
     pub(crate) side: BinaryExprSide,
+    pub(crate) constrained_expr: &'a hir::Expr,
     pub(crate) constraining_expr: &'a hir::Expr,
     pub(crate) comparison_affinity: Option<Affinity>,
     pub(crate) comparison_collation: Option<CollationSeq>,
@@ -338,17 +348,20 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
     };
 
     let target = |expr: &hir::Expr| match expr {
-        hir::Expr::Column(column) if column.source == source => Some(HirConstraintTarget {
-            source,
-            column: Some(column.column),
-            is_rowid: false,
-        }),
-        hir::Expr::RowId(rowid_source) if *rowid_source == source => Some(HirConstraintTarget {
-            source,
-            column: None,
-            is_rowid: true,
-        }),
-        _ => None,
+        hir::Expr::Column(column) if column.source == source => {
+            Some(HirConstraintTarget::Column(*column))
+        }
+        hir::Expr::RowId(rowid_source) if *rowid_source == source => {
+            Some(HirConstraintTarget::RowId(source))
+        }
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Subquery(_)
+        | hir::Expr::Raise { .. } => None,
+        _ => Some(HirConstraintTarget::Expression(source)),
     };
 
     let component = comparison.components.first();
@@ -363,6 +376,7 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
             target,
             operator,
             side: BinaryExprSide::Rhs,
+            constrained_expr: lhs,
             constraining_expr: rhs,
             comparison_affinity: affinity,
             comparison_collation: collation,
@@ -373,6 +387,7 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
             target,
             operator: opposite_cmp_op(operator),
             side: BinaryExprSide::Lhs,
+            constrained_expr: rhs,
             constraining_expr: lhs,
             comparison_affinity: affinity,
             comparison_collation: collation,
@@ -430,6 +445,19 @@ fn hir_binary_constraints_for_term(
     }
 
     for part in hir_binary_constraint_parts(&term.expr, source) {
+        if matches!(part.target, HirConstraintTarget::Expression(_)) {
+            let target_mask =
+                table_mask_from_hir_expr(document, Some(from), part.constrained_expr)?;
+            let target_position = from.source_position(part.target.source()).ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "HIR constraint source {} is absent from FROM",
+                    part.target.source()
+                ))
+            })?;
+            if !target_mask.get(target_position) || target_mask.count() != 1 {
+                continue;
+            }
+        }
         let is_op = part.operator.as_ast_operator() == Some(ast::Operator::Is);
         let null_matching = is_op && !hir_is_non_null_literal(part.constraining_expr);
         let usable = term.from_outer_join == Some(source)
@@ -439,18 +467,15 @@ fn hir_binary_constraints_for_term(
                 !from.full_join_may_null_extend(source)
             };
 
-        let (table_col_pos, column, index) = if part.target.is_rowid {
-            (None, None, None)
-        } else {
-            let column_position = part
-                .target
-                .column
-                .expect("non-rowid HIR constraint target has a column");
-            (
-                Some(column_position),
-                Some(&table.columns()[column_position]),
-                selectivity_index_for_column(schema, table, indexes, column_position),
-            )
+        let (table_col_pos, column, index, is_rowid) = match part.target {
+            HirConstraintTarget::Column(column) => (
+                Some(column.column),
+                Some(&table.columns()[column.column]),
+                selectivity_index_for_column(schema, table, indexes, column.column),
+                false,
+            ),
+            HirConstraintTarget::RowId(_) => (None, None, None, true),
+            HirConstraintTarget::Expression(_) => (None, None, None, false),
         };
         let selectivity = estimate_constraint_selectivity(
             schema,
@@ -460,7 +485,7 @@ fn hir_binary_constraints_for_term(
             null_matching,
             index,
             params,
-            part.target.is_rowid,
+            is_rowid,
         );
 
         constraints.push(HirConstraint {
@@ -472,13 +497,52 @@ fn hir_binary_constraints_for_term(
             lhs_mask: table_mask_from_hir_expr(document, Some(from), part.constraining_expr)?,
             selectivity,
             usable,
-            is_rowid: part.target.is_rowid,
+            is_rowid,
             comparison_affinity: part.comparison_affinity,
             comparison_collation: part.comparison_collation,
             null_matching,
         });
     }
     Ok(constraints)
+}
+
+fn hir_constrained_expr<'a>(
+    constraint: &HirConstraint,
+    where_clause: &'a [HirWhereTerm],
+) -> Result<&'a hir::Expr> {
+    let (term_position, constraining_side) = constraint.where_clause_pos;
+    let term = where_clause.get(term_position).ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "HIR constraint WHERE position {term_position} is out of bounds"
+        ))
+    })?;
+    let hir::Expr::Binary { lhs, rhs, .. } = &term.expr else {
+        return Err(crate::LimboError::InternalError(format!(
+            "HIR constraint WHERE position {term_position} is not binary"
+        )));
+    };
+    Ok(match constraining_side {
+        BinaryExprSide::Lhs => rhs,
+        BinaryExprSide::Rhs => lhs,
+    })
+}
+
+fn hir_index_expressions<'a>(
+    source: &'a hir::Source,
+    index: &Index,
+) -> Result<Option<&'a hir::IndexExpressions>> {
+    let expressions = source
+        .index_expressions
+        .iter()
+        .find(|expressions| std::ptr::eq(expressions.index.value(), index));
+    if expressions.is_none() && matches!(source.index_coverage, hir::IndexCoverage::Complete { .. })
+    {
+        return Err(crate::LimboError::InternalError(format!(
+            "source {} is missing complete metadata for index {}",
+            source.id, index.name
+        )));
+    }
+    Ok(expressions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,11 +602,7 @@ pub(crate) fn hir_table_constraints_for_source(
             .indexes_for_table(table.internal_id)
             .into_iter()
             .flat_map(|indexes| indexes.iter())
-            .filter(|index| {
-                index.index_method.is_none()
-                    && index.where_clause.is_none()
-                    && index.columns.iter().all(|column| column.expr.is_none())
-            })
+            .filter(|index| index.index_method.is_none() && index.where_clause.is_none())
             .map(|index| ConstraintUseCandidate {
                 index: Some(index.clone()),
                 refs: Vec::new(),
@@ -588,35 +648,60 @@ pub(crate) fn hir_table_constraints_for_source(
                 });
         }
 
-        let Some(table_column_position) = constraint.table_col_pos else {
-            continue;
-        };
         for candidate in table_constraints
             .candidates
             .iter_mut()
             .filter(|candidate| candidate.index.is_some())
         {
             let index = candidate.index.as_ref().expect("candidate has an index");
-            let Some(index_column_position) =
-                index.column_table_pos_to_index_pos(table_column_position)
-            else {
+            let index_column_position = match constraint.table_col_pos {
+                Some(table_column_position) => {
+                    index.column_table_pos_to_index_pos(table_column_position)
+                }
+                None if !constraint.is_rowid => {
+                    let source_definition = document.source(source).ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "missing HIR source {source} for expression-index matching"
+                        ))
+                    })?;
+                    let Some(expressions) =
+                        hir_index_expressions(source_definition, index.as_ref())?
+                    else {
+                        continue;
+                    };
+                    let constrained_expr = hir_constrained_expr(constraint, where_clause)?;
+                    expressions.columns.iter().position(|indexed_expr| {
+                        indexed_expr.as_ref().is_some_and(|indexed_expr| {
+                            constrained_expr.equivalent_for_index(indexed_expr)
+                        })
+                    })
+                }
+                None => None,
+            };
+            let Some(index_column_position) = index_column_position else {
                 continue;
             };
-            let constrained_column = &table.columns()[table_column_position];
             let index_column = &index.columns[index_column_position];
-            if constrained_column.collation() != index_column.collation.unwrap_or_default() {
-                continue;
-            }
-            if schema
-                .get_type_def(&constrained_column.ty_str, table.table.is_strict())
-                .is_some()
-                && constraint.operator != ast::Operator::Equals.into()
+            if let Some(table_column_position) = constraint.table_col_pos {
+                let constrained_column = &table.columns()[table_column_position];
+                if constrained_column.collation() != index_column.collation.unwrap_or_default() {
+                    continue;
+                }
+                if schema
+                    .get_type_def(&constrained_column.ty_str, table.table.is_strict())
+                    .is_some()
+                    && constraint.operator != ast::Operator::Equals.into()
+                {
+                    continue;
+                }
+                if !constraint.satisfies_index_affinity(
+                    constrained_column.affinity_with_strict(table.table.is_strict()),
+                ) {
+                    continue;
+                }
+            } else if constraint.comparison_collation.unwrap_or_default()
+                != index_column.collation.unwrap_or_default()
             {
-                continue;
-            }
-            if !constraint.satisfies_index_affinity(
-                constrained_column.affinity_with_strict(table.table.is_strict()),
-            ) {
                 continue;
             }
             candidate.refs.push(ConstraintRef {
@@ -2604,6 +2689,22 @@ mod tests {
         }
     }
 
+    fn hir_document_with_source(source: hir::Source) -> hir::HirDocument {
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: source.id,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![source],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
     fn table_with_columns(columns: Vec<Column>) -> JoinedTable {
         let table = crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
             1,
@@ -2641,6 +2742,17 @@ mod tests {
         affinity: Affinity,
     ) -> hir::Expr {
         hir_comparison_with_collation(lhs, operator, rhs, affinity, None)
+    }
+
+    fn hir_binary(lhs: hir::Expr, operator: ast::Operator, rhs: hir::Expr) -> hir::Expr {
+        hir::Expr::Binary {
+            lhs: Box::new(lhs),
+            operator,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        }
     }
 
     fn hir_comparison_with_collation(
@@ -2717,9 +2829,10 @@ mod tests {
         let [left_part] = left_parts.as_slice() else {
             panic!("left column produces one constraint part");
         };
-        assert_eq!(left_part.target.source, source);
-        assert_eq!(left_part.target.column, Some(2));
-        assert!(!left_part.target.is_rowid);
+        assert_eq!(
+            left_part.target,
+            HirConstraintTarget::Column(hir::ColumnRef { source, column: 2 })
+        );
         assert_eq!(
             left_part.operator,
             ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
@@ -2741,14 +2854,7 @@ mod tests {
         let [right_part] = right_parts.as_slice() else {
             panic!("right rowid produces one constraint part");
         };
-        assert_eq!(
-            right_part.target,
-            HirConstraintTarget {
-                source,
-                column: None,
-                is_rowid: true,
-            }
-        );
+        assert_eq!(right_part.target, HirConstraintTarget::RowId(source));
         assert_eq!(
             right_part.operator,
             ConstraintOperator::AstNativeOperator(ast::Operator::Less)
@@ -2944,6 +3050,146 @@ mod tests {
         assert_eq!(index_candidate.refs[0].index_col_pos, 0);
         assert_eq!(constraints.temporary_index_terms.len(), 1);
         assert_eq!(constraints.temporary_index_terms[0].constraint_vec_pos, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn hir_table_constraints_match_expression_index_candidates() -> Result<()> {
+        let source = hir::SourceId::new(0);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let term = HirWhereTerm {
+            expr: hir_comparison(
+                hir_binary(
+                    hir::Expr::column(source, 0),
+                    ast::Operator::Add,
+                    hir::Expr::column(source, 1),
+                ),
+                ast::Operator::Equals,
+                hir::Expr::Literal(ast::Literal::Numeric("10".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let table = table_with_columns(vec![
+            Column::new_default_integer(Some("a".into()), "INTEGER".into(), None),
+            Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
+        ]);
+        let index = Arc::new(Index {
+            name: "items_sum".into(),
+            table_name: "items".into(),
+            root_page: 2,
+            columns: vec![crate::schema::IndexColumn {
+                name: "a + b".into(),
+                order: SortOrder::Asc,
+                nulls_order: None,
+                pos_in_table: crate::schema::EXPR_INDEX_SENTINEL,
+                collation: None,
+                default: None,
+                expr: Some(Box::new(ast::Expr::Literal(ast::Literal::Null))),
+            }],
+            unique: false,
+            ephemeral: false,
+            has_rowid: true,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let index_id = hir::CatalogObjectId::new(2);
+        let resolved_index = hir::CatalogObject::new(
+            index_id,
+            hir::CatalogSnapshot::from_id(0),
+            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            index.clone(),
+        );
+        let resolved_table = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(0),
+            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            Arc::new(table.table.clone()),
+        );
+        let document = hir_document_with_source(hir::Source {
+            id: source,
+            owner: hir::SourceOwner::Root,
+            database: Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            name: "items".into(),
+            alias: None,
+            kind: hir::SourceKind::Table(resolved_table),
+            columns: vec![
+                hir::SourceColumn {
+                    name: "a".into(),
+                    type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
+                    affinity: Affinity::Integer,
+                    has_affinity: true,
+                    collation: None,
+                    hidden: false,
+                    rowid_alias: false,
+                },
+                hir::SourceColumn {
+                    name: "b".into(),
+                    type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
+                    affinity: Affinity::Integer,
+                    has_affinity: true,
+                    collation: None,
+                    hidden: false,
+                    rowid_alias: false,
+                },
+            ],
+            generated_expressions: vec![hir::ColumnReadExpression::Absent; 2],
+            default_expressions: vec![hir::ColumnReadExpression::Absent; 2],
+            column_type_programs: vec![None; 2],
+            check_constraints: None,
+            rowid_available: true,
+            index_hint: hir::IndexHint::None,
+            index_expressions: vec![hir::IndexExpressions {
+                index: resolved_index,
+                columns: vec![Some(hir_binary(
+                    hir::Expr::column(source, 1),
+                    ast::Operator::Add,
+                    hir::Expr::column(source, 0),
+                ))],
+                predicate: None,
+            }],
+            index_coverage: hir::IndexCoverage::Complete {
+                indexes: vec![index_id],
+            },
+            index_method_patterns: Vec::new(),
+        });
+        let mut indexes = AvailableIndexes::default();
+        indexes.insert_for_table_name(
+            std::slice::from_ref(&table),
+            "items",
+            VecDeque::from([index.clone()]),
+        );
+
+        let constraints = hir_table_constraints_for_source(
+            &document,
+            &from,
+            &[term],
+            source,
+            &table,
+            &Schema::new(),
+            &indexes,
+            &CostModelParams::default(),
+        )?;
+
+        let candidate = constraints
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .index
+                    .as_ref()
+                    .is_some_and(|value| Arc::ptr_eq(value, &index))
+            })
+            .expect("expression index remains a candidate");
+        assert_eq!(candidate.refs.len(), 1);
+        assert_eq!(candidate.refs[0].constraint_vec_pos, 0);
+        assert_eq!(candidate.refs[0].index_col_pos, 0);
+        assert!(constraints.constraints[0].expr.is_none());
         Ok(())
     }
 }
