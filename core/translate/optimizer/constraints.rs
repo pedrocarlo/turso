@@ -290,6 +290,72 @@ pub struct TableConstraints<E = ast::Expr, S = TableInternalId> {
 pub(crate) type HirConstraint = Constraint<hir::Expr>;
 pub(crate) type HirTableConstraints = TableConstraints<hir::Expr, hir::SourceId>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HirConstraintTarget {
+    pub(crate) source: hir::SourceId,
+    pub(crate) column: Option<usize>,
+    pub(crate) is_rowid: bool,
+}
+
+/// Read the resolved comparison facts needed to constrain one HIR source.
+///
+/// The returned side points at the constraining expression. For example,
+/// `1 > items.value` returns `Lhs` and normalizes the operator to `<`.
+pub(crate) fn hir_binary_constraint_parts<'a>(
+    expr: &'a hir::Expr,
+    source: hir::SourceId,
+) -> Option<(
+    HirConstraintTarget,
+    ConstraintOperator,
+    BinaryExprSide,
+    &'a hir::Expr,
+    Option<Affinity>,
+)> {
+    let hir::Expr::Binary {
+        lhs,
+        operator,
+        rhs,
+        comparison: Some(comparison),
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    let target = |expr: &hir::Expr| match expr {
+        hir::Expr::Column(column) if column.source == source => Some(HirConstraintTarget {
+            source,
+            column: Some(column.column),
+            is_rowid: false,
+        }),
+        hir::Expr::RowId(rowid_source) if *rowid_source == source => Some(HirConstraintTarget {
+            source,
+            column: None,
+            is_rowid: true,
+        }),
+        _ => None,
+    };
+
+    let affinity = comparison
+        .components
+        .first()
+        .map(|component| component.affinity);
+    let operator = ConstraintOperator::from(*operator);
+
+    if let Some(target) = target(lhs) {
+        return Some((target, operator, BinaryExprSide::Rhs, rhs, affinity));
+    }
+    target(rhs).map(|target| {
+        (
+            target,
+            opposite_cmp_op(operator),
+            BinaryExprSide::Lhs,
+            lhs.as_ref(),
+            affinity,
+        )
+    })
+}
+
 /// Build the search terms for an automatic index.
 ///
 /// Terms for the same table column use the same index column.
@@ -2222,6 +2288,28 @@ fn find_best_index_for_constraint(
 mod tests {
     use super::*;
 
+    fn hir_comparison(
+        lhs: hir::Expr,
+        operator: ast::Operator,
+        rhs: hir::Expr,
+        affinity: Affinity,
+    ) -> hir::Expr {
+        hir::Expr::Binary {
+            lhs: Box::new(lhs),
+            operator,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: Some(hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity,
+                    collation: None,
+                    array: false,
+                }],
+            }),
+        }
+    }
+
     #[test]
     fn hir_constraints_use_shared_index_rules() {
         let constraint = HirConstraint {
@@ -2248,5 +2336,58 @@ mod tests {
         assert_eq!(table_constraints.table_id, hir::SourceId::new(7));
         let key_columns = ordered_ephemeral_key_columns(&[&table_constraints.constraints[0]]);
         assert_eq!(key_columns.as_slice(), [2]);
+    }
+
+    #[test]
+    fn hir_binary_constraint_parts_follow_the_constrained_source() {
+        let source = hir::SourceId::new(7);
+        let left = hir_comparison(
+            hir::Expr::column(source, 2),
+            ast::Operator::GreaterEquals,
+            hir::Expr::Literal(ast::Literal::Numeric("10".into())),
+            Affinity::Integer,
+        );
+        let (target, operator, side, constraining, affinity) =
+            hir_binary_constraint_parts(&left, source).expect("left column constrains source");
+        assert_eq!(target.source, source);
+        assert_eq!(target.column, Some(2));
+        assert!(!target.is_rowid);
+        assert_eq!(
+            operator,
+            ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
+        );
+        assert_eq!(side, BinaryExprSide::Rhs);
+        assert!(matches!(
+            constraining,
+            hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "10"
+        ));
+        assert_eq!(affinity, Some(Affinity::Integer));
+
+        let right = hir_comparison(
+            hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+            ast::Operator::Greater,
+            hir::Expr::rowid(source),
+            Affinity::Integer,
+        );
+        let (target, operator, side, constraining, affinity) =
+            hir_binary_constraint_parts(&right, source).expect("right rowid constrains source");
+        assert_eq!(
+            target,
+            HirConstraintTarget {
+                source,
+                column: None,
+                is_rowid: true,
+            }
+        );
+        assert_eq!(
+            operator,
+            ConstraintOperator::AstNativeOperator(ast::Operator::Less)
+        );
+        assert_eq!(side, BinaryExprSide::Lhs);
+        assert!(matches!(
+            constraining,
+            hir::Expr::Literal(ast::Literal::Numeric(value)) if value == "1"
+        ));
+        assert_eq!(affinity, Some(Affinity::Integer));
     }
 }
