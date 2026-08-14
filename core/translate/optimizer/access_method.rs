@@ -503,9 +503,9 @@ fn consume_partial_index_predicate_terms(
 /// Because of that execution shape, only rowid or the first column of an index
 /// can drive `InSeek`, and the comparison collation must match the chosen
 /// index's first-key collation.
-pub(super) fn choose_best_in_seek_candidate(
+pub(super) fn choose_best_in_seek_candidate<E, S>(
     rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,

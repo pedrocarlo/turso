@@ -3183,6 +3183,54 @@ mod tests {
     }
 
     #[test]
+    fn shared_in_seek_chooser_accepts_hir_constraints() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let constraints = HirTableConstraints {
+            table_id: source,
+            constraints: vec![HirConstraint {
+                where_clause_pos: (3, BinaryExprSide::Rhs),
+                operator: ConstraintOperator::In {
+                    not: false,
+                    estimated_values: 2.0,
+                },
+                table_col_pos: None,
+                expr: None,
+                constraining_expr: None,
+                lhs_mask: TableMask::default(),
+                selectivity: 0.1,
+                usable: false,
+                is_rowid: true,
+                comparison_affinity: Some(Affinity::Integer),
+                comparison_collation: None,
+                null_matching: false,
+            }],
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+            }],
+            temporary_index_terms: SmallVec::new(),
+        };
+        let params = CostModelParams::default();
+
+        let chosen = crate::translate::optimizer::access_method::choose_best_in_seek_candidate(
+            &rowid_table(),
+            &constraints,
+            &TableMask::default(),
+            1.0,
+            crate::translate::optimizer::cost::RowCountEstimate::hardcoded_fallback(&params),
+            &params,
+            crate::translate::optimizer::cost::Cost(f64::INFINITY),
+            crate::translate::optimizer::access_method::BranchReadMode::RowIdOnly,
+        )?
+        .expect("HIR rowid IN constraint drives existing chooser");
+
+        assert!(chosen.index.is_none());
+        assert_eq!(chosen.affinity, Affinity::Integer);
+        assert_eq!(chosen.constraint_idx, 3);
+        Ok(())
+    }
+
+    #[test]
     fn hir_binary_constraint_parts_follow_the_constrained_source() {
         let source = hir::SourceId::new(7);
         let left = hir_comparison(
