@@ -545,6 +545,28 @@ fn hir_index_expressions<'a>(
     Ok(expressions)
 }
 
+fn hir_partial_index_predicate_terms(
+    from: &hir::From,
+    source: hir::SourceId,
+    predicate: &hir::Expr,
+    query_where_clause: &[HirWhereTerm],
+) -> Option<SmallVec<[usize; 4]>> {
+    let full_join = from.full_join_may_null_extend(source);
+    let outer_join = from.outer_join_may_null_extend(source);
+    let can_use_query_term =
+        |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
+    let mut matched_terms = SmallVec::new();
+    for index_conjunct in predicate.conjuncts() {
+        let (term_position, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && index_conjunct.equivalent_for_index(&term.expr)
+        })?;
+        if !matched_terms.contains(&term_position) {
+            matched_terms.push(term_position);
+        }
+    }
+    Some(matched_terms)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_binary_constraints_for_source(
     document: &hir::HirDocument,
@@ -595,19 +617,42 @@ pub(crate) fn hir_table_constraints_for_source(
         indexes,
         params,
     )?;
+    let mut candidates = Vec::new();
+    for index in indexes
+        .indexes_for_table(table.internal_id)
+        .into_iter()
+        .flat_map(|indexes| indexes.iter())
+        .filter(|index| index.index_method.is_none())
+    {
+        if index.where_clause.is_some() {
+            let source_definition = document.source(source).ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "missing HIR source {source} for partial-index matching"
+                ))
+            })?;
+            let Some(expressions) = hir_index_expressions(source_definition, index.as_ref())?
+            else {
+                continue;
+            };
+            let predicate = expressions.predicate.as_ref().ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "HIR metadata for partial index {} has no predicate",
+                    index.name
+                ))
+            })?;
+            if hir_partial_index_predicate_terms(from, source, predicate, where_clause).is_none() {
+                continue;
+            }
+        }
+        candidates.push(ConstraintUseCandidate {
+            index: Some(index.clone()),
+            refs: Vec::new(),
+        });
+    }
     let mut table_constraints = HirTableConstraints {
         table_id: source,
         constraints,
-        candidates: indexes
-            .indexes_for_table(table.internal_id)
-            .into_iter()
-            .flat_map(|indexes| indexes.iter())
-            .filter(|index| index.index_method.is_none() && index.where_clause.is_none())
-            .map(|index| ConstraintUseCandidate {
-                index: Some(index.clone()),
-                refs: Vec::new(),
-            })
-            .collect(),
+        candidates,
         temporary_index_terms: SmallVec::new(),
     };
     table_constraints.candidates.push(ConstraintUseCandidate {
@@ -2705,6 +2750,65 @@ mod tests {
         }
     }
 
+    fn hir_document_with_index(
+        table: &JoinedTable,
+        index: Arc<Index>,
+        columns: Vec<Option<hir::Expr>>,
+        predicate: Option<hir::Expr>,
+    ) -> hir::HirDocument {
+        let source = hir::SourceId::new(0);
+        let index_id = hir::CatalogObjectId::new(2);
+        let resolved_index = hir::CatalogObject::new(
+            index_id,
+            hir::CatalogSnapshot::from_id(0),
+            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            index,
+        );
+        let resolved_table = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(0),
+            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            Arc::new(table.table.clone()),
+        );
+        let width = table.columns().len();
+        hir_document_with_source(hir::Source {
+            id: source,
+            owner: hir::SourceOwner::Root,
+            database: Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+            name: "items".into(),
+            alias: None,
+            kind: hir::SourceKind::Table(resolved_table),
+            columns: table
+                .columns()
+                .iter()
+                .map(|column| hir::SourceColumn {
+                    name: column.name.clone().expect("test column has a name"),
+                    type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
+                    affinity: Affinity::Integer,
+                    has_affinity: true,
+                    collation: None,
+                    hidden: false,
+                    rowid_alias: column.is_rowid_alias(),
+                })
+                .collect(),
+            generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+            default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+            column_type_programs: vec![None; width],
+            check_constraints: None,
+            rowid_available: true,
+            index_hint: hir::IndexHint::None,
+            index_expressions: vec![hir::IndexExpressions {
+                index: resolved_index,
+                columns,
+                predicate,
+            }],
+            index_coverage: hir::IndexCoverage::Complete {
+                indexes: vec![index_id],
+            },
+            index_method_patterns: Vec::new(),
+        })
+    }
+
     fn table_with_columns(columns: Vec<Column>) -> JoinedTable {
         let table = crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
             1,
@@ -3098,66 +3202,16 @@ mod tests {
             index_method: None,
             on_conflict: None,
         });
-        let index_id = hir::CatalogObjectId::new(2);
-        let resolved_index = hir::CatalogObject::new(
-            index_id,
-            hir::CatalogSnapshot::from_id(0),
-            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
+        let document = hir_document_with_index(
+            &table,
             index.clone(),
+            vec![Some(hir_binary(
+                hir::Expr::column(source, 1),
+                ast::Operator::Add,
+                hir::Expr::column(source, 0),
+            ))],
+            None,
         );
-        let resolved_table = hir::CatalogObject::new(
-            hir::CatalogObjectId::new(1),
-            hir::CatalogSnapshot::from_id(0),
-            Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
-            Arc::new(table.table.clone()),
-        );
-        let document = hir_document_with_source(hir::Source {
-            id: source,
-            owner: hir::SourceOwner::Root,
-            database: Some(hir::DatabaseId::new(crate::MAIN_DB_ID)),
-            name: "items".into(),
-            alias: None,
-            kind: hir::SourceKind::Table(resolved_table),
-            columns: vec![
-                hir::SourceColumn {
-                    name: "a".into(),
-                    type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
-                    affinity: Affinity::Integer,
-                    has_affinity: true,
-                    collation: None,
-                    hidden: false,
-                    rowid_alias: false,
-                },
-                hir::SourceColumn {
-                    name: "b".into(),
-                    type_fact: hir::TypeFact::known(crate::schema::Type::Integer),
-                    affinity: Affinity::Integer,
-                    has_affinity: true,
-                    collation: None,
-                    hidden: false,
-                    rowid_alias: false,
-                },
-            ],
-            generated_expressions: vec![hir::ColumnReadExpression::Absent; 2],
-            default_expressions: vec![hir::ColumnReadExpression::Absent; 2],
-            column_type_programs: vec![None; 2],
-            check_constraints: None,
-            rowid_available: true,
-            index_hint: hir::IndexHint::None,
-            index_expressions: vec![hir::IndexExpressions {
-                index: resolved_index,
-                columns: vec![Some(hir_binary(
-                    hir::Expr::column(source, 1),
-                    ast::Operator::Add,
-                    hir::Expr::column(source, 0),
-                ))],
-                predicate: None,
-            }],
-            index_coverage: hir::IndexCoverage::Complete {
-                indexes: vec![index_id],
-            },
-            index_method_patterns: Vec::new(),
-        });
         let mut indexes = AvailableIndexes::default();
         indexes.insert_for_table_name(
             std::slice::from_ref(&table),
@@ -3191,5 +3245,154 @@ mod tests {
         assert_eq!(candidate.refs[0].index_col_pos, 0);
         assert!(constraints.constraints[0].expr.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn hir_partial_index_requires_every_hir_predicate_conjunct() -> Result<()> {
+        let source = hir::SourceId::new(0);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let seek = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 0),
+                ast::Operator::Equals,
+                hir::Expr::Literal(ast::Literal::Numeric("10".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let lower = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 1),
+                ast::Operator::Greater,
+                hir::Expr::Literal(ast::Literal::Numeric("0".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let upper = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 1),
+                ast::Operator::Less,
+                hir::Expr::Literal(ast::Literal::Numeric("100".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let predicate = hir_binary(lower.expr.clone(), ast::Operator::And, upper.expr.clone());
+        let table = table_with_columns(vec![
+            Column::new_default_integer(Some("a".into()), "INTEGER".into(), None),
+            Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
+        ]);
+        let index = Arc::new(Index {
+            name: "items_a_partial".into(),
+            table_name: "items".into(),
+            root_page: 2,
+            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            unique: false,
+            ephemeral: false,
+            has_rowid: true,
+            where_clause: Some(Box::new(ast::Expr::Literal(ast::Literal::True))),
+            index_method: None,
+            on_conflict: None,
+        });
+        let document = hir_document_with_index(&table, index.clone(), vec![None], Some(predicate));
+        let mut indexes = AvailableIndexes::default();
+        indexes.insert_for_table_name(
+            std::slice::from_ref(&table),
+            "items",
+            VecDeque::from([index.clone()]),
+        );
+
+        let accepted = hir_table_constraints_for_source(
+            &document,
+            &from,
+            &[seek.clone(), lower.clone(), upper],
+            source,
+            &table,
+            &Schema::new(),
+            &indexes,
+            &CostModelParams::default(),
+        )?;
+        assert!(accepted.candidates.iter().any(|candidate| {
+            candidate
+                .index
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &index))
+        }));
+
+        let rejected = hir_table_constraints_for_source(
+            &document,
+            &from,
+            &[seek, lower],
+            source,
+            &table,
+            &Schema::new(),
+            &indexes,
+            &CostModelParams::default(),
+        )?;
+        assert!(!rejected.candidates.iter().any(|candidate| {
+            candidate
+                .index
+                .as_ref()
+                .is_some_and(|value| Arc::ptr_eq(value, &index))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_partial_index_respects_outer_join_predicate_origin() {
+        let left = hir::SourceId::new(0);
+        let source = hir::SourceId::new(1);
+        let predicate = hir_comparison(
+            hir::Expr::column(source, 0),
+            ast::Operator::Greater,
+            hir::Expr::Literal(ast::Literal::Numeric("0".into())),
+            Affinity::Integer,
+        );
+        let mut term = HirWhereTerm {
+            expr: predicate.clone(),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let mut from = hir::From {
+            first: left,
+            joins: vec![hir::Join {
+                right: source,
+                kind: hir::JoinKind::Left,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+
+        assert!(hir_partial_index_predicate_terms(
+            &from,
+            source,
+            &predicate,
+            std::slice::from_ref(&term),
+        )
+        .is_none());
+        term.from_outer_join = Some(source);
+        let matched = hir_partial_index_predicate_terms(
+            &from,
+            source,
+            &predicate,
+            std::slice::from_ref(&term),
+        )
+        .expect("matching LEFT JOIN predicate proves partial index");
+        assert_eq!(matched.as_slice(), [0]);
+
+        from.joins[0].kind = hir::JoinKind::Full;
+        assert!(hir_partial_index_predicate_terms(
+            &from,
+            source,
+            &predicate,
+            std::slice::from_ref(&term),
+        )
+        .is_none());
     }
 }

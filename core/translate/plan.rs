@@ -247,6 +247,15 @@ pub(crate) trait PredicateExpr: Clone {
 
     fn and_operands(&self) -> Option<(&Self, &Self)>;
 
+    fn conjuncts(&self) -> PredicateConjuncts<'_, Self>
+    where
+        Self: Sized,
+    {
+        PredicateConjuncts {
+            pending: vec![self],
+        }
+    }
+
     fn append_conjuncts<T>(&self, output: &mut Vec<T>)
     where
         Self: Sized,
@@ -259,6 +268,27 @@ pub(crate) trait PredicateExpr: Clone {
         } else {
             output.push(expression.clone().into());
         }
+    }
+}
+
+pub(crate) struct PredicateConjuncts<'expr, E: PredicateExpr> {
+    pending: Vec<&'expr E>,
+}
+
+impl<'expr, E: PredicateExpr> Iterator for PredicateConjuncts<'expr, E> {
+    type Item = &'expr E;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(expression) = self.pending.pop() {
+            let expression = expression.ungrouped();
+            if let Some((lhs, rhs)) = expression.and_operands() {
+                self.pending.push(rhs);
+                self.pending.push(lhs);
+            } else {
+                return Some(expression);
+            }
+        }
+        None
     }
 }
 
