@@ -4002,6 +4002,7 @@ fn resolve_outer_ref_loop(
 #[cfg(test)]
 mod tests {
     use crate::alloc::TursoFromIterator;
+    use crate::translate::semantic::hir;
 
     use super::*;
     use rand_chacha::{
@@ -4029,6 +4030,76 @@ mod tests {
         }
     }
 
+    fn hir_output(id: hir::OutputId, expr: hir::Expr) -> hir::Output {
+        hir::Output {
+            id,
+            name: "value".into(),
+            expr,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            schema_affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        }
+    }
+
+    fn hir_dependency_document(
+        output_expr: hir::Expr,
+        captures: Vec<hir::SourceId>,
+    ) -> hir::HirDocument {
+        let outer_query = hir::QueryId::new(0);
+        let outer_block = hir::QueryBlockId::new(outer_query, 0);
+        let output = hir::OutputId::query(outer_block, 0);
+        let mut block = hir::QueryBlock::new(
+            outer_block,
+            hir::QueryBlockBody::Values { rows: Vec::new() },
+        );
+        block.outputs.push(hir_output(output, output_expr));
+
+        let inner_query = hir::QueryId::new(1);
+        let inner_block = hir::QueryBlockId::new(inner_query, 0);
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::Query(hir::QueryRoot { query: outer_query }),
+            queries: vec![
+                hir::Query {
+                    id: outer_query,
+                    parent: None,
+                    captures: Vec::new(),
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![block],
+                    first: outer_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: vec![output],
+                },
+                hir::Query {
+                    id: inner_query,
+                    parent: Some(outer_query),
+                    captures,
+                    reachable_ctes: Vec::new(),
+                    blocks: vec![hir::QueryBlock::new(
+                        inner_block,
+                        hir::QueryBlockBody::Values { rows: Vec::new() },
+                    )],
+                    first: inner_block,
+                    compounds: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    output: Vec::new(),
+                },
+            ],
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
     #[test]
     fn hir_predicates_split_without_ast_conversion() {
         let expression = hir_and(hir_integer(1), hir_and(hir_integer(2), hir_integer(3)));
@@ -4047,6 +4118,82 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(values, ["1", "2", "3"]);
         assert!(terms.iter().all(|term| term.from_outer_join.is_none()));
+    }
+
+    #[test]
+    fn hir_expression_dependencies_map_to_local_from_positions() -> Result<()> {
+        let first = hir::SourceId::new(10);
+        let joined = hir::SourceId::new(20);
+        let outside = hir::SourceId::new(30);
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: joined,
+                kind: hir::JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let output = hir::OutputId::query(hir::QueryBlockId::new(hir::QueryId::new(0), 0), 0);
+        let document = hir_dependency_document(hir::Expr::column(joined, 0), vec![joined, outside]);
+
+        let direct = hir_and(hir::Expr::column(first, 0), hir::Expr::rowid(joined));
+        let direct_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &direct)?;
+        assert!(direct_mask.get(0));
+        assert!(direct_mask.get(1));
+
+        let merged = hir::Expr::MergedColumn(hir::MergedColumn {
+            left: Box::new(hir::Expr::column(first, 0)),
+            right: hir::ColumnRef {
+                source: joined,
+                column: 0,
+            },
+            value: hir::MergedColumnValue::Coalesce,
+            type_fact: hir::TypeFact::dynamic(),
+            affinity: Affinity::Blob,
+            has_affinity: false,
+            collation: None,
+        });
+        let merged_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &merged)?;
+        assert!(merged_mask.get(0));
+        assert!(merged_mask.get(1));
+
+        let output_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            &hir::Expr::output(output),
+        )?;
+        assert!(!output_mask.get(0));
+        assert!(output_mask.get(1));
+
+        let subquery = hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs: Box::new(hir::Expr::column(first, 0)),
+            query: hir::QueryId::new(1),
+            negated: false,
+            comparison: hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity: Affinity::Blob,
+                    collation: None,
+                    array: false,
+                }],
+            },
+        });
+        let subquery_mask =
+            crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &subquery)?;
+        assert!(subquery_mask.get(0));
+        assert!(subquery_mask.get(1));
+        assert_eq!(subquery_mask.iter().count(), 2);
+
+        let duplicate = hir_and(hir::Expr::column(first, 0), hir::Expr::column(first, 1));
+        let duplicate_mask = crate::translate::planner::table_mask_from_hir_expr(
+            &document,
+            Some(&from),
+            &duplicate,
+        )?;
+        assert_eq!(duplicate_mask.iter().collect::<Vec<_>>(), [0]);
+
+        Ok(())
     }
 
     #[test]

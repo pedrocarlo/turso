@@ -125,6 +125,20 @@ pub struct From {
     pub joins: Vec<Join>,
 }
 
+impl From {
+    /// Return the source's position in the original FROM order used by join
+    /// planning masks.
+    pub(crate) fn source_position(&self, source: SourceId) -> Option<usize> {
+        if self.first == source {
+            return Some(0);
+        }
+        self.joins
+            .iter()
+            .position(|join| join.right == source)
+            .map(|position| position + 1)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Join {
     pub right: SourceId,

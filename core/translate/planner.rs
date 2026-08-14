@@ -19,6 +19,7 @@ use crate::translate::{
         WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
+    semantic::hir::{self, HirDocument},
 };
 use crate::{
     ast::Limit,
@@ -2423,6 +2424,32 @@ pub fn table_mask_from_expr(
         Ok(WalkControl::Continue)
     })?;
 
+    Ok(mask)
+}
+
+/// Return the FROM positions needed to evaluate a resolved HIR expression.
+/// Sources captured from an outer query are deliberately absent from the
+/// current query block's mask.
+pub(crate) fn table_mask_from_hir_expr(
+    document: &HirDocument,
+    from: Option<&hir::From>,
+    expression: &hir::Expr,
+) -> Result<TableMask> {
+    let mut mask = TableMask::default();
+    let mut allocation_error = None;
+
+    document.visit_expr_sources(expression, &mut |source| {
+        let Some(position) = from.and_then(|from| from.source_position(source)) else {
+            return;
+        };
+        if allocation_error.is_none() {
+            allocation_error = mask.set(position).err();
+        }
+    });
+
+    if let Some(error) = allocation_error {
+        return Err(error.into());
+    }
     Ok(mask)
 }
 

@@ -40,6 +40,39 @@ impl ColumnUsageCollector {
 }
 
 impl HirDocument {
+    /// Visit every source needed to evaluate one expression in its owning
+    /// query. Output references follow their resolved expression; subqueries
+    /// contribute their validated outer captures rather than their local
+    /// sources.
+    pub(crate) fn visit_expr_sources(&self, expression: &Expr, visit: &mut impl FnMut(SourceId)) {
+        expression.walk(&mut |expression| match expression {
+            Expr::Column(reference) => visit(reference.source),
+            Expr::MergedColumn(column) => visit(column.right.source),
+            Expr::RowId(source) => visit(*source),
+            Expr::Output(id) => {
+                let output = self
+                    .output(*id)
+                    .expect("validated HIR output reference must exist");
+                self.visit_expr_sources(&output.expr, visit);
+            }
+            Expr::Subquery(subquery) => {
+                let query = match subquery {
+                    SubqueryExpr::Scalar { query, .. }
+                    | SubqueryExpr::Row { query }
+                    | SubqueryExpr::In { query, .. }
+                    | SubqueryExpr::Exists(query) => query,
+                };
+                let query = self
+                    .query(*query)
+                    .expect("validated HIR subquery reference must exist");
+                for source in &query.captures {
+                    visit(*source);
+                }
+            }
+            _ => {}
+        });
+    }
+
     /// Recompute the exact external source set read directly by one query.
     /// Nested queries own their own capture summaries and are not traversed.
     pub(crate) fn direct_query_captures(&self, id: QueryId) -> Vec<SourceId> {
