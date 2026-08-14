@@ -596,6 +596,24 @@ pub(crate) fn hir_binary_constraints_for_source(
     Ok(constraints)
 }
 
+fn hir_scalar_comparison(
+    comparison: &hir::ComparisonSemantics,
+) -> Option<(Affinity, Option<CollationSeq>)> {
+    let [component] = comparison.components.as_slice() else {
+        return None;
+    };
+    if component.array {
+        return None;
+    }
+    Some((
+        component.affinity,
+        component
+            .collation
+            .as_ref()
+            .map(|collation| *collation.value()),
+    ))
+}
+
 fn hir_in_list_comparison(
     values: &[hir::Expr],
     comparisons: &[hir::ComparisonSemantics],
@@ -607,30 +625,13 @@ fn hir_in_list_comparison(
             comparisons.len()
         )));
     }
-    let Some(first) = comparisons.first() else {
+    let Some(first) = comparisons.first().and_then(hir_scalar_comparison) else {
         return Ok(None);
     };
-    let [first] = first.components.as_slice() else {
-        return Ok(None);
-    };
-    if first.array {
-        return Ok(None);
-    }
-    let affinity = first.affinity;
-    let collation = first.collation.as_ref().map(|collation| *collation.value());
-    let same_comparison = comparisons.iter().all(|comparison| {
-        let [component] = comparison.components.as_slice() else {
-            return false;
-        };
-        !component.array
-            && component.affinity == affinity
-            && component
-                .collation
-                .as_ref()
-                .map(|collation| *collation.value())
-                == collation
-    });
-    Ok(same_comparison.then_some((affinity, collation)))
+    Ok(comparisons
+        .iter()
+        .all(|comparison| hir_scalar_comparison(comparison) == Some(first))
+        .then_some(first))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,6 +707,85 @@ fn hir_in_list_constraint_for_term(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn hir_in_query_constraint_for_term(
+    document: &hir::HirDocument,
+    term_position: usize,
+    term: &HirWhereTerm,
+    source: hir::SourceId,
+    table: &JoinedTable,
+    schema: &Schema,
+    params: &CostModelParams,
+    query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
+) -> Result<Option<HirConstraint>> {
+    if term
+        .from_outer_join
+        .is_some_and(|outer_source| outer_source != source)
+    {
+        return Ok(None);
+    }
+    let hir::Expr::Subquery(hir::SubqueryExpr::In {
+        lhs,
+        query,
+        negated,
+        comparison,
+    }) = &term.expr
+    else {
+        return Ok(None);
+    };
+    let query_definition = document.query(*query).ok_or_else(|| {
+        crate::LimboError::InternalError(format!(
+            "HIR IN constraint references missing query {query}"
+        ))
+    })?;
+    if !query_definition.captures.is_empty() {
+        return Ok(None);
+    }
+    let Some((comparison_affinity, comparison_collation)) = hir_scalar_comparison(comparison)
+    else {
+        return Ok(None);
+    };
+
+    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    let (table_col_pos, is_rowid) = match lhs.as_ref() {
+        hir::Expr::Column(column) if column.source == source => (
+            Some(column.column),
+            rowid_alias_column == Some(column.column),
+        ),
+        hir::Expr::RowId(rowid_source) if *rowid_source == source => (rowid_alias_column, true),
+        _ => return Ok(None),
+    };
+
+    let row_count = schema
+        .analyze_stats
+        .table_stats(table.table.get_name())
+        .and_then(|stats| stats.row_count)
+        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
+    // The HIR owns query meaning, while its row estimate remains planner state.
+    // Keep the existing cap and fallback when that plan is not available yet.
+    let estimated_values = query_output_rows(*query)
+        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
+        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
+
+    Ok(Some(HirConstraint {
+        where_clause_pos: (term_position, BinaryExprSide::Rhs),
+        operator: ConstraintOperator::In {
+            not: *negated,
+            estimated_values,
+        },
+        table_col_pos,
+        expr: None,
+        constraining_expr: None,
+        lhs_mask: TableMask::default(),
+        selectivity: estimate_in_selectivity(estimated_values, row_count, *negated),
+        usable: false,
+        is_rowid,
+        comparison_affinity: Some(comparison_affinity),
+        comparison_collation,
+        null_matching: false,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_table_constraints_for_source(
     document: &hir::HirDocument,
     from: &hir::From,
@@ -715,6 +795,7 @@ pub(crate) fn hir_table_constraints_for_source(
     schema: &Schema,
     indexes: &AvailableIndexes,
     params: &CostModelParams,
+    query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<HirTableConstraints> {
     let mut constraints = hir_binary_constraints_for_source(
         document,
@@ -736,6 +817,18 @@ pub(crate) fn hir_table_constraints_for_source(
             table,
             schema,
             params,
+        )? {
+            constraints.push(constraint);
+        }
+        if let Some(constraint) = hir_in_query_constraint_for_term(
+            document,
+            term_position,
+            term,
+            source,
+            table,
+            schema,
+            params,
+            query_output_rows,
         )? {
             constraints.push(constraint);
         }
@@ -2873,6 +2966,27 @@ mod tests {
         }
     }
 
+    fn hir_document_with_query(
+        source: hir::SourceId,
+        query: hir::QueryId,
+        captures: Vec<hir::SourceId>,
+    ) -> hir::HirDocument {
+        let mut document = empty_hir_document(source);
+        document.queries.push(hir::Query {
+            id: query,
+            parent: None,
+            captures,
+            reachable_ctes: Vec::new(),
+            blocks: Vec::new(),
+            first: hir::QueryBlockId::new(query, 0),
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: Vec::new(),
+        });
+        document
+    }
+
     fn hir_document_with_index(
         table: &JoinedTable,
         index: Arc<Index>,
@@ -3262,6 +3376,7 @@ mod tests {
             &Schema::new(),
             &AvailableIndexes::default(),
             &CostModelParams::default(),
+            &|_| None,
         )?;
         let [constraint] = constraints.constraints.as_slice() else {
             panic!("scalar IN list becomes one constraint");
@@ -3349,6 +3464,107 @@ mod tests {
     }
 
     #[test]
+    fn hir_in_query_constraint_uses_captures_comparison_and_planned_rows() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let captured = hir::SourceId::new(8);
+        let query = hir::QueryId::new(0);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let expression = hir::Expr::Subquery(hir::SubqueryExpr::In {
+            lhs: Box::new(hir::Expr::column(source, 0)),
+            query,
+            negated: false,
+            comparison: hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity: Affinity::Text,
+                    collation: Some(resolved_collation(CollationSeq::NoCase)),
+                    array: false,
+                }],
+            },
+        });
+        let term = HirWhereTerm {
+            expr: expression.clone(),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let table = table_with_columns(vec![Column::new_default_text(
+            Some("a".into()),
+            "TEXT".into(),
+            None,
+        )]);
+        let params = CostModelParams::default();
+        let row_count = params.rows_per_table_fallback;
+        let document = hir_document_with_query(source, query, Vec::new());
+
+        let constraints = hir_table_constraints_for_source(
+            &document,
+            &from,
+            std::slice::from_ref(&term),
+            source,
+            &table,
+            &Schema::new(),
+            &AvailableIndexes::default(),
+            &params,
+            &|planned_query| {
+                assert_eq!(planned_query, query);
+                Some(row_count * 2.0)
+            },
+        )?;
+        let [constraint] = constraints.constraints.as_slice() else {
+            panic!("uncorrelated scalar IN query becomes one constraint");
+        };
+        assert_eq!(
+            constraint.operator,
+            ConstraintOperator::In {
+                not: false,
+                estimated_values: row_count.sqrt().max(1.0),
+            }
+        );
+        assert_eq!(constraint.comparison_affinity, Some(Affinity::Text));
+        assert_eq!(constraint.comparison_collation, Some(CollationSeq::NoCase));
+        assert_eq!(constraint.lhs_mask.count(), 0);
+
+        let fallback = hir_in_query_constraint_for_term(
+            &document,
+            0,
+            &term,
+            source,
+            &table,
+            &Schema::new(),
+            &params,
+            &|_| None,
+        )?
+        .expect("missing plan estimate uses existing fallback");
+        assert_eq!(
+            fallback.operator,
+            ConstraintOperator::In {
+                not: false,
+                estimated_values: params.in_subquery_rows.min(row_count),
+            }
+        );
+
+        let correlated = hir_document_with_query(source, query, vec![captured]);
+        assert!(hir_in_query_constraint_for_term(
+            &correlated,
+            0,
+            &HirWhereTerm {
+                expr: expression,
+                from_outer_join: None,
+                consumed: false,
+            },
+            source,
+            &table,
+            &Schema::new(),
+            &params,
+            &|_| panic!("correlated query must not request a row estimate"),
+        )?
+        .is_none());
+        Ok(())
+    }
+
+    #[test]
     fn hir_table_constraints_attach_compatible_index_candidates() -> Result<()> {
         let source = hir::SourceId::new(7);
         let from = hir::From {
@@ -3409,6 +3625,7 @@ mod tests {
             &Schema::new(),
             &indexes,
             &CostModelParams::default(),
+            &|_| None,
         )?;
 
         assert_eq!(constraints.table_id, source);
@@ -3503,6 +3720,7 @@ mod tests {
             &Schema::new(),
             &indexes,
             &CostModelParams::default(),
+            &|_| None,
         )?;
 
         let candidate = constraints
@@ -3593,6 +3811,7 @@ mod tests {
             &Schema::new(),
             &indexes,
             &CostModelParams::default(),
+            &|_| None,
         )?;
         assert!(accepted.candidates.iter().any(|candidate| {
             candidate
@@ -3610,6 +3829,7 @@ mod tests {
             &Schema::new(),
             &indexes,
             &CostModelParams::default(),
+            &|_| None,
         )?;
         assert!(!rejected.candidates.iter().any(|candidate| {
             candidate
