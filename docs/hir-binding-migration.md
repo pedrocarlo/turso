@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Whole-block HIR sources and constraints now enter the shared greedy
+  starting-source selector directly. The selector reads frozen source
+  definitions lazily, allocates no compatibility source vector, and applies
+  HIR RIGHT/FULL ordering restrictions before scoring.
 - The HIR plan context now collects constraints for every query-block source
   from the already assembled HIR sources and predicates. Whole-block planning
   no longer needs callers to reconstruct the per-source constraint loop.

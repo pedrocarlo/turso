@@ -261,12 +261,16 @@ mod tests {
     use super::*;
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Schema, Table, Type},
+        stats::AnalyzeStats,
         sync::Arc,
-        translate::semantic::hir::{
-            CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
-            ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
-            JoinConstraint, JoinKind, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
-            SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
+        translate::{
+            optimizer::{cost::RowCountEstimate, join::hir_best_starting_source},
+            semantic::hir::{
+                CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
+                ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
+                JoinConstraint, JoinKind, QueryBlock, QueryBlockBody, QueryBlockId, QueryId,
+                SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
+            },
         },
         vdbe::affinity::Affinity,
     };
@@ -761,12 +765,13 @@ mod tests {
         ));
         assert_eq!(actual_comparison.as_ref(), Some(&comparison));
 
+        let params = CostModelParams::default();
         let constraints = context
             .constraints(
                 block.from.as_ref().expect("test block has FROM"),
                 &input,
                 &Schema::default(),
-                &CostModelParams::default(),
+                &params,
                 &|_| None,
             )
             .expect("whole query block constraints collect");
@@ -774,5 +779,17 @@ mod tests {
         assert_eq!(constraints[0].table_id, left);
         assert_eq!(constraints[1].table_id, right);
         assert!(!constraints[1].constraints.is_empty());
+
+        let base_rows = vec![RowCountEstimate::hardcoded_fallback(&params); 2];
+        let first = hir_best_starting_source(
+            &document,
+            &input.sources,
+            &constraints,
+            &base_rows,
+            &AnalyzeStats::default(),
+            &params,
+        )
+        .expect("HIR join starting source is selected");
+        assert_eq!(first, 0);
     }
 }

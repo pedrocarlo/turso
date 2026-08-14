@@ -8,8 +8,9 @@ use turso_parser::ast::{Operator, TableInternalId};
 use super::{
     access_method::{
         add_where_cost, find_best_access_method_for_join_order, AccessMethod, AccessSource,
+        HirAccessSource,
     },
-    constraints::{usable_constraints_for_lhs_mask, TableConstraints},
+    constraints::{usable_constraints_for_lhs_mask, HirTableConstraints, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
     AvailableIndexes, IndexMethodCandidate,
@@ -37,6 +38,7 @@ use crate::{
             NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
+        semantic::hir::HirDocument,
     },
     LimboError, Result,
 };
@@ -1813,6 +1815,34 @@ fn compute_greedy_join_order<'a>(
         best_plan: current_plan.expect("loop invariant: current_plan always Some"),
         best_ordered_plan: None, // Greedy doesn't track ordered variants
     }))
+}
+
+/// Choose the first source for greedy HIR join planning with the same scoring
+/// and ordering rules used by parser-expression planning.
+pub(crate) fn hir_best_starting_source(
+    document: &HirDocument,
+    sources: &[HirPlannedSource],
+    constraints: &[HirTableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<usize> {
+    let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
+    find_best_starting_source(
+        sources.iter().map(|source| {
+            HirAccessSource::new(
+                source,
+                document
+                    .source(source.internal_id)
+                    .expect("validated HIR contains referenced source"),
+            )
+        }),
+        constraints,
+        base_table_rows,
+        &ordering_restrictions,
+        analyze_stats,
+        params,
+    )
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
