@@ -1,4 +1,4 @@
-use crate::schema::{impl_effective_nulls_order, Table};
+use crate::schema::Table;
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
@@ -27,25 +27,38 @@ use super::{
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
-pub enum ColumnTarget {
+pub enum ColumnTarget<E = *const ast::Expr> {
     Column(usize),
     RowId,
-    /// We know that the ast lives at least as long as the Statement/Program,
-    /// so we store a raw pointer here to avoid cloning yet another ast::Expr
-    Expr(*const ast::Expr),
+    Expr(E),
 }
 
 /// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
 #[derive(Debug, PartialEq, Clone)]
-pub struct ColumnOrder {
-    pub table_id: TableInternalId,
-    pub target: ColumnTarget,
+pub struct ColumnOrder<I = TableInternalId, E = *const ast::Expr> {
+    pub source: I,
+    pub target: ColumnTarget<E>,
     pub order: SortOrder,
     pub collation: CollationSeq,
     pub nulls_order: Option<ast::NullsOrder>,
 }
 
-impl_effective_nulls_order!(ColumnOrder);
+impl<I, E> ColumnOrder<I, E> {
+    pub fn effective_nulls_order_when_iterated(
+        &self,
+        iter_dir: IterationDirection,
+    ) -> ast::NullsOrder {
+        match iter_dir {
+            IterationDirection::Forwards => self.effective_nulls_order(),
+            IterationDirection::Backwards => self.effective_nulls_order().reverse(),
+        }
+    }
+
+    pub fn effective_nulls_order(&self) -> ast::NullsOrder {
+        self.nulls_order
+            .unwrap_or_else(|| ast::NullsOrder::default_for(self.order))
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 /// If an [OrderTarget] is satisfied, then [EliminatesSort] describes which part
@@ -70,10 +83,19 @@ pub enum OrderTargetPurpose {
 /// An [OrderTarget] is considered in join optimization and index selection,
 /// so that if a given join ordering and its access methods satisfy the [OrderTarget],
 /// then the join ordering and its access methods are preferred, all other things being equal.
-pub struct OrderTarget {
-    pub columns: Vec<ColumnOrder>,
+pub struct OrderTarget<I = TableInternalId, E = *const ast::Expr> {
+    pub columns: Vec<ColumnOrder<I, E>>,
     pub purpose: OrderTargetPurpose,
 }
+
+/// Legacy AST expressions live at least as long as their statement/program.
+/// Keep pointers here to avoid cloning another parser expression during the
+/// transition; HIR targets borrow their resolved expressions instead.
+pub type LegacyOrderTarget = OrderTarget<TableInternalId, *const ast::Expr>;
+pub type HirOrderTarget<'a> = OrderTarget<
+    crate::translate::semantic::hir::SourceId,
+    &'a crate::translate::semantic::hir::Expr,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EqualityPrefixScope {
@@ -86,7 +108,7 @@ pub enum EqualityPrefixScope {
     ConstantEquality,
 }
 
-impl OrderTarget {
+impl LegacyOrderTarget {
     /// Build an `OrderTarget` from a list of expressions if they can all be
     /// satisfied by a single-table ordering (needed for index satisfaction).
     fn maybe_from_iterator<'a>(
@@ -273,7 +295,7 @@ pub fn plan_satisfies_order_target(
             .is_some_and(|join_info| join_info.is_outer())
             && order_target.columns[target_col_idx..]
                 .iter()
-                .any(|target_col| target_col.table_id == table_ref.internal_id)
+                .any(|target_col| target_col.source == table_ref.internal_id)
         {
             return false;
         }
@@ -368,7 +390,7 @@ pub fn plan_satisfies_order_target(
                     plan.data[loop_pos + 1..]
                         .iter()
                         .any(|(later_table_index, _)| {
-                            joined_tables[*later_table_index].internal_id == target_col.table_id
+                            joined_tables[*later_table_index].internal_id == target_col.source
                         })
                 });
         if next_term_comes_from_later_loop
@@ -519,7 +541,7 @@ fn build_intrinsic_order(
             break;
         };
         intrinsic.push(ColumnOrder {
-            table_id,
+            source: table_id,
             target: ColumnTarget::Column(col_idx),
             order,
             collation: collation.unwrap_or_else(|| {
@@ -544,7 +566,7 @@ fn match_intrinsic_order(
 ) -> usize {
     let target_len = target.len().min(intrinsic.len());
     for (intrinsic_col, target_col) in intrinsic.iter().zip(target.iter()).take(target_len) {
-        if intrinsic_col.table_id != target_col.table_id
+        if intrinsic_col.source != target_col.source
             || intrinsic_col.target != target_col.target
             || intrinsic_col.collation != target_col.collation
         {
@@ -623,7 +645,7 @@ fn finalized_scan_subquery_order_consumed(
     // Map outer target columns to inner scan columns through result column expressions.
     let mut mapped_target = Vec::with_capacity(target.len());
     for target_col in target {
-        if target_col.table_id != table_id {
+        if target_col.source != table_id {
             return 0;
         }
         let ColumnTarget::Column(result_col_idx) = target_col.target else {
@@ -642,7 +664,7 @@ fn finalized_scan_subquery_order_consumed(
         ) else {
             return 0;
         };
-        if inner_target_col.table_id != joined_table.internal_id
+        if inner_target_col.source != joined_table.internal_id
             || inner_target_col.collation != target_col.collation
         {
             return 0;
@@ -699,7 +721,7 @@ fn expr_to_column_order(
             let table = tables.find_joined_table_by_internal_id(*table_id)?;
             let col = table.columns().get(*column)?;
             return Some(ColumnOrder {
-                table_id: *table_id,
+                source: *table_id,
                 target: ColumnTarget::Column(*column),
                 order,
                 collation: col.collation(),
@@ -715,7 +737,7 @@ fn expr_to_column_order(
             {
                 let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
                 return Some(ColumnOrder {
-                    table_id: *table_id,
+                    source: *table_id,
                     target: ColumnTarget::Column(*column),
                     order,
                     collation,
@@ -725,7 +747,7 @@ fn expr_to_column_order(
         }
         ast::Expr::RowId { table, .. } => {
             return Some(ColumnOrder {
-                table_id: *table,
+                source: *table,
                 target: ColumnTarget::RowId,
                 order,
                 collation: CollationSeq::default(),
@@ -748,7 +770,7 @@ fn expr_to_column_order(
         .find_map(|(i, _)| mask.get(i).then_some(i))?;
     let table_id = tables.joined_tables()[table_no].internal_id;
     Some(ColumnOrder {
-        table_id,
+        source: table_id,
         target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
         collation,
@@ -785,7 +807,7 @@ fn target_matches_order_column(
     idx_col: IndexOrderColumn<'_>,
     table_ref: &JoinedTable,
 ) -> bool {
-    if target_col.table_id != table_ref.internal_id {
+    if target_col.source != table_ref.internal_id {
         return false;
     }
     match (&target_col.target, idx_col.expr) {
@@ -860,7 +882,7 @@ pub(super) fn btree_access_order_consumed(
     match index {
         None => {
             // Without an index, only rowid order is available.
-            if first_target_col.table_id != table_ref.internal_id {
+            if first_target_col.source != table_ref.internal_id {
                 return OrderConsumption::NONE;
             }
             match first_target_col.target {
@@ -997,7 +1019,7 @@ fn index_columns_order_consumed<'a>(
             break;
         };
         let target_col = &target_columns[col_idx];
-        if target_col.table_id != table_ref.internal_id {
+        if target_col.source != table_ref.internal_id {
             break;
         }
         let eq_prefix_usable = constraint_refs.iter().any(|constraint| {
@@ -1065,7 +1087,7 @@ fn index_columns_order_consumed<'a>(
         } else {
             target_col.order == SortOrder::Desc
         };
-        if target_col.table_id == table_ref.internal_id
+        if target_col.source == table_ref.internal_id
             && target_is_rowid(target_col)
             && correct_order
         {
@@ -1077,5 +1099,33 @@ fn index_columns_order_consumed<'a>(
     OrderConsumption {
         consumed: col_idx,
         includes_rowid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::semantic::hir::{Expr, SourceId};
+
+    #[test]
+    fn hir_order_target_borrows_resolved_expression() {
+        let source = SourceId::new(3);
+        let expression = Expr::column(source, 1);
+        let target: HirOrderTarget<'_> = OrderTarget {
+            columns: vec![ColumnOrder {
+                source,
+                target: ColumnTarget::Expr(&expression),
+                order: SortOrder::Asc,
+                collation: CollationSeq::Binary,
+                nulls_order: None,
+            }],
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        };
+
+        let ColumnTarget::Expr(stored) = target.columns[0].target else {
+            panic!("HIR expression target is preserved");
+        };
+        assert!(std::ptr::eq(stored, &expression));
+        assert_eq!(target.columns[0].source, source);
     }
 }

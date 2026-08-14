@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Order-target storage is generic over source identity and expression
+  representation. The legacy planner keeps its existing table IDs and AST
+  pointers, while HIR can borrow resolved expressions keyed by `SourceId`
+  without cloning or converting them back to parser nodes.
 - Base row-count estimation now consumes a physical `Table` instead of a
   parser-era `JoinedTable`. HIR query-block sources therefore receive the same
   ANALYZE statistics and subquery fallbacks before join scoring, without a

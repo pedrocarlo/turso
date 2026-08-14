@@ -3286,7 +3286,7 @@ fn maybe_remove_index_candidate(
     if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
         for col_order in &order_target.columns {
             // Only check columns from this table
-            if col_order.table_id != table_reference.internal_id {
+            if col_order.source != table_reference.internal_id {
                 continue;
             }
 
