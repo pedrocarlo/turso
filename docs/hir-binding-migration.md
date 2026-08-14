@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- The HIR plan context now collects constraints for every query-block source
+  from the already assembled HIR sources and predicates. Whole-block planning
+  no longer needs callers to reconstruct the per-source constraint loop.
 - `IN`-seek access selection now consumes the shared borrowed access-source
   view. HIR supplies its planned source plus frozen definition, so rowid/index
   choice, collation, affinity, covering, and cost rules remain one algorithm.

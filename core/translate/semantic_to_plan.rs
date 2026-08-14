@@ -1,10 +1,14 @@
 //! Adapts resolved semantic sources to planner structures.
 
 use super::{
+    optimizer::{
+        constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        CostModelParams,
+    },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, Operation, PredicateExpr},
-    semantic::hir::{self, ColumnUsage, HirDocument, SourceId},
+    semantic::hir::{self, ColumnUsage, HirDocument, QueryId, SourceId},
 };
-use crate::{LimboError, Result};
+use crate::{schema::Schema, LimboError, Result};
 
 /// Resolved source and predicate input for one query block.
 pub(crate) struct HirQueryBlockPlanInput {
@@ -123,6 +127,33 @@ impl<'a> HirPlanContext<'a> {
         Ok(input)
     }
 
+    /// Collect physical constraints for every source while keeping the source
+    /// and predicate order established by `query_block_input`.
+    pub(crate) fn constraints(
+        &self,
+        from: &hir::From,
+        input: &HirQueryBlockPlanInput,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_rows: &dyn Fn(QueryId) -> Option<f64>,
+    ) -> Result<Vec<HirTableConstraints>> {
+        input
+            .sources
+            .iter()
+            .map(|source| {
+                hir_table_constraints_for_source(
+                    self.document,
+                    from,
+                    &input.predicates,
+                    source,
+                    schema,
+                    params,
+                    query_rows,
+                )
+            })
+            .collect()
+    }
+
     fn register_expression_index_usage(
         &self,
         sources: &mut [HirPlannedSource],
@@ -229,7 +260,7 @@ fn column_usage(source: SourceId, usage: &[ColumnUsage]) -> Result<(ColumnUsedMa
 mod tests {
     use super::*;
     use crate::{
-        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Table, Type},
+        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Schema, Table, Type},
         sync::Arc,
         translate::semantic::hir::{
             CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
@@ -698,7 +729,8 @@ mod tests {
             }],
         });
 
-        let input = HirPlanContext::new(&document)
+        let context = HirPlanContext::new(&document);
+        let input = context
             .query_block_input(&block, &[], &[])
             .expect("query block input converts");
 
@@ -728,5 +760,19 @@ mod tests {
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: right, column: 0 }
         ));
         assert_eq!(actual_comparison.as_ref(), Some(&comparison));
+
+        let constraints = context
+            .constraints(
+                block.from.as_ref().expect("test block has FROM"),
+                &input,
+                &Schema::default(),
+                &CostModelParams::default(),
+                &|_| None,
+            )
+            .expect("whole query block constraints collect");
+        assert_eq!(constraints.len(), 2);
+        assert_eq!(constraints[0].table_id, left);
+        assert_eq!(constraints[1].table_id, right);
+        assert!(!constraints[1].constraints.is_empty());
     }
 }
