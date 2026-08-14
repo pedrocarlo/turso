@@ -1,8 +1,43 @@
 //! Derived dependency summaries for resolved queries.
 
-use rustc_hash::FxHashSet as HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColumnUsage {
+    pub(crate) reference: ColumnRef,
+    pub(crate) count: usize,
+}
+
+#[derive(Default)]
+struct ColumnUsageCollector {
+    counts: HashMap<ColumnRef, usize>,
+}
+
+impl ColumnUsageCollector {
+    fn record(&mut self, reference: ColumnRef) {
+        *self.counts.entry(reference).or_default() += 1;
+    }
+
+    fn into_usage(self) -> Vec<ColumnUsage> {
+        let mut usage = self
+            .counts
+            .into_iter()
+            .map(|(reference, count)| ColumnUsage { reference, count })
+            .collect::<Vec<_>>();
+        usage
+            .sort_unstable_by_key(|usage| (usage.reference.source.index(), usage.reference.column));
+        usage
+    }
+
+    fn into_reads(self) -> Vec<ColumnRef> {
+        self.into_usage()
+            .into_iter()
+            .map(|usage| usage.reference)
+            .collect()
+    }
+}
 
 impl HirDocument {
     /// Recompute the exact external source set read directly by one query.
@@ -69,13 +104,13 @@ impl Query {
         captures
     }
 
-    /// Return every table column read directly by this query. Nested queries
-    /// own their reads and are visited separately by the analyzer.
-    pub(crate) fn direct_column_reads<'source>(
+    /// Count every table column read directly by this query. Nested queries
+    /// own their usage and are visited separately by later phases.
+    pub(crate) fn direct_column_usage<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
-    ) -> Vec<ColumnRef> {
-        let mut reads = HashSet::default();
+    ) -> Vec<ColumnUsage> {
+        let mut reads = ColumnUsageCollector::default();
         for block in &self.blocks {
             if let Some(from) = &block.from {
                 collect_from_column_reads(from, &mut reads, source_by_id);
@@ -109,9 +144,19 @@ impl Query {
             collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
         }
 
-        let mut reads = reads.into_iter().collect::<Vec<_>>();
-        reads.sort_unstable_by_key(|read| (read.source.index(), read.column));
-        reads
+        reads.into_usage()
+    }
+
+    /// Return every table column read directly by this query. Nested queries
+    /// own their reads and are visited separately by the analyzer.
+    pub(crate) fn direct_column_reads<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+    ) -> Vec<ColumnRef> {
+        self.direct_column_usage(source_by_id)
+            .into_iter()
+            .map(|usage| usage.reference)
+            .collect()
     }
 }
 
@@ -122,7 +167,7 @@ impl Update {
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
     ) -> Vec<ColumnRef> {
-        let mut reads = HashSet::default();
+        let mut reads = ColumnUsageCollector::default();
         if let Some(from) = &self.from {
             collect_from_column_reads(from, &mut reads, source_by_id);
         }
@@ -146,9 +191,7 @@ impl Update {
             }
         }
 
-        let mut reads = reads.into_iter().collect::<Vec<_>>();
-        reads.sort_unstable_by_key(|read| (read.source.index(), read.column));
-        reads
+        reads.into_reads()
     }
 }
 
@@ -156,7 +199,7 @@ impl Delete {
     /// Return every table column read directly by the DELETE root. Nested
     /// queries own their reads and are visited separately by the analyzer.
     pub(crate) fn direct_column_reads(&self) -> Vec<ColumnRef> {
-        let mut reads = HashSet::default();
+        let mut reads = ColumnUsageCollector::default();
         collect_optional_expr_column_reads(self.predicate.as_ref(), &mut reads);
         collect_order_column_reads(&self.order_by, &mut reads);
         if let Some(limit) = &self.limit {
@@ -169,15 +212,13 @@ impl Delete {
             }
         }
 
-        let mut reads = reads.into_iter().collect::<Vec<_>>();
-        reads.sort_unstable_by_key(|read| (read.source.index(), read.column));
-        reads
+        reads.into_reads()
     }
 }
 
 fn collect_from_column_reads<'source>(
     from: &From,
-    reads: &mut HashSet<ColumnRef>,
+    reads: &mut ColumnUsageCollector,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     collect_source_argument_column_reads(from.first, reads, source_by_id);
@@ -189,7 +230,7 @@ fn collect_from_column_reads<'source>(
             JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
                 for column in columns {
                     collect_expr_column_reads(&column.left, reads);
-                    reads.insert(column.right);
+                    reads.record(column.right);
                 }
             }
         }
@@ -198,7 +239,7 @@ fn collect_from_column_reads<'source>(
 
 fn collect_source_argument_column_reads<'source>(
     id: SourceId,
-    reads: &mut HashSet<ColumnRef>,
+    reads: &mut ColumnUsageCollector,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     let Some(source) = source_by_id(id) else {
@@ -216,37 +257,37 @@ fn collect_source_argument_column_reads<'source>(
     }
 }
 
-fn collect_expr_column_reads(expression: &Expr, reads: &mut HashSet<ColumnRef>) {
+fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector) {
     expression.walk(&mut |expression| match expression {
         Expr::Column(reference) => {
-            reads.insert(*reference);
+            reads.record(*reference);
         }
         Expr::MergedColumn(column) => {
-            reads.insert(column.right);
+            reads.record(column.right);
         }
         _ => {}
     });
 }
 
-fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut HashSet<ColumnRef>) {
+fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut ColumnUsageCollector) {
     for expression in expressions {
         collect_expr_column_reads(expression, reads);
     }
 }
 
-fn collect_optional_expr_column_reads(expression: Option<&Expr>, reads: &mut HashSet<ColumnRef>) {
+fn collect_optional_expr_column_reads(expression: Option<&Expr>, reads: &mut ColumnUsageCollector) {
     if let Some(expression) = expression {
         collect_expr_column_reads(expression, reads);
     }
 }
 
-fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut HashSet<ColumnRef>) {
+fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut ColumnUsageCollector) {
     for term in terms {
         collect_expr_column_reads(&term.expr, reads);
     }
 }
 
-fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut HashSet<ColumnRef>) {
+fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut ColumnUsageCollector) {
     collect_exprs_column_reads(&window.partition_by, reads);
     collect_order_column_reads(&window.order_by, reads);
     let frame = &window.frame;
@@ -256,7 +297,7 @@ fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut HashSet<Colu
     }
 }
 
-fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut HashSet<ColumnRef>) {
+fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut ColumnUsageCollector) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
         collect_expr_column_reads(expression, reads);
@@ -436,5 +477,123 @@ fn collect_window_bound_references(bound: &WindowFrameBound, references: &mut Ha
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
         collect_expr_references(expression, references);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(filter: Expr, from: Option<From>) -> Query {
+        let query = QueryId::new(0);
+        let block = QueryBlockId::new(query, 0);
+        let mut block_value = QueryBlock::new(
+            block,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: Some(filter),
+                grouping: None,
+            },
+        );
+        block_value.from = from;
+        Query {
+            id: query,
+            parent: None,
+            captures: Vec::new(),
+            reachable_ctes: Vec::new(),
+            blocks: vec![block_value],
+            first: block,
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: Vec::new(),
+        }
+    }
+
+    fn no_source(_: SourceId) -> Option<&'static Source> {
+        None
+    }
+
+    #[test]
+    fn repeated_column_reads_are_counted() {
+        let source = SourceId::new(0);
+        let query = query(
+            Expr::Row(vec![
+                Expr::column(source, 0),
+                Expr::column(source, 0),
+                Expr::column(source, 0),
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            query.direct_column_usage(no_source),
+            vec![ColumnUsage {
+                reference: ColumnRef { source, column: 0 },
+                count: 3,
+            }]
+        );
+        assert_eq!(
+            query.direct_column_reads(no_source),
+            vec![ColumnRef { source, column: 0 }]
+        );
+    }
+
+    #[test]
+    fn join_constraint_reads_are_counted() {
+        let left = SourceId::new(0);
+        let right = SourceId::new(1);
+        let from = From {
+            first: left,
+            joins: vec![Join {
+                right,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::On(Expr::Row(vec![
+                    Expr::column(left, 0),
+                    Expr::column(right, 1),
+                ])),
+            }],
+        };
+        let query = query(Expr::Row(Vec::new()), Some(from));
+
+        assert_eq!(
+            query.direct_column_usage(no_source),
+            vec![
+                ColumnUsage {
+                    reference: ColumnRef {
+                        source: left,
+                        column: 0,
+                    },
+                    count: 1,
+                },
+                ColumnUsage {
+                    reference: ColumnRef {
+                        source: right,
+                        column: 1,
+                    },
+                    count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_query_references_are_not_counted_by_parent() {
+        let source = SourceId::new(0);
+        let query = query(
+            Expr::Row(vec![
+                Expr::column(source, 0),
+                Expr::Subquery(SubqueryExpr::Exists(QueryId::new(1))),
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            query.direct_column_usage(no_source),
+            vec![ColumnUsage {
+                reference: ColumnRef { source, column: 0 },
+                count: 1,
+            }]
+        );
     }
 }
