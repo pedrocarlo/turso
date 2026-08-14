@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Greedy starting-source scoring and directed indexed-seek benefits now consume
+  generic constraints and an exact-size iterator of borrowed source views.
+  HIR can run the same loop without building an adapter vector.
 - Greedy join ordering now consumes the same `JoinOrderingRestrictions` used
   by exhaustive legacy and HIR planning. Starting-source eligibility,
   indexed-seek benefits, and later-source eligibility no longer rebuild a

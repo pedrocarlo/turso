@@ -71,6 +71,16 @@ trait SeekSource {
     fn index_is_covering(&self, index: &Index) -> bool;
 }
 
+impl<T: SeekSource + ?Sized> SeekSource for &T {
+    fn table(&self) -> &Table {
+        (*self).table()
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        (*self).index_is_covering(index)
+    }
+}
+
 impl SeekSource for JoinedTable {
     fn table(&self) -> &Table {
         &self.table
@@ -1707,9 +1717,8 @@ fn compute_greedy_join_order<'a>(
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick the starting table using local filters and directed indexed-seek benefits.
-    let first_idx = find_best_starting_table(
-        num_tables,
-        joined_tables,
+    let first_idx = find_best_starting_source(
+        joined_tables.iter(),
         constraints,
         base_table_rows,
         &ordering_restrictions,
@@ -1863,18 +1872,22 @@ fn compute_greedy_join_order<'a>(
 /// better reached via an index only after a predecessor has been joined.
 ///
 /// Lower score wins. Outer join RHS tables are excluded.
-fn find_best_starting_table(
-    num_tables: usize,
-    joined_tables: &[JoinedTable],
-    constraints: &[TableConstraints],
+fn find_best_starting_source<E, S, I>(
+    sources: I,
+    constraints: &[TableConstraints<E, S>],
     base_table_rows: &[RowCountEstimate],
     ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<usize> {
+) -> Result<usize>
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: SeekSource,
+{
+    let num_sources = constraints.len();
     let multipliers = compute_indexed_seek_benefits(
-        num_tables,
-        joined_tables,
+        sources,
         constraints,
         base_table_rows,
         ordering_restrictions,
@@ -1883,32 +1896,17 @@ fn find_best_starting_table(
     )?;
 
     let mut best: Option<(usize, f64)> = None;
-    for t in 0..num_tables {
-        if ordering_restrictions.required_lhs(t).is_some() {
+    for source in 0..num_sources {
+        if ordering_restrictions.required_lhs(source).is_some() {
             continue; // Outer join RHS - cannot be first
         }
 
-        let base_rows = *base_table_rows[t];
-
-        // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
-        let self_mask = {
-            let mut m = TableMask::default();
-            m.set(t)?;
-            m
-        };
-
-        // Include literal constraints (lhs_mask empty) and self-constraints in selectivity
-        let selectivity: f64 = constraints[t]
-            .constraints
-            .iter()
-            .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
-            .map(|c| c.selectivity)
-            .product();
-
-        let score = base_rows * selectivity * multipliers[t];
+        let score = *base_table_rows[source]
+            * build_self_constraint_selectivity(&constraints[source], source)
+            * multipliers[source];
 
         if best.is_none_or(|(_, s)| score < s) {
-            best = Some((t, score));
+            best = Some((source, score));
         }
     }
 
@@ -1938,24 +1936,30 @@ impl IndexedSeekBenefit {
 /// A table enables a seek on another when its presence in the join prefix allows
 /// the second table to use an indexed seek instead of a scan. The returned
 /// multiplier is lower for better starting choices.
-fn compute_indexed_seek_benefits(
-    num_tables: usize,
-    joined_tables: &[JoinedTable],
-    constraints: &[TableConstraints],
+fn compute_indexed_seek_benefits<E, S, I>(
+    sources: I,
+    constraints: &[TableConstraints<E, S>],
     base_table_rows: &[RowCountEstimate],
     ordering_restrictions: &JoinOrderingRestrictions,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
-) -> Result<Vec<f64>> {
-    let mut benefits = vec![IndexedSeekBenefit::default(); num_tables];
+) -> Result<Vec<f64>>
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: SeekSource,
+{
+    let sources = sources.into_iter();
+    let num_sources = constraints.len();
+    turso_assert_eq!(sources.len(), num_sources);
+    let mut benefits = vec![IndexedSeekBenefit::default(); num_sources];
 
     let mut total_constant_score = 0.0;
-    let mut constant_scores = vec![0.0; num_tables];
+    let mut constant_scores = vec![0.0; num_sources];
     let empty_lhs_mask = TableMask::default();
 
-    for rhs in 0..num_tables {
+    for (rhs, rhs_source) in sources.enumerate() {
         let rhs_constraints = &constraints[rhs];
-        let rhs_table = &joined_tables[rhs];
         let rhs_base_rows = base_table_rows[rhs];
 
         if let Some(deps) = ordering_restrictions.required_lhs(rhs) {
@@ -1969,7 +1973,7 @@ fn compute_indexed_seek_benefits(
                     rhs_constraints,
                     &lhs_mask,
                     rhs,
-                    rhs_table,
+                    &rhs_source,
                     rhs_base_rows,
                     analyze_stats,
                     params,
@@ -2005,7 +2009,7 @@ fn compute_indexed_seek_benefits(
             rhs_constraints,
             &empty_lhs_mask,
             rhs,
-            rhs_table,
+            &rhs_source,
             rhs_base_rows,
             analyze_stats,
             params,
@@ -2013,7 +2017,7 @@ fn compute_indexed_seek_benefits(
         if constant_score > 0.0 {
             total_constant_score += constant_score;
             constant_scores[rhs] = constant_score;
-            benefits[rhs].penalty += constant_score * (num_tables.saturating_sub(1)) as f64;
+            benefits[rhs].penalty += constant_score * (num_sources.saturating_sub(1)) as f64;
         }
 
         for t in potential_predecessors.iter() {
@@ -2026,7 +2030,7 @@ fn compute_indexed_seek_benefits(
                 rhs_constraints,
                 &lhs_mask,
                 rhs,
-                rhs_table,
+                &rhs_source,
                 rhs_base_rows,
                 analyze_stats,
                 params,
@@ -2039,7 +2043,7 @@ fn compute_indexed_seek_benefits(
         }
     }
 
-    for start in 0..num_tables {
+    for start in 0..num_sources {
         benefits[start].reward += total_constant_score - constant_scores[start];
     }
 
@@ -4157,6 +4161,26 @@ mod tests {
         );
         assert_eq!(ast_score, hir_score);
         assert!(ast_score > 0.0);
+
+        let ast_ordering = legacy_join_ordering_restrictions(std::slice::from_ref(&ast_source))?;
+        let hir_ordering = hir_join_ordering_restrictions(std::slice::from_ref(&hir_planned))?;
+        let ast_start = find_best_starting_source(
+            std::iter::once(&ast_source),
+            std::slice::from_ref(&ast_constraints),
+            std::slice::from_ref(&rows),
+            &ast_ordering,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+        let hir_start = find_best_starting_source(
+            std::iter::once(&hir_source),
+            std::slice::from_ref(&hir_constraints),
+            std::slice::from_ref(&rows),
+            &hir_ordering,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+        assert_eq!(ast_start, hir_start);
 
         Ok(())
     }
