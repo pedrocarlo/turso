@@ -1,9 +1,8 @@
-use crate::schema::Index;
+use crate::schema::{Index, Table};
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
-use crate::translate::plan::JoinedTable;
 use turso_parser::ast;
 
 use super::constraints::Constraint;
@@ -96,7 +95,7 @@ pub fn index_leaf_rows_per_page(
 /// Compute `rows_per_leaf_page` for an index on the given table.
 pub fn rows_per_leaf_page_for_index(
     index_column_count: usize,
-    rhs_table: &JoinedTable,
+    rhs_table: &Table,
     rows_per_table_page: f64,
 ) -> f64 {
     let table_column_count = rhs_table.columns().len();
@@ -277,7 +276,7 @@ impl std::ops::Deref for RowCountEstimate {
 /// Uses sqlite_stat1 histogram data for row estimates when available,
 /// otherwise falls through to heuristic selectivity multipliers.
 pub struct AnalyzeCtx<'a> {
-    pub rhs_table: &'a JoinedTable,
+    pub table_name: &'a str,
     pub index: Option<&'a Arc<Index>>,
     pub stats: &'a AnalyzeStats,
 }
@@ -379,9 +378,7 @@ fn estimate_rows_from_analyze_stats(
         return None;
     }
 
-    let table_name = ctx.rhs_table.table.get_name();
-
-    let table_stats = ctx.stats.table_stats(table_name)?;
+    let table_stats = ctx.stats.table_stats(ctx.table_name)?;
     let idx_stats = table_stats.index_stats.get(&index.name)?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {

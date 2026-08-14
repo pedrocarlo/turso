@@ -253,7 +253,7 @@ pub(super) fn choose_best_btree_candidate(
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    rhs_table,
+                    &rhs_table.table,
                     params.rows_per_table_page,
                 ),
             },
@@ -320,7 +320,7 @@ pub(super) fn choose_best_btree_candidate(
             };
 
         let analyze_ctx = AnalyzeCtx {
-            rhs_table,
+            table_name: rhs_table.table.get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
@@ -538,7 +538,7 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    rhs_table,
+                    &rhs_table.table,
                     params.rows_per_table_page,
                 ),
             },
@@ -832,7 +832,7 @@ fn find_best_access_method_for_btree(
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    rhs_table,
+                    &rhs_table.table,
                     params.rows_per_table_page,
                 ),
             },
@@ -844,7 +844,7 @@ fn find_best_access_method_for_btree(
             },
         };
         let analyze_ctx = AnalyzeCtx {
-            rhs_table,
+            table_name: rhs_table.table.get_name(),
             index: best.index.as_ref(),
             stats: analyze_stats,
         };
@@ -916,7 +916,7 @@ fn find_best_access_method_for_btree(
                 covering: true,
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     column_count,
-                    rhs_table,
+                    &rhs_table.table,
                     params.rows_per_table_page,
                 ),
             };

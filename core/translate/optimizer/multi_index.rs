@@ -295,7 +295,7 @@ fn index_info_for_branch(
             column_count: index.columns.len(),
             rows_per_leaf_page: rows_per_leaf_page_for_index(
                 index.columns.len(),
-                rhs_table,
+                &rhs_table.table,
                 rows_per_table_page,
             ),
         }),
@@ -366,7 +366,7 @@ fn choose_multi_index_branch_access(
             )
             .expect("multi-index branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
-                rhs_table,
+                table_name: rhs_table.table.get_name(),
                 index: chosen.index.as_ref(),
                 stats: analyze_stats,
             };
@@ -1153,7 +1153,7 @@ pub fn consider_multi_index_intersection(
             )
             .expect("intersection branches always have costable access");
             let analyze_ctx = AnalyzeCtx {
-                rhs_table,
+                table_name: rhs_table.table.get_name(),
                 index: b.index.as_ref(),
                 stats: analyze_stats,
             };

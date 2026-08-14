@@ -106,6 +106,10 @@ Completed:
 - Filter multipliers, self-filter selectivity, and rows-per-seek costing now
   consume generic constraint records. AST and HIR constraints therefore use
   the same formulas rather than parallel cost implementations.
+- Index seek-benefit costing now consumes a physical table, generic
+  constraints, and a covering-index decision. Index page-width and ANALYZE
+  lookups no longer require `JoinedTable`; the legacy path supplies only a
+  temporary covering-index adapter.
 - Legacy and HIR join planning now share one builder for CROSS and outer-join
   ordering restrictions. Preserved HIR RIGHT JOIN is constrained directly;
   the HIR path does not need the parser-era source swap.

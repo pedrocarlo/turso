@@ -15,7 +15,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
 use crate::{
-    schema::Schema,
+    schema::{Index, Schema, Table},
     stats::AnalyzeStats,
     translate::{
         expr::expr_references_subquery_id,
@@ -1938,7 +1938,8 @@ fn compute_indexed_seek_benefits(
                     rhs_constraints,
                     &lhs_mask,
                     rhs,
-                    rhs_table,
+                    &rhs_table.table,
+                    |index| rhs_table.index_is_covering(index),
                     rhs_base_rows,
                     analyze_stats,
                     params,
@@ -1974,7 +1975,8 @@ fn compute_indexed_seek_benefits(
             rhs_constraints,
             &empty_lhs_mask,
             rhs,
-            rhs_table,
+            &rhs_table.table,
+            |index| rhs_table.index_is_covering(index),
             rhs_base_rows,
             analyze_stats,
             params,
@@ -1995,7 +1997,8 @@ fn compute_indexed_seek_benefits(
                 rhs_constraints,
                 &lhs_mask,
                 rhs,
-                rhs_table,
+                &rhs_table.table,
+                |index| rhs_table.index_is_covering(index),
                 rhs_base_rows,
                 analyze_stats,
                 params,
@@ -2020,11 +2023,12 @@ fn compute_indexed_seek_benefits(
 /// Higher is better, based on estimated row reduction:
 ///
 /// `ln(base_rows / estimated_rows_per_seek)`
-fn get_best_seek_score(
-    rhs_constraints: &TableConstraints,
+fn get_best_seek_score<E, S>(
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs: usize,
-    rhs_table: &JoinedTable,
+    rhs_table: &Table,
+    index_is_covering: impl Fn(&Index) -> bool,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -2044,7 +2048,7 @@ fn get_best_seek_score(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
+                covering: index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
@@ -2060,7 +2064,7 @@ fn get_best_seek_score(
             },
         };
         let analyze_ctx = AnalyzeCtx {
-            rhs_table,
+            table_name: rhs_table.get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
@@ -2294,7 +2298,7 @@ mod tests {
                 access_method::AccessMethodParams,
                 constraints::{
                     constraints_from_where_clause, BinaryExprSide, Constraint, ConstraintOperator,
-                    RangeConstraintRef, TableConstraints,
+                    ConstraintRef, ConstraintUseCandidate, RangeConstraintRef, TableConstraints,
                 },
                 cost_params::DEFAULT_PARAMS,
             },
@@ -3987,7 +3991,23 @@ mod tests {
                 constraint(1, Operator::Greater, 0.2),
                 constraint(2, Operator::Less, 0.3),
             ],
-            candidates: Vec::new(),
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: vec![
+                    ConstraintRef {
+                        constraint_vec_pos: 1,
+                        index_col_pos: 0,
+                        sort_order: ast::SortOrder::Asc,
+                        nulls_order: ast::NullsOrder::First,
+                    },
+                    ConstraintRef {
+                        constraint_vec_pos: 2,
+                        index_col_pos: 0,
+                        sort_order: ast::SortOrder::Asc,
+                        nulls_order: ast::NullsOrder::First,
+                    },
+                ],
+            }],
             temporary_index_terms: SmallVec::new(),
         }
     }
@@ -4061,6 +4081,33 @@ mod tests {
         );
         assert_eq!(ast_rows, hir_rows);
         assert_eq!(ast_rows, 0.2 * 0.3 * 1_000.0);
+
+        let table = Table::BTree(_create_btree_table(
+            "items",
+            _create_column_list(&["value"], Type::Integer),
+        ));
+        let ast_score = get_best_seek_score(
+            &ast_constraints,
+            &TableMask::default(),
+            0,
+            &table,
+            |_| false,
+            rows,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        );
+        let hir_score = get_best_seek_score(
+            &hir_constraints,
+            &TableMask::default(),
+            0,
+            &table,
+            |_| false,
+            rows,
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        );
+        assert_eq!(ast_score, hir_score);
+        assert!(ast_score > 0.0);
 
         Ok(())
     }
@@ -4224,7 +4271,8 @@ mod tests {
             &constraints[1],
             &lhs_mask,
             1,
-            &joined_tables[1],
+            &joined_tables[1].table,
+            |index| joined_tables[1].index_is_covering(index),
             RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
