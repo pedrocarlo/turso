@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- B-tree order matching now shares one source-generic algorithm across legacy
+  and HIR planning. HIR compares computed order terms against frozen resolved
+  index expressions, while preserving the existing equality-prefix,
+  collation, direction, NULL-order, custom-type, and rowid rules without AST
+  conversion or adapter allocation.
 - HIR ORDER BY terms now build planner order targets directly from resolved
   source, output, collation, direction, and NULL-order facts. Output references
   are followed inside the frozen document and computed expressions stay
