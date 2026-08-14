@@ -276,9 +276,9 @@ pub struct ConstraintUseCandidate {
 
 #[derive(Debug)]
 /// A collection of [Constraint]s and their potential [ConstraintUseCandidate]s for a given table.
-pub struct TableConstraints<E = ast::Expr> {
-    /// The internal ID of the [TableReference] that these constraints are for.
-    pub table_id: TableInternalId,
+pub struct TableConstraints<E = ast::Expr, S = TableInternalId> {
+    /// Identity of the source these constraints apply to.
+    pub table_id: S,
     /// The constraints for the table, i.e. any [WhereTerm]s that reference columns from this table.
     pub constraints: Vec<Constraint<E>>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
@@ -288,14 +288,14 @@ pub struct TableConstraints<E = ast::Expr> {
 }
 
 pub(crate) type HirConstraint = Constraint<hir::Expr>;
-pub(crate) type HirTableConstraints = TableConstraints<hir::Expr>;
+pub(crate) type HirTableConstraints = TableConstraints<hir::Expr, hir::SourceId>;
 
 /// Build the search terms for an automatic index.
 ///
 /// Terms for the same table column use the same index column.
-pub(super) fn automatic_index_terms<E>(
+pub(super) fn automatic_index_terms<E, S>(
     table: &JoinedTable,
-    constraints: &TableConstraints<E>,
+    constraints: &TableConstraints<E, S>,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
     let is_strict = table.table.is_strict();
@@ -2238,13 +2238,14 @@ mod tests {
             null_matching: false,
         };
         let table_constraints = HirTableConstraints {
-            table_id: TableInternalId::default(),
+            table_id: hir::SourceId::new(7),
             constraints: vec![constraint],
             candidates: Vec::new(),
             temporary_index_terms: SmallVec::new(),
         };
 
         assert!(table_constraints.constraints[0].satisfies_index_affinity(Affinity::Integer));
+        assert_eq!(table_constraints.table_id, hir::SourceId::new(7));
         let key_columns = ordered_ephemeral_key_columns(&[&table_constraints.constraints[0]]);
         assert_eq!(key_columns.as_slice(), [2]);
     }
