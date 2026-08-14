@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- `IN`-seek access selection now consumes the shared borrowed access-source
+  view. HIR supplies its planned source plus frozen definition, so rowid/index
+  choice, collation, affinity, covering, and cost rules remain one algorithm.
 - Greedy starting-source scoring and directed indexed-seek benefits now consume
   generic constraints and an exact-size iterator of borrowed source views.
   HIR can run the same loop without building an adapter vector.

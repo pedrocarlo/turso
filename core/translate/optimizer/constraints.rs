@@ -3308,9 +3308,18 @@ mod tests {
             temporary_index_terms: SmallVec::new(),
         };
         let params = CostModelParams::default();
+        let table = rowid_table();
+        let planned = hir_planned_source(source, &table);
+        let document = empty_hir_document(source);
+        let access_source = crate::translate::optimizer::access_method::HirAccessSource::new(
+            &planned,
+            document
+                .source(source)
+                .expect("test document contains HIR source"),
+        );
 
         let chosen = crate::translate::optimizer::access_method::choose_best_in_seek_candidate(
-            &rowid_table(),
+            &access_source,
             &constraints,
             &TableMask::default(),
             1.0,

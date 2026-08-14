@@ -6,7 +6,9 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Operator, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    access_method::{
+        add_where_cost, find_best_access_method_for_join_order, AccessMethod, AccessSource,
+    },
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -15,7 +17,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
 use crate::{
-    schema::{Index, Schema, Table},
+    schema::Schema,
     stats::AnalyzeStats,
     translate::{
         expr::expr_references_subquery_id,
@@ -35,7 +37,6 @@ use crate::{
             NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, TableMask},
-        semantic::hir,
     },
     LimboError, Result,
 };
@@ -65,55 +66,6 @@ impl<'a> JoinPlanningContext<'a> {
 // Upper bound on rowids to materialize for a hash build input.
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
-
-trait SeekSource {
-    fn table(&self) -> &Table;
-    fn index_is_covering(&self, index: &Index) -> bool;
-}
-
-impl<T: SeekSource + ?Sized> SeekSource for &T {
-    fn table(&self) -> &Table {
-        (*self).table()
-    }
-
-    fn index_is_covering(&self, index: &Index) -> bool {
-        (*self).index_is_covering(index)
-    }
-}
-
-impl SeekSource for JoinedTable {
-    fn table(&self) -> &Table {
-        &self.table
-    }
-
-    fn index_is_covering(&self, index: &Index) -> bool {
-        JoinedTable::index_is_covering(self, index)
-    }
-}
-
-pub(crate) struct HirSeekSource<'a> {
-    planned: &'a HirPlannedSource,
-    definition: &'a hir::Source,
-}
-
-impl<'a> HirSeekSource<'a> {
-    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
-        Self {
-            planned,
-            definition,
-        }
-    }
-}
-
-impl SeekSource for HirSeekSource<'_> {
-    fn table(&self) -> &Table {
-        &self.planned.table
-    }
-
-    fn index_is_covering(&self, index: &Index) -> bool {
-        self.planned.index_is_covering(self.definition, index)
-    }
-}
 
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
@@ -1883,7 +1835,7 @@ fn find_best_starting_source<E, S, I>(
 where
     I: IntoIterator,
     I::IntoIter: ExactSizeIterator,
-    I::Item: SeekSource,
+    I::Item: AccessSource,
 {
     let num_sources = constraints.len();
     let multipliers = compute_indexed_seek_benefits(
@@ -1947,7 +1899,7 @@ fn compute_indexed_seek_benefits<E, S, I>(
 where
     I: IntoIterator,
     I::IntoIter: ExactSizeIterator,
-    I::Item: SeekSource,
+    I::Item: AccessSource,
 {
     let sources = sources.into_iter();
     let num_sources = constraints.len();
@@ -2059,7 +2011,7 @@ fn get_best_seek_score<E, S>(
     rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs: usize,
-    rhs_source: &impl SeekSource,
+    rhs_source: &impl AccessSource,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -2327,7 +2279,7 @@ mod tests {
         stats::AnalyzeStats,
         translate::{
             optimizer::{
-                access_method::AccessMethodParams,
+                access_method::{AccessMethodParams, HirAccessSource},
                 constraints::{
                     constraints_from_where_clause, BinaryExprSide, Constraint, ConstraintOperator,
                     ConstraintRef, ConstraintUseCandidate, RangeConstraintRef, TableConstraints,
@@ -4140,7 +4092,7 @@ mod tests {
         let hir_id = SourceId::new(0);
         let hir_planned = _create_hir_source(table, None, hir_id);
         let hir_definition = _create_hir_definition("items", hir_id);
-        let hir_source = HirSeekSource::new(&hir_planned, &hir_definition);
+        let hir_source = HirAccessSource::new(&hir_planned, &hir_definition);
         let ast_score = get_best_seek_score(
             &ast_constraints,
             &TableMask::default(),

@@ -18,9 +18,10 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, HirPlannedSource,
+    NonFromClauseSubquery, Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
+use crate::translate::semantic::hir;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -50,6 +51,55 @@ use super::{
     AvailableIndexes,
 };
 use crate::translate::planner::TableMask;
+
+pub(super) trait AccessSource {
+    fn table(&self) -> &Table;
+    fn index_is_covering(&self, index: &Index) -> bool;
+}
+
+impl<T: AccessSource + ?Sized> AccessSource for &T {
+    fn table(&self) -> &Table {
+        (*self).table()
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        (*self).index_is_covering(index)
+    }
+}
+
+impl AccessSource for JoinedTable {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        JoinedTable::index_is_covering(self, index)
+    }
+}
+
+pub(crate) struct HirAccessSource<'a> {
+    planned: &'a HirPlannedSource,
+    definition: &'a hir::Source,
+}
+
+impl<'a> HirAccessSource<'a> {
+    pub(crate) fn new(planned: &'a HirPlannedSource, definition: &'a hir::Source) -> Self {
+        Self {
+            planned,
+            definition,
+        }
+    }
+}
+
+impl AccessSource for HirAccessSource<'_> {
+    fn table(&self) -> &Table {
+        &self.planned.table
+    }
+
+    fn index_is_covering(&self, index: &Index) -> bool {
+        self.planned.index_is_covering(self.definition, index)
+    }
+}
 
 #[derive(Debug, Clone)]
 /// Represents a way to access a table.
@@ -504,7 +554,7 @@ fn consume_partial_index_predicate_terms(
 /// can drive `InSeek`, and the comparison collation must match the chosen
 /// index's first-key collation.
 pub(super) fn choose_best_in_seek_candidate<E, S>(
-    rhs_table: &JoinedTable,
+    rhs_source: &impl AccessSource,
     rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     input_cardinality: f64,
@@ -513,7 +563,8 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
     best_cost: Cost,
     read_mode: BranchReadMode,
 ) -> Result<Option<ChosenInSeekCandidate>> {
-    let Table::BTree(btree) = &rhs_table.table else {
+    let rhs_table = rhs_source.table();
+    let Table::BTree(btree) = rhs_table else {
         return Err(LimboError::InternalError(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
@@ -534,11 +585,11 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rowid_only || rhs_table.index_is_covering(index),
+                covering: rowid_only || rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    &rhs_table.table,
+                    rhs_table,
                     params.rows_per_table_page,
                 ),
             },
@@ -577,13 +628,13 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
             // IN cursor. Reject mismatches here so a BINARY `IN` comparison
             // cannot silently become `NOCASE`/`RTRIM` just because the index is.
             if let (Some(index), Some(col_pos)) = (&candidate.index, constraint.table_col_pos) {
-                let constrained_column = &rhs_table.table.columns()[col_pos];
+                let constrained_column = &rhs_table.columns()[col_pos];
                 let table_collation = constrained_column.collation();
                 let index_collation = index.columns[0].collation.unwrap_or_default();
                 if table_collation != index_collation {
                     continue;
                 }
-                let idx_aff = constrained_column.affinity_with_strict(rhs_table.table.is_strict());
+                let idx_aff = constrained_column.affinity_with_strict(rhs_table.is_strict());
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
