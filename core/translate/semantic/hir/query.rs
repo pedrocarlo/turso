@@ -137,6 +137,38 @@ impl From {
             .position(|join| join.right == source)
             .map(|position| position + 1)
     }
+
+    /// Whether an outer join can supply NULLs for this source's columns.
+    ///
+    /// LEFT affects its right source, RIGHT affects every source already on
+    /// its left, and FULL affects both sides.
+    pub(crate) fn outer_join_may_null_extend(&self, source: SourceId) -> bool {
+        let Some(source_position) = self.source_position(source) else {
+            return false;
+        };
+        self.joins.iter().enumerate().any(|(join_position, join)| {
+            let right_position = join_position + 1;
+            match join.kind {
+                JoinKind::Left => source_position == right_position,
+                JoinKind::Right => source_position < right_position,
+                JoinKind::Full => source_position <= right_position,
+                JoinKind::Comma | JoinKind::Inner | JoinKind::Cross => false,
+            }
+        })
+    }
+
+    /// Whether a FULL JOIN can supply NULLs for this source's columns.
+    ///
+    /// This is separate because FULL JOIN emits unmatched rows without
+    /// re-checking constraints consumed by the source scan.
+    pub(crate) fn full_join_may_null_extend(&self, source: SourceId) -> bool {
+        let Some(source_position) = self.source_position(source) else {
+            return false;
+        };
+        self.joins.iter().enumerate().any(|(join_position, join)| {
+            join.kind == JoinKind::Full && source_position <= join_position + 1
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -383,4 +415,67 @@ pub struct RecursiveOrderTerm {
 pub struct RecursiveArm {
     pub operator: CompoundOperator,
     pub query: QueryId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_with_joins(kinds: &[JoinKind]) -> From {
+        From {
+            first: SourceId::new(0),
+            joins: kinds
+                .iter()
+                .enumerate()
+                .map(|(position, kind)| Join {
+                    right: SourceId::new(position + 1),
+                    kind: *kind,
+                    constraint: JoinConstraint::None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn left_join_null_extends_only_its_right_source() {
+        let from = from_with_joins(&[JoinKind::Left, JoinKind::Inner]);
+
+        assert!(!from.outer_join_may_null_extend(SourceId::new(0)));
+        assert!(from.outer_join_may_null_extend(SourceId::new(1)));
+        assert!(!from.outer_join_may_null_extend(SourceId::new(2)));
+        assert!(!from.full_join_may_null_extend(SourceId::new(1)));
+    }
+
+    #[test]
+    fn right_join_null_extends_sources_to_its_left() {
+        let from = from_with_joins(&[JoinKind::Right]);
+
+        assert!(from.outer_join_may_null_extend(SourceId::new(0)));
+        assert!(!from.outer_join_may_null_extend(SourceId::new(1)));
+        assert!(!from.full_join_may_null_extend(SourceId::new(0)));
+    }
+
+    #[test]
+    fn full_join_null_extends_both_sides_but_not_later_sources() {
+        let from = from_with_joins(&[JoinKind::Full, JoinKind::Inner]);
+
+        assert!(from.outer_join_may_null_extend(SourceId::new(0)));
+        assert!(from.outer_join_may_null_extend(SourceId::new(1)));
+        assert!(!from.outer_join_may_null_extend(SourceId::new(2)));
+        assert!(from.full_join_may_null_extend(SourceId::new(0)));
+        assert!(from.full_join_may_null_extend(SourceId::new(1)));
+        assert!(!from.full_join_may_null_extend(SourceId::new(2)));
+    }
+
+    #[test]
+    fn later_full_join_null_extends_every_source_already_present() {
+        let from = from_with_joins(&[JoinKind::Inner, JoinKind::Full]);
+
+        for source in 0..=2 {
+            assert!(from.outer_join_may_null_extend(SourceId::new(source)));
+            assert!(from.full_join_may_null_extend(SourceId::new(source)));
+        }
+        assert!(!from.outer_join_may_null_extend(SourceId::new(3)));
+        assert!(!from.full_join_may_null_extend(SourceId::new(3)));
+    }
 }
