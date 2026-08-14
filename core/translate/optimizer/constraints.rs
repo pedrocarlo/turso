@@ -510,6 +510,141 @@ pub(crate) fn hir_binary_constraints_for_source(
     Ok(constraints)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hir_table_constraints_for_source(
+    document: &hir::HirDocument,
+    from: &hir::From,
+    where_clause: &[HirWhereTerm],
+    source: hir::SourceId,
+    table: &JoinedTable,
+    schema: &Schema,
+    indexes: &AvailableIndexes,
+    params: &CostModelParams,
+) -> Result<HirTableConstraints> {
+    let constraints = hir_binary_constraints_for_source(
+        document,
+        from,
+        where_clause,
+        source,
+        table,
+        schema,
+        indexes,
+        params,
+    )?;
+    let mut table_constraints = HirTableConstraints {
+        table_id: source,
+        constraints,
+        candidates: indexes
+            .indexes_for_table(table.internal_id)
+            .into_iter()
+            .flat_map(|indexes| indexes.iter())
+            .filter(|index| {
+                index.index_method.is_none()
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|column| column.expr.is_none())
+            })
+            .map(|index| ConstraintUseCandidate {
+                index: Some(index.clone()),
+                refs: Vec::new(),
+            })
+            .collect(),
+        temporary_index_terms: SmallVec::new(),
+    };
+    table_constraints.candidates.push(ConstraintUseCandidate {
+        index: None,
+        refs: Vec::new(),
+    });
+
+    let rowid_alias_column = table.columns().iter().position(Column::is_rowid_alias);
+    for (constraint_position, constraint) in table_constraints.constraints.iter_mut().enumerate() {
+        if !constraint.usable {
+            continue;
+        }
+        let constrained_column = constraint
+            .table_col_pos
+            .and_then(|position| table.columns().get(position));
+        if matches!(
+            (constraint.comparison_collation, constrained_column),
+            (Some(comparison), Some(column)) if comparison != column.collation()
+        ) {
+            constraint.usable = false;
+            continue;
+        }
+
+        if constraint.is_rowid
+            || rowid_alias_column.is_some_and(|position| constraint.table_col_pos == Some(position))
+        {
+            table_constraints
+                .candidates
+                .iter_mut()
+                .find(|candidate| candidate.index.is_none())
+                .expect("HIR table constraints contain a rowid candidate")
+                .refs
+                .push(ConstraintRef {
+                    constraint_vec_pos: constraint_position,
+                    index_col_pos: 0,
+                    sort_order: SortOrder::Asc,
+                    nulls_order: ast::NullsOrder::First,
+                });
+        }
+
+        let Some(table_column_position) = constraint.table_col_pos else {
+            continue;
+        };
+        for candidate in table_constraints
+            .candidates
+            .iter_mut()
+            .filter(|candidate| candidate.index.is_some())
+        {
+            let index = candidate.index.as_ref().expect("candidate has an index");
+            let Some(index_column_position) =
+                index.column_table_pos_to_index_pos(table_column_position)
+            else {
+                continue;
+            };
+            let constrained_column = &table.columns()[table_column_position];
+            let index_column = &index.columns[index_column_position];
+            if constrained_column.collation() != index_column.collation.unwrap_or_default() {
+                continue;
+            }
+            if schema
+                .get_type_def(&constrained_column.ty_str, table.table.is_strict())
+                .is_some()
+                && constraint.operator != ast::Operator::Equals.into()
+            {
+                continue;
+            }
+            if !constraint.satisfies_index_affinity(
+                constrained_column.affinity_with_strict(table.table.is_strict()),
+            ) {
+                continue;
+            }
+            candidate.refs.push(ConstraintRef {
+                constraint_vec_pos: constraint_position,
+                index_col_pos: index_column_position,
+                sort_order: index_column.order,
+                nulls_order: index_column.effective_nulls_order(),
+            });
+        }
+    }
+
+    for candidate in &mut table_constraints.candidates {
+        candidate
+            .refs
+            .sort_by_key(|reference| reference.index_col_pos);
+    }
+    table_constraints.temporary_index_terms = automatic_index_terms(table, &table_constraints)
+        .into_iter()
+        .filter(|reference| {
+            !matches!(
+                table_constraints.constraints[reference.constraint_vec_pos].comparison_collation,
+                Some(CollationSeq::Custom(_))
+            )
+        })
+        .collect();
+    Ok(table_constraints)
+}
+
 /// Build the search terms for an automatic index.
 ///
 /// Terms for the same table column use the same index column.
@@ -2531,6 +2666,15 @@ mod tests {
         }
     }
 
+    fn resolved_collation(value: CollationSeq) -> hir::ResolvedCollation {
+        hir::ResolvedCollation::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(0),
+            None,
+            Arc::new(value),
+        )
+    }
+
     #[test]
     fn hir_constraints_use_shared_index_rules() {
         let constraint = HirConstraint {
@@ -2635,12 +2779,7 @@ mod tests {
                 ast::Operator::Is,
                 hir::Expr::column(left_source, 0),
                 Affinity::Integer,
-                Some(hir::ResolvedCollation::new(
-                    hir::CatalogObjectId::new(1),
-                    hir::CatalogSnapshot::from_id(0),
-                    None,
-                    Arc::new(CollationSeq::NoCase),
-                )),
+                Some(resolved_collation(CollationSeq::NoCase)),
             ),
             from_outer_join: None,
             consumed: false,
@@ -2721,6 +2860,90 @@ mod tests {
         assert_eq!(constraints[1].table_col_pos, Some(1));
         assert_eq!(constraints[2].operator, ast::Operator::Greater.into());
         assert_eq!(constraints[2].table_col_pos, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_table_constraints_attach_compatible_index_candidates() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let compatible = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 0),
+                ast::Operator::Equals,
+                hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let incompatible = HirWhereTerm {
+            expr: hir_comparison_with_collation(
+                hir::Expr::column(source, 0),
+                ast::Operator::Equals,
+                hir::Expr::Literal(ast::Literal::Numeric("2".into())),
+                Affinity::Integer,
+                Some(resolved_collation(CollationSeq::NoCase)),
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let table = table_with_columns(vec![Column::new_default_integer(
+            Some("a".into()),
+            "INTEGER".into(),
+            None,
+        )]);
+        let index = Arc::new(Index {
+            name: "items_a".into(),
+            table_name: "items".into(),
+            root_page: 2,
+            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            unique: false,
+            ephemeral: false,
+            has_rowid: true,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let mut indexes = AvailableIndexes::default();
+        indexes.insert_for_table_name(
+            std::slice::from_ref(&table),
+            "items",
+            VecDeque::from([index.clone()]),
+        );
+
+        let constraints = hir_table_constraints_for_source(
+            &empty_hir_document(source),
+            &from,
+            &[compatible, incompatible],
+            source,
+            &table,
+            &Schema::new(),
+            &indexes,
+            &CostModelParams::default(),
+        )?;
+
+        assert_eq!(constraints.table_id, source);
+        assert!(constraints.constraints[0].usable);
+        assert!(!constraints.constraints[1].usable);
+        let index_candidate = constraints
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .index
+                    .as_ref()
+                    .is_some_and(|value| Arc::ptr_eq(value, &index))
+            })
+            .expect("ordinary index remains a candidate");
+        assert_eq!(index_candidate.refs.len(), 1);
+        assert_eq!(index_candidate.refs[0].constraint_vec_pos, 0);
+        assert_eq!(index_candidate.refs[0].index_col_pos, 0);
+        assert_eq!(constraints.temporary_index_terms.len(), 1);
+        assert_eq!(constraints.temporary_index_terms[0].constraint_vec_pos, 0);
         Ok(())
     }
 }
