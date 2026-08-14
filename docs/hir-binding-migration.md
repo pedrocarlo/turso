@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Query-block planning input now comes directly from HIR. It preserves lexical
+  source order and exact join kinds, splits resolved ON and WHERE conjunctions,
+  and builds USING/NATURAL equality predicates from frozen column references
+  and comparison rules without resolver, `TableReferences`, or parser-expression
+  conversion.
 - HIR planned sources retain `SourceId`, resolved index hints, HIR expressions,
   and string join names. Their construction no longer depends on
   `ProgramBuilder`, planner table-ID allocation, or parser index-hint nodes.

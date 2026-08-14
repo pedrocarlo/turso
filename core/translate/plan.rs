@@ -1281,7 +1281,7 @@ impl<N> JoinInfo<N> {
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct PlannedSource<I, H, E, N> {
+pub struct PlannedSource<I, H, E, J> {
     /// The operation that this source performs.
     pub op: Operation,
     /// Table object, which contains metadata about the table, e.g. columns.
@@ -1291,7 +1291,7 @@ pub struct PlannedSource<I, H, E, N> {
     /// Identity used by expressions and planner metadata.
     pub internal_id: I,
     /// Join info when this source is the right side of a join.
-    pub join_info: Option<JoinInfo<N>>,
+    pub join_info: Option<J>,
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
@@ -1316,19 +1316,25 @@ pub struct PlannedSource<I, H, E, N> {
 }
 
 /// Source used by the parser-expression planning path.
-pub type JoinedTable = PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name>;
+pub type JoinedTable =
+    PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>>;
 
-pub(crate) type HirJoinInfo = JoinInfo<String>;
+/// Resolved join metadata used by HIR planning without rewriting RIGHT JOIN.
+#[derive(Debug, Clone)]
+pub(crate) struct HirJoinInfo {
+    pub(crate) kind: crate::translate::semantic::hir::JoinKind,
+    pub(crate) using: Vec<String>,
+}
 
 /// Source used by HIR planning without parser expressions or planner IDs.
 pub(crate) type HirPlannedSource = PlannedSource<
     crate::translate::semantic::hir::SourceId,
     crate::translate::semantic::hir::IndexHint,
     crate::translate::semantic::hir::Expr,
-    String,
+    HirJoinInfo,
 >;
 
-impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name> {
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>> {
     pub fn using_dedup_hidden_cols(&self) -> Result<ColumnMask> {
         let Some(join_info) = self.join_info.as_ref() else {
             return Ok(ColumnMask::default());
@@ -2600,7 +2606,7 @@ fn query_output_columns(
     Ok(columns)
 }
 
-impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, ast::Name> {
+impl PlannedSource<TableInternalId, Option<ast::Indexed>, ast::Expr, JoinInfo<ast::Name>> {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match &self.table {
