@@ -8,7 +8,10 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::{as_binary_components, expr_data_type, get_expr_affinity, StorageClassMask},
+        expr::{
+            as_binary_components, expr_data_type, get_expr_affinity, unwrap_parens,
+            StorageClassMask,
+        },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -188,45 +191,106 @@ pub struct GroupBy {
     pub having: Option<Vec<ast::Expr>>,
 }
 
-/// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
-/// This is done so that we can evaluate the conditions at the correct loop depth.
-/// We also need to keep track of whether the condition came from an OUTER JOIN. Take this example:
-/// SELECT * FROM users u LEFT JOIN products p ON u.id = 5.
-/// Even though the condition only refers to 'u', we CANNOT evaluate it at the users loop, because we need to emit NULL
-/// values for the columns of 'p', for EVERY row in 'u', instead of completely skipping any rows in 'u' where the condition is false.
+/// One WHERE or JOIN condition tracked by the planner so it can be evaluated
+/// at the correct loop depth.
 #[derive(Debug, Clone)]
-pub struct WhereTerm {
+pub struct PredicateTerm<E, S> {
     /// The original condition expression.
-    pub expr: ast::Expr,
-    /// For normal JOIN conditions (ON or WHERE clauses), we break them up into individual [WhereTerm] conditions
-    /// and let the optimizer determine when each should be evaluated based on the tables they reference.
-    /// See e.g. [EvalAt].
-    /// For example, in "SELECT * FROM x JOIN y WHERE x.a = 2", we want to evaluate x.a = 2 right after opening x
-    /// since it only depends on x.
+    pub expr: E,
+    /// The outer-join source that must be open before this condition runs.
     ///
-    /// However, OUTER JOIN conditions require special handling. Consider:
-    ///   SELECT * FROM t LEFT JOIN s ON t.a = 2
-    ///
-    /// Even though t.a = 2 only references t, we cannot evaluate it during t's loop and skip rows where t.a != 2.
-    /// Instead, we must:
-    /// 1. Process ALL rows from t
-    /// 2. For each t row where t.a != 2, emit NULL values for s's columns
-    /// 3. For each t row where t.a = 2, emit the actual s values
-    ///
-    /// This means the condition must be evaluated during s's loop, regardless of which tables it references.
-    /// We track this requirement using [WhereTerm::from_outer_join], which contains the [TableInternalId] of the
-    /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
-    /// is set, we force evaluation to happen during that table's loop.
-    pub from_outer_join: Option<TableInternalId>,
-    /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
-    /// in the normal place where WHERE terms are evaluated.
-    /// A term may have been consumed e.g. if:
-    /// - it has been converted into a constraint in a seek key
-    /// - it has been removed due to being trivially true or false
+    /// A condition on the left side of an outer join cannot run early even
+    /// when it only reads that side: doing so would skip the null-extended
+    /// result that the join must produce.
+    pub from_outer_join: Option<S>,
+    /// Whether the optimizer already incorporated this condition elsewhere.
     pub consumed: bool,
 }
 
-impl WhereTerm {
+/// Predicate term used by the existing parser-expression planning path.
+pub type WhereTerm = PredicateTerm<ast::Expr, TableInternalId>;
+
+/// Predicate term used by HIR planning without parser expressions or planner IDs.
+pub(crate) type HirWhereTerm =
+    PredicateTerm<crate::translate::semantic::hir::Expr, crate::translate::semantic::hir::SourceId>;
+
+/// Expression behavior needed to split predicates for planning.
+pub(crate) trait PredicateExpr: Clone {
+    fn ungrouped(&self) -> &Self {
+        self
+    }
+
+    fn and_operands(&self) -> Option<(&Self, &Self)>;
+
+    fn append_conjuncts<T>(&self, output: &mut Vec<T>)
+    where
+        Self: Sized,
+        T: From<Self>,
+    {
+        let expression = self.ungrouped();
+        if let Some((lhs, rhs)) = expression.and_operands() {
+            lhs.append_conjuncts(output);
+            rhs.append_conjuncts(output);
+        } else {
+            output.push(expression.clone().into());
+        }
+    }
+}
+
+impl PredicateExpr for ast::Expr {
+    fn ungrouped(&self) -> &Self {
+        unwrap_parens(self).unwrap_or(self)
+    }
+
+    fn and_operands(&self) -> Option<(&Self, &Self)> {
+        let Self::Binary(lhs, ast::Operator::And, rhs) = self else {
+            return None;
+        };
+        Some((lhs, rhs))
+    }
+}
+
+impl PredicateExpr for crate::translate::semantic::hir::Expr {
+    fn and_operands(&self) -> Option<(&Self, &Self)> {
+        let Self::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some((lhs, rhs))
+    }
+}
+
+impl From<ast::Expr> for PredicateTerm<ast::Expr, TableInternalId> {
+    fn from(expr: ast::Expr) -> Self {
+        Self {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
+impl From<crate::translate::semantic::hir::Expr>
+    for PredicateTerm<
+        crate::translate::semantic::hir::Expr,
+        crate::translate::semantic::hir::SourceId,
+    >
+{
+    fn from(expr: crate::translate::semantic::hir::Expr) -> Self {
+        Self {
+            expr,
+            from_outer_join: None,
+            consumed: false,
+        }
+    }
+}
+
+impl PredicateTerm<ast::Expr, TableInternalId> {
     pub fn should_eval_before_loop(
         &self,
         join_order: &[JoinOrderMember],
@@ -265,16 +329,6 @@ impl WhereTerm {
         table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
         determine_where_to_eval_term(self, join_order, subqueries, table_references)
-    }
-}
-
-impl From<Expr> for WhereTerm {
-    fn from(value: Expr) -> Self {
-        Self {
-            expr: value,
-            from_outer_join: None,
-            consumed: false,
-        }
     }
 }
 
@@ -3931,6 +3985,44 @@ mod tests {
     };
 
     type TestResult = std::result::Result<(), alloc::TryReserveError>;
+
+    fn hir_integer(value: i64) -> crate::translate::semantic::hir::Expr {
+        crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value.to_string()))
+    }
+
+    fn hir_and(
+        lhs: crate::translate::semantic::hir::Expr,
+        rhs: crate::translate::semantic::hir::Expr,
+    ) -> crate::translate::semantic::hir::Expr {
+        crate::translate::semantic::hir::Expr::Binary {
+            lhs: Box::new(lhs),
+            operator: ast::Operator::And,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        }
+    }
+
+    #[test]
+    fn hir_predicates_split_without_ast_conversion() {
+        let expression = hir_and(hir_integer(1), hir_and(hir_integer(2), hir_integer(3)));
+        let mut terms: Vec<HirWhereTerm> = Vec::new();
+
+        expression.append_conjuncts(&mut terms);
+
+        let values = terms
+            .iter()
+            .map(|term| match &term.expr {
+                crate::translate::semantic::hir::Expr::Literal(ast::Literal::Numeric(value)) => {
+                    value.as_str()
+                }
+                _ => panic!("conjunct remains an HIR numeric literal"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["1", "2", "3"]);
+        assert!(terms.iter().all(|term| term.from_outer_join.is_none()));
+    }
 
     #[test]
     fn test_column_used_mask_empty() -> TestResult {
