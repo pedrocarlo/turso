@@ -83,6 +83,27 @@ impl HirDocument {
     }
 }
 
+impl Expr {
+    /// Return distinct column positions when this expression reads exactly
+    /// one source. Output definitions and nested queries remain separate work.
+    pub(crate) fn single_source_column_usage(&self) -> Option<(SourceId, Vec<usize>)> {
+        let mut reads = ColumnUsageCollector::default();
+        collect_expr_column_reads(self, &mut reads);
+        let usage = reads.into_usage();
+        let source = usage.first()?.reference.source;
+        if usage.iter().any(|usage| usage.reference.source != source) {
+            return None;
+        }
+        Some((
+            source,
+            usage
+                .into_iter()
+                .map(|usage| usage.reference.column)
+                .collect(),
+        ))
+    }
+}
+
 impl Query {
     /// Derive the external sources read directly by this query from resolved
     /// HIR. Nested queries own their own capture summaries.
@@ -569,6 +590,28 @@ mod tests {
         assert_eq!(
             query.direct_column_reads(no_source),
             vec![ColumnRef { source, column: 0 }]
+        );
+    }
+
+    #[test]
+    fn expression_usage_requires_exactly_one_source() {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let single_source = Expr::Row(vec![
+            Expr::column(first, 1),
+            Expr::column(first, 0),
+            Expr::column(first, 1),
+        ]);
+        assert_eq!(
+            single_source.single_source_column_usage(),
+            Some((first, vec![0, 1]))
+        );
+
+        let multiple_sources = Expr::Row(vec![Expr::column(first, 0), Expr::column(second, 0)]);
+        assert_eq!(multiple_sources.single_source_column_usage(), None);
+        assert_eq!(
+            Expr::Literal(turso_parser::ast::Literal::Null).single_source_column_usage(),
+            None
         );
     }
 

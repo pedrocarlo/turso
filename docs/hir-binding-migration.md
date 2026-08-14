@@ -105,7 +105,9 @@ Completed:
 
 - Covering-index required-column rules are shared by legacy and HIR planned
   sources. HIR expression-key matching reads frozen resolved index expressions;
-  parser-expression matching remains only as a temporary legacy wrapper.
+  output, grouping, HAVING, and ORDER BY usage is registered directly from
+  resolved source and column identities. Parser-expression matching remains
+  only as a temporary legacy wrapper.
 - Filter multipliers, self-filter selectivity, and rows-per-seek costing now
   consume generic constraint records. AST and HIR constraints therefore use
   the same formulas rather than parallel cost implementations.

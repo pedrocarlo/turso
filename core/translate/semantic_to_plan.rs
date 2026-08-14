@@ -43,6 +43,7 @@ impl<'a> HirPlanContext<'a> {
     pub(crate) fn query_block_input(
         &self,
         block: &hir::QueryBlock,
+        order_by: &[hir::OrderTerm],
         usage: &[ColumnUsage],
     ) -> Result<HirQueryBlockPlanInput> {
         let mut input = HirQueryBlockPlanInput {
@@ -100,7 +101,58 @@ impl<'a> HirPlanContext<'a> {
             append_predicates(&mut input.predicates, filter, None);
         }
 
+        for output in &block.outputs {
+            self.register_expression_index_usage(&mut input.sources, &output.expr)?;
+        }
+        if let hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } = &block.body
+        {
+            for key in &grouping.keys {
+                self.register_expression_index_usage(&mut input.sources, key)?;
+            }
+            if let Some(having) = &grouping.having {
+                self.register_expression_index_usage(&mut input.sources, having)?;
+            }
+        }
+        for term in order_by {
+            self.register_expression_index_usage(&mut input.sources, &term.expr)?;
+        }
+
         Ok(input)
+    }
+
+    fn register_expression_index_usage(
+        &self,
+        sources: &mut [HirPlannedSource],
+        expression: &hir::Expr,
+    ) -> Result<()> {
+        let Some((source, columns)) = expression.single_source_column_usage() else {
+            return Ok(());
+        };
+        let Some(planned) = sources
+            .iter_mut()
+            .find(|planned| planned.internal_id == source)
+        else {
+            // Outer-query reads are planned by their owning query.
+            return Ok(());
+        };
+        let has_expression_key = self
+            .definition(source)
+            .index_expressions
+            .iter()
+            .any(|index| index.columns.iter().any(Option::is_some));
+        if !has_expression_key {
+            return Ok(());
+        }
+
+        let mut columns_mask = ColumnUsedMask::default();
+        for column in columns {
+            columns_mask.set(column)?;
+        }
+        planned.register_expression_index_usage(expression.clone(), columns_mask);
+        Ok(())
     }
 }
 
@@ -179,7 +231,6 @@ mod tests {
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Table, Type},
         sync::Arc,
-        translate::plan::ExpressionIndexUsage,
         translate::semantic::hir::{
             CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
             ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -455,15 +506,46 @@ mod tests {
                 count: 1,
             },
         ];
-        let mut planned =
-            planned_source_from_definition(&source, None, &usage).expect("table source converts");
-        let mut columns_mask = ColumnUsedMask::default();
-        columns_mask.set(0).expect("column mask grows");
-        columns_mask.set(1).expect("column mask grows");
-        planned.expression_index_usages.push(ExpressionIndexUsage {
-            normalized_expr: Box::new(indexed_expression),
-            columns_mask,
+        let block_id = QueryBlockId::new(QueryId::new(0), 0);
+        let mut block = QueryBlock::new(
+            block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: source.id,
+            joins: Vec::new(),
         });
+        block.outputs.push(hir::Output {
+            id: hir::OutputId::query(block_id, 0),
+            name: "sum".to_string(),
+            expr: indexed_expression.clone(),
+            type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
+            schema_affinity: Affinity::Integer,
+            has_affinity: true,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        });
+        let order_by = [hir::OrderTerm {
+            expr: indexed_expression,
+            order: turso_parser::ast::SortOrder::Asc,
+            nulls: None,
+            type_fact: TypeFact::known(Type::Integer),
+            collation: None,
+        }];
+        let document = document(vec![source.clone()]);
+        let input = HirPlanContext::new(&document)
+            .query_block_input(&block, &order_by, &usage)
+            .expect("query block input converts");
+        let mut planned = input.sources.into_iter().next().expect("source is planned");
+
+        // Output and ORDER BY use the same expression, so registration deduplicates them.
+        assert_eq!(planned.expression_index_usages.len(), 1);
 
         assert!(planned.index_is_covering(&source, index.value()));
 
@@ -528,7 +610,7 @@ mod tests {
         });
 
         let input = HirPlanContext::new(&document)
-            .query_block_input(&block, &[])
+            .query_block_input(&block, &[], &[])
             .expect("query block input converts");
 
         assert_eq!(
@@ -617,7 +699,7 @@ mod tests {
         });
 
         let input = HirPlanContext::new(&document)
-            .query_block_input(&block, &[])
+            .query_block_input(&block, &[], &[])
             .expect("query block input converts");
 
         assert_eq!(

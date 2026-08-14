@@ -1466,6 +1466,27 @@ impl
         HirJoinInfo,
     >
 {
+    pub(crate) fn register_expression_index_usage(
+        &mut self,
+        expression: crate::translate::semantic::hir::Expr,
+        columns_mask: ColumnUsedMask,
+    ) {
+        if columns_mask.is_empty() {
+            return;
+        }
+        if self
+            .expression_index_usages
+            .iter()
+            .any(|usage| usage.normalized_expr.equivalent_for_index(&expression))
+        {
+            return;
+        }
+        self.expression_index_usages.push(ExpressionIndexUsage {
+            normalized_expr: Box::new(expression),
+            columns_mask,
+        });
+    }
+
     pub(crate) fn index_is_covering(
         &self,
         source: &crate::translate::semantic::hir::Source,
