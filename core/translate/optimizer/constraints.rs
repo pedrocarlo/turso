@@ -94,6 +94,12 @@ pub struct Constraint<E = ast::Expr> {
     /// not yet plumb per-column affinity into the index-selection path, so
     /// such constraints fall through to scans).
     pub comparison_affinity: Option<Affinity>,
+    /// Comparison collation already chosen by semantic analysis.
+    ///
+    /// HIR constraints carry this directly. Legacy AST constraints leave it
+    /// empty and keep their current expression lookup until that path is
+    /// removed.
+    pub comparison_collation: Option<CollationSeq>,
     /// Whether this constraint's seek key can be NULL and still match rows.
     /// True only for `IS` whose constraining value is not known to be
     /// non-NULL. `a IS 5` gets false: a literal 5 is never NULL, so the
@@ -307,6 +313,7 @@ pub(crate) struct HirBinaryConstraintPart<'a> {
     pub(crate) side: BinaryExprSide,
     pub(crate) constraining_expr: &'a hir::Expr,
     pub(crate) comparison_affinity: Option<Affinity>,
+    pub(crate) comparison_collation: Option<CollationSeq>,
 }
 
 /// Read every resolved comparison target for one HIR source.
@@ -344,10 +351,11 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
         _ => None,
     };
 
-    let affinity = comparison
-        .components
-        .first()
-        .map(|component| component.affinity);
+    let component = comparison.components.first();
+    let affinity = component.map(|component| component.affinity);
+    let collation = component
+        .and_then(|component| component.collation.as_ref())
+        .map(|collation| *collation.value());
     let operator = ConstraintOperator::from(*operator);
 
     if let Some(target) = target(lhs) {
@@ -357,6 +365,7 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
             side: BinaryExprSide::Rhs,
             constraining_expr: rhs,
             comparison_affinity: affinity,
+            comparison_collation: collation,
         });
     }
     if let Some(target) = target(rhs) {
@@ -366,6 +375,7 @@ pub(crate) fn hir_binary_constraint_parts<'a>(
             side: BinaryExprSide::Lhs,
             constraining_expr: lhs,
             comparison_affinity: affinity,
+            comparison_collation: collation,
         });
     }
     parts
@@ -464,6 +474,7 @@ fn hir_binary_constraints_for_term(
             usable,
             is_rowid: part.target.is_rowid,
             comparison_affinity: part.comparison_affinity,
+            comparison_collation: part.comparison_collation,
             null_matching,
         });
     }
@@ -866,6 +877,7 @@ pub fn constraints_from_where_clause(
                                 usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: null_matching(rhs),
                             });
                         }
@@ -897,6 +909,7 @@ pub fn constraints_from_where_clause(
                                 usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: null_matching(rhs),
                             });
                         }
@@ -937,6 +950,7 @@ pub fn constraints_from_where_clause(
                             usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            comparison_collation: None,
                             null_matching: null_matching(rhs),
                         });
                     }
@@ -966,6 +980,7 @@ pub fn constraints_from_where_clause(
                                 usable,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: null_matching(lhs),
                             });
                         }
@@ -997,6 +1012,7 @@ pub fn constraints_from_where_clause(
                                 usable,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: null_matching(lhs),
                             });
                         }
@@ -1037,6 +1053,7 @@ pub fn constraints_from_where_clause(
                             usable,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            comparison_collation: None,
                             null_matching: null_matching(lhs),
                         });
                     }
@@ -1091,6 +1108,7 @@ pub fn constraints_from_where_clause(
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             is_rowid,
                             comparison_affinity: cmp_aff,
+                            comparison_collation: None,
                             null_matching: false,
                         });
                     }
@@ -1109,6 +1127,7 @@ pub fn constraints_from_where_clause(
                             usable: false,
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
+                            comparison_collation: None,
                             null_matching: false,
                         });
                     }
@@ -1188,6 +1207,7 @@ pub fn constraints_from_where_clause(
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: false,
                             });
                         }
@@ -1206,6 +1226,7 @@ pub fn constraints_from_where_clause(
                                 usable: false,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                comparison_collation: None,
                                 null_matching: false,
                             });
                         }
@@ -2303,6 +2324,7 @@ pub(crate) fn analyze_binary_term_for_index(
         usable: true,
         is_rowid,
         comparison_affinity: Some(affinity),
+        comparison_collation: None,
         null_matching,
     };
 
@@ -2483,6 +2505,16 @@ mod tests {
         rhs: hir::Expr,
         affinity: Affinity,
     ) -> hir::Expr {
+        hir_comparison_with_collation(lhs, operator, rhs, affinity, None)
+    }
+
+    fn hir_comparison_with_collation(
+        lhs: hir::Expr,
+        operator: ast::Operator,
+        rhs: hir::Expr,
+        affinity: Affinity,
+        collation: Option<hir::ResolvedCollation>,
+    ) -> hir::Expr {
         hir::Expr::Binary {
             lhs: Box::new(lhs),
             operator,
@@ -2492,7 +2524,7 @@ mod tests {
             comparison: Some(hir::ComparisonSemantics {
                 components: vec![hir::ComparisonComponent {
                     affinity,
-                    collation: None,
+                    collation,
                     array: false,
                 }],
             }),
@@ -2512,6 +2544,7 @@ mod tests {
             usable: true,
             is_rowid: false,
             comparison_affinity: Some(Affinity::Integer),
+            comparison_collation: None,
             null_matching: false,
         };
         let table_constraints = HirTableConstraints {
@@ -2597,11 +2630,17 @@ mod tests {
             }],
         };
         let term = HirWhereTerm {
-            expr: hir_comparison(
+            expr: hir_comparison_with_collation(
                 hir::Expr::rowid(source),
                 ast::Operator::Is,
                 hir::Expr::column(left_source, 0),
                 Affinity::Integer,
+                Some(hir::ResolvedCollation::new(
+                    hir::CatalogObjectId::new(1),
+                    hir::CatalogSnapshot::from_id(0),
+                    None,
+                    Arc::new(CollationSeq::NoCase),
+                )),
             ),
             from_outer_join: None,
             consumed: false,
@@ -2628,6 +2667,7 @@ mod tests {
         assert!(constraint.lhs_mask.get(0));
         assert!(!constraint.lhs_mask.get(1));
         assert_eq!(constraint.comparison_affinity, Some(Affinity::Integer));
+        assert_eq!(constraint.comparison_collation, Some(CollationSeq::NoCase));
         Ok(())
     }
 
