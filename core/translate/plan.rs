@@ -191,19 +191,44 @@ pub struct GroupBy {
     pub having: Option<Vec<ast::Expr>>,
 }
 
-/// One WHERE or JOIN condition tracked by the planner so it can be evaluated
-/// at the correct loop depth.
+/// In a query plan, WHERE and JOIN conditions are split into predicate terms
+/// so each condition can run at the correct loop depth.
+///
+/// Outer joins require the originating join source to be retained. For:
+///
+/// `SELECT * FROM users u LEFT JOIN products p ON u.id = 5`
+///
+/// `u.id = 5` cannot run in the `users` loop and skip rows. Every `users` row
+/// must reach the join so `products` can be NULL-extended when the condition
+/// is false.
 #[derive(Debug, Clone)]
 pub struct PredicateTerm<E, S> {
     /// The original condition expression.
     pub expr: E,
-    /// The outer-join source that must be open before this condition runs.
+
+    /// For ordinary conditions, the optimizer chooses the earliest loop
+    /// containing every referenced source.
     ///
-    /// A condition on the left side of an outer join cannot run early even
-    /// when it only reads that side: doing so would skip the null-extended
-    /// result that the join must produce.
+    /// Outer-join conditions cannot always run at that earliest loop. For:
+    ///
+    /// `SELECT * FROM t LEFT JOIN s ON t.a = 2`
+    ///
+    /// the engine must:
+    ///
+    /// 1. Process every row from `t`.
+    /// 2. Emit NULL values for `s` when `t.a != 2`.
+    /// 3. Emit the matching `s` values when `t.a = 2`.
+    ///
+    /// This field forces evaluation at the outer join's source loop. `S` is
+    /// `TableInternalId` for the legacy path and `SourceId` for HIR.
     pub from_outer_join: Option<S>,
+
     /// Whether the optimizer already incorporated this condition elsewhere.
+    ///
+    /// A term may be consumed because:
+    ///
+    /// - it became a seek constraint;
+    /// - it was proven trivially true or false.
     pub consumed: bool,
 }
 
