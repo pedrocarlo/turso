@@ -2,27 +2,37 @@
 
 use super::{
     optimizer::{
-        CostModelParams, HirBtreeOperation, apply_hir_selected_btree_access,
-        constraints::{HirTableConstraints, hir_table_constraints_for_source},
-        cost::Cost,
+        apply_hir_selected_btree_access,
+        constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        cost::{estimate_cost_for_scan_or_seek, Cost, RowCountEstimate},
         hir_base_row_estimates,
         join::compute_hir_greedy_btree_join_order,
         order::{
             ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
             OrderTargetPurpose,
         },
+        CostModelParams, HirBtreeOperation,
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
-use crate::{LimboError, Result, schema::Schema, sync::Arc};
+use crate::{schema::Schema, sync::Arc, LimboError, Result};
+use rustc_hash::FxHashSet as HashSet;
 
 /// Planned form of one resolved query. The semantic document stays alive so
 /// source and output identities remain resolvable without copying definitions.
 pub(crate) struct HirQueryPlan {
     pub(crate) document: Arc<HirDocument>,
     pub(crate) query: QueryId,
+    pub(crate) queries: Vec<HirPlannedQuery>,
+}
+
+/// Access plans and estimates for one query in the owned HIR document.
+pub(crate) struct HirPlannedQuery {
+    pub(crate) query: QueryId,
     pub(crate) blocks: Vec<HirQueryBlockPlan>,
+    pub(crate) output_cardinality: f64,
+    pub(crate) cost: Cost,
 }
 
 impl HirQueryPlan {
@@ -33,12 +43,24 @@ impl HirQueryPlan {
         schema: &Schema,
         params: &CostModelParams,
     ) -> Result<Self> {
-        let blocks = HirPlanContext::new(&document).plan_query(query, schema, params)?;
+        let mut queries = Vec::new();
+        HirPlanContext::new(&document).plan_query_tree(
+            query,
+            schema,
+            params,
+            &mut queries,
+            &mut HashSet::default(),
+        )?;
+        queries.sort_unstable_by_key(|plan| plan.query.index());
         Ok(Self {
             document,
             query,
-            blocks,
+            queries,
         })
+    }
+
+    fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
+        self.queries.iter().find(|plan| plan.query == query)
     }
 }
 
@@ -62,7 +84,19 @@ pub(crate) struct HirQueryBlockPlan {
 pub(crate) struct HirPlannedLoop {
     pub(crate) source: SourceId,
     pub(crate) source_position: usize,
-    pub(crate) access: HirBtreeOperation,
+    pub(crate) access: HirSourceAccess,
+}
+
+/// Selected access for one resolved HIR source.
+pub(crate) enum HirSourceAccess {
+    BTree(HirBtreeOperation),
+    Derived { query: QueryId },
+}
+
+#[derive(Clone, Copy)]
+struct HirQueryEstimate {
+    output_cardinality: f64,
+    cost: Cost,
 }
 
 /// State shared while one HIR document is converted into plan nodes.
@@ -81,32 +115,81 @@ impl<'a> HirPlanContext<'a> {
             .expect("validated HIR contains referenced source")
     }
 
-    /// Plan every block in one resolved query. A compound query's ORDER BY
-    /// applies after its arms are combined, so it is not an access-order target
-    /// for any individual arm.
-    fn plan_query(
+    /// Plan derived-query dependencies before their owning query so source
+    /// scans can use the child's output and work estimates.
+    fn plan_query_tree(
         &self,
         query_id: QueryId,
         schema: &Schema,
         params: &CostModelParams,
-    ) -> Result<Vec<HirQueryBlockPlan>> {
+        planned: &mut Vec<HirPlannedQuery>,
+        active: &mut HashSet<QueryId>,
+    ) -> Result<HirQueryEstimate> {
+        if let Some(plan) = planned.iter().find(|plan| plan.query == query_id) {
+            return Ok(HirQueryEstimate {
+                output_cardinality: plan.output_cardinality,
+                cost: plan.cost,
+            });
+        }
+        if !active.insert(query_id) {
+            return Err(LimboError::InternalError(format!(
+                "derived HIR query dependency cycle at {query_id}"
+            )));
+        }
+
         let query = self
             .document
             .query(query_id)
             .expect("validated HIR query exists");
+        let mut dependencies = Vec::new();
+        for block in &query.blocks {
+            let Some(from) = &block.from else {
+                continue;
+            };
+            for source in
+                core::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
+            {
+                if let hir::SourceKind::Derived(dependency) = &self.definition(source).kind {
+                    dependencies.push(*dependency);
+                }
+            }
+        }
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        for dependency in dependencies {
+            self.plan_query_tree(dependency, schema, params, planned, active)?;
+        }
+
         let block_order_by = query
             .compounds
             .is_empty()
             .then_some(query.order_by.as_slice())
             .unwrap_or_default();
-        let query_rows = |_| None;
-        query
+        let query_estimate = |query| {
+            planned
+                .iter()
+                .find(|plan| plan.query == query)
+                .map(|plan| HirQueryEstimate {
+                    output_cardinality: plan.output_cardinality,
+                    cost: plan.cost,
+                })
+        };
+        let blocks = query
             .blocks
             .iter()
             .map(|block| {
-                self.plan_query_block(block, block_order_by, 1.0, schema, params, &query_rows)
+                self.plan_query_block(block, block_order_by, 1.0, schema, params, &query_estimate)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let estimate = query_estimate_from_blocks(query, &blocks, params);
+        planned.push(HirPlannedQuery {
+            query: query_id,
+            blocks,
+            output_cardinality: estimate.output_cardinality,
+            cost: estimate.cost,
+        });
+        active.remove(&query_id);
+        Ok(estimate)
     }
 
     /// Build planner source metadata without resolving names, allocating a
@@ -224,35 +307,71 @@ impl<'a> HirPlanContext<'a> {
 
     /// Plan one resolved query block without exposing mutable planner input.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn plan_query_block(
+    fn plan_query_block(
         &self,
         block: &hir::QueryBlock,
         order_by: &[hir::OrderTerm],
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
-        query_rows: &dyn Fn(QueryId) -> Option<f64>,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirQueryBlockPlan> {
         let query = self
             .document
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
         let usage = query.direct_column_usage(|source| self.document.source(source));
-        let input = self.query_block_input(block, order_by, &usage)?;
         let Some(from) = &block.from else {
+            let input = self.query_block_input(block, order_by, &usage)?;
+            let output_cardinality = match &block.body {
+                hir::QueryBlockBody::Values { rows } => initial_cardinality * rows.len() as f64,
+                hir::QueryBlockBody::Select { .. } => initial_cardinality,
+            };
             return Ok(HirQueryBlockPlan {
                 block: block.id,
                 loops: Vec::new(),
                 predicates: input.predicates,
-                output_cardinality: initial_cardinality,
+                output_cardinality,
                 cost: Cost(0.0),
             });
         };
+
+        if from.joins.is_empty() {
+            if let hir::SourceKind::Derived(query) = &self.definition(from.first).kind {
+                let mut predicates = Vec::new();
+                if let hir::QueryBlockBody::Select {
+                    filter: Some(filter),
+                    ..
+                } = &block.body
+                {
+                    append_predicates(&mut predicates, filter, None);
+                }
+                return self.plan_derived_scan(
+                    block.id,
+                    from.first,
+                    *query,
+                    predicates,
+                    initial_cardinality,
+                    params,
+                    query_estimate,
+                );
+            }
+        }
+        if core::iter::once(from.first)
+            .chain(from.joins.iter().map(|join| join.right))
+            .any(|source| !matches!(self.definition(source).kind, hir::SourceKind::Table(_)))
+        {
+            return Err(LimboError::InternalError(
+                "mixed HIR source planning is not implemented".to_string(),
+            ));
+        }
+
+        let input = self.query_block_input(block, order_by, &usage)?;
         let order_target = self.order_target(
             order_by,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         );
+        let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
         self.plan_btree_access(
             block.id,
             from,
@@ -261,12 +380,55 @@ impl<'a> HirPlanContext<'a> {
             initial_cardinality,
             schema,
             params,
-            query_rows,
+            &query_rows,
         )?
         .ok_or_else(|| {
             LimboError::InternalError(
                 "query block with FROM produced no B-tree access plan".to_string(),
             )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_derived_scan(
+        &self,
+        block: QueryBlockId,
+        source: SourceId,
+        query: QueryId,
+        predicates: Vec<HirWhereTerm>,
+        initial_cardinality: f64,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirQueryBlockPlan> {
+        let child = query_estimate(query).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "derived HIR source {source} references unplanned query {query}"
+            ))
+        })?;
+        let child_rows = child.output_cardinality.max(1.0);
+        let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
+            None,
+            &[],
+            &[],
+            initial_cardinality,
+            RowCountEstimate::AnalyzeStats(child_rows),
+            false,
+            params,
+            None,
+        );
+        let reexecution_cost =
+            Cost((initial_cardinality - 1.0).max(0.0) * child_rows * params.cpu_cost_per_seek);
+
+        Ok(HirQueryBlockPlan {
+            block,
+            loops: vec![HirPlannedLoop {
+                source,
+                source_position: 0,
+                access: HirSourceAccess::Derived { query },
+            }],
+            predicates,
+            output_cardinality: initial_cardinality * child_rows,
+            cost: scan_cost + reexecution_cost + Cost(initial_cardinality * child.cost.0),
         })
     }
 
@@ -320,7 +482,7 @@ impl<'a> HirPlanContext<'a> {
             loops.push(HirPlannedLoop {
                 source: input.sources[source_position].internal_id,
                 source_position,
-                access,
+                access: HirSourceAccess::BTree(access),
             });
             prior_sources.set(source_position)?;
         }
@@ -415,6 +577,37 @@ impl<'a> HirPlanContext<'a> {
         }
         planned.register_expression_index_usage(expression.clone(), columns_mask);
         Ok(())
+    }
+}
+
+fn query_estimate_from_blocks(
+    query: &hir::Query,
+    blocks: &[HirQueryBlockPlan],
+    params: &CostModelParams,
+) -> HirQueryEstimate {
+    let fallback = *RowCountEstimate::hardcoded_fallback(params);
+    let block_rows = |block| {
+        blocks
+            .iter()
+            .find(|plan| plan.block == block)
+            .map_or(fallback, |plan| plan.output_cardinality)
+    };
+    let mut output_cardinality = block_rows(query.first);
+    for arm in &query.compounds {
+        let rhs = block_rows(arm.block);
+        output_cardinality = match arm.operator {
+            turso_parser::ast::CompoundOperator::Union
+            | turso_parser::ast::CompoundOperator::UnionAll => output_cardinality + rhs,
+            turso_parser::ast::CompoundOperator::Except => output_cardinality,
+            turso_parser::ast::CompoundOperator::Intersect => output_cardinality.min(rhs),
+        };
+    }
+
+    HirQueryEstimate {
+        output_cardinality,
+        cost: blocks
+            .iter()
+            .fold(Cost(0.0), |cost, block| cost + block.cost),
     }
 }
 
@@ -1138,7 +1331,10 @@ mod tests {
             .expect("HIR query planning succeeds");
         assert!(Arc::ptr_eq(&query_plan.document, &document));
         assert_eq!(query_plan.query, query_id);
-        let [plan] = query_plan.blocks.as_slice() else {
+        let planned_query = query_plan
+            .planned_query(query_id)
+            .expect("root query is planned");
+        let [plan] = planned_query.blocks.as_slice() else {
             panic!("ordinary SELECT has one planned block");
         };
         assert_eq!(plan.block, block.id);
@@ -1151,10 +1347,10 @@ mod tests {
         assert_eq!(left_loop.source_position, 0);
         assert_eq!(right_loop.source, right);
         assert_eq!(right_loop.source_position, 1);
-        let HirBtreeOperation::Seek {
+        let HirSourceAccess::BTree(HirBtreeOperation::Seek {
             index: Some(index),
             seek_def,
-        } = &right_loop.access
+        }) = &right_loop.access
         else {
             panic!("right source uses its selected automatic-index seek");
         };
@@ -1235,12 +1431,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&plan.document, &document));
         assert_eq!(plan.query, block.id.query);
-        assert_eq!(plan.blocks.len(), 1);
-        assert_eq!(plan.blocks[0].block, block.id);
-        assert!(plan.blocks[0].loops.is_empty());
-        assert!(plan.blocks[0].predicates.is_empty());
-        assert_eq!(plan.blocks[0].output_cardinality, 1.0);
-        assert_eq!(plan.blocks[0].cost, Cost(0.0));
+        let query = plan
+            .planned_query(block.id.query)
+            .expect("root query is planned");
+        assert_eq!(query.blocks.len(), 1);
+        assert_eq!(query.blocks[0].block, block.id);
+        assert!(query.blocks[0].loops.is_empty());
+        assert!(query.blocks[0].predicates.is_empty());
+        assert_eq!(query.blocks[0].output_cardinality, 1.0);
+        assert_eq!(query.blocks[0].cost, Cost(0.0));
     }
 
     #[test]
@@ -1288,15 +1487,122 @@ mod tests {
         )
         .expect("compound query arms plan from HIR");
 
+        let planned_query = plan.planned_query(query_id).expect("root query is planned");
         assert_eq!(
-            plan.blocks
+            planned_query
+                .blocks
                 .iter()
                 .map(|block| block.block)
                 .collect::<Vec<_>>(),
             [first_id, second_id]
         );
+        assert_eq!(planned_query.output_cardinality, 2.0);
         let query = plan.document.query(query_id).expect("query remains owned");
         assert_eq!(query.compounds.len(), 1);
         assert_eq!(query.order_by.len(), 1);
+    }
+
+    #[test]
+    fn owned_hir_query_plan_plans_derived_query_before_its_scan() {
+        let root_query = QueryId::new(0);
+        let child_query = QueryId::new(1);
+        let root_block_id = QueryBlockId::new(root_query, 0);
+        let child_block_id = QueryBlockId::new(child_query, 0);
+        let source_id = SourceId::new(0);
+
+        let mut root_block = QueryBlock::new(
+            root_block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        root_block.from = Some(hir::From {
+            first: source_id,
+            joins: Vec::new(),
+        });
+        let mut child_block = QueryBlock::new(
+            child_block_id,
+            QueryBlockBody::Values {
+                rows: vec![
+                    vec![hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                        "1".into(),
+                    ))],
+                    vec![hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                        "2".into(),
+                    ))],
+                ],
+            },
+        );
+        child_block.outputs.push(Output {
+            id: OutputId::query(child_block_id, 0),
+            name: "column1".to_string(),
+            expr: hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into())),
+            type_fact: TypeFact::known(Type::Integer),
+            affinity: Affinity::Integer,
+            schema_affinity: Affinity::Integer,
+            has_affinity: false,
+            collation: None,
+            collation_is_explicit: false,
+            name_kind: hir::OutputNameKind::Inferred,
+        });
+        let query = |id, parent, block: QueryBlock| {
+            let output = block.outputs.iter().map(|output| output.id).collect();
+            Query {
+                id,
+                parent,
+                captures: Vec::new(),
+                reachable_ctes: Vec::new(),
+                first: block.id,
+                blocks: vec![block],
+                compounds: Vec::new(),
+                order_by: Vec::new(),
+                limit: None,
+                output,
+            }
+        };
+        let mut derived_source = source();
+        derived_source.id = source_id;
+        derived_source.owner = SourceOwner::QueryBlock(root_block_id);
+        derived_source.database = None;
+        derived_source.kind = SourceKind::Derived(child_query);
+        derived_source.columns.truncate(1);
+        derived_source.generated_expressions.truncate(1);
+        derived_source.default_expressions.truncate(1);
+        derived_source.column_type_programs.truncate(1);
+        let mut document = document(vec![derived_source]);
+        document.root = hir::HirRoot::Query(QueryRoot { query: root_query });
+        document.queries = vec![
+            query(root_query, None, root_block),
+            query(child_query, Some(root_query), child_block),
+        ];
+        document.validate().expect("derived query HIR is valid");
+        let plan = HirQueryPlan::build(
+            Arc::new(document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("derived query plans from HIR");
+
+        let child = plan
+            .planned_query(child_query)
+            .expect("child query is planned");
+        assert_eq!(child.output_cardinality, 2.0);
+        let root = plan
+            .planned_query(root_query)
+            .expect("root query is planned");
+        assert_eq!(root.output_cardinality, 2.0);
+        let [source_loop] = root.blocks[0].loops.as_slice() else {
+            panic!("derived source produces one scan loop");
+        };
+        assert_eq!(source_loop.source, source_id);
+        assert_eq!(source_loop.source_position, 0);
+        assert!(matches!(
+            source_loop.access,
+            HirSourceAccess::Derived { query } if query == child_query
+        ));
+        assert!(root.cost.0 > child.cost.0);
     }
 }

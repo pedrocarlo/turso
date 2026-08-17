@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Derived `FROM` sources now retain their child `QueryId` in the final source
+  loop. Query planning visits the child first, then uses its output cardinality
+  and cost with the existing coroutine-scan formula; no legacy
+  `FromClauseSubquery`, AST conversion, resolver, or `TableReferences` enters
+  this path.
 - Compound SELECT arms now receive HIR access plans while their final ORDER BY
   remains query-level. Operators, arm IDs, ordering, and limits stay in the
   owned semantic document instead of being copied into another query shape.
