@@ -7,12 +7,12 @@ use turso_parser::ast::{Operator, TableInternalId};
 
 use super::{
     access_method::{
-        add_where_cost, find_best_access_method_for_join_order, AccessMethod, AccessSource,
-        HirAccessSource,
+        add_where_cost, choose_single_btree_access_method, find_best_access_method_for_join_order,
+        AccessMethod, AccessSource, HirAccessSource,
     },
     constraints::{usable_constraints_for_lhs_mask, HirTableConstraints, TableConstraints},
     cost_params::CostModelParams,
-    order::OrderTarget,
+    order::{HirOrderTarget, OrderTarget},
     AvailableIndexes, IndexMethodCandidate,
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
@@ -1848,6 +1848,84 @@ pub(crate) fn hir_best_starting_source(
         analyze_stats,
         params,
     )
+}
+
+/// First source and access method chosen by greedy HIR join planning.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct HirJoinStep {
+    pub(crate) source_position: usize,
+    pub(crate) access_method: AccessMethod,
+}
+
+/// Choose the first HIR source and its B-tree access method.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn hir_first_join_step(
+    document: &HirDocument,
+    from: &hir::From,
+    sources: &[HirPlannedSource],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    base_table_rows: &[RowCountEstimate],
+    order_target: Option<&HirOrderTarget<'_>>,
+    initial_input_cardinality: f64,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<HirJoinStep> {
+    let source_position = hir_best_starting_source(
+        document,
+        sources,
+        constraints,
+        base_table_rows,
+        analyze_stats,
+        params,
+    )?;
+    let source = &sources[source_position];
+    let mut joined_mask = TableMask::default();
+    joined_mask.set(source_position)?;
+    let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
+    let ready_where = ready_predicate_work(
+        where_clause,
+        &predicate_work,
+        &joined_mask,
+        source_position,
+        source.internal_id,
+    );
+    let base_row_count = base_table_rows
+        .get(source_position)
+        .copied()
+        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let mut access_method = choose_single_btree_access_method(
+        &HirAccessSource::new(
+            source,
+            document
+                .source(source.internal_id)
+                .expect("validated HIR contains referenced source"),
+        ),
+        &constraints[source_position],
+        &TableMask::default(),
+        source_position,
+        order_target,
+        &ready_where,
+        schema,
+        analyze_stats,
+        initial_input_cardinality,
+        base_row_count,
+        params,
+    )?;
+    add_where_cost(
+        &mut access_method,
+        &ready_where,
+        initial_input_cardinality,
+        params,
+    );
+
+    Ok(HirJoinStep {
+        source_position,
+        access_method,
+    })
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.

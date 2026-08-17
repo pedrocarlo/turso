@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- The first greedy HIR join step now selects both the starting source and its
+  ordinary B-tree access method. It applies ready-predicate cost using resolved
+  source dependencies and returns the existing planner `AccessMethod` without
+  parser expressions, resolver state, or `TableReferences`.
 - Ready-predicate masks, loop ownership, and residual expression work now flow
   through one representation-neutral join helper. HIR derives the inputs from
   resolved source dependencies and its iterative expression walker; only the

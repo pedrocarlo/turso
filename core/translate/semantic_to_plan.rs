@@ -318,7 +318,7 @@ mod tests {
         translate::collate::CollationSeq,
         translate::{
             optimizer::{
-                cost::RowCountEstimate, hir_base_row_estimates, join::hir_best_starting_source,
+                cost::RowCountEstimate, hir_base_row_estimates, join::hir_first_join_step,
             },
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
@@ -938,15 +938,24 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1.0),
             ]
         );
-        let first = hir_best_starting_source(
+        let first = hir_first_join_step(
             &document,
+            block.from.as_ref().expect("test block has FROM"),
             &input.sources,
             &constraints,
+            &input.predicates,
             &base_rows,
+            None,
+            1.0,
+            &schema,
             &AnalyzeStats::default(),
             &params,
         )
-        .expect("HIR join starting source is selected");
-        assert_eq!(first, 0);
+        .expect("HIR first join step is selected");
+        assert_eq!(first.source_position, 0);
+        assert!(matches!(
+            first.access_method.params,
+            crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable { .. }
+        ));
     }
 }
