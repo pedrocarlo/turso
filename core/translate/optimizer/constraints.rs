@@ -3360,7 +3360,7 @@ mod tests {
         HirPlannedSource {
             op: (),
             table: table.table.clone(),
-            identifier: table.identifier.clone(),
+            identifier: (),
             internal_id: source,
             join_info: None,
             col_used_mask: table.col_used_mask.clone(),

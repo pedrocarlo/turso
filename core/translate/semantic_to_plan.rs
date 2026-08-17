@@ -78,18 +78,9 @@ impl<'a> HirPlanContext<'a> {
         if let Some(from) = &block.from {
             input.sources.push(self.source(from.first, None, usage)?);
             for join in &from.joins {
-                let using = match &join.constraint {
-                    hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
-                        columns.iter().map(|column| column.name.clone()).collect()
-                    }
-                    hir::JoinConstraint::None | hir::JoinConstraint::On(_) => Vec::new(),
-                };
                 input.sources.push(self.source(
                     join.right,
-                    Some(HirJoinInfo {
-                        kind: join.kind,
-                        using,
-                    }),
+                    Some(HirJoinInfo { kind: join.kind }),
                     usage,
                 )?);
 
@@ -362,7 +353,7 @@ fn planned_source_from_definition(
     Ok(HirPlannedSource {
         op: (),
         table: table.value().clone(),
-        identifier: source.alias.as_ref().unwrap_or(&source.name).clone(),
+        identifier: (),
         internal_id: source.id,
         join_info,
         col_used_mask,
@@ -615,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_source_reuses_identity_metadata_and_alias() {
+    fn hir_source_reuses_identity_and_table_metadata() {
         let source = source();
         let SourceKind::Table(resolved) = &source.kind else {
             unreachable!();
@@ -639,27 +630,22 @@ mod tests {
                 source.id,
                 Some(HirJoinInfo {
                     kind: hir::JoinKind::Inner,
-                    using: vec!["first".into()],
                 }),
                 &[],
             )
             .expect("table source converts");
 
-        assert_eq!(joined.identifier, "i");
         assert_eq!(joined.internal_id, source.id);
-        assert_eq!(joined.join_info.as_ref().unwrap().using[0], "first");
+        assert_eq!(
+            joined.join_info.as_ref().unwrap().kind,
+            hir::JoinKind::Inner
+        );
         assert_eq!(joined.database_id, 0);
         let (Table::BTree(expected), Table::BTree(actual)) = (resolved.value(), &joined.table)
         else {
             panic!("resolved and planned tables are btree tables");
         };
         assert!(Arc::ptr_eq(expected, actual));
-
-        let mut unaliased = source;
-        unaliased.alias = None;
-        let joined = planned_source_from_definition(&unaliased, None, &[])
-            .expect("unaliased table source converts");
-        assert_eq!(joined.identifier, "items");
     }
 
     #[test]
@@ -881,7 +867,6 @@ mod tests {
         assert!(input.sources[0].join_info.is_none());
         let join = input.sources[1].join_info.as_ref().unwrap();
         assert_eq!(join.kind, JoinKind::Right);
-        assert!(join.using.is_empty());
         assert_eq!(input.predicates.len(), 3);
         assert!(input.predicates[..2]
             .iter()
@@ -978,8 +963,8 @@ mod tests {
             .expect("query block input converts");
 
         assert_eq!(
-            input.sources[1].join_info.as_ref().unwrap().using,
-            ["first"]
+            input.sources[1].join_info.as_ref().unwrap().kind,
+            JoinKind::Left
         );
         assert_eq!(input.predicates.len(), 1);
         assert_eq!(input.predicates[0].from_outer_join, Some(right));

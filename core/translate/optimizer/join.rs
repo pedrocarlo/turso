@@ -4520,17 +4520,13 @@ mod tests {
         join_kind: Option<JoinKind>,
         internal_id: SourceId,
     ) -> HirPlannedSource {
-        let name = table.name.clone();
         let table = Table::BTree(table);
         HirPlannedSource {
             op: (),
             table,
-            identifier: name,
+            identifier: (),
             internal_id,
-            join_info: join_kind.map(|kind| HirJoinInfo {
-                kind,
-                using: Vec::new(),
-            }),
+            join_info: join_kind.map(|kind| HirJoinInfo { kind }),
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),

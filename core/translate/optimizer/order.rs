@@ -1373,7 +1373,7 @@ mod tests {
         let planned = HirPlannedSource {
             op: (),
             table,
-            identifier: "items".to_string(),
+            identifier: (),
             internal_id: source_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),

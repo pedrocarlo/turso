@@ -3315,8 +3315,8 @@ fn mark_seek_constraints_consumed<E, S: Copy>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_selected_btree_access<I, H, E, J, O, P, B>(
-    source: &PlannedSource<I, H, E, J, O>,
+fn apply_selected_btree_access<I, H, E, J, O, N, P, B>(
+    source: &PlannedSource<I, H, E, J, O, N>,
     constraints: &TableConstraints<E, I>,
     predicates: &mut [P],
     access_method: &mut AccessMethod,
@@ -3885,8 +3885,8 @@ impl Optimizable for ast::Expr {
     }
 }
 
-pub(crate) fn ephemeral_index_build<I, H, E, J, O>(
-    source: &PlannedSource<I, H, E, J, O>,
+pub(crate) fn ephemeral_index_build<I, H, E, J, O, N>(
+    source: &PlannedSource<I, H, E, J, O, N>,
     constraint_refs: &[RangeConstraintRef],
 ) -> Result<Index>
 where
