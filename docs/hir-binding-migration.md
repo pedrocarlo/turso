@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Temporary scope columns are now named and stored as expression bindings.
+  Parenthesized FROM-group names resolve directly to their inner HIR column or
+  merged-column expression, so the group source is only join structure and
+  never becomes a fake runtime column source.
 - Table-valued function calls now freeze hidden-column argument predicates in
   HIR. NULL uses `IS NULL`; other arguments use ordinary resolved equality
   semantics. HIR planning consumes those predicates with existing outer-join

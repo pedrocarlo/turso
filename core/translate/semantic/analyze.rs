@@ -4821,9 +4821,15 @@ mod tests {
         assert_eq!(group.from.joins.len(), 1);
         assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
         assert_eq!(block.outputs.len(), 7);
-        assert!(block.outputs.iter().all(|output| {
-            matches!(output.expr, Expr::Column(reference) if reference.source == group_source.id)
-        }));
+        assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
+        for output in &block.outputs {
+            output.expr.walk(&mut |expression| {
+                assert!(!matches!(
+                    expression,
+                    Expr::Column(reference) if reference.source == group_source.id
+                ));
+            });
+        }
 
         let error = analyze_sql_with_schema(
             &schema,
@@ -4865,10 +4871,7 @@ mod tests {
             block.outputs[1].expr,
             Expr::Column(reference) if reference.source == categories && reference.column == 1
         ));
-        assert!(matches!(
-            block.outputs[2].expr,
-            Expr::Column(reference) if reference.source == group_id && reference.column == 0
-        ));
+        assert!(matches!(block.outputs[2].expr, Expr::MergedColumn(_)));
         assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
     }
 
