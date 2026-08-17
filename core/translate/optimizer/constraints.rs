@@ -15,8 +15,8 @@ use crate::{
             NonFromClauseSubquery, Plan, PredicateExpr, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{
-            rewrite_between_exprs, table_mask_from_expr, table_mask_from_hir_expr, TableMask,
-            ROWID_STRS,
+            rewrite_between_exprs, table_mask_from_expr, table_mask_from_hir_scope, HirFromScope,
+            TableMask, ROWID_STRS,
         },
         semantic::hir,
         Resolver,
@@ -486,7 +486,7 @@ fn hir_is_non_null_literal(expr: &hir::Expr) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn hir_binary_constraints_for_term(
     document: &hir::HirDocument,
-    from: &hir::From,
+    from: &impl HirFromScope,
     term_position: usize,
     term: &HirWhereTerm,
     source_definition: &hir::Source,
@@ -511,8 +511,7 @@ fn hir_binary_constraints_for_term(
 
     for part in hir_binary_constraint_parts(&term.expr, source) {
         if matches!(part.target, HirConstraintTarget::Expression(_)) {
-            let target_mask =
-                table_mask_from_hir_expr(document, Some(from), part.constrained_expr)?;
+            let target_mask = table_mask_from_hir_scope(document, from, part.constrained_expr)?;
             let target_position = from.source_position(part.target.source()).ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "HIR constraint source {} is absent from FROM",
@@ -565,7 +564,7 @@ fn hir_binary_constraints_for_term(
             table_col_pos,
             expr: None,
             constraining_expr: None,
-            lhs_mask: table_mask_from_hir_expr(document, Some(from), part.constraining_expr)?,
+            lhs_mask: table_mask_from_hir_scope(document, from, part.constraining_expr)?,
             selectivity,
             usable,
             is_rowid,
@@ -838,7 +837,7 @@ fn hir_index_expressions<'a>(
 }
 
 fn hir_partial_index_predicate_terms(
-    from: &hir::From,
+    from: &impl HirFromScope,
     source: hir::SourceId,
     predicate: &hir::Expr,
     query_where_clause: &[HirWhereTerm],
@@ -862,7 +861,7 @@ fn hir_partial_index_predicate_terms(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_binary_constraints_for_source(
     document: &hir::HirDocument,
-    from: &hir::From,
+    from: &impl HirFromScope,
     where_clause: &[HirWhereTerm],
     constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
@@ -933,7 +932,7 @@ fn hir_in_list_comparison(
 #[allow(clippy::too_many_arguments)]
 fn hir_in_list_constraint_for_term(
     document: &hir::HirDocument,
-    from: &hir::From,
+    from: &impl HirFromScope,
     term_position: usize,
     term: &HirWhereTerm,
     constraint_source: HirConstraintSource<'_>,
@@ -974,7 +973,7 @@ fn hir_in_list_constraint_for_term(
 
     let mut rhs_mask = TableMask::default();
     for value in values {
-        rhs_mask.union_with(&table_mask_from_hir_expr(document, Some(from), value)?)?;
+        rhs_mask.union_with(&table_mask_from_hir_scope(document, from, value)?)?;
     }
     let estimated_values = values.len() as f64;
     let row_count = constraint_source.row_count(schema, params);
@@ -1076,7 +1075,7 @@ fn hir_in_query_constraint_for_term(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_constraints_for_source(
     document: &hir::HirDocument,
-    from: &hir::From,
+    from: &impl HirFromScope,
     where_clause: &[HirWhereTerm],
     constraint_source: HirConstraintSource<'_>,
     schema: &Schema,

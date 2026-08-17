@@ -111,6 +111,10 @@ Completed:
   groups wait for their left side, nested prerequisites cannot deadlock an
   active parent group, and a started group finishes before planning continues
   outside it. Access selection still operates on the same flat physical leaves.
+- HIR constraint and predicate masks now use one flat FROM layout instead of
+  searching only the top-level semantic FROM list. Group leaves map to their
+  physical positions, while nested RIGHT and FULL null extension stays local
+  to the parenthesized group that owns the join.
 - Temporary scope columns are now named and stored as expression bindings.
   Parenthesized FROM-group names resolve directly to their inner HIR column or
   merged-column expression, so the group source is only join structure and

@@ -35,11 +35,11 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, HirFromGroupBoundary, HirPlanSource, HirWhereTerm,
-            JoinOrderMember, JoinedTable, NonFromClauseSubquery, PredicateTerm, SubqueryState,
-            TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, HirFromGroupBoundary, HirFromLayout, HirPlanSource,
+            HirWhereTerm, JoinOrderMember, JoinedTable, NonFromClauseSubquery, PredicateTerm,
+            SubqueryState, TableReferences, WhereTerm,
         },
-        planner::{table_mask_from_expr, table_mask_from_hir_expr, TableMask},
+        planner::{table_mask_from_expr, table_mask_from_hir_scope, HirFromScope, TableMask},
         semantic::hir::{self, HirDocument},
     },
     LimboError, Result,
@@ -1917,7 +1917,6 @@ fn hir_join_kind_is_ordering_constrained(kind: hir::JoinKind) -> bool {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compute_hir_greedy_join_order(
     document: &HirDocument,
-    from: &hir::From,
     sources: &[HirPlanSource],
     groups: &[HirFromGroupBoundary],
     constraints: &[HirTableConstraints],
@@ -1940,7 +1939,8 @@ pub(crate) fn compute_hir_greedy_join_order(
         groups,
         ordering_restrictions: &ordering_restrictions,
     };
-    let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
+    let layout = HirFromLayout::new(sources, groups);
+    let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
     let first_position = find_best_hir_starting_source(
         document,
         sources,
@@ -2658,14 +2658,14 @@ fn build_where_term_info(
 
 fn build_hir_predicate_work(
     document: &HirDocument,
-    from: &hir::From,
+    from: &impl HirFromScope,
     terms: &[HirWhereTerm],
 ) -> Result<Vec<PredicateWorkInfo>> {
     terms
         .iter()
         .map(|term| {
             Ok(PredicateWorkInfo {
-                table_mask: table_mask_from_hir_expr(document, Some(from), &term.expr)?,
+                table_mask: table_mask_from_hir_scope(document, from, &term.expr)?,
                 extra_steps: hir_where_expr_steps(&term.expr).saturating_sub(1),
             })
         })
@@ -3202,21 +3202,6 @@ mod tests {
             schema_programs: Vec::new(),
             cdc: None,
         };
-        let from = hir::From {
-            first,
-            joins: vec![
-                hir::Join {
-                    right: second,
-                    kind: JoinKind::Left,
-                    constraint: hir::JoinConstraint::None,
-                },
-                hir::Join {
-                    right: third,
-                    kind: JoinKind::Inner,
-                    constraint: hir::JoinConstraint::None,
-                },
-            ],
-        };
         let equality = |lhs, rhs| {
             HirWhereTerm::from(hir::Expr::Binary {
                 lhs: Box::new(hir::Expr::column(lhs, 0)),
@@ -3236,7 +3221,6 @@ mod tests {
         let mut access_methods = Vec::new();
         let result = compute_hir_greedy_join_order(
             &document,
-            &from,
             &sources,
             &[],
             &constraints,

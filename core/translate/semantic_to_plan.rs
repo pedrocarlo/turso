@@ -13,8 +13,8 @@ use super::{
         CostModelParams, HirBtreeOperation, HirVirtualTableOperation,
     },
     plan::{
-        ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirJoinInfo, HirPlanSource,
-        HirPlannedSource, HirWhereTerm, PredicateExpr,
+        ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirFromLayout, HirJoinInfo,
+        HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
@@ -590,7 +590,6 @@ impl<'a> HirPlanContext<'a> {
     /// and predicate order established by `query_block_input`.
     pub(crate) fn constraints(
         &self,
-        from: &hir::From,
         input: &HirQueryBlockPlanInput,
         base_rows: &[RowCountEstimate],
         schema: &Schema,
@@ -602,6 +601,7 @@ impl<'a> HirPlanContext<'a> {
             base_rows.len(),
             "every HIR plan source must have a base-row estimate"
         );
+        let layout = HirFromLayout::new(&input.sources, &input.groups);
         input
             .sources
             .iter()
@@ -625,7 +625,7 @@ impl<'a> HirPlanContext<'a> {
                 };
                 hir_constraints_for_source(
                     self.document,
-                    from,
+                    &layout,
                     &input.predicates,
                     source,
                     schema,
@@ -652,7 +652,7 @@ impl<'a> HirPlanContext<'a> {
             .query(block.id.query)
             .expect("validated HIR query block has owning query");
         let usage = query.direct_column_usage(|source| self.document.source(source));
-        let Some(from) = &block.from else {
+        if block.from.is_none() {
             let input = self.query_block_input(block, order_by, &usage)?;
             let output_cardinality = match &block.body {
                 hir::QueryBlockBody::Values { rows } => initial_cardinality * rows.len() as f64,
@@ -665,7 +665,7 @@ impl<'a> HirPlanContext<'a> {
                 output_cardinality,
                 cost: Cost(0.0),
             });
-        };
+        }
 
         let input = self.query_block_input(block, order_by, &usage)?;
         let order_target = self.order_target(
@@ -674,7 +674,6 @@ impl<'a> HirPlanContext<'a> {
         );
         self.plan_source_access(
             block.id,
-            from,
             input,
             order_target.as_ref(),
             initial_cardinality,
@@ -696,7 +695,6 @@ impl<'a> HirPlanContext<'a> {
     fn plan_source_access(
         &self,
         block: QueryBlockId,
-        from: &hir::From,
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         initial_cardinality: f64,
@@ -752,12 +750,10 @@ impl<'a> HirPlanContext<'a> {
                 }
             }
         }
-        let constraints =
-            self.constraints(from, &input, &base_rows, schema, params, &query_rows)?;
+        let constraints = self.constraints(&input, &base_rows, schema, params, &query_rows)?;
         let mut access_methods = Vec::new();
         let result = compute_hir_greedy_join_order(
             self.document,
-            from,
             &input.sources,
             &input.groups,
             &constraints,
@@ -1695,6 +1691,18 @@ mod tests {
             .predicates
             .iter()
             .all(|predicate| predicate.from_outer_join == Some(group)));
+
+        let layout = HirFromLayout::new(&input.sources, &input.groups);
+        let mask = layout
+            .table_mask(&document, &input.predicates[0].expr)
+            .expect("group predicate has a physical source mask");
+        assert!(!mask.get(0));
+        assert!(mask.get(1));
+        assert!(mask.get(2));
+        assert!(!layout.outer_join_may_null_extend(outer));
+        assert!(layout.outer_join_may_null_extend(inner_left));
+        assert!(layout.outer_join_may_null_extend(inner_right));
+        assert!(!layout.full_join_may_null_extend(inner_left));
     }
 
     #[test]
@@ -1766,6 +1774,55 @@ mod tests {
             .expect("outer boundary exists");
         assert_eq!(outer.parent, None);
         assert_eq!(outer.source_range, 0..3);
+    }
+
+    #[test]
+    fn hir_from_layout_keeps_nested_right_and_full_join_scope_local() {
+        let sources = (0..4)
+            .map(|id| {
+                HirPlanSource::BTree(
+                    planned_source_from_definition(
+                        &source_with_id(id, &format!("source_{id}")),
+                        None,
+                        &[],
+                    )
+                    .expect("table source converts"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let outer_group = SourceId::new(10);
+        let nested_group = SourceId::new(11);
+        let boundaries = |kind| {
+            vec![
+                HirFromGroupBoundary {
+                    source: nested_group,
+                    parent: Some(outer_group),
+                    source_range: 2..4,
+                    join_info: Some(HirJoinInfo { kind }),
+                },
+                HirFromGroupBoundary {
+                    source: outer_group,
+                    parent: None,
+                    source_range: 1..4,
+                    join_info: None,
+                },
+            ]
+        };
+
+        let right_groups = boundaries(JoinKind::Right);
+        let right = HirFromLayout::new(&sources, &right_groups);
+        assert!(!right.outer_join_may_null_extend(SourceId::new(0)));
+        assert!(right.outer_join_may_null_extend(SourceId::new(1)));
+        assert!(!right.outer_join_may_null_extend(SourceId::new(2)));
+        assert!(!right.outer_join_may_null_extend(SourceId::new(3)));
+        assert!(!(0..4).any(|id| right.full_join_may_null_extend(SourceId::new(id))));
+
+        let full_groups = boundaries(JoinKind::Full);
+        let full = HirFromLayout::new(&sources, &full_groups);
+        assert!(!full.full_join_may_null_extend(SourceId::new(0)));
+        for id in 1..4 {
+            assert!(full.full_join_may_null_extend(SourceId::new(id)));
+        }
     }
 
     #[test]

@@ -2427,19 +2427,58 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
-/// Return the FROM positions needed to evaluate a resolved HIR expression.
-/// Sources captured from an outer query are deliberately absent from the
-/// current query block's mask.
+/// Source positions and outer-join facts needed by HIR constraint planning.
+pub(crate) trait HirFromScope {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize>;
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool;
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool;
+}
+
+impl HirFromScope for hir::From {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        hir::From::source_position(self, source)
+    }
+
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        hir::From::outer_join_may_null_extend(self, source)
+    }
+
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        hir::From::full_join_may_null_extend(self, source)
+    }
+}
+
+pub(crate) fn table_mask_from_hir_scope(
+    document: &HirDocument,
+    from: &impl HirFromScope,
+    expression: &hir::Expr,
+) -> Result<TableMask> {
+    table_mask_from_hir_positions(document, expression, |source| from.source_position(source))
+}
+
+/// Return direct FROM positions for tests and parser-shaped HIR callers.
+/// Sources captured from an outer query are absent from the local mask.
+#[cfg(test)]
 pub(crate) fn table_mask_from_hir_expr(
     document: &HirDocument,
     from: Option<&hir::From>,
     expression: &hir::Expr,
 ) -> Result<TableMask> {
+    table_mask_from_hir_positions(document, expression, |source| {
+        from.and_then(|from| from.source_position(source))
+    })
+}
+
+fn table_mask_from_hir_positions(
+    document: &HirDocument,
+    expression: &hir::Expr,
+    position: impl Fn(hir::SourceId) -> Option<usize>,
+) -> Result<TableMask> {
     let mut mask = TableMask::default();
     let mut allocation_error = None;
 
     document.visit_expr_sources(expression, &mut |source| {
-        let Some(position) = from.and_then(|from| from.source_position(source)) else {
+        let Some(position) = position(source) else {
             return;
         };
         if allocation_error.is_none() {

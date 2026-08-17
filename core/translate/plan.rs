@@ -14,7 +14,10 @@ use crate::{
         },
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
-        planner::determine_where_to_eval_term,
+        planner::{
+            determine_where_to_eval_term, table_mask_from_hir_scope, HirFromScope, TableMask,
+        },
+        semantic::hir,
     },
     types::SeekOp,
     util::exprs_are_equivalent,
@@ -1332,6 +1335,111 @@ pub(crate) struct HirFromGroupBoundary {
     pub(crate) parent: Option<crate::translate::semantic::hir::SourceId>,
     pub(crate) source_range: Range<usize>,
     pub(crate) join_info: Option<HirJoinInfo>,
+}
+
+/// Flat physical source positions plus parenthesized join boundaries for one
+/// resolved FROM clause.
+pub(crate) struct HirFromLayout<'a> {
+    sources: &'a [HirPlanSource],
+    groups: &'a [HirFromGroupBoundary],
+}
+
+impl<'a> HirFromLayout<'a> {
+    pub(crate) fn new(sources: &'a [HirPlanSource], groups: &'a [HirFromGroupBoundary]) -> Self {
+        Self { sources, groups }
+    }
+
+    pub(crate) fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        self.sources
+            .iter()
+            .position(|candidate| candidate.source() == source)
+    }
+
+    pub(crate) fn table_mask(
+        &self,
+        document: &hir::HirDocument,
+        expression: &hir::Expr,
+    ) -> Result<TableMask> {
+        table_mask_from_hir_scope(document, self, expression)
+    }
+
+    pub(crate) fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, false)
+    }
+
+    pub(crate) fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        self.join_may_null_extend(source, true)
+    }
+
+    fn join_may_null_extend(&self, source: hir::SourceId, full_only: bool) -> bool {
+        let Some(position) = self.source_position(source) else {
+            return false;
+        };
+        self.sources.iter().enumerate().any(|(right, candidate)| {
+            candidate.join_info().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.innermost_group_start(right),
+                        right..right + 1,
+                    )
+            })
+        }) || self.groups.iter().any(|group| {
+            group.join_info.as_ref().is_some_and(|join| {
+                (!full_only || join.kind == hir::JoinKind::Full)
+                    && join_kind_may_null_extend(
+                        join.kind,
+                        position,
+                        self.parent_group_start(group),
+                        group.source_range.clone(),
+                    )
+            })
+        })
+    }
+
+    fn innermost_group_start(&self, position: usize) -> usize {
+        self.groups
+            .iter()
+            .filter(|group| group.source_range.contains(&position))
+            .min_by_key(|group| group.source_range.len())
+            .map_or(0, |group| group.source_range.start)
+    }
+
+    fn parent_group_start(&self, group: &HirFromGroupBoundary) -> usize {
+        group
+            .parent
+            .and_then(|parent| self.groups.iter().find(|group| group.source == parent))
+            .map_or(0, |parent| parent.source_range.start)
+    }
+}
+
+impl HirFromScope for HirFromLayout<'_> {
+    fn source_position(&self, source: hir::SourceId) -> Option<usize> {
+        HirFromLayout::source_position(self, source)
+    }
+
+    fn outer_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::outer_join_may_null_extend(self, source)
+    }
+
+    fn full_join_may_null_extend(&self, source: hir::SourceId) -> bool {
+        HirFromLayout::full_join_may_null_extend(self, source)
+    }
+}
+
+fn join_kind_may_null_extend(
+    kind: hir::JoinKind,
+    source_position: usize,
+    left_start: usize,
+    right: Range<usize>,
+) -> bool {
+    match kind {
+        hir::JoinKind::Left => right.contains(&source_position),
+        hir::JoinKind::Right => (left_start..right.start).contains(&source_position),
+        hir::JoinKind::Full => (left_start..right.end).contains(&source_position),
+        hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
+    }
 }
 
 /// Source used by HIR planning without parser expressions or planner IDs.
