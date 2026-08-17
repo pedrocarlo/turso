@@ -24,6 +24,21 @@ use crate::{
     LimboError, Result,
 };
 use rustc_hash::FxHashSet as HashSet;
+use std::ops::Range;
+
+enum HirFromItem<'a> {
+    Source(SourceId),
+    Group {
+        source: SourceId,
+        from: &'a hir::From,
+    },
+}
+
+#[derive(Clone, Copy, Default)]
+struct HirFromContext {
+    parent_group: Option<SourceId>,
+    outer_join: Option<SourceId>,
+}
 
 /// Planned form of one resolved query. The semantic document stays alive so
 /// source and output identities remain resolvable without copying definitions.
@@ -73,7 +88,18 @@ impl HirQueryPlan {
 /// Resolved source and predicate input for one query block.
 pub(crate) struct HirQueryBlockPlanInput {
     pub(crate) sources: Vec<HirPlanSource>,
+    pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+}
+
+/// Structural boundary for a parenthesized FROM group. The physical leaves
+/// remain in `HirQueryBlockPlanInput::sources`; this records their nesting
+/// without inventing a runtime source for the group.
+pub(crate) struct HirFromGroupBoundary {
+    pub(crate) source: SourceId,
+    pub(crate) parent: Option<SourceId>,
+    pub(crate) source_range: Range<usize>,
+    pub(crate) join_info: Option<HirJoinInfo>,
 }
 
 /// Access choices for one resolved HIR query block.
@@ -393,6 +419,112 @@ impl<'a> HirPlanContext<'a> {
         }
     }
 
+    fn from_item(&self, source: SourceId) -> HirFromItem<'_> {
+        match &self.definition(source).kind {
+            hir::SourceKind::FromGroup(group) => HirFromItem::Group {
+                source,
+                from: &group.from,
+            },
+            _ => HirFromItem::Source(source),
+        }
+    }
+
+    fn append_from(
+        &self,
+        from: &hir::From,
+        context: HirFromContext,
+        input: &mut HirQueryBlockPlanInput,
+        usage: &[ColumnUsage],
+    ) -> Result<()> {
+        self.append_from_item(from.first, None, context, input, usage)?;
+
+        for join in &from.joins {
+            let local_outer_join = match join.kind {
+                hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full => {
+                    Some(join.right)
+                }
+                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => None,
+            };
+            let predicate_owner = local_outer_join.or(context.outer_join);
+            self.append_from_item(
+                join.right,
+                Some(HirJoinInfo { kind: join.kind }),
+                HirFromContext {
+                    outer_join: predicate_owner,
+                    ..context
+                },
+                input,
+                usage,
+            )?;
+            self.append_join_predicates(&mut input.predicates, join, predicate_owner);
+        }
+        Ok(())
+    }
+
+    fn append_from_item(
+        &self,
+        source: SourceId,
+        join_info: Option<HirJoinInfo>,
+        context: HirFromContext,
+        input: &mut HirQueryBlockPlanInput,
+        usage: &[ColumnUsage],
+    ) -> Result<()> {
+        match self.from_item(source) {
+            HirFromItem::Source(source) => {
+                input
+                    .sources
+                    .push(self.plan_source(source, join_info, usage)?);
+                self.append_table_function_predicates(
+                    &mut input.predicates,
+                    source,
+                    context.outer_join,
+                );
+            }
+            HirFromItem::Group { source, from } => {
+                let start = input.sources.len();
+                self.append_from(
+                    from,
+                    HirFromContext {
+                        parent_group: Some(source),
+                        ..context
+                    },
+                    input,
+                    usage,
+                )?;
+                input.groups.push(HirFromGroupBoundary {
+                    source,
+                    parent: context.parent_group,
+                    source_range: start..input.sources.len(),
+                    join_info,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn append_join_predicates(
+        &self,
+        predicates: &mut Vec<HirWhereTerm>,
+        join: &hir::Join,
+        from_outer_join: Option<SourceId>,
+    ) {
+        match &join.constraint {
+            hir::JoinConstraint::None => {}
+            hir::JoinConstraint::On(expression) => {
+                append_predicates(predicates, expression, from_outer_join)
+            }
+            hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
+                for column in columns {
+                    predicates.push(HirWhereTerm {
+                        expr: using_equality(column),
+                        from_outer_join,
+                        consumed: false,
+                    });
+                }
+            }
+        }
+    }
+
     /// Assemble planner input from resolved HIR without repeating binding.
     pub(crate) fn query_block_input(
         &self,
@@ -402,47 +534,12 @@ impl<'a> HirPlanContext<'a> {
     ) -> Result<HirQueryBlockPlanInput> {
         let mut input = HirQueryBlockPlanInput {
             sources: Vec::new(),
+            groups: Vec::new(),
             predicates: Vec::new(),
         };
 
         if let Some(from) = &block.from {
-            input
-                .sources
-                .push(self.plan_source(from.first, None, usage)?);
-            self.append_table_function_predicates(&mut input.predicates, from.first, None);
-            for join in &from.joins {
-                let from_outer_join = match join.kind {
-                    hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full => {
-                        Some(join.right)
-                    }
-                    hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => None,
-                };
-                input.sources.push(self.plan_source(
-                    join.right,
-                    Some(HirJoinInfo { kind: join.kind }),
-                    usage,
-                )?);
-                self.append_table_function_predicates(
-                    &mut input.predicates,
-                    join.right,
-                    from_outer_join,
-                );
-                match &join.constraint {
-                    hir::JoinConstraint::None => {}
-                    hir::JoinConstraint::On(expression) => {
-                        append_predicates(&mut input.predicates, expression, from_outer_join)
-                    }
-                    hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) => {
-                        for column in columns {
-                            input.predicates.push(HirWhereTerm {
-                                expr: using_equality(column),
-                                from_outer_join,
-                                consumed: false,
-                            });
-                        }
-                    }
-                }
-            }
+            self.append_from(from, HirFromContext::default(), &mut input, usage)?;
         }
 
         if let hir::QueryBlockBody::Select {
@@ -618,6 +715,11 @@ impl<'a> HirPlanContext<'a> {
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<Option<HirQueryBlockPlan>> {
+        if !input.groups.is_empty() {
+            return Err(LimboError::InternalError(
+                "FROM-group access planning is not implemented".to_string(),
+            ));
+        }
         let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
         let mut base_rows = Vec::with_capacity(input.sources.len());
         let mut source_costs = Vec::with_capacity(input.sources.len());
@@ -1081,6 +1183,30 @@ mod tests {
         source
     }
 
+    fn group_source(id: usize, from: hir::From) -> hir::Source {
+        hir::Source {
+            id: SourceId::new(id),
+            owner: SourceOwner::Root,
+            database: None,
+            name: format!("group-{id}"),
+            alias: None,
+            kind: SourceKind::FromGroup(hir::FromGroup {
+                from: Box::new(from),
+                columns: Vec::new(),
+            }),
+            columns: Vec::new(),
+            generated_expressions: Vec::new(),
+            default_expressions: Vec::new(),
+            column_type_programs: Vec::new(),
+            check_constraints: None,
+            rowid_available: false,
+            index_hint: hir::IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        }
+    }
+
     fn document(sources: Vec<hir::Source>) -> hir::HirDocument {
         hir::HirDocument {
             snapshot: CatalogSnapshot::from_id(1),
@@ -1504,6 +1630,152 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn query_block_input_flattens_group_leaves_and_records_the_boundary() {
+        let outer = SourceId::new(0);
+        let inner_left = SourceId::new(1);
+        let inner_right = SourceId::new(2);
+        let group = SourceId::new(3);
+        let inner_predicate = binary(
+            hir::Expr::column(inner_left, 0),
+            Operator::Equals,
+            hir::Expr::column(inner_right, 0),
+        );
+        let outer_predicate = binary(
+            hir::Expr::column(outer, 0),
+            Operator::Equals,
+            hir::Expr::column(inner_right, 0),
+        );
+        let group_from = hir::From {
+            first: inner_left,
+            joins: vec![Join {
+                right: inner_right,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::On(inner_predicate),
+            }],
+        };
+        let document = document(vec![
+            source_with_id(0, "outer_items"),
+            source_with_id(1, "inner_left"),
+            source_with_id(2, "inner_right"),
+            group_source(3, group_from),
+        ]);
+        let mut block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: outer,
+            joins: vec![Join {
+                right: group,
+                kind: JoinKind::Left,
+                constraint: JoinConstraint::On(outer_predicate),
+            }],
+        });
+
+        let input = HirPlanContext::new(&document)
+            .query_block_input(&block, &[], &[])
+            .expect("FROM group produces recursive planner input");
+
+        assert_eq!(
+            input
+                .sources
+                .iter()
+                .map(HirPlanSource::source)
+                .collect::<Vec<_>>(),
+            vec![outer, inner_left, inner_right]
+        );
+        let [boundary] = input.groups.as_slice() else {
+            panic!("one FROM-group boundary is recorded");
+        };
+        assert_eq!(boundary.source, group);
+        assert_eq!(boundary.parent, None);
+        assert_eq!(boundary.source_range, 1..3);
+        assert_eq!(boundary.join_info.as_ref().unwrap().kind, JoinKind::Left);
+        assert!(input.sources[1].join_info().is_none());
+        assert_eq!(input.sources[2].join_info().unwrap().kind, JoinKind::Inner);
+        assert_eq!(input.predicates.len(), 2);
+        assert!(input
+            .predicates
+            .iter()
+            .all(|predicate| predicate.from_outer_join == Some(group)));
+    }
+
+    #[test]
+    fn query_block_input_records_nested_group_ranges() {
+        let last = SourceId::new(0);
+        let first = SourceId::new(1);
+        let second = SourceId::new(2);
+        let inner_group = SourceId::new(3);
+        let outer_group = SourceId::new(4);
+        let inner_from = hir::From {
+            first,
+            joins: vec![Join {
+                right: second,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::None,
+            }],
+        };
+        let outer_from = hir::From {
+            first: inner_group,
+            joins: vec![Join {
+                right: last,
+                kind: JoinKind::Cross,
+                constraint: JoinConstraint::None,
+            }],
+        };
+        let document = document(vec![
+            source_with_id(0, "last"),
+            source_with_id(1, "first"),
+            source_with_id(2, "second"),
+            group_source(3, inner_from),
+            group_source(4, outer_from),
+        ]);
+        let mut block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: outer_group,
+            joins: Vec::new(),
+        });
+
+        let input = HirPlanContext::new(&document)
+            .query_block_input(&block, &[], &[])
+            .expect("nested FROM groups produce recursive planner input");
+
+        assert_eq!(
+            input
+                .sources
+                .iter()
+                .map(HirPlanSource::source)
+                .collect::<Vec<_>>(),
+            vec![first, second, last]
+        );
+        let inner = input
+            .groups
+            .iter()
+            .find(|boundary| boundary.source == inner_group)
+            .expect("inner boundary exists");
+        assert_eq!(inner.parent, Some(outer_group));
+        assert_eq!(inner.source_range, 0..2);
+        let outer = input
+            .groups
+            .iter()
+            .find(|boundary| boundary.source == outer_group)
+            .expect("outer boundary exists");
+        assert_eq!(outer.parent, None);
+        assert_eq!(outer.source_range, 0..3);
     }
 
     #[test]

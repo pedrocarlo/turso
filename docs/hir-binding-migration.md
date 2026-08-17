@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR planner input now walks parenthesized FROM groups recursively. Physical
+  leaves stay flat for the existing join planner, while nested group ranges,
+  parent boundaries, join kinds, and outer-join predicate ownership remain
+  explicit without a fake group cursor or a copied join tree.
 - Temporary scope columns are now named and stored as expression bindings.
   Parenthesized FROM-group names resolve directly to their inner HIR column or
   merged-column expression, so the group source is only join structure and
