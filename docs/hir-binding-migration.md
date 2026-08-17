@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Ready-predicate masks, loop ownership, and residual expression work now flow
+  through one representation-neutral join helper. HIR derives the inputs from
+  resolved source dependencies and its iterative expression walker; only the
+  legacy hash-join metadata still depends on parser expressions.
 - Ordinary indexes, automatic temporary indexes, and `IN` seeks now compete in
   one source-generic B-tree selector. The legacy wrapper retains only AST-based
   multi-index scans; HIR uses the same single-source cost and replacement logic.

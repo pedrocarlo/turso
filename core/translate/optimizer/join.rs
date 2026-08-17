@@ -28,17 +28,18 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx,
-                Cost, IndexInfo, RowCountEstimate,
+                estimate_rows_per_seek, hir_where_expr_steps, rows_per_leaf_page_for_index,
+                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, HirPlannedSource, JoinOrderMember, JoinedTable,
-            NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, HirPlannedSource, HirWhereTerm, JoinOrderMember,
+            JoinedTable, NonFromClauseSubquery, PredicateTerm, SubqueryState, TableReferences,
+            WhereTerm,
         },
-        planner::{table_mask_from_expr, TableMask},
-        semantic::hir::HirDocument,
+        planner::{table_mask_from_expr, table_mask_from_hir_expr, TableMask},
+        semantic::hir::{self, HirDocument},
     },
     LimboError, Result,
 };
@@ -286,9 +287,13 @@ pub struct JoinN {
     pub cost: Cost,
 }
 
-struct WhereTermInfo {
+struct PredicateWorkInfo {
     table_mask: TableMask,
     extra_steps: usize,
+}
+
+struct WhereTermInfo {
+    work: PredicateWorkInfo,
     equal_tables: Option<(TableInternalId, TableInternalId, Option<TableInternalId>)>,
 }
 
@@ -353,9 +358,9 @@ fn join_lhs_and_rhs<'a>(
     };
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(rhs_table_number)?;
-    let ready_where = ready_where_work(
+    let ready_where = ready_predicate_work(
         where_clause,
-        where_terms,
+        where_terms.iter().map(|term| &term.work),
         &joined_mask,
         rhs_table_number,
         rhs_table_reference.internal_id,
@@ -403,7 +408,7 @@ fn join_lhs_and_rhs<'a>(
 
     let has_join_constraint = lhs.is_some()
         && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
+            term.work.table_mask.get(rhs_table_number) && term.work.table_mask.intersects(&lhs_mask)
         });
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
@@ -1733,9 +1738,9 @@ fn compute_greedy_join_order<'a>(
                     continue;
                 }
             }
-            let connected = where_terms
-                .iter()
-                .any(|term| term.table_mask.get(idx) && term.table_mask.intersects(&current_mask));
+            let connected = where_terms.iter().any(|term| {
+                term.work.table_mask.get(idx) && term.work.table_mask.intersects(&current_mask)
+            });
             if connected {
                 has_connected_candidate = true;
                 break;
@@ -1751,7 +1756,7 @@ fn compute_greedy_join_order<'a>(
             }
             if has_connected_candidate {
                 let connected = where_terms.iter().any(|term| {
-                    term.table_mask.get(idx) && term.table_mask.intersects(&current_mask)
+                    term.work.table_mask.get(idx) && term.work.table_mask.intersects(&current_mask)
                 });
                 if !connected {
                     continue;
@@ -2202,10 +2207,12 @@ fn build_where_term_info(
         .iter()
         .map(|term| {
             Ok(WhereTermInfo {
-                table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
-                // FIXME: The row cost also includes one simple condition. Give row work
-                // and condition work separate costs so this does not need to subtract one.
-                extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                work: PredicateWorkInfo {
+                    table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
+                    // FIXME: The row cost also includes one simple condition. Give row work
+                    // and condition work separate costs so this does not need to subtract one.
+                    extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
+                },
                 equal_tables: (!term.consumed)
                     .then(|| tables_in_equal_test(&term.expr))
                     .flatten()
@@ -2215,26 +2222,42 @@ fn build_where_term_info(
         .collect()
 }
 
-/// Return the extra `WHERE` work that can run after this table.
-fn ready_where_work(
-    where_clause: &[WhereTerm],
-    where_terms: &[WhereTermInfo],
-    joined_mask: &TableMask,
-    rhs_table_number: usize,
-    rhs_table_id: TableInternalId,
-) -> SmallVec<[(usize, usize); 4]> {
-    where_clause
+fn build_hir_predicate_work(
+    document: &HirDocument,
+    from: &hir::From,
+    terms: &[HirWhereTerm],
+) -> Result<Vec<PredicateWorkInfo>> {
+    terms
         .iter()
-        .zip(where_terms)
+        .map(|term| {
+            Ok(PredicateWorkInfo {
+                table_mask: table_mask_from_hir_expr(document, Some(from), &term.expr)?,
+                extra_steps: hir_where_expr_steps(&term.expr).saturating_sub(1),
+            })
+        })
+        .collect()
+}
+
+/// Return the extra `WHERE` work that can run after this table.
+fn ready_predicate_work<'work, E, S: Copy + PartialEq>(
+    terms: &[PredicateTerm<E, S>],
+    work: impl IntoIterator<Item = &'work PredicateWorkInfo>,
+    joined_mask: &TableMask,
+    rhs_position: usize,
+    rhs_source: S,
+) -> SmallVec<[(usize, usize); 4]> {
+    terms
+        .iter()
+        .zip(work)
         .enumerate()
         .filter_map(|(term_idx, (term, info))| {
             if term.consumed || info.extra_steps == 0 {
                 return None;
             }
             let ready = match term.from_outer_join {
-                Some(table_id) => table_id == rhs_table_id,
+                Some(source) => source == rhs_source,
                 None => {
-                    info.table_mask.get(rhs_table_number)
+                    info.table_mask.get(rhs_position)
                         && joined_mask.contains_all_set_bits_of(&info.table_mask)
                 }
             };
@@ -2475,13 +2498,24 @@ mod tests {
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
-        assert!(
-            ready_where_work(&two_table_where, &where_terms, &joined_mask, 0, first_id).is_empty()
-        );
+        assert!(ready_predicate_work(
+            &two_table_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            0,
+            first_id,
+        )
+        .is_empty());
 
         joined_mask.set(1)?;
-        let ready = ready_where_work(&two_table_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        let ready = ready_predicate_work(
+            &two_table_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            1,
+            second_id,
+        );
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].work.extra_steps)]);
         let mut term = WhereTerm::from(Expr::Binary(
             Box::new(check(first_id)),
             Operator::Or,
@@ -2493,13 +2527,103 @@ mod tests {
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
+        assert!(ready_predicate_work(
+            &outer_join_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            0,
+            first_id,
+        )
+        .is_empty());
+
+        joined_mask.set(1)?;
+        let ready = ready_predicate_work(
+            &outer_join_where,
+            where_terms.iter().map(|term| &term.work),
+            &joined_mask,
+            1,
+            second_id,
+        );
+        assert_eq!(ready.as_slice(), &[(0, where_terms[0].work.extra_steps)]);
+        Ok(())
+    }
+
+    #[test]
+    fn hir_where_work_uses_resolved_source_dependencies() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: second,
+                kind: JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let check = |source| hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::column(source, 0)),
+            operator: Operator::Equals,
+            rhs: Box::new(hir::Expr::Literal(ast::Literal::Numeric("1".into()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let terms = vec![HirWhereTerm::from(hir::Expr::Binary {
+            lhs: Box::new(check(first)),
+            operator: Operator::Or,
+            rhs: Box::new(check(second)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        })];
+        let work = build_hir_predicate_work(&document, &from, &terms)?;
+        assert_eq!(work[0].extra_steps, 2);
+
+        let mut joined_mask = TableMask::default();
+        joined_mask.set(0)?;
         assert!(
-            ready_where_work(&outer_join_where, &where_terms, &joined_mask, 0, first_id).is_empty()
+            ready_predicate_work(&terms, &work, &joined_mask, 0, first).is_empty(),
+            "predicate still needs the second source"
         );
 
         joined_mask.set(1)?;
-        let ready = ready_where_work(&outer_join_where, &where_terms, &joined_mask, 1, second_id);
-        assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
+        assert_eq!(
+            ready_predicate_work(&terms, &work, &joined_mask, 1, second).as_slice(),
+            [(0, 2)]
+        );
+
+        let mut outer_join_term = HirWhereTerm::from(hir::Expr::Binary {
+            lhs: Box::new(check(first)),
+            operator: Operator::Or,
+            rhs: Box::new(check(first)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        });
+        outer_join_term.from_outer_join = Some(second);
+        let terms = vec![outer_join_term];
+        let work = build_hir_predicate_work(&document, &from, &terms)?;
+        assert!(ready_predicate_work(&terms, &work, &joined_mask, 0, first).is_empty());
+        assert_eq!(
+            ready_predicate_work(&terms, &work, &joined_mask, 1, second).as_slice(),
+            [(0, work[0].extra_steps)]
+        );
         Ok(())
     }
 

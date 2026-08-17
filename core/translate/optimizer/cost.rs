@@ -3,6 +3,7 @@ use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::RangeConstraintRef;
+use crate::translate::semantic::hir;
 use turso_parser::ast;
 
 use super::constraints::Constraint;
@@ -44,6 +45,28 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
         | ast::Expr::Qualified(..)
         | ast::Expr::Variable(_)
         | ast::Expr::Default => 0,
+        _ => 1,
+    }
+}
+
+/// Count the operations needed to check one resolved `WHERE` expression.
+pub(super) fn hir_where_expr_steps(expr: &hir::Expr) -> usize {
+    let mut steps = 0;
+    expr.walk(&mut |expr| steps += hir_where_node_steps(expr));
+    steps.max(1)
+}
+
+fn hir_where_node_steps(expr: &hir::Expr) -> usize {
+    match expr {
+        hir::Expr::Between { .. } => 2,
+        hir::Expr::InList { values, .. } => values.len().max(1),
+        hir::Expr::Case { when_then, .. } => when_then.len().max(1),
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Collate { .. } => 0,
         _ => 1,
     }
 }
