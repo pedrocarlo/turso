@@ -35,8 +35,9 @@ use crate::{
         },
         plan::{
             DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
-            NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
+            NonFromClauseSubquery, PlannedSource, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent, SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause,
+            WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
@@ -71,6 +72,7 @@ use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, VecDeque},
+    fmt::Display,
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintUsage};
@@ -3638,16 +3640,20 @@ impl Optimizable for ast::Expr {
     }
 }
 
-fn ephemeral_index_build(
-    table_reference: &JoinedTable,
+pub(crate) fn ephemeral_index_build<I, H, E, J>(
+    source: &PlannedSource<I, H, E, J>,
     constraint_refs: &[RangeConstraintRef],
-) -> Result<Index> {
-    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
+) -> Result<Index>
+where
+    I: Display,
+{
+    let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = source
+        .table
         .columns()
         .iter()
         .enumerate()
         // Only copy columns that the query reads.
-        .filter(|(index, _)| table_reference.column_is_used(*index))
+        .filter(|(index, _)| source.col_used_mask.get(*index))
         .map(|(i, c)| {
             let expr = match c.generated_type() {
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
@@ -3684,19 +3690,16 @@ fn ephemeral_index_build(
     let ephemeral_index = Index {
         name: format!(
             "ephemeral_{}_{}",
-            table_reference.table.get_name(),
-            table_reference.internal_id
+            source.table.get_name(),
+            source.internal_id
         ),
         columns: ephemeral_columns,
         unique: false,
         ephemeral: true,
-        table_name: table_reference.table.get_name().to_string(),
+        table_name: source.table.get_name().to_string(),
         root_page: 0,
         where_clause: None,
-        has_rowid: table_reference
-            .table
-            .btree()
-            .is_some_and(|btree| btree.has_rowid),
+        has_rowid: source.table.btree().is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
     };

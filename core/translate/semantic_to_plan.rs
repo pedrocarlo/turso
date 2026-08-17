@@ -368,7 +368,7 @@ mod tests {
         translate::{
             optimizer::{
                 build_hir_seek_def_from_constraints, constraints::usable_constraints_for_lhs_mask,
-                cost::RowCountEstimate,
+                cost::RowCountEstimate, ephemeral_index_build,
             },
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
@@ -927,9 +927,26 @@ mod tests {
             }],
         });
 
+        let usage = [
+            ColumnUsage {
+                reference: hir::ColumnRef {
+                    source: left,
+                    column: 0,
+                },
+                count: 1,
+            },
+            ColumnUsage {
+                reference: hir::ColumnRef {
+                    source: right,
+                    column: 0,
+                },
+                count: 1,
+            },
+        ];
+
         let context = HirPlanContext::new(&document);
         let input = context
-            .query_block_input(&block, &[], &[])
+            .query_block_input(&block, &[], &usage)
             .expect("query block input converts");
 
         assert_eq!(
@@ -1022,5 +1039,18 @@ mod tests {
             expression,
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
+
+        let ephemeral = ephemeral_index_build(&input.sources[1], &seek_terms)
+            .expect("resolved HIR source builds a temporary index");
+        assert_eq!(ephemeral.name, "ephemeral_right_items_s1");
+        assert!(ephemeral.ephemeral);
+        assert_eq!(
+            ephemeral
+                .columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .collect::<Vec<_>>(),
+            [0]
+        );
     }
 }

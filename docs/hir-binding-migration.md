@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Automatic-index construction now consumes a generic planned source. HIR
+  supplies its resolved source identity, physical table, and frozen column-use
+  mask directly; building the index no longer requires `JoinedTable`.
 - Seek construction now shares the existing direction, range, equality, and
   NULL-boundary algorithm across parser and HIR expressions. HIR extracts seek
   values and frozen comparison affinity directly from resolved predicates;
