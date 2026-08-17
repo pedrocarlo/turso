@@ -1,4 +1,4 @@
-use super::{cost_params::CostModelParams, AvailableIndexes};
+use super::{cost::RowCountEstimate, cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
@@ -309,6 +309,57 @@ pub struct TableConstraints<E = ast::Expr, S = TableInternalId> {
 pub(crate) type HirConstraint = Constraint<hir::Expr>;
 pub(crate) type HirTableConstraints = TableConstraints<hir::Expr, hir::SourceId>;
 
+/// Resolved source facts needed while collecting HIR constraints.
+///
+/// Physical tables can use catalog statistics and produce index candidates.
+/// Derived queries only produce filter selectivity for their scan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HirConstraintSource<'a> {
+    BTree(&'a HirPlannedSource),
+    Derived {
+        source: hir::SourceId,
+        row_count: RowCountEstimate,
+    },
+}
+
+impl<'a> HirConstraintSource<'a> {
+    fn source(self) -> hir::SourceId {
+        match self {
+            Self::BTree(source) => source.internal_id,
+            Self::Derived { source, .. } => source,
+        }
+    }
+
+    fn btree(self) -> Option<&'a HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. } => None,
+        }
+    }
+
+    fn row_count(self, schema: &Schema, params: &CostModelParams) -> f64 {
+        match self {
+            Self::BTree(source) => schema
+                .analyze_stats
+                .table_stats(source.table.get_name())
+                .and_then(|stats| stats.row_count)
+                .unwrap_or(params.rows_per_table_fallback as u64)
+                as f64,
+            Self::Derived { row_count, .. } => *row_count,
+        }
+    }
+
+    fn rowid_alias_column(self) -> Option<usize> {
+        self.btree().and_then(|source| {
+            source
+                .table
+                .columns()
+                .iter()
+                .position(Column::is_rowid_alias)
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HirConstraintTarget {
     Column(hir::ColumnRef),
@@ -435,7 +486,7 @@ fn hir_binary_constraints_for_term(
     term_position: usize,
     term: &HirWhereTerm,
     source_definition: &hir::Source,
-    table: &HirPlannedSource,
+    constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
     params: &CostModelParams,
 ) -> Result<SmallVec<[HirConstraint; 2]>> {
@@ -477,26 +528,32 @@ fn hir_binary_constraints_for_term(
                 !from.full_join_may_null_extend(source)
             };
 
-        let (table_col_pos, column, index, is_rowid) = match part.target {
-            HirConstraintTarget::Column(column) => (
-                Some(column.column),
-                Some(&table.table.columns()[column.column]),
-                hir_selectivity_index_for_column(schema, table, source_definition, column.column),
-                false,
-            ),
-            HirConstraintTarget::RowId(_) => (None, None, None, true),
-            HirConstraintTarget::Expression(_) => (None, None, None, false),
+        let (table_col_pos, is_rowid) = match part.target {
+            HirConstraintTarget::Column(column) => (Some(column.column), false),
+            HirConstraintTarget::RowId(_) => (None, true),
+            HirConstraintTarget::Expression(_) => (None, false),
         };
-        let selectivity = hir_estimate_constraint_selectivity(
-            schema,
-            table,
-            column,
-            part.operator,
-            null_matching,
-            index,
-            params,
-            is_rowid,
-        );
+        let selectivity = match constraint_source {
+            HirConstraintSource::BTree(table) => {
+                let column = table_col_pos.map(|position| &table.table.columns()[position]);
+                let index = table_col_pos.and_then(|position| {
+                    hir_selectivity_index_for_column(schema, table, source_definition, position)
+                });
+                hir_estimate_constraint_selectivity(
+                    schema,
+                    table,
+                    column,
+                    part.operator,
+                    null_matching,
+                    index,
+                    params,
+                    is_rowid,
+                )
+            }
+            HirConstraintSource::Derived { .. } => {
+                hir_estimate_scan_constraint_selectivity(part.operator, null_matching, params)
+            }
+        };
 
         constraints.push(HirConstraint {
             where_clause_pos: (term_position, part.side),
@@ -536,6 +593,36 @@ fn hir_estimate_constraint_selectivity(
         params,
         is_rowid,
     )
+}
+
+fn hir_estimate_scan_constraint_selectivity(
+    operator: ConstraintOperator,
+    null_matching: bool,
+    params: &CostModelParams,
+) -> f64 {
+    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
+        ConstraintOperator::from(ast::Operator::Equals)
+    } else {
+        operator
+    };
+    match operator {
+        ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => params.sel_eq_unindexed,
+        ConstraintOperator::AstNativeOperator(
+            ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals,
+        ) => params.sel_range,
+        ConstraintOperator::AstNativeOperator(ast::Operator::Is) => params.sel_is_null,
+        ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => params.sel_is_not_null,
+        ConstraintOperator::Like { not: false } => params.sel_like,
+        ConstraintOperator::Like { not: true } => params.sel_not_like,
+        ConstraintOperator::In {
+            not,
+            estimated_values,
+        } => estimate_in_selectivity(estimated_values, params.rows_per_table_fallback, not),
+        _ => params.sel_other,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,14 +860,15 @@ pub(crate) fn hir_binary_constraints_for_source(
     document: &hir::HirDocument,
     from: &hir::From,
     where_clause: &[HirWhereTerm],
-    table: &HirPlannedSource,
+    constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Vec<HirConstraint>> {
-    let source = document.source(table.internal_id).ok_or_else(|| {
+    let source_id = constraint_source.source();
+    let source = document.source(source_id).ok_or_else(|| {
         crate::LimboError::InternalError(format!(
             "missing HIR source {} for constraint planning",
-            table.internal_id
+            source_id
         ))
     })?;
     let mut constraints = Vec::new();
@@ -791,7 +879,7 @@ pub(crate) fn hir_binary_constraints_for_source(
             term_position,
             term,
             source,
-            table,
+            constraint_source,
             schema,
             params,
         )?);
@@ -844,11 +932,11 @@ fn hir_in_list_constraint_for_term(
     from: &hir::From,
     term_position: usize,
     term: &HirWhereTerm,
-    table: &HirPlannedSource,
+    constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Option<HirConstraint>> {
-    let source = table.internal_id;
+    let source = constraint_source.source();
     if term
         .from_outer_join
         .is_some_and(|outer_source| outer_source != source)
@@ -870,11 +958,7 @@ fn hir_in_list_constraint_for_term(
         return Ok(None);
     };
 
-    let rowid_alias_column = table
-        .table
-        .columns()
-        .iter()
-        .position(Column::is_rowid_alias);
+    let rowid_alias_column = constraint_source.rowid_alias_column();
     let (table_col_pos, is_rowid) = match lhs.as_ref() {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
@@ -889,11 +973,7 @@ fn hir_in_list_constraint_for_term(
         rhs_mask.union_with(&table_mask_from_hir_expr(document, Some(from), value)?)?;
     }
     let estimated_values = values.len() as f64;
-    let row_count = schema
-        .analyze_stats
-        .table_stats(table.table.get_name())
-        .and_then(|stats| stats.row_count)
-        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
+    let row_count = constraint_source.row_count(schema, params);
 
     Ok(Some(HirConstraint {
         where_clause_pos: (term_position, BinaryExprSide::Rhs),
@@ -919,12 +999,12 @@ fn hir_in_query_constraint_for_term(
     document: &hir::HirDocument,
     term_position: usize,
     term: &HirWhereTerm,
-    table: &HirPlannedSource,
+    constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
     params: &CostModelParams,
     query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<Option<HirConstraint>> {
-    let source = table.internal_id;
+    let source = constraint_source.source();
     if term
         .from_outer_join
         .is_some_and(|outer_source| outer_source != source)
@@ -953,11 +1033,7 @@ fn hir_in_query_constraint_for_term(
         return Ok(None);
     };
 
-    let rowid_alias_column = table
-        .table
-        .columns()
-        .iter()
-        .position(Column::is_rowid_alias);
+    let rowid_alias_column = constraint_source.rowid_alias_column();
     let (table_col_pos, is_rowid) = match lhs.as_ref() {
         hir::Expr::Column(column) if column.source == source => (
             Some(column.column),
@@ -967,11 +1043,7 @@ fn hir_in_query_constraint_for_term(
         _ => return Ok(None),
     };
 
-    let row_count = schema
-        .analyze_stats
-        .table_stats(table.table.get_name())
-        .and_then(|stats| stats.row_count)
-        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
+    let row_count = constraint_source.row_count(schema, params);
     // The HIR owns query meaning, while its row estimate remains planner state.
     // Keep the existing cap and fallback when that plan is not available yet.
     let estimated_values = query_output_rows(*query)
@@ -998,30 +1070,36 @@ fn hir_in_query_constraint_for_term(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn hir_table_constraints_for_source(
+pub(crate) fn hir_constraints_for_source(
     document: &hir::HirDocument,
     from: &hir::From,
     where_clause: &[HirWhereTerm],
-    table: &HirPlannedSource,
+    constraint_source: HirConstraintSource<'_>,
     schema: &Schema,
     params: &CostModelParams,
     query_output_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<HirTableConstraints> {
-    let source = table.internal_id;
+    let source = constraint_source.source();
     let source_definition = document.source(source).ok_or_else(|| {
         crate::LimboError::InternalError(format!(
             "missing HIR source {source} for constraint planning"
         ))
     })?;
-    let mut constraints =
-        hir_binary_constraints_for_source(document, from, where_clause, table, schema, params)?;
+    let mut constraints = hir_binary_constraints_for_source(
+        document,
+        from,
+        where_clause,
+        constraint_source,
+        schema,
+        params,
+    )?;
     for (term_position, term) in where_clause.iter().enumerate() {
         if let Some(constraint) = hir_in_list_constraint_for_term(
             document,
             from,
             term_position,
             term,
-            table,
+            constraint_source,
             schema,
             params,
         )? {
@@ -1031,7 +1109,7 @@ pub(crate) fn hir_table_constraints_for_source(
             document,
             term_position,
             term,
-            table,
+            constraint_source,
             schema,
             params,
             query_output_rows,
@@ -1039,6 +1117,14 @@ pub(crate) fn hir_table_constraints_for_source(
             constraints.push(constraint);
         }
     }
+    let Some(table) = constraint_source.btree() else {
+        return Ok(HirTableConstraints {
+            table_id: source,
+            constraints,
+            candidates: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
+        });
+    };
     let mut candidates = Vec::new();
     for expressions in &source_definition.index_expressions {
         let index = expressions.index.value();
@@ -3710,7 +3796,7 @@ mod tests {
             &empty_hir_document(source),
             &from,
             &[term],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
         )?;
@@ -3767,7 +3853,7 @@ mod tests {
             &empty_hir_document(source),
             &from,
             &[range, equality],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
         )?;
@@ -3779,6 +3865,63 @@ mod tests {
         assert_eq!(constraints[1].table_col_pos, Some(1));
         assert_eq!(constraints[2].operator, ast::Operator::Greater.into());
         assert_eq!(constraints[2].table_col_pos, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_derived_scan_constraints_reduce_rows_without_access_candidates() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let from = hir::From {
+            first: source,
+            joins: Vec::new(),
+        };
+        let equality = HirWhereTerm {
+            expr: hir_comparison(
+                hir::Expr::column(source, 0),
+                ast::Operator::Equals,
+                hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+                Affinity::Integer,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let in_list = HirWhereTerm {
+            expr: hir_in_list(
+                hir::Expr::column(source, 0),
+                false,
+                vec![
+                    hir::Expr::Literal(ast::Literal::Numeric("2".into())),
+                    hir::Expr::Literal(ast::Literal::Numeric("3".into())),
+                ],
+                Affinity::Integer,
+                None,
+            ),
+            from_outer_join: None,
+            consumed: false,
+        };
+        let params = CostModelParams::default();
+        let constraints = hir_constraints_for_source(
+            &empty_hir_document(source),
+            &from,
+            &[equality, in_list],
+            HirConstraintSource::Derived {
+                source,
+                row_count: RowCountEstimate::AnalyzeStats(40.0),
+            },
+            &Schema::new(),
+            &params,
+            &|query| panic!("derived scan constraint references unexpected query {query}"),
+        )?;
+
+        assert_eq!(constraints.table_id, source);
+        assert!(constraints.candidates.is_empty());
+        assert!(constraints.temporary_index_terms.is_empty());
+        assert_eq!(constraints.constraints.len(), 2);
+        assert_eq!(
+            constraints.constraints[0].selectivity,
+            params.sel_eq_unindexed
+        );
+        assert_eq!(constraints.constraints[1].selectivity, 2.0 / 40.0);
         Ok(())
     }
 
@@ -3815,11 +3958,11 @@ mod tests {
         )]);
         let table = hir_planned_source(source, &table);
 
-        let constraints = hir_table_constraints_for_source(
+        let constraints = hir_constraints_for_source(
             &empty_hir_document(source),
             &from,
             &[term],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
             &|_| None,
@@ -3879,7 +4022,7 @@ mod tests {
             &from,
             0,
             &term(expression.clone()),
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
         )?
@@ -3900,7 +4043,7 @@ mod tests {
             &from,
             0,
             &term(expression),
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
         )?
@@ -3944,11 +4087,11 @@ mod tests {
         let row_count = params.rows_per_table_fallback;
         let document = hir_document_with_query(source, query, Vec::new());
 
-        let constraints = hir_table_constraints_for_source(
+        let constraints = hir_constraints_for_source(
             &document,
             &from,
             std::slice::from_ref(&term),
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|planned_query| {
@@ -3974,7 +4117,7 @@ mod tests {
             &document,
             0,
             &term,
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| None,
@@ -3997,7 +4140,7 @@ mod tests {
                 from_outer_join: None,
                 consumed: false,
             },
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| panic!("correlated query must not request a row estimate"),
@@ -4054,11 +4197,11 @@ mod tests {
         let document = hir_document_with_index(source, &table, index.clone(), vec![None], None);
         let table = hir_planned_source(source, &table);
 
-        let constraints = hir_table_constraints_for_source(
+        let constraints = hir_constraints_for_source(
             &document,
             &from,
             &[compatible, incompatible],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &CostModelParams::default(),
             &|_| None,
@@ -4144,11 +4287,11 @@ mod tests {
         let table = hir_planned_source(source, &table);
 
         let params = CostModelParams::default();
-        let constraints = hir_table_constraints_for_source(
+        let constraints = hir_constraints_for_source(
             &document,
             &from,
             &[term],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| None,
@@ -4169,11 +4312,11 @@ mod tests {
         assert_eq!(candidate.refs[0].index_col_pos, 0);
         assert!(constraints.constraints[0].expr.is_none());
 
-        let scan_constraints = hir_table_constraints_for_source(
+        let scan_constraints = hir_constraints_for_source(
             &document,
             &from,
             &[],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| None,
@@ -4287,11 +4430,11 @@ mod tests {
         let table = hir_planned_source(source, &table);
         let params = CostModelParams::default();
 
-        let accepted = hir_table_constraints_for_source(
+        let accepted = hir_constraints_for_source(
             &document,
             &from,
             &[seek.clone(), lower.clone(), upper],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| None,
@@ -4390,11 +4533,11 @@ mod tests {
             } if Arc::ptr_eq(chosen_index, &index) && !constraint_refs.is_empty()
         ));
 
-        let rejected = hir_table_constraints_for_source(
+        let rejected = hir_constraints_for_source(
             &document,
             &from,
             &[seek, lower],
-            &table,
+            HirConstraintSource::BTree(&table),
             &Schema::new(),
             &params,
             &|_| None,

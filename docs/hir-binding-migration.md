@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Derived-query scans now collect resolved binary and `IN` constraints through
+  the same HIR extractor as B-tree sources. They use child-query row estimates
+  for generic filter selectivity but cannot produce index or automatic-index
+  candidates.
 - One HIR join input now represents physical B-tree and derived-query sources
   explicitly. Mixed joins use the same greedy ordering, connectivity,
   cross-product, and predicate-work loop; derived scans compete using their

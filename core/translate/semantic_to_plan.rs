@@ -3,7 +3,7 @@
 use super::{
     optimizer::{
         apply_hir_selected_btree_access, base_row_estimate,
-        constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        constraints::{hir_constraints_for_source, HirConstraintSource, HirTableConstraints},
         cost::{Cost, RowCountEstimate},
         join::compute_hir_greedy_join_order,
         order::{
@@ -308,15 +308,29 @@ impl<'a> HirPlanContext<'a> {
         &self,
         from: &hir::From,
         input: &HirQueryBlockPlanInput,
+        base_rows: &[RowCountEstimate],
         schema: &Schema,
         params: &CostModelParams,
         query_rows: &dyn Fn(QueryId) -> Option<f64>,
     ) -> Result<Vec<HirTableConstraints>> {
+        assert_eq!(
+            input.sources.len(),
+            base_rows.len(),
+            "every HIR plan source must have a base-row estimate"
+        );
         input
             .sources
             .iter()
-            .map(|source| match source {
-                HirPlanSource::BTree(source) => hir_table_constraints_for_source(
+            .zip(base_rows)
+            .map(|(source, row_count)| {
+                let source = match source {
+                    HirPlanSource::BTree(source) => HirConstraintSource::BTree(source),
+                    HirPlanSource::Derived { source, .. } => HirConstraintSource::Derived {
+                        source: *source,
+                        row_count: *row_count,
+                    },
+                };
+                hir_constraints_for_source(
                     self.document,
                     from,
                     &input.predicates,
@@ -324,13 +338,7 @@ impl<'a> HirPlanContext<'a> {
                     schema,
                     params,
                     query_rows,
-                ),
-                HirPlanSource::Derived { source, .. } => Ok(HirTableConstraints {
-                    table_id: *source,
-                    constraints: Vec::new(),
-                    candidates: Vec::new(),
-                    temporary_index_terms: Default::default(),
-                }),
+                )
             })
             .collect()
     }
@@ -404,7 +412,6 @@ impl<'a> HirPlanContext<'a> {
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<Option<HirQueryBlockPlan>> {
         let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
-        let constraints = self.constraints(from, &input, schema, params, &query_rows)?;
         let mut base_rows = Vec::with_capacity(input.sources.len());
         let mut source_costs = Vec::with_capacity(input.sources.len());
         for source in &input.sources {
@@ -426,6 +433,8 @@ impl<'a> HirPlanContext<'a> {
                 }
             }
         }
+        let constraints =
+            self.constraints(from, &input, &base_rows, schema, params, &query_rows)?;
         let mut access_methods = Vec::new();
         let result = compute_hir_greedy_join_order(
             self.document,
@@ -1516,7 +1525,22 @@ mod tests {
             root_block_id,
             QueryBlockBody::Select {
                 distinctness: None,
-                filter: None,
+                filter: Some(hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::column(source_id, 0)),
+                    operator: Operator::Equals,
+                    rhs: Box::new(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                        "1".into(),
+                    ))),
+                    array_concat: false,
+                    custom: None,
+                    comparison: Some(ComparisonSemantics {
+                        components: vec![ComparisonComponent {
+                            affinity: Affinity::Integer,
+                            collation: None,
+                            array: false,
+                        }],
+                    }),
+                }),
                 grouping: None,
             },
         );
@@ -1595,7 +1619,7 @@ mod tests {
         let root = plan
             .planned_query(root_query)
             .expect("root query is planned");
-        assert_eq!(root.output_cardinality, 2.0);
+        assert_eq!(root.output_cardinality, 0.2);
         let [source_loop] = root.blocks[0].loops.as_slice() else {
             panic!("derived source produces one scan loop");
         };
