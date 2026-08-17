@@ -1873,18 +1873,16 @@ mod tests {
         );
         analyze(
             &context,
-            AnalyzeInput::TriggerProgram(
-                crate::translate::semantic::TriggerProgramInput {
-                    context: TriggerAnalysis {
-                        database: DatabaseId::new(MAIN_DB_ID),
-                        table: schema.get_table("writable").expect("writable table exists"),
-                        event,
-                    },
-                    predicate: when_clause.as_deref(),
-                    commands: &commands,
-                    conflict_override,
+            AnalyzeInput::TriggerProgram(crate::translate::semantic::TriggerProgramInput {
+                context: TriggerAnalysis {
+                    database: DatabaseId::new(MAIN_DB_ID),
+                    table: schema.get_table("writable").expect("writable table exists"),
+                    event,
                 },
-            ),
+                predicate: when_clause.as_deref(),
+                commands: &commands,
+                conflict_override,
+            }),
         )
     }
 
@@ -5010,9 +5008,8 @@ mod tests {
         ));
 
         let query = root.query;
-        let plan = crate::translate::semantic_to_plan::HirQueryPlan::build(
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
             Arc::new(document),
-            query,
             &schema,
             &crate::translate::optimizer::CostModelParams::default(),
         )
@@ -5054,9 +5051,8 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let query = root.query;
-        let plan = crate::translate::semantic_to_plan::HirQueryPlan::build(
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
             Arc::new(document),
-            query,
             &schema,
             &crate::translate::optimizer::CostModelParams::default(),
         )
@@ -6413,12 +6409,8 @@ mod tests {
         assert!(predicate_reads.contains(&new_source));
         assert!(predicate_reads.contains(&old_source));
 
-        let [
-            hir::TriggerCommand::Select(query_id),
-            hir::TriggerCommand::Insert(insert),
-            hir::TriggerCommand::Update(update),
-            hir::TriggerCommand::Delete(delete),
-        ] = program.commands.as_slice()
+        let [hir::TriggerCommand::Select(query_id), hir::TriggerCommand::Insert(insert), hir::TriggerCommand::Update(update), hir::TriggerCommand::Delete(delete)] =
+            program.commands.as_slice()
         else {
             panic!("trigger commands preserve source order and shape");
         };
@@ -6986,6 +6978,35 @@ mod tests {
             document.query(*inner).expect("inner query exists").captures,
             [input]
         );
+
+        let inner = *inner;
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("INSERT-owned queries plan from resolved HIR");
+        assert_eq!(plan.queries.len(), 2);
+        assert!(plan.queries.iter().any(|planned| planned.query == query_id));
+        assert!(plan.queries.iter().any(|planned| planned.query == inner));
+    }
+
+    #[test]
+    fn query_free_insert_builds_an_empty_hir_query_plan() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "INSERT INTO items DEFAULT VALUES")
+            .expect("DEFAULT VALUES INSERT binds");
+        document
+            .validate()
+            .expect("DEFAULT VALUES INSERT produces closed HIR");
+
+        let plan = crate::translate::semantic_to_plan::HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("query-free INSERT plans from resolved HIR");
+        assert!(plan.queries.is_empty());
     }
 
     #[test]

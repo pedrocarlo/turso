@@ -39,11 +39,11 @@ struct HirFromContext {
     outer_join: Option<SourceId>,
 }
 
-/// Planned form of one resolved query. The semantic document stays alive so
-/// source and output identities remain resolvable without copying definitions.
-pub(crate) struct HirQueryPlan {
+/// Planned form of one resolved HIR document. The semantic document stays
+/// alive so source and output identities remain resolvable without copying
+/// definitions.
+pub(crate) struct HirPlan {
     pub(crate) document: Arc<HirDocument>,
-    pub(crate) query: QueryId,
     pub(crate) queries: Vec<HirPlannedQuery>,
 }
 
@@ -55,28 +55,21 @@ pub(crate) struct HirPlannedQuery {
     pub(crate) cost: Cost,
 }
 
-impl HirQueryPlan {
+impl HirPlan {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build(
         document: Arc<HirDocument>,
-        query: QueryId,
         schema: &Schema,
         params: &CostModelParams,
     ) -> Result<Self> {
         let mut queries = Vec::new();
-        HirPlanContext::new(&document).plan_query_tree(
-            query,
-            schema,
-            params,
-            &mut queries,
-            &mut HashSet::default(),
-        )?;
+        let mut active = HashSet::default();
+        let context = HirPlanContext::new(&document);
+        for query in &document.queries {
+            context.plan_query_tree(query.id, schema, params, &mut queries, &mut active)?;
+        }
         queries.sort_unstable_by_key(|plan| plan.query.index());
-        Ok(Self {
-            document,
-            query,
-            queries,
-        })
+        Ok(Self { document, queries })
     }
 
     fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
@@ -1701,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_hir_query_plan_plans_parenthesized_from_group() {
+    fn owned_hir_plan_plans_parenthesized_from_group() {
         let outer = SourceId::new(0);
         let inner_left = SourceId::new(1);
         let inner_right = SourceId::new(2);
@@ -1742,9 +1735,8 @@ mod tests {
         });
         add_query(&mut document, &block);
 
-        let plan = HirQueryPlan::build(
+        let plan = HirPlan::build(
             Arc::new(document),
-            block.id.query,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2060,10 +2052,9 @@ mod tests {
         );
         let query_id = block.id.query;
         let document = Arc::new(document);
-        let query_plan = HirQueryPlan::build(document.clone(), query_id, &schema, &params)
+        let query_plan = HirPlan::build(document.clone(), &schema, &params)
             .expect("HIR query planning succeeds");
         assert!(Arc::ptr_eq(&query_plan.document, &document));
-        assert_eq!(query_plan.query, query_id);
         let planned_query = query_plan
             .planned_query(query_id)
             .expect("root query is planned");
@@ -2141,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_hir_query_plan_plans_values_block() {
+    fn owned_hir_plan_plans_values_block() {
         let mut document = document(vec![source()]);
         let block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
@@ -2154,16 +2145,14 @@ mod tests {
         add_query(&mut document, &block);
         let document = Arc::new(document);
 
-        let plan = HirQueryPlan::build(
+        let plan = HirPlan::build(
             document.clone(),
-            block.id.query,
             &Schema::default(),
             &CostModelParams::default(),
         )
         .expect("VALUES query plans from HIR");
 
         assert!(Arc::ptr_eq(&plan.document, &document));
-        assert_eq!(plan.query, block.id.query);
         let query = plan
             .planned_query(block.id.query)
             .expect("root query is planned");
@@ -2176,7 +2165,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_hir_query_plan_plans_compound_arms_without_arm_ordering() {
+    fn owned_hir_plan_plans_compound_arms_without_arm_ordering() {
         let query_id = QueryId::new(0);
         let first_id = QueryBlockId::new(query_id, 0);
         let second_id = QueryBlockId::new(query_id, 1);
@@ -2212,9 +2201,8 @@ mod tests {
         });
         let document = Arc::new(document);
 
-        let plan = HirQueryPlan::build(
+        let plan = HirPlan::build(
             document.clone(),
-            query_id,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2236,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_hir_query_plan_plans_query_dependencies_before_their_owner() {
+    fn owned_hir_plan_plans_query_dependencies_before_their_owner() {
         let root_query = QueryId::new(0);
         let child_query = QueryId::new(1);
         let root_block_id = QueryBlockId::new(root_query, 0);
@@ -2326,9 +2314,8 @@ mod tests {
             query(child_query, Some(root_query), child_block),
         ];
         document.validate().expect("derived query HIR is valid");
-        let plan = HirQueryPlan::build(
+        let plan = HirPlan::build(
             Arc::new(document),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2373,9 +2360,8 @@ mod tests {
         subquery_document
             .validate()
             .expect("expression subquery HIR is valid");
-        let subquery_plan = HirQueryPlan::build(
+        let subquery_plan = HirPlan::build(
             Arc::new(subquery_document),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2407,9 +2393,8 @@ mod tests {
         let materialization =
             HirPlanContext::new(&cte_document).cte_materialization(root_query, cte_id, child_query);
         assert_eq!(materialization, HirCteMaterialization::Explicit);
-        let cte_plan = HirQueryPlan::build(
+        let cte_plan = HirPlan::build(
             Arc::new(cte_document.clone()),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2484,9 +2469,8 @@ mod tests {
         recursive_document
             .validate()
             .expect("recursive CTE source HIR is valid");
-        let recursive_plan = HirQueryPlan::build(
+        let recursive_plan = HirPlan::build(
             Arc::new(recursive_document),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )
@@ -2565,13 +2549,20 @@ mod tests {
             HirCteMaterialization::PerReference,
         );
 
-        let shared_plan = HirQueryPlan::build(
+        let shared_plan = HirPlan::build(
             Arc::new(cte_document),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )
         .expect("repeated CTE references plan from HIR");
+        assert_eq!(
+            shared_plan
+                .queries
+                .iter()
+                .filter(|planned| planned.query == child_query)
+                .count(),
+            1
+        );
         assert!(shared_plan
             .planned_query(root_query)
             .expect("shared CTE root query is planned")
@@ -2620,9 +2611,8 @@ mod tests {
         mixed_document
             .validate()
             .expect("mixed table and derived query HIR is valid");
-        let mixed_plan = HirQueryPlan::build(
+        let mixed_plan = HirPlan::build(
             Arc::new(mixed_document),
-            root_query,
             &Schema::default(),
             &CostModelParams::default(),
         )

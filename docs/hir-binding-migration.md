@@ -118,6 +118,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR planning now starts from the owned document rather than a caller-supplied
+  query ID. Query, DML, and trigger roots plan every reachable query once, while
+  documents without query work produce an empty query-plan list.
 - Parenthesized FROM groups now pass through complete HIR access planning.
   Outer-join predicates owned by a group become ready only when the current
   physical leaf completes that group, including nested and single-leaf groups;
