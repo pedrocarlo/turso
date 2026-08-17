@@ -3113,6 +3113,13 @@ pub(crate) enum HirInSeekSource {
 
 pub(crate) type HirBtreeOperation = SelectedBtreeOperation<hir::Expr, HirInSeekSource>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct HirVirtualTableOperation {
+    pub(crate) idx_num: i32,
+    pub(crate) idx_str: Option<String>,
+    pub(crate) arguments: Vec<hir::Expr>,
+}
+
 trait BtreeOperationBuilder<E, P> {
     type InSource;
 
@@ -3454,6 +3461,76 @@ pub(crate) fn apply_hir_selected_btree_access(
     )?
     .ok_or_else(|| {
         LimboError::InternalError("HIR B-tree plan selected a non-B-tree access method".into())
+    })
+}
+
+pub(crate) fn apply_hir_selected_virtual_access(
+    constraints: &constraints::HirTableConstraints,
+    predicates: &mut [HirWhereTerm],
+    access_method: &AccessMethod,
+) -> Result<HirVirtualTableOperation> {
+    let AccessMethodParams::VirtualTable {
+        idx_num,
+        idx_str,
+        constraints: virtual_constraints,
+        constraint_usages,
+    } = &access_method.params
+    else {
+        return Err(LimboError::InternalError(
+            "HIR virtual table selected a non-virtual access method".into(),
+        ));
+    };
+    if constraint_usages.len() != virtual_constraints.len() {
+        return Err(LimboError::ExtensionError(format!(
+            "Constraint usage count mismatch (expected {}, got {})",
+            virtual_constraints.len(),
+            constraint_usages.len()
+        )));
+    }
+
+    let mut arguments = vec![None; constraint_usages.len()];
+    let mut argument_count = 0;
+    for (virtual_constraint, usage) in virtual_constraints.iter().zip(constraint_usages) {
+        let Some(index) = usage.argv_index else {
+            continue;
+        };
+        if index < 1 || index as usize > constraint_usages.len() {
+            return Err(LimboError::ExtensionError(format!(
+                "argv_index {index} is out of valid range [1..{}]",
+                constraint_usages.len()
+            )));
+        }
+        let argument = &mut arguments[index as usize - 1];
+        if argument.is_some() {
+            return Err(LimboError::ExtensionError(format!(
+                "duplicate argv_index {index}"
+            )));
+        }
+        let constraint = &constraints.constraints[virtual_constraint.index];
+        if usage.omit {
+            predicates[constraint.where_clause_pos.0].consumed = true;
+        }
+        *argument = Some(constraint.get_hir_constraining_expr(predicates).1);
+        argument_count += 1;
+    }
+    let arguments = arguments
+        .into_iter()
+        .take(argument_count)
+        .enumerate()
+        .map(|(index, argument)| {
+            argument.ok_or_else(|| {
+                LimboError::ExtensionError(format!(
+                    "argv_index values must form contiguous sequence starting from 1, missing index {}",
+                    index + 1
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(HirVirtualTableOperation {
+        idx_num: *idx_num,
+        idx_str: idx_str.clone(),
+        arguments,
     })
 }
 

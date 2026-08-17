@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Table-valued function calls now freeze hidden-column argument predicates in
+  HIR. NULL uses `IS NULL`; other arguments use ordinary resolved equality
+  semantics. HIR planning consumes those predicates with existing outer-join
+  ownership and virtual-table access selection, without parser-expression
+  rebinding.
 - Expression subqueries now participate in HIR query dependency planning.
   Scalar, row, EXISTS, and IN subqueries are planned before their owning query
   through the iterative HIR expression walker; their resolved expression shape

@@ -207,9 +207,12 @@ fn visit_from_parts<'hir>(
                 .expect("validated HIR query source must exist");
             visit(QueryPart::Source(source));
             match &source.kind {
-                SourceKind::TableFunction { arguments, .. } => {
-                    for argument in arguments {
-                        visit(QueryPart::Expression(argument));
+                SourceKind::TableFunction {
+                    argument_predicates,
+                    ..
+                } => {
+                    for predicate in argument_predicates {
+                        visit(QueryPart::Expression(predicate));
                     }
                 }
                 SourceKind::FromGroup(group) => {
@@ -462,8 +465,11 @@ fn collect_source_argument_column_reads<'source>(
         return;
     };
     match &source.kind {
-        SourceKind::TableFunction { arguments, .. } => {
-            collect_exprs_column_reads(arguments, reads);
+        SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } => {
+            collect_exprs_column_reads(argument_predicates, reads);
         }
         SourceKind::FromGroup(group) => {
             collect_from_column_reads(&group.from, reads, source_by_id);
@@ -552,8 +558,11 @@ fn collect_source_arguments<'source>(
         return;
     };
     match &source.kind {
-        SourceKind::TableFunction { arguments, .. } => {
-            collect_exprs_references(arguments, references);
+        SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } => {
+            collect_exprs_references(argument_predicates, references);
         }
         SourceKind::FromGroup(group) => {
             collect_from_references(&group.from, references, source_by_id);

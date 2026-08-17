@@ -2,7 +2,7 @@
 
 use super::{
     optimizer::{
-        apply_hir_selected_btree_access, base_row_estimate,
+        apply_hir_selected_btree_access, apply_hir_selected_virtual_access, base_row_estimate,
         constraints::{hir_constraints_for_source, HirConstraintSource, HirTableConstraints},
         cost::{Cost, RowCountEstimate},
         join::compute_hir_greedy_join_order,
@@ -10,7 +10,7 @@ use super::{
             ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
             OrderTargetPurpose,
         },
-        CostModelParams, HirBtreeOperation,
+        CostModelParams, HirBtreeOperation, HirVirtualTableOperation,
     },
     plan::{
         ColumnUsedMask, HirCteMaterialization, HirJoinInfo, HirPlanSource, HirPlannedSource,
@@ -18,7 +18,11 @@ use super::{
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
-use crate::{schema::Schema, sync::Arc, LimboError, Result};
+use crate::{
+    schema::{Schema, Table},
+    sync::Arc,
+    LimboError, Result,
+};
 use rustc_hash::FxHashSet as HashSet;
 
 /// Planned form of one resolved query. The semantic document stays alive so
@@ -92,6 +96,7 @@ pub(crate) struct HirPlannedLoop {
 /// Selected access for one resolved HIR source.
 pub(crate) enum HirSourceAccess {
     BTree(HirBtreeOperation),
+    Virtual(HirVirtualTableOperation),
     Derived {
         query: QueryId,
     },
@@ -339,7 +344,7 @@ impl<'a> HirPlanContext<'a> {
         usage: &[ColumnUsage],
     ) -> Result<HirPlanSource> {
         match &self.definition(source).kind {
-            hir::SourceKind::Table(_) => self
+            hir::SourceKind::Table(_) | hir::SourceKind::TableFunction { .. } => self
                 .source(source, join_info, usage)
                 .map(HirPlanSource::BTree),
             hir::SourceKind::Derived(query) => Ok(HirPlanSource::Derived {
@@ -404,19 +409,24 @@ impl<'a> HirPlanContext<'a> {
             input
                 .sources
                 .push(self.plan_source(from.first, None, usage)?);
+            self.append_table_function_predicates(&mut input.predicates, from.first, None);
             for join in &from.joins {
-                input.sources.push(self.plan_source(
-                    join.right,
-                    Some(HirJoinInfo { kind: join.kind }),
-                    usage,
-                )?);
-
                 let from_outer_join = match join.kind {
                     hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full => {
                         Some(join.right)
                     }
                     hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => None,
                 };
+                input.sources.push(self.plan_source(
+                    join.right,
+                    Some(HirJoinInfo { kind: join.kind }),
+                    usage,
+                )?);
+                self.append_table_function_predicates(
+                    &mut input.predicates,
+                    join.right,
+                    from_outer_join,
+                );
                 match &join.constraint {
                     hir::JoinConstraint::None => {}
                     hir::JoinConstraint::On(expression) => {
@@ -463,6 +473,31 @@ impl<'a> HirPlanContext<'a> {
         }
 
         Ok(input)
+    }
+
+    fn append_table_function_predicates(
+        &self,
+        predicates: &mut Vec<HirWhereTerm>,
+        source: SourceId,
+        from_outer_join: Option<SourceId>,
+    ) {
+        let hir::SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } = &self.definition(source).kind
+        else {
+            return;
+        };
+        predicates.extend(
+            argument_predicates
+                .iter()
+                .cloned()
+                .map(|expr| HirWhereTerm {
+                    expr,
+                    from_outer_join,
+                    consumed: false,
+                }),
+        );
     }
 
     /// Collect physical constraints for every source while keeping the source
@@ -652,16 +687,29 @@ impl<'a> HirPlanContext<'a> {
         let mut loops = Vec::with_capacity(input.sources.len());
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
             let access = match &input.sources[source_position] {
-                HirPlanSource::BTree(source) => {
-                    HirSourceAccess::BTree(apply_hir_selected_btree_access(
+                HirPlanSource::BTree(source) => match &source.table {
+                    Table::BTree(_) => HirSourceAccess::BTree(apply_hir_selected_btree_access(
                         source,
                         &constraints[source_position],
                         &mut input.predicates,
                         &mut access_methods[access_method_position],
                         &prior_sources,
                         source_position,
-                    )?)
-                }
+                    )?),
+                    Table::Virtual(_) => {
+                        HirSourceAccess::Virtual(apply_hir_selected_virtual_access(
+                            &constraints[source_position],
+                            &mut input.predicates,
+                            &access_methods[access_method_position],
+                        )?)
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(format!(
+                            "HIR catalog source {} is not a table",
+                            source.internal_id
+                        )))
+                    }
+                },
                 HirPlanSource::Derived { query, .. } => {
                     if !matches!(
                         access_methods[access_method_position].params,
@@ -878,11 +926,14 @@ fn planned_source_from_definition(
     join_info: Option<HirJoinInfo>,
     usage: &[ColumnUsage],
 ) -> Result<HirPlannedSource> {
-    let hir::SourceKind::Table(table) = &source.kind else {
-        return Err(LimboError::InternalError(format!(
-            "source {} is not a table source",
-            source.id
-        )));
+    let table = match &source.kind {
+        hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => table,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "source {} is not a table source",
+                source.id
+            )))
+        }
     };
     let database = source.database.ok_or_else(|| {
         LimboError::InternalError(format!("table source {} has no database", source.id))
@@ -1453,6 +1504,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn query_block_input_adds_table_function_predicates_with_join_ownership() {
+        let left = SourceId::new(0);
+        let function = SourceId::new(1);
+        let mut function_source = source_with_id(1, "table_function");
+        let argument_predicate = binary(
+            hir::Expr::column(function, 1),
+            Operator::Equals,
+            hir::Expr::column(left, 0),
+        );
+        let SourceKind::Table(table) = function_source.kind else {
+            unreachable!();
+        };
+        function_source.kind = SourceKind::TableFunction {
+            table,
+            argument_predicates: vec![argument_predicate],
+        };
+        let document = document(vec![source_with_id(0, "items"), function_source]);
+        let mut block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: left,
+            joins: vec![Join {
+                right: function,
+                kind: JoinKind::Left,
+                constraint: JoinConstraint::None,
+            }],
+        });
+
+        let input = HirPlanContext::new(&document)
+            .query_block_input(&block, &[], &[])
+            .expect("table-function source converts");
+
+        assert_eq!(input.sources.len(), 2);
+        assert_eq!(input.sources[1].source(), function);
+        assert_eq!(input.predicates.len(), 1);
+        assert!(matches!(
+            &input.predicates[0].expr,
+            hir::Expr::Binary { lhs, operator: Operator::Equals, rhs, .. }
+                if matches!(lhs.as_ref(), hir::Expr::Column(column) if *column == hir::ColumnRef { source: function, column: 1 })
+                    && matches!(rhs.as_ref(), hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 })
+        ));
+        assert_eq!(input.predicates[0].from_outer_join, Some(function));
+        assert!(!input.predicates[0].consumed);
     }
 
     #[test]

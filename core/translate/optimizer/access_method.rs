@@ -11,8 +11,9 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
+    convert_to_vtab_constraint, convert_to_vtab_constraint_for_prefix, expr_uses_custom_collation,
+    ordered_ephemeral_key_columns, BinaryExprSide, Constraint, ConstraintOperator,
+    RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -1271,16 +1272,54 @@ fn find_best_access_method_for_btree(
     Ok(Some(best_access_method))
 }
 
-fn find_best_access_method_for_vtab(
+pub(super) fn find_best_access_method_for_vtab<E>(
     vtab: &VirtualTable,
-    constraints: &[Constraint],
+    constraints: &[Constraint<E>],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order)?;
+    find_best_access_method_for_vtab_constraints(
+        vtab,
+        constraints,
+        vtab_constraints,
+        input_cardinality,
+        base_row_count,
+        params,
+    )
+}
 
+pub(super) fn find_best_hir_access_method_for_vtab<E>(
+    vtab: &VirtualTable,
+    constraints: &[Constraint<E>],
+    source_position: usize,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    let vtab_constraints =
+        convert_to_vtab_constraint_for_prefix(constraints, source_position, lhs_mask);
+    find_best_access_method_for_vtab_constraints(
+        vtab,
+        constraints,
+        vtab_constraints,
+        input_cardinality,
+        base_row_count,
+        params,
+    )
+}
+
+fn find_best_access_method_for_vtab_constraints<E>(
+    vtab: &VirtualTable,
+    constraints: &[Constraint<E>],
+    vtab_constraints: Vec<ConstraintInfo>,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
     // TODO: get proper order_by information to pass to the vtab.
     // maybe encode more info on t_ctx? we need: [col_idx , is_descending]
     let best_index_result = vtab.best_index(&vtab_constraints, &[]);
@@ -1316,7 +1355,7 @@ fn find_best_access_method_for_vtab(
             };
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost`.
-                cost: estimate_cost_for_scan_or_seek::<ast::Expr>(
+                cost: estimate_cost_for_scan_or_seek::<E>(
                     None,
                     &[],
                     &[],

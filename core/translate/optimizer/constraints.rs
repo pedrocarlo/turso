@@ -2846,7 +2846,19 @@ pub fn convert_to_vtab_constraint<E>(
         .take(join_order.len() - 1)
         .map(|j| j.original_idx)
         .try_collect()?;
-    let constraints = constraints
+    Ok(convert_to_vtab_constraint_for_prefix(
+        constraints,
+        table_idx,
+        &lhs_mask,
+    ))
+}
+
+pub fn convert_to_vtab_constraint_for_prefix<E>(
+    constraints: &[Constraint<E>],
+    table_idx: usize,
+    lhs_mask: &TableMask,
+) -> Vec<ConstraintInfo> {
+    constraints
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
@@ -2864,8 +2876,7 @@ pub fn convert_to_vtab_constraint<E>(
                 index: i,
             })
         })
-        .collect();
-    Ok(constraints)
+        .collect()
 }
 
 /// Whether `op` constrains an index column to a single value, making it usable

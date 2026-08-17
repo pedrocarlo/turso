@@ -294,7 +294,8 @@ pub enum SourceKind {
     Table(ResolvedTable),
     TableFunction {
         table: ResolvedTable,
-        arguments: Vec<Expr>,
+        /// Resolved hidden-column constraints produced from call arguments.
+        argument_predicates: Vec<Expr>,
     },
     Cte(CteId),
     Derived(QueryId),

@@ -8,7 +8,7 @@ use turso_parser::ast::{Operator, TableInternalId};
 use super::{
     access_method::{
         add_where_cost, choose_single_btree_access_method, find_best_access_method_for_join_order,
-        AccessMethod, AccessSource, HirAccessSource,
+        find_best_hir_access_method_for_vtab, AccessMethod, AccessSource, HirAccessSource,
     },
     constraints::{usable_constraints_for_lhs_mask, HirTableConstraints, TableConstraints},
     cost_params::CostModelParams,
@@ -18,7 +18,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::translate::plan::BitSet;
 use crate::{
-    schema::Schema,
+    schema::{Schema, Table},
     stats::AnalyzeStats,
     translate::{
         expr::expr_references_subquery_id,
@@ -2040,24 +2040,47 @@ fn hir_join_step(
         .copied()
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
     let mut access_method = match source {
-        HirPlanSource::BTree(source) => choose_single_btree_access_method(
-            &HirAccessSource::new(
-                source,
-                document
-                    .source(source.internal_id)
-                    .expect("validated HIR contains referenced source"),
-            ),
-            &constraints[source_position],
-            lhs_mask,
-            source_position,
-            order_target,
-            &ready_where,
-            schema,
-            analyze_stats,
-            input_cardinality,
-            base_row_count,
-            params,
-        )?,
+        HirPlanSource::BTree(source) => match &source.table {
+            Table::BTree(_) => choose_single_btree_access_method(
+                &HirAccessSource::new(
+                    source,
+                    document
+                        .source(source.internal_id)
+                        .expect("validated HIR contains referenced source"),
+                ),
+                &constraints[source_position],
+                lhs_mask,
+                source_position,
+                order_target,
+                &ready_where,
+                schema,
+                analyze_stats,
+                input_cardinality,
+                base_row_count,
+                params,
+            )?,
+            Table::Virtual(vtab) => find_best_hir_access_method_for_vtab(
+                vtab,
+                &constraints[source_position].constraints,
+                source_position,
+                lhs_mask,
+                input_cardinality,
+                base_row_count,
+                params,
+            )?
+            .ok_or_else(|| {
+                LimboError::PlanningError(format!(
+                    "virtual table {} rejected the available constraints",
+                    source.table.get_name()
+                ))
+            })?,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR catalog source {} is not a table",
+                    source.internal_id
+                )))
+            }
+        },
         HirPlanSource::Derived { .. }
         | HirPlanSource::Cte { .. }
         | HirPlanSource::RecursiveCte { .. }

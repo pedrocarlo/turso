@@ -4013,13 +4013,15 @@ mod tests {
             .as_ref()
             .expect("relation query has FROM")
             .first;
-        let SourceKind::TableFunction { table, arguments } =
-            &document.source(source).expect("source exists").kind
+        let SourceKind::TableFunction {
+            table,
+            argument_predicates,
+        } = &document.source(source).expect("source exists").kind
         else {
             panic!("relation source is table function");
         };
         assert_eq!(table.value().get_name(), "json_each");
-        assert_eq!(arguments.len(), 1);
+        assert_eq!(argument_predicates.len(), 1);
     }
 
     #[test]
@@ -4958,17 +4960,125 @@ mod tests {
             let source = document
                 .source(function_id)
                 .expect("function source exists");
-            let SourceKind::TableFunction { table, arguments } = &source.kind else {
+            let SourceKind::TableFunction {
+                table,
+                argument_predicates,
+            } = &source.kind
+            else {
                 panic!("json_each is a table-function source");
             };
             assert_eq!(table.value().get_name(), "json_each");
-            assert_eq!(arguments.len(), 1);
+            assert_eq!(argument_predicates.len(), 1);
             assert!(matches!(
-                arguments[0],
-                Expr::Column(reference)
-                    if reference.source == items_id && reference.column == 1
+                &argument_predicates[0],
+                Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
+                    if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == function_id)
+                        && matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
             ));
         }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn null_table_function_arguments_become_hidden_column_is_null_predicates() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each(NULL)")
+            .expect("NULL table-function argument binds");
+        document
+            .validate()
+            .expect("NULL table-function argument produces closed HIR");
+
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source = block.from.as_ref().expect("query has FROM").first;
+        let SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } = &document.source(source).expect("source exists").kind
+        else {
+            panic!("json_each is a table-function source");
+        };
+        assert!(matches!(
+            argument_predicates.as_slice(),
+            [Expr::IsNull(expression)]
+                if matches!(expression.as_ref(), Expr::Column(reference) if reference.source == source)
+        ));
+
+        let query = root.query;
+        let plan = crate::translate::semantic_to_plan::HirQueryPlan::build(
+            Arc::new(document),
+            query,
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("table function plans from resolved HIR");
+        let planned = plan
+            .queries
+            .iter()
+            .find(|planned| planned.query == query)
+            .expect("root query is planned");
+        let [block] = planned.blocks.as_slice() else {
+            panic!("SELECT has one planned block");
+        };
+        let [source] = block.loops.as_slice() else {
+            panic!("table function has one planned source");
+        };
+        let crate::translate::semantic_to_plan::HirSourceAccess::Virtual(operation) =
+            &source.access
+        else {
+            panic!("table function uses virtual-table access");
+        };
+        assert!(operation.arguments.is_empty());
+        assert!(matches!(
+            block.predicates.as_slice(),
+            [crate::translate::plan::HirWhereTerm {
+                expr: Expr::IsNull(_),
+                consumed: false,
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn table_function_hir_plan_freezes_selected_arguments() {
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each('[1]')")
+            .expect("table-function argument binds");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = root.query;
+        let plan = crate::translate::semantic_to_plan::HirQueryPlan::build(
+            Arc::new(document),
+            query,
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("table function plans from resolved HIR");
+        let planned = plan
+            .queries
+            .iter()
+            .find(|planned| planned.query == query)
+            .expect("root query is planned");
+        let [block] = planned.blocks.as_slice() else {
+            panic!("SELECT has one planned block");
+        };
+        let [source] = block.loops.as_slice() else {
+            panic!("table function has one planned source");
+        };
+        let crate::translate::semantic_to_plan::HirSourceAccess::Virtual(operation) =
+            &source.access
+        else {
+            panic!("table function uses virtual-table access");
+        };
+        assert!(matches!(
+            operation.arguments.as_slice(),
+            [Expr::Literal(ast::Literal::String(_))]
+        ));
+        assert!(block.predicates[0].consumed);
     }
 
     #[cfg(feature = "json")]
@@ -5004,7 +5114,10 @@ mod tests {
             .as_ref()
             .expect("inner query has FROM")
             .first;
-        let SourceKind::TableFunction { arguments, .. } = &document
+        let SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } = &document
             .source(function_source)
             .expect("source exists")
             .kind
@@ -5012,9 +5125,9 @@ mod tests {
             panic!("inner source is a table function");
         };
         assert!(matches!(
-            arguments.as_slice(),
-            [Expr::Column(reference)]
-                if reference.source == outer_source && reference.column == 1
+            argument_predicates.as_slice(),
+            [Expr::Binary { rhs, comparison: Some(_), .. }]
+                if matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
         ));
     }
 
