@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR B-tree join-step selection now accepts the mask of sources already
+  joined. Later sources can therefore use resolved join constraints for index
+  seeks and automatic indexes; the first-source entry point is only the empty
+  left-hand-side wrapper around the same step.
 - The first greedy HIR join step now selects both the starting source and its
   ordinary B-tree access method. It applies ready-predicate cost using resolved
   source dependencies and returns the existing planner `AccessMethod` without

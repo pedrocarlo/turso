@@ -1882,13 +1882,46 @@ pub(crate) fn hir_first_join_step(
         analyze_stats,
         params,
     )?;
-    let source = &sources[source_position];
-    let mut joined_mask = TableMask::default();
-    joined_mask.set(source_position)?;
     let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
-    let ready_where = ready_predicate_work(
+    hir_btree_join_step(
+        document,
+        sources,
+        constraints,
         where_clause,
         &predicate_work,
+        base_table_rows,
+        order_target,
+        source_position,
+        &TableMask::default(),
+        initial_input_cardinality,
+        schema,
+        analyze_stats,
+        params,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hir_btree_join_step(
+    document: &HirDocument,
+    sources: &[HirPlannedSource],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    predicate_work: &[PredicateWorkInfo],
+    base_table_rows: &[RowCountEstimate],
+    order_target: Option<&HirOrderTarget<'_>>,
+    source_position: usize,
+    lhs_mask: &TableMask,
+    input_cardinality: f64,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<HirJoinStep> {
+    let source = &sources[source_position];
+    let mut joined_mask = lhs_mask.try_clone()?;
+    joined_mask.set(source_position)?;
+    let ready_where = ready_predicate_work(
+        where_clause,
+        predicate_work,
         &joined_mask,
         source_position,
         source.internal_id,
@@ -1905,22 +1938,17 @@ pub(crate) fn hir_first_join_step(
                 .expect("validated HIR contains referenced source"),
         ),
         &constraints[source_position],
-        &TableMask::default(),
+        lhs_mask,
         source_position,
         order_target,
         &ready_where,
         schema,
         analyze_stats,
-        initial_input_cardinality,
+        input_cardinality,
         base_row_count,
         params,
     )?;
-    add_where_cost(
-        &mut access_method,
-        &ready_where,
-        initial_input_cardinality,
-        params,
-    );
+    add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
 
     Ok(HirJoinStep {
         source_position,
@@ -2702,6 +2730,129 @@ mod tests {
             ready_predicate_work(&terms, &work, &joined_mask, 1, second).as_slice(),
             [(0, work[0].extra_steps)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn later_hir_join_step_uses_constraints_from_joined_sources() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let first_table =
+            _create_btree_table("first", _create_column_list(&["value"], Type::Integer));
+        let second_table =
+            _create_btree_table("second", _create_column_list(&["value"], Type::Integer));
+        let first_source = _create_hir_source(first_table, None, first);
+        let mut second_source = _create_hir_source(second_table, Some(JoinKind::Inner), second);
+        second_source.col_used_mask.set(0)?;
+        let sources = vec![first_source, second_source];
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let from = hir::From {
+            first,
+            joins: vec![hir::Join {
+                right: second,
+                kind: JoinKind::Inner,
+                constraint: hir::JoinConstraint::None,
+            }],
+        };
+        let where_clause = vec![HirWhereTerm {
+            expr: hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::column(second, 0)),
+                operator: Operator::Equals,
+                rhs: Box::new(hir::Expr::column(first, 0)),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            },
+            from_outer_join: None,
+            consumed: false,
+        }];
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(0)?;
+        let constraints = vec![
+            HirTableConstraints {
+                table_id: first,
+                constraints: Vec::new(),
+                candidates: Vec::new(),
+                temporary_index_terms: SmallVec::new(),
+            },
+            HirTableConstraints {
+                table_id: second,
+                constraints: vec![Constraint {
+                    where_clause_pos: (0, BinaryExprSide::Rhs),
+                    operator: ConstraintOperator::from(Operator::Equals),
+                    table_col_pos: Some(0),
+                    expr: None,
+                    constraining_expr: None,
+                    lhs_mask: lhs_mask.try_clone()?,
+                    selectivity: DEFAULT_PARAMS.sel_eq_unindexed,
+                    usable: true,
+                    is_rowid: false,
+                    comparison_affinity: Some(crate::vdbe::affinity::Affinity::Integer),
+                    comparison_collation: None,
+                    null_matching: false,
+                }],
+                candidates: vec![ConstraintUseCandidate {
+                    index: None,
+                    refs: Vec::new(),
+                    partial_index: None,
+                }],
+                temporary_index_terms: smallvec::smallvec![ConstraintRef {
+                    constraint_vec_pos: 0,
+                    index_col_pos: 0,
+                    sort_order: ast::SortOrder::Asc,
+                    nulls_order: ast::NullsOrder::First,
+                }],
+            },
+        ];
+        let predicate_work = build_hir_predicate_work(&document, &from, &where_clause)?;
+        let step = hir_btree_join_step(
+            &document,
+            &sources,
+            &constraints,
+            &where_clause,
+            &predicate_work,
+            &[
+                RowCountEstimate::AnalyzeStats(1_000.0),
+                RowCountEstimate::AnalyzeStats(10_000.0),
+            ],
+            None,
+            1,
+            &lhs_mask,
+            1_000.0,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?;
+
+        assert_eq!(step.source_position, 1);
+        assert_eq!(
+            (&step.access_method.consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(matches!(
+            step.access_method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        ));
         Ok(())
     }
 
