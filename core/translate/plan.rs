@@ -1335,6 +1335,14 @@ pub(crate) type HirPlannedSource = PlannedSource<
     (),
 >;
 
+/// Resolved reuse policy for a non-recursive CTE scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HirCteMaterialization {
+    PerReference,
+    Shared,
+    Explicit,
+}
+
 /// One resolved HIR source as seen by join planning.
 ///
 /// B-tree sources carry physical access metadata. Query-backed sources point
@@ -1350,7 +1358,7 @@ pub(crate) enum HirPlanSource {
         source: crate::translate::semantic::hir::SourceId,
         cte: crate::translate::semantic::hir::CteId,
         query: crate::translate::semantic::hir::QueryId,
-        materialized: ast::Materialized,
+        materialization: HirCteMaterialization,
         join_info: Option<HirJoinInfo>,
     },
 }

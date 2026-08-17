@@ -13,7 +13,8 @@ use super::{
         CostModelParams, HirBtreeOperation,
     },
     plan::{
-        ColumnUsedMask, HirJoinInfo, HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
+        ColumnUsedMask, HirCteMaterialization, HirJoinInfo, HirPlanSource, HirPlannedSource,
+        HirWhereTerm, PredicateExpr,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
@@ -97,7 +98,7 @@ pub(crate) enum HirSourceAccess {
     Cte {
         cte: hir::CteId,
         query: QueryId,
-        materialized: turso_parser::ast::Materialized,
+        materialization: HirCteMaterialization,
     },
 }
 
@@ -226,6 +227,135 @@ impl<'a> HirPlanContext<'a> {
         }
     }
 
+    fn cte_materialization(
+        &self,
+        owner: QueryId,
+        cte: hir::CteId,
+        query: QueryId,
+    ) -> HirCteMaterialization {
+        let definition = self
+            .document
+            .cte(cte)
+            .expect("validated HIR contains referenced CTE");
+        if matches!(
+            definition.materialized,
+            turso_parser::ast::Materialized::Yes
+        ) {
+            return HirCteMaterialization::Explicit;
+        }
+
+        if self.cte_reference_count(owner, cte) > 1 && !self.query_tree_has_outer_dependency(query)
+        {
+            HirCteMaterialization::Shared
+        } else {
+            HirCteMaterialization::PerReference
+        }
+    }
+
+    /// Count references in one query plan. A CTE body is a separate plan tree:
+    /// when reached through a CTE source, its nested references are classified
+    /// while that body is planned instead of being multiplied by its callers.
+    fn cte_reference_count(&self, root: QueryId, target: hir::CteId) -> usize {
+        self.document
+            .queries
+            .iter()
+            .filter(|query| self.query_belongs_to_tree(query.id, root, true))
+            .flat_map(|query| &query.blocks)
+            .filter_map(|block| block.from.as_ref())
+            .map(|from| self.count_cte_references_in_from(from, target))
+            .sum()
+    }
+
+    fn count_cte_references_in_from(&self, from: &hir::From, target: hir::CteId) -> usize {
+        core::iter::once(from.first)
+            .chain(from.joins.iter().map(|join| join.right))
+            .map(|source| self.count_cte_references_in_source(source, target))
+            .sum()
+    }
+
+    fn count_cte_references_in_source(&self, source: SourceId, target: hir::CteId) -> usize {
+        match &self.definition(source).kind {
+            hir::SourceKind::Cte(cte) => usize::from(*cte == target),
+            hir::SourceKind::FromGroup(group) => {
+                self.count_cte_references_in_from(&group.from, target)
+            }
+            _ => 0,
+        }
+    }
+
+    fn query_tree_has_outer_dependency(&self, root: QueryId) -> bool {
+        let queries = self
+            .document
+            .queries
+            .iter()
+            .filter(|query| self.query_belongs_to_tree(query.id, root, false))
+            .map(|query| query.id)
+            .collect::<HashSet<_>>();
+
+        self.document.queries.iter().any(|query| {
+            queries.contains(&query.id)
+                && query.captures.iter().any(|source| {
+                    let source = self.definition(*source);
+                    match source.owner {
+                        hir::SourceOwner::QueryBlock(block) => !queries.contains(&block.query),
+                        hir::SourceOwner::Cte(cte) => !self.cte_belongs_to_queries(cte, &queries),
+                        hir::SourceOwner::Root => true,
+                    }
+                })
+        })
+    }
+
+    fn query_belongs_to_tree(
+        &self,
+        mut query: QueryId,
+        root: QueryId,
+        stop_at_cte_body: bool,
+    ) -> bool {
+        loop {
+            if query == root {
+                return true;
+            }
+            if stop_at_cte_body && self.is_cte_body_query(query) {
+                return false;
+            }
+            let Some(parent) = self
+                .document
+                .query(query)
+                .expect("validated HIR query exists")
+                .parent
+            else {
+                return false;
+            };
+            query = parent;
+        }
+    }
+
+    fn is_cte_body_query(&self, query: QueryId) -> bool {
+        self.document.ctes.iter().any(|cte| match &cte.body {
+            hir::CteBody::Query(body) => *body == query,
+            hir::CteBody::Recursive(recursive) => {
+                recursive.seed == query || recursive.arms.iter().any(|arm| arm.query == query)
+            }
+        })
+    }
+
+    fn cte_belongs_to_queries(&self, cte: hir::CteId, queries: &HashSet<QueryId>) -> bool {
+        let definition = self
+            .document
+            .cte(cte)
+            .expect("validated HIR contains captured CTE source");
+        match &definition.body {
+            hir::CteBody::Query(query) => queries.contains(query),
+            hir::CteBody::Recursive(recursive) => {
+                queries.contains(&recursive.seed)
+                    || recursive
+                        .arms
+                        .iter()
+                        .any(|arm| queries.contains(&arm.query))
+            }
+        }
+    }
+
     fn plan_source(
         &self,
         source: SourceId,
@@ -242,15 +372,20 @@ impl<'a> HirPlanContext<'a> {
                 join_info,
             }),
             hir::SourceKind::Cte(cte) => {
-                let definition = self
-                    .document
-                    .cte(*cte)
-                    .expect("validated HIR contains referenced CTE");
+                let query = self.cte_query(*cte)?;
+                let owner = match self.definition(source).owner {
+                    hir::SourceOwner::QueryBlock(block) => block.query,
+                    owner => {
+                        return Err(LimboError::InternalError(format!(
+                            "CTE HIR source {source} has non-query owner {owner:?}"
+                        )));
+                    }
+                };
                 Ok(HirPlanSource::Cte {
                     source,
                     cte: *cte,
-                    query: self.cte_query(*cte)?,
-                    materialized: definition.materialized.clone(),
+                    query,
+                    materialization: self.cte_materialization(owner, *cte, query),
                     join_info,
                 })
             }
@@ -535,7 +670,7 @@ impl<'a> HirPlanContext<'a> {
                 HirPlanSource::Cte {
                     cte,
                     query,
-                    materialized,
+                    materialization,
                     ..
                 } => {
                     if !matches!(
@@ -549,7 +684,7 @@ impl<'a> HirPlanContext<'a> {
                     HirSourceAccess::Cte {
                         cte: *cte,
                         query: *query,
-                        materialized: materialized.clone(),
+                        materialization: *materialization,
                     }
                 }
             };
@@ -1724,8 +1859,11 @@ mod tests {
         cte_document
             .validate()
             .expect("non-recursive CTE query HIR is valid");
+        let materialization =
+            HirPlanContext::new(&cte_document).cte_materialization(root_query, cte_id, child_query);
+        assert_eq!(materialization, HirCteMaterialization::Explicit);
         let cte_plan = HirQueryPlan::build(
-            Arc::new(cte_document),
+            Arc::new(cte_document.clone()),
             root_query,
             &Schema::default(),
             &CostModelParams::default(),
@@ -1743,9 +1881,88 @@ mod tests {
             HirSourceAccess::Cte {
                 cte,
                 query,
-                materialized: Materialized::Yes,
+                materialization: HirCteMaterialization::Explicit,
             } if cte == cte_id && query == child_query
         ));
+
+        cte_document.ctes[cte_id.index()].materialized = Materialized::Any;
+        let materialization =
+            HirPlanContext::new(&cte_document).cte_materialization(root_query, cte_id, child_query);
+        assert_eq!(materialization, HirCteMaterialization::PerReference);
+
+        let second_cte_source = SourceId::new(cte_document.sources.len());
+        let mut second_reference = cte_document.sources[source_id.index()].clone();
+        second_reference.id = second_cte_source;
+        cte_document.sources.push(second_reference);
+        cte_document.queries[root_query.index()].blocks[0]
+            .from
+            .as_mut()
+            .expect("root query has a CTE source")
+            .joins
+            .push(Join {
+                right: second_cte_source,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::None,
+            });
+        cte_document.ctes[cte_id.index()].materialized = Materialized::No;
+        cte_document
+            .validate()
+            .expect("two references to a NOT MATERIALIZED CTE are valid");
+
+        let mut correlated_document = cte_document.clone();
+        let outer_source = SourceId::new(correlated_document.sources.len());
+        let mut outer_definition = source_with_id(outer_source.index(), "outer_items");
+        outer_definition.owner = SourceOwner::QueryBlock(root_block_id);
+        correlated_document.sources.push(outer_definition);
+        correlated_document.databases.push(DatabaseSnapshot {
+            database: DatabaseId::new(0),
+            schema_version: 0,
+        });
+        correlated_document.queries[root_query.index()].blocks[0]
+            .from
+            .as_mut()
+            .expect("root query has CTE references")
+            .joins
+            .push(Join {
+                right: outer_source,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::None,
+            });
+        correlated_document.queries[child_query.index()].blocks[0].outputs[0].expr =
+            hir::Expr::column(outer_source, 0);
+        correlated_document.queries[child_query.index()].captures = vec![outer_source];
+        correlated_document
+            .validate()
+            .expect("correlated CTE body HIR is valid");
+        assert_eq!(
+            HirPlanContext::new(&correlated_document).cte_materialization(
+                root_query,
+                cte_id,
+                child_query,
+            ),
+            HirCteMaterialization::PerReference,
+        );
+
+        let shared_plan = HirQueryPlan::build(
+            Arc::new(cte_document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("repeated CTE references plan from HIR");
+        assert!(shared_plan
+            .planned_query(root_query)
+            .expect("shared CTE root query is planned")
+            .blocks[0]
+            .loops
+            .iter()
+            .all(|source_loop| matches!(
+                source_loop.access,
+                HirSourceAccess::Cte {
+                    materialization: HirCteMaterialization::Shared,
+                    ..
+                }
+            )));
 
         let table_source_id = SourceId::new(1);
         let mut table_source = source_with_id(1, "items");

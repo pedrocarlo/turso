@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR planning now resolves non-recursive CTE materialization into explicit
+  `PerReference`, `Shared`, or `Explicit` policy. Reference counting stops at
+  CTE-body boundaries, outer captures prevent sharing, and `NOT MATERIALIZED`
+  keeps the legacy behavior of allowing safe multi-reference sharing.
 - Non-recursive CTE sources now retain their `CteId`, body `QueryId`, and
   materialization choice in HIR planning. The body is planned before each
   referencing query block, and CTE scans reuse the resolved query-backed
