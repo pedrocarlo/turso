@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Ordinary indexes, automatic temporary indexes, and `IN` seeks now compete in
+  one source-generic B-tree selector. The legacy wrapper retains only AST-based
+  multi-index scans; HIR uses the same single-source cost and replacement logic.
 - `IN`-seek selection now returns the final planner `AccessMethod` through one
   expression-representation-neutral entry point. Legacy and HIR paths share
   consumed predicates, affinity, index identity, row estimates, and cost.

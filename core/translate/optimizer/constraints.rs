@@ -3426,7 +3426,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_in_seek_chooser_accepts_hir_constraints() -> Result<()> {
+    fn shared_btree_selector_chooses_hir_in_seek() -> Result<()> {
         let source = hir::SourceId::new(7);
         let constraints = HirTableConstraints {
             table_id: source,
@@ -3466,17 +3466,19 @@ mod tests {
         );
 
         let access_method =
-            crate::translate::optimizer::access_method::choose_in_seek_access_method(
+            crate::translate::optimizer::access_method::choose_single_btree_access_method(
                 &access_source,
                 &constraints,
                 &TableMask::default(),
+                source.index(),
+                None,
+                &[],
+                &Schema::new(),
+                &crate::stats::AnalyzeStats::default(),
                 1.0,
                 crate::translate::optimizer::cost::RowCountEstimate::hardcoded_fallback(&params),
                 &params,
-                crate::translate::optimizer::cost::Cost(f64::INFINITY),
-                crate::translate::optimizer::access_method::BranchReadMode::RowIdOnly,
-            )?
-            .expect("HIR rowid IN constraint drives existing chooser");
+            )?;
 
         assert_eq!(
             (&access_method.consumed_where_terms)
@@ -3490,6 +3492,87 @@ mod tests {
                 index: None,
                 affinity: Affinity::Integer,
                 where_term_idx: 3,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_btree_selector_builds_hir_automatic_index() -> Result<()> {
+        let source = hir::SourceId::new(7);
+        let mut prerequisite = TableMask::default();
+        prerequisite.set(0)?;
+        let constraints = HirTableConstraints {
+            table_id: source,
+            constraints: vec![HirConstraint {
+                where_clause_pos: (4, BinaryExprSide::Rhs),
+                operator: ast::Operator::Equals.into(),
+                table_col_pos: Some(0),
+                expr: None,
+                constraining_expr: None,
+                lhs_mask: prerequisite.clone(),
+                selectivity: CostModelParams::default().sel_eq_unindexed,
+                usable: true,
+                is_rowid: false,
+                comparison_affinity: Some(Affinity::Integer),
+                comparison_collation: None,
+                null_matching: false,
+            }],
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+                partial_index: None,
+            }],
+            temporary_index_terms: smallvec::smallvec![ConstraintRef {
+                constraint_vec_pos: 0,
+                index_col_pos: 0,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            }],
+        };
+        let table = table_with_columns(vec![Column::new_default_integer(
+            Some("a".into()),
+            "INTEGER".into(),
+            None,
+        )]);
+        let mut planned = hir_planned_source(source, &table);
+        planned.col_used_mask.set(0)?;
+        let document = empty_hir_document(source);
+        let access_source = crate::translate::optimizer::access_method::HirAccessSource::new(
+            &planned,
+            document
+                .source(source)
+                .expect("test document contains HIR source"),
+        );
+        let params = CostModelParams::default();
+
+        let access_method =
+            crate::translate::optimizer::access_method::choose_single_btree_access_method(
+                &access_source,
+                &constraints,
+                &prerequisite,
+                1,
+                None,
+                &[],
+                &Schema::new(),
+                &crate::stats::AnalyzeStats::default(),
+                100.0,
+                crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(10_000.0),
+                &params,
+            )?;
+
+        assert_eq!(
+            (&access_method.consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        assert!(matches!(
+            access_method.params,
+            crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable {
+                index: None,
+                build_index: true,
+                ..
             }
         ));
         Ok(())
@@ -4225,18 +4308,20 @@ mod tests {
                         .selectivity
             )
         );
-        let access_method = crate::translate::optimizer::access_method::choose_btree_access_method(
-            &access_source,
-            &accepted,
-            &TableMask::default(),
-            source.index(),
-            None,
-            &Schema::new(),
-            &crate::stats::AnalyzeStats::default(),
-            1.0,
-            base_row_count,
-            &params,
-        )?;
+        let access_method =
+            crate::translate::optimizer::access_method::choose_single_btree_access_method(
+                &access_source,
+                &accepted,
+                &TableMask::default(),
+                source.index(),
+                None,
+                &[],
+                &Schema::new(),
+                &crate::stats::AnalyzeStats::default(),
+                1.0,
+                base_row_count,
+                &params,
+            )?;
         assert_eq!(
             (&access_method.consumed_where_terms)
                 .into_iter()
