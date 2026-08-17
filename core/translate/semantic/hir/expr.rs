@@ -2,6 +2,7 @@
 
 use std::num::NonZeroU32;
 
+use smallvec::SmallVec;
 use turso_parser::ast::{
     Distinctness, FrameExclude, FrameMode, LikeOperator, Literal, NullsOrder, Operator,
     ResolveType, SortOrder, UnaryOperator,
@@ -403,6 +404,28 @@ pub enum Expr {
     },
 }
 
+struct ExprFrame<'expr, T> {
+    expression: &'expr Expr,
+    next_child: usize,
+    child_values: SmallVec<[T; 3]>,
+}
+
+impl<'expr, T> ExprFrame<'expr, T> {
+    fn new(expression: &'expr Expr) -> Self {
+        Self {
+            expression,
+            next_child: 0,
+            child_values: SmallVec::new(),
+        }
+    }
+
+    fn next_child(&mut self) -> Option<&'expr Expr> {
+        let child = self.expression.child(self.next_child)?;
+        self.next_child += 1;
+        Some(child)
+    }
+}
+
 impl Expr {
     pub fn column(source: SourceId, column: usize) -> Self {
         Self::Column(ColumnRef { source, column })
@@ -414,6 +437,115 @@ impl Expr {
 
     pub fn output(output: OutputId) -> Self {
         Self::Output(output)
+    }
+
+    fn child(&self, mut index: usize) -> Option<&Self> {
+        match self {
+            Self::Literal(_)
+            | Self::Parameter(_)
+            | Self::Column(_)
+            | Self::RowId(_)
+            | Self::Output(_)
+            | Self::Subquery(
+                SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
+            ) => None,
+            Self::MergedColumn(column) => (index == 0).then_some(column.left.as_ref()),
+            Self::Unary { expr, .. }
+            | Self::IsNull(expr)
+            | Self::NotNull(expr)
+            | Self::Collate { expr, .. } => (index == 0).then_some(expr.as_ref()),
+            Self::Binary {
+                lhs, rhs, custom, ..
+            } => match index {
+                0 => Some(lhs),
+                1 => Some(rhs),
+                _ => {
+                    index -= 2;
+                    let encoder = custom
+                        .as_ref()
+                        .and_then(|custom| custom.literal_encoding.as_ref())
+                        .and_then(|encoding| encoding.encoder.as_ref());
+                    child_from_optional_schema_call(encoder, &mut index)
+                }
+            },
+            Self::Between {
+                expr, start, end, ..
+            } => [expr.as_ref(), start.as_ref(), end.as_ref()]
+                .get(index)
+                .copied(),
+            Self::Case {
+                base,
+                when_then,
+                else_expr,
+                ..
+            } => {
+                if let Some(child) = child_from_optional_expr(base.as_deref(), &mut index) {
+                    return Some(child);
+                }
+                let pair_index = index / 2;
+                if let Some((when, then)) = when_then.get(pair_index) {
+                    return Some(if index % 2 == 0 { when } else { then });
+                }
+                index -= when_then.len() * 2;
+                child_from_optional_expr(else_expr.as_deref(), &mut index)
+            }
+            Self::Cast { expr, target } => {
+                if index == 0 {
+                    return Some(expr);
+                }
+                index -= 1;
+                if let Some(child) = child_from_exprs(&target.parameters, &mut index) {
+                    return Some(child);
+                }
+                if let Some(child) = child_from_schema_calls(&target.programs.encode, &mut index) {
+                    return Some(child);
+                }
+                target.programs.domain.as_ref().and_then(|domain| {
+                    child_from_schema_calls(
+                        domain.checks.iter().map(|check| &check.call),
+                        &mut index,
+                    )
+                })
+            }
+            Self::Function(call) => {
+                if let Some(child) = child_from_exprs(call.arguments.expressions(), &mut index) {
+                    return Some(child);
+                }
+                if let Some(child) =
+                    child_from_order_terms(call.arguments.order_terms(), &mut index)
+                {
+                    return Some(child);
+                }
+                child_from_optional_expr(call.evaluation.filter(), &mut index)
+            }
+            Self::InList { lhs, values, .. } => {
+                if index == 0 {
+                    return Some(lhs);
+                }
+                index -= 1;
+                child_from_exprs(values, &mut index)
+            }
+            Self::Subquery(SubqueryExpr::In { lhs, .. }) => (index == 0).then_some(lhs.as_ref()),
+            Self::Like {
+                lhs, rhs, escape, ..
+            } => match index {
+                0 => Some(lhs),
+                1 => Some(rhs),
+                2 => escape.as_deref(),
+                _ => None,
+            },
+            Self::Row(expressions) | Self::Array(expressions) => expressions.get(index),
+            Self::Subscript {
+                base,
+                index: offset,
+            } => match index {
+                0 => Some(base),
+                1 => Some(offset),
+                _ => None,
+            },
+            Self::FieldAccess(access) => (index == 0).then_some(access.base.as_ref()),
+            Self::Raise { message, .. } => (index == 0).then(|| message.as_deref()).flatten(),
+        }
     }
 
     /// Compare resolved expression shapes for expression-index matching.
@@ -678,91 +810,38 @@ impl Expr {
     /// by the query that owns them.
     pub(crate) fn walk<'expr>(&'expr self, visitor: &mut impl FnMut(&'expr Expr)) {
         visitor(self);
-        match self {
-            Self::Literal(_)
-            | Self::Parameter(_)
-            | Self::Column(_)
-            | Self::RowId(_)
-            | Self::Output(_)
-            | Self::Subquery(
-                SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
-            ) => {}
-            Self::MergedColumn(column) => column.left.walk(visitor),
-            Self::Unary { expr, .. }
-            | Self::IsNull(expr)
-            | Self::NotNull(expr)
-            | Self::Collate { expr, .. } => expr.walk(visitor),
-            Self::Binary {
-                lhs, rhs, custom, ..
-            } => {
-                lhs.walk(visitor);
-                rhs.walk(visitor);
-                if let Some(call) = custom
-                    .as_ref()
-                    .and_then(|custom| custom.literal_encoding.as_ref())
-                    .and_then(|encoding| encoding.encoder.as_ref())
-                {
-                    walk_schema_call(call, visitor);
-                }
+        let mut frames = vec![ExprFrame::<()>::new(self)];
+        while let Some(frame) = frames.last_mut() {
+            let Some(child) = frame.next_child() else {
+                frames.pop();
+                continue;
+            };
+            visitor(child);
+            frames.push(ExprFrame::new(child));
+        }
+    }
+
+    /// Reduce this expression from leaves to root without using the call stack.
+    /// Child values keep expression-child order, letting callers handle nodes
+    /// whose result depends on more than one child.
+    pub(crate) fn fold<T>(&self, folder: &mut impl FnMut(&Expr, &[T]) -> T) -> T {
+        let mut frames = vec![ExprFrame::new(self)];
+        loop {
+            if let Some(child) = frames
+                .last_mut()
+                .expect("root expression frame exists")
+                .next_child()
+            {
+                frames.push(ExprFrame::new(child));
+                continue;
             }
-            Self::Between {
-                expr, start, end, ..
-            } => {
-                expr.walk(visitor);
-                start.walk(visitor);
-                end.walk(visitor);
-            }
-            Self::Case {
-                base,
-                when_then,
-                else_expr,
-                ..
-            } => {
-                walk_optional_expr(base.as_deref(), visitor);
-                for (when, then) in when_then {
-                    when.walk(visitor);
-                    then.walk(visitor);
-                }
-                walk_optional_expr(else_expr.as_deref(), visitor);
-            }
-            Self::Cast { expr, target } => {
-                expr.walk(visitor);
-                walk_exprs(&target.parameters, visitor);
-                for call in &target.programs.encode {
-                    walk_schema_call(call, visitor);
-                }
-                if let Some(domain) = &target.programs.domain {
-                    for check in &domain.checks {
-                        walk_schema_call(&check.call, visitor);
-                    }
-                }
-            }
-            Self::Function(call) => {
-                walk_exprs(call.arguments.expressions(), visitor);
-                walk_order_terms(call.arguments.order_terms(), visitor);
-                walk_optional_expr(call.evaluation.filter(), visitor);
-            }
-            Self::InList { lhs, values, .. } => {
-                lhs.walk(visitor);
-                walk_exprs(values, visitor);
-            }
-            Self::Subquery(SubqueryExpr::In { lhs, .. }) => lhs.walk(visitor),
-            Self::Like {
-                lhs, rhs, escape, ..
-            } => {
-                lhs.walk(visitor);
-                rhs.walk(visitor);
-                walk_optional_expr(escape.as_deref(), visitor);
-            }
-            Self::Row(expressions) | Self::Array(expressions) => {
-                walk_exprs(expressions, visitor);
-            }
-            Self::Subscript { base, index } => {
-                base.walk(visitor);
-                index.walk(visitor);
-            }
-            Self::FieldAccess(access) => access.base.walk(visitor),
-            Self::Raise { message, .. } => walk_optional_expr(message.as_deref(), visitor),
+
+            let frame = frames.pop().expect("completed expression frame exists");
+            let value = folder(frame.expression, &frame.child_values);
+            let Some(parent) = frames.last_mut() else {
+                return value;
+            };
+            parent.child_values.push(value);
         }
     }
 }
@@ -951,27 +1030,97 @@ fn order_terms_match<'expr>(
     true
 }
 
-fn walk_exprs<'expr>(expressions: &'expr [Expr], visitor: &mut impl FnMut(&'expr Expr)) {
-    for expression in expressions {
-        expression.walk(visitor);
+fn child_from_exprs<'expr>(expressions: &'expr [Expr], index: &mut usize) -> Option<&'expr Expr> {
+    if let Some(expression) = expressions.get(*index) {
+        return Some(expression);
     }
+    *index -= expressions.len();
+    None
 }
 
-fn walk_optional_expr<'expr>(
+fn child_from_optional_expr<'expr>(
     expression: Option<&'expr Expr>,
-    visitor: &mut impl FnMut(&'expr Expr),
-) {
-    if let Some(expression) = expression {
-        expression.walk(visitor);
+    index: &mut usize,
+) -> Option<&'expr Expr> {
+    let expression = expression?;
+    if *index == 0 {
+        return Some(expression);
     }
+    *index -= 1;
+    None
 }
 
-fn walk_order_terms<'expr>(terms: &'expr [OrderTerm], visitor: &mut impl FnMut(&'expr Expr)) {
-    for term in terms {
-        term.expr.walk(visitor);
+fn child_from_order_terms<'expr>(
+    terms: &'expr [OrderTerm],
+    index: &mut usize,
+) -> Option<&'expr Expr> {
+    if let Some(term) = terms.get(*index) {
+        return Some(&term.expr);
     }
+    *index -= terms.len();
+    None
 }
 
-fn walk_schema_call<'expr>(call: &'expr BoundSchemaCall, visitor: &mut impl FnMut(&'expr Expr)) {
-    walk_exprs(&call.arguments, visitor);
+fn child_from_optional_schema_call<'expr>(
+    call: Option<&'expr BoundSchemaCall>,
+    index: &mut usize,
+) -> Option<&'expr Expr> {
+    child_from_schema_calls(call, index)
+}
+
+fn child_from_schema_calls<'expr>(
+    calls: impl IntoIterator<Item = &'expr BoundSchemaCall>,
+    index: &mut usize,
+) -> Option<&'expr Expr> {
+    for call in calls {
+        if let Some(child) = child_from_exprs(&call.arguments, index) {
+            return Some(child);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expression_frames_preserve_child_order_for_walk_and_fold() {
+        let expression = Expr::Binary {
+            lhs: Box::new(Expr::Literal(Literal::Numeric("2".into()))),
+            operator: Operator::Add,
+            rhs: Box::new(Expr::Unary {
+                operator: UnaryOperator::Negative,
+                expr: Box::new(Expr::Literal(Literal::Numeric("3".into()))),
+            }),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+
+        let mut visited = Vec::new();
+        expression.walk(&mut |expression| {
+            visited.push(match expression {
+                Expr::Binary { .. } => "binary",
+                Expr::Unary { .. } => "unary",
+                Expr::Literal(_) => "literal",
+                _ => unreachable!("test expression contains only binary, unary, and literals"),
+            });
+        });
+        assert_eq!(visited, ["binary", "literal", "unary", "literal"]);
+
+        let value = expression.fold(&mut |expression, children: &[i64]| match expression {
+            Expr::Literal(Literal::Numeric(value)) => value.parse().expect("integer literal"),
+            Expr::Unary {
+                operator: UnaryOperator::Negative,
+                ..
+            } => -children[0],
+            Expr::Binary {
+                operator: Operator::Add,
+                ..
+            } => children[0] + children[1],
+            _ => unreachable!("test expression contains only addition and negation"),
+        });
+        assert_eq!(value, -1);
+    }
 }

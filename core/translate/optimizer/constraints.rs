@@ -594,18 +594,9 @@ fn hir_partial_index_selectivity(
     schema: &Schema,
     params: &CostModelParams,
 ) -> f64 {
-    enum Task<'a> {
-        Visit(&'a hir::Expr),
-        And,
-        Or,
-        Not,
-    }
-
     let resolve_side = |expression: &hir::Expr| {
         let (column, is_rowid) = match expression {
-            hir::Expr::Column(column) if column.source == source.id => {
-                (Some(column.column), false)
-            }
+            hir::Expr::Column(column) if column.source == source.id => (Some(column.column), false),
             hir::Expr::RowId(row_source) if *row_source == source.id => (None, true),
             _ => return None,
         };
@@ -632,102 +623,80 @@ fn hir_partial_index_selectivity(
         )
     };
 
-    let mut tasks = vec![Task::Visit(predicate)];
-    let mut values = Vec::new();
-    while let Some(task) = tasks.pop() {
-        match task {
-            Task::Visit(expression) => match expression {
-                hir::Expr::Binary {
-                    lhs,
-                    operator: ast::Operator::And,
-                    rhs,
-                    ..
-                } => {
-                    tasks.push(Task::And);
-                    tasks.push(Task::Visit(rhs));
-                    tasks.push(Task::Visit(lhs));
-                }
-                hir::Expr::Binary {
-                    lhs,
-                    operator: ast::Operator::Or,
-                    rhs,
-                    ..
-                } => {
-                    tasks.push(Task::Or);
-                    tasks.push(Task::Visit(rhs));
-                    tasks.push(Task::Visit(lhs));
-                }
-                hir::Expr::Binary {
-                    operator: ast::Operator::Is,
-                    rhs,
-                    ..
-                } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
-                    values.push(params.sel_is_null);
-                }
-                hir::Expr::Binary {
-                    operator: ast::Operator::IsNot,
-                    rhs,
-                    ..
-                } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
-                    values.push(params.sel_is_not_null);
-                }
-                hir::Expr::Binary {
-                    lhs, operator, rhs, ..
-                } => values.push(leaf(lhs, rhs, (*operator).into())),
-                hir::Expr::IsNull(_) => values.push(params.sel_is_null),
-                hir::Expr::NotNull(_) => values.push(params.sel_is_not_null),
-                hir::Expr::Between { negated, .. } => values.push(if *negated {
-                    1.0 - params.sel_range
-                } else {
-                    params.sel_range
-                }),
-                hir::Expr::InList {
-                    lhs,
-                    negated,
-                    values: items,
-                    ..
-                } => values.push(leaf(
-                    lhs,
-                    lhs,
-                    ConstraintOperator::In {
-                        not: *negated,
-                        estimated_values: items.len() as f64,
-                    },
-                )),
-                hir::Expr::Like { negated, .. } => values.push(if *negated {
-                    params.sel_not_like
-                } else {
-                    params.sel_like
-                }),
-                hir::Expr::Unary {
-                    operator: ast::UnaryOperator::Not,
-                    expr,
-                } => {
-                    tasks.push(Task::Not);
-                    tasks.push(Task::Visit(expr));
-                }
-                _ => values.push(params.sel_other),
-            },
-            Task::And => {
-                let right = values.pop().expect("AND right selectivity was evaluated");
-                let left = values.pop().expect("AND left selectivity was evaluated");
-                values.push(left * right);
-            }
-            Task::Or => {
-                let right = values.pop().expect("OR right selectivity was evaluated");
-                let left = values.pop().expect("OR left selectivity was evaluated");
-                values.push((left + right - left * right).min(1.0));
-            }
-            Task::Not => {
-                let value = values.pop().expect("NOT selectivity was evaluated");
-                values.push(1.0 - value);
+    predicate.fold(&mut |expression, children: &[f64]| match expression {
+        hir::Expr::Binary {
+            operator: ast::Operator::And,
+            ..
+        } => {
+            let [left, right] = children else {
+                unreachable!("binary AND has two children")
+            };
+            left * right
+        }
+        hir::Expr::Binary {
+            operator: ast::Operator::Or,
+            ..
+        } => {
+            let [left, right] = children else {
+                unreachable!("binary OR has two children")
+            };
+            (left + right - left * right).min(1.0)
+        }
+        hir::Expr::Binary {
+            operator: ast::Operator::Is,
+            rhs,
+            ..
+        } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => params.sel_is_null,
+        hir::Expr::Binary {
+            operator: ast::Operator::IsNot,
+            rhs,
+            ..
+        } if matches!(rhs.as_ref(), hir::Expr::Literal(ast::Literal::Null)) => {
+            params.sel_is_not_null
+        }
+        hir::Expr::Binary {
+            lhs, operator, rhs, ..
+        } => leaf(lhs, rhs, (*operator).into()),
+        hir::Expr::IsNull(_) => params.sel_is_null,
+        hir::Expr::NotNull(_) => params.sel_is_not_null,
+        hir::Expr::Between { negated, .. } => {
+            if *negated {
+                1.0 - params.sel_range
+            } else {
+                params.sel_range
             }
         }
-    }
-    let [selectivity] = values.as_slice() else {
-        unreachable!("one predicate produces one selectivity")
-    };
-    *selectivity
+        hir::Expr::InList {
+            lhs,
+            negated,
+            values,
+            ..
+        } => leaf(
+            lhs,
+            lhs,
+            ConstraintOperator::In {
+                not: *negated,
+                estimated_values: values.len() as f64,
+            },
+        ),
+        hir::Expr::Like { negated, .. } => {
+            if *negated {
+                params.sel_not_like
+            } else {
+                params.sel_like
+            }
+        }
+        hir::Expr::Unary {
+            operator: ast::UnaryOperator::Not,
+            ..
+        } => {
+            let [value] = children else {
+                unreachable!("unary NOT has one child")
+            };
+            1.0 - value
+        }
+        _ => params.sel_other,
+    })
 }
 
 fn hir_constrained_expr<'a>(

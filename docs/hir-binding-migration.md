@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR expressions now share one iterative frame traversal for preorder walks
+  and postorder folds. Partial-index selectivity uses the fold directly instead
+  of maintaining its own traversal tasks and result stack.
 - Partial-index candidates now carry their estimated stored-row fraction.
   Legacy collection runs its existing bound-AST estimator once; HIR collection
   applies the same formulas iteratively to the frozen resolved predicate.
