@@ -2,8 +2,8 @@
 
 use super::{
     optimizer::{
-        apply_hir_selected_btree_access,
-        constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        CostModelParams, HirBtreeOperation, apply_hir_selected_btree_access,
+        constraints::{HirTableConstraints, hir_table_constraints_for_source},
         cost::Cost,
         hir_base_row_estimates,
         join::compute_hir_greedy_btree_join_order,
@@ -11,12 +11,11 @@ use super::{
             ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
             OrderTargetPurpose,
         },
-        CostModelParams, HirBtreeOperation,
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
     semantic::hir::{self, ColumnUsage, HirDocument, QueryId, SourceId},
 };
-use crate::{schema::Schema, LimboError, Result};
+use crate::{LimboError, Result, schema::Schema};
 
 /// Resolved source and predicate input for one query block.
 pub(crate) struct HirQueryBlockPlanInput {
@@ -176,13 +175,17 @@ impl<'a> HirPlanContext<'a> {
         &self,
         block: &hir::QueryBlock,
         order_by: &[hir::OrderTerm],
-        usage: &[ColumnUsage],
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
         query_rows: &dyn Fn(QueryId) -> Option<f64>,
     ) -> Result<HirQueryBlockPlan> {
-        let input = self.query_block_input(block, order_by, usage)?;
+        let query = self
+            .document
+            .query(block.id.query)
+            .expect("validated HIR query block has owning query");
+        let usage = query.direct_column_usage(|source| self.document.source(source));
+        let input = self.query_block_input(block, order_by, &usage)?;
         let Some(from) = &block.from else {
             return Ok(HirQueryBlockPlan {
                 loops: Vec::new(),
@@ -552,6 +555,23 @@ mod tests {
         }
     }
 
+    fn add_query(document: &mut hir::HirDocument, block: &QueryBlock) {
+        let query = block.id.query;
+        document.root = hir::HirRoot::Query(QueryRoot { query });
+        document.queries.push(Query {
+            id: query,
+            parent: None,
+            captures: Vec::new(),
+            reachable_ctes: Vec::new(),
+            blocks: vec![block.clone()],
+            first: block.id,
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: block.outputs.iter().map(|output| output.id).collect(),
+        });
+    }
+
     fn binary(lhs: hir::Expr, operator: Operator, rhs: hir::Expr) -> hir::Expr {
         hir::Expr::Binary {
             lhs: Box::new(lhs),
@@ -914,9 +934,11 @@ mod tests {
         let join = input.sources[1].join_info.as_ref().unwrap();
         assert_eq!(join.kind, JoinKind::Right);
         assert_eq!(input.predicates.len(), 3);
-        assert!(input.predicates[..2]
-            .iter()
-            .all(|predicate| predicate.from_outer_join == Some(right)));
+        assert!(
+            input.predicates[..2]
+                .iter()
+                .all(|predicate| predicate.from_outer_join == Some(right))
+        );
         assert_eq!(input.predicates[2].from_outer_join, None);
         assert!(matches!(
             &input.predicates[0].expr,
@@ -945,7 +967,7 @@ mod tests {
     fn query_block_input_builds_using_equality_from_resolved_columns() {
         let left = SourceId::new(0);
         let right = SourceId::new(1);
-        let document = document(vec![
+        let mut document = document(vec![
             source_with_id(0, "left_items"),
             source_with_id(1, "right_items"),
         ]);
@@ -1003,6 +1025,8 @@ mod tests {
             },
         ];
 
+        add_query(&mut document, &block);
+
         let context = HirPlanContext::new(&document);
         let input = context
             .query_block_input(&block, &[], &usage)
@@ -1051,7 +1075,7 @@ mod tests {
             ]
         );
         let plan = context
-            .plan_query_block(&block, &[], &usage, 1.0, &schema, &params, &|_| None)
+            .plan_query_block(&block, &[], 1.0, &schema, &params, &|_| None)
             .expect("HIR access planning succeeds");
         assert!(plan.output_cardinality > 0.0);
         assert!(plan.cost.0 >= 0.0);
@@ -1092,7 +1116,7 @@ mod tests {
 
     #[test]
     fn source_less_query_block_keeps_predicates_without_access_loops() {
-        let document = document(vec![source()]);
+        let mut document = document(vec![source()]);
         let block = QueryBlock::new(
             QueryBlockId::new(QueryId::new(0), 0),
             QueryBlockBody::Select {
@@ -1103,10 +1127,10 @@ mod tests {
                 grouping: None,
             },
         );
+        add_query(&mut document, &block);
         let plan = HirPlanContext::new(&document)
             .plan_query_block(
                 &block,
-                &[],
                 &[],
                 7.0,
                 &Schema::default(),
