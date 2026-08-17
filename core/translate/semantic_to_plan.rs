@@ -2,7 +2,10 @@
 
 use super::{
     optimizer::{
+        access_method::AccessMethod,
         constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        hir_base_row_estimates,
+        join::{compute_hir_greedy_btree_join_order, JoinN},
         order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
         CostModelParams,
     },
@@ -15,6 +18,13 @@ use crate::{schema::Schema, LimboError, Result};
 pub(crate) struct HirQueryBlockPlanInput {
     pub(crate) sources: Vec<HirPlannedSource>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+}
+
+/// B-tree access choices for one resolved HIR query block.
+pub(crate) struct HirBTreePlan {
+    pub(crate) constraints: Vec<HirTableConstraints>,
+    pub(crate) access_methods: Vec<AccessMethod>,
+    pub(crate) join: JoinN,
 }
 
 /// State shared while one HIR document is converted into plan nodes.
@@ -153,6 +163,46 @@ impl<'a> HirPlanContext<'a> {
                 )
             })
             .collect()
+    }
+
+    /// Choose B-tree access methods and a complete join order directly from
+    /// resolved HIR. This keeps the planning boundary free of parser-era table
+    /// identities and bound AST expressions.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn plan_btree_access(
+        &self,
+        from: &hir::From,
+        input: &HirQueryBlockPlanInput,
+        order_target: Option<&HirOrderTarget<'_>>,
+        initial_cardinality: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_rows: &dyn Fn(QueryId) -> Option<f64>,
+    ) -> Result<Option<HirBTreePlan>> {
+        let constraints = self.constraints(from, input, schema, params, query_rows)?;
+        let base_rows = hir_base_row_estimates(&input.sources, schema, params);
+        let mut access_methods = Vec::new();
+        let result = compute_hir_greedy_btree_join_order(
+            self.document,
+            from,
+            &input.sources,
+            &constraints,
+            &input.predicates,
+            &base_rows,
+            order_target,
+            initial_cardinality,
+            &mut access_methods,
+            schema,
+            &schema.analyze_stats,
+            params,
+        )?;
+
+        Ok(result.map(|result| HirBTreePlan {
+            constraints,
+            access_methods,
+            join: result.best_plan,
+        }))
     }
 
     /// Build an ordering requirement from resolved HIR terms without reopening
@@ -313,14 +363,10 @@ mod tests {
     use super::*;
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, Schema, Table, Type},
-        stats::AnalyzeStats,
         sync::Arc,
         translate::collate::CollationSeq,
         translate::{
-            optimizer::{
-                cost::RowCountEstimate, hir_base_row_estimates,
-                join::compute_hir_greedy_btree_join_order,
-            },
+            optimizer::cost::RowCountEstimate,
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
                 ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -917,20 +963,6 @@ mod tests {
             .analyze_stats
             .table_stats_mut("right_items")
             .row_count = Some(1);
-        let constraints = context
-            .constraints(
-                block.from.as_ref().expect("test block has FROM"),
-                &input,
-                &schema,
-                &params,
-                &|_| None,
-            )
-            .expect("whole query block constraints collect");
-        assert_eq!(constraints.len(), 2);
-        assert_eq!(constraints[0].table_id, left);
-        assert_eq!(constraints[1].table_id, right);
-        assert!(!constraints[1].constraints.is_empty());
-
         let base_rows = hir_base_row_estimates(&input.sources, &schema, &params);
         assert_eq!(
             base_rows,
@@ -939,26 +971,25 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1.0),
             ]
         );
-        let mut access_methods = Vec::new();
-        let result = compute_hir_greedy_btree_join_order(
-            &document,
-            block.from.as_ref().expect("test block has FROM"),
-            &input.sources,
-            &constraints,
-            &input.predicates,
-            &base_rows,
-            None,
-            1.0,
-            &mut access_methods,
-            &schema,
-            &AnalyzeStats::default(),
-            &params,
-        )
-        .expect("HIR join planning succeeds")
-        .expect("two HIR sources produce a join plan");
-        assert_eq!(result.best_plan.table_numbers().collect::<Vec<_>>(), [0, 1]);
-        assert!(result.best_plan.best_access_methods().all(|index| matches!(
-            access_methods[index].params,
+        let plan = context
+            .plan_btree_access(
+                block.from.as_ref().expect("test block has FROM"),
+                &input,
+                None,
+                1.0,
+                &schema,
+                &params,
+                &|_| None,
+            )
+            .expect("HIR access planning succeeds")
+            .expect("two HIR sources produce an access plan");
+        assert_eq!(plan.constraints.len(), 2);
+        assert_eq!(plan.constraints[0].table_id, left);
+        assert_eq!(plan.constraints[1].table_id, right);
+        assert!(!plan.constraints[1].constraints.is_empty());
+        assert_eq!(plan.join.table_numbers().collect::<Vec<_>>(), [0, 1]);
+        assert!(plan.join.best_access_methods().all(|index| matches!(
+            plan.access_methods[index].params,
             crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable { .. }
         )));
     }

@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR query-block B-tree planning now has one boundary that collects resolved
+  constraints, derives ANALYZE row estimates, owns the access-method arena, and
+  returns the complete `JoinN`. Callers no longer assemble those planning steps
+  themselves, and the boundary uses no AST, resolver, or `TableReferences`.
 - Greedy HIR B-tree planning now builds a complete left-deep `JoinN`. It uses
   the existing ordering restrictions, connected-source preference,
   cross-product penalty, cardinality formula, and access-method arena without
