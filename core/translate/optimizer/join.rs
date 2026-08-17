@@ -1908,11 +1908,10 @@ fn hir_join_kind_is_ordering_constrained(kind: hir::JoinKind) -> bool {
     )
 }
 
-/// Build a left-deep HIR join plan using the greedy B-tree rules.
+/// Build a left-deep HIR join plan using the existing greedy rules.
 ///
-/// This is the HIR counterpart of [`compute_greedy_join_order`] for the
-/// ordinary B-tree access paths already supported by HIR planning. Hash joins,
-/// virtual tables, and multi-index plans remain on the legacy path for now.
+/// HIR supports B-tree, virtual-table, derived, and CTE scans. Hash joins and
+/// multi-index scans remain optional legacy optimizations.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compute_hir_greedy_join_order(

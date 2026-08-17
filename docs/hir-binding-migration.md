@@ -81,6 +81,21 @@ Deferred migration surfaces:
 |---|---|
 | Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Preparation can capture that catalog from the same schema inputs used to create the legacy resolver, but does not call the semantic entry point yet. Switching execution to HIR remains a later step; physical lowering is explicitly out of scope for now. |
 
+### Cutover deletion map
+
+SELECT has no remaining HIR planning guard. Its planner handoff does not use a
+resolver, `TableReferences`, parser-expression conversion, binding, or
+rewriting. Remaining parser types are frozen enums and literals already owned
+by HIR.
+
+| Legacy work | HIR replacement | Why still live |
+|---|---|---|
+| SELECT binding in `select.rs` | Semantic analyzer and HIR | Production preparation still builds the legacy plan. |
+| `expr/binding.rs` | `semantic/expr.rs` | The legacy emitter still consumes parser expressions. |
+| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | Legacy SELECT and DML callers still use it. |
+| `TableReferences` physical facts | HIR planned sources and loops | The legacy emitter still uses its cursor and ordering metadata. |
+| Bind and rewrite passes | Closed, validated HIR | Production cutover has not happened. |
+
 Preserved binding restrictions, not HIR gaps:
 
 | Restriction | Matching old-path evidence |
