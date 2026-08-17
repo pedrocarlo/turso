@@ -7,7 +7,10 @@ use super::{
         cost::Cost,
         hir_base_row_estimates,
         join::compute_hir_greedy_btree_join_order,
-        order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
+        order::{
+            ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
+            OrderTargetPurpose,
+        },
         CostModelParams, HirBtreeOperation,
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
@@ -22,7 +25,7 @@ pub(crate) struct HirQueryBlockPlanInput {
 }
 
 /// B-tree access choices for one resolved HIR query block.
-pub(crate) struct HirBTreePlan {
+pub(crate) struct HirQueryBlockPlan {
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) output_cardinality: f64,
@@ -166,12 +169,53 @@ impl<'a> HirPlanContext<'a> {
             .collect()
     }
 
+    /// Plan one resolved query block without exposing mutable planner input.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn plan_query_block(
+        &self,
+        block: &hir::QueryBlock,
+        order_by: &[hir::OrderTerm],
+        usage: &[ColumnUsage],
+        initial_cardinality: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_rows: &dyn Fn(QueryId) -> Option<f64>,
+    ) -> Result<HirQueryBlockPlan> {
+        let input = self.query_block_input(block, order_by, usage)?;
+        let Some(from) = &block.from else {
+            return Ok(HirQueryBlockPlan {
+                loops: Vec::new(),
+                predicates: input.predicates,
+                output_cardinality: initial_cardinality,
+                cost: Cost(0.0),
+            });
+        };
+        let order_target = self.order_target(
+            order_by,
+            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        );
+        self.plan_btree_access(
+            from,
+            input,
+            order_target.as_ref(),
+            initial_cardinality,
+            schema,
+            params,
+            query_rows,
+        )?
+        .ok_or_else(|| {
+            LimboError::InternalError(
+                "query block with FROM produced no B-tree access plan".to_string(),
+            )
+        })
+    }
+
     /// Choose B-tree access methods and a complete join order directly from
     /// resolved HIR. This keeps the planning boundary free of parser-era table
     /// identities and bound AST expressions.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn plan_btree_access(
+    fn plan_btree_access(
         &self,
         from: &hir::From,
         mut input: HirQueryBlockPlanInput,
@@ -180,7 +224,7 @@ impl<'a> HirPlanContext<'a> {
         schema: &Schema,
         params: &CostModelParams,
         query_rows: &dyn Fn(QueryId) -> Option<f64>,
-    ) -> Result<Option<HirBTreePlan>> {
+    ) -> Result<Option<HirQueryBlockPlan>> {
         let constraints = self.constraints(from, &input, schema, params, query_rows)?;
         let base_rows = hir_base_row_estimates(&input.sources, schema, params);
         let mut access_methods = Vec::new();
@@ -221,7 +265,7 @@ impl<'a> HirPlanContext<'a> {
             prior_sources.set(source_position)?;
         }
 
-        Ok(Some(HirBTreePlan {
+        Ok(Some(HirQueryBlockPlan {
             loops,
             predicates: input.predicates,
             output_cardinality: result.best_plan.output_cardinality,
@@ -1007,17 +1051,8 @@ mod tests {
             ]
         );
         let plan = context
-            .plan_btree_access(
-                block.from.as_ref().expect("test block has FROM"),
-                input,
-                None,
-                1.0,
-                &schema,
-                &params,
-                &|_| None,
-            )
-            .expect("HIR access planning succeeds")
-            .expect("two HIR sources produce an access plan");
+            .plan_query_block(&block, &[], &usage, 1.0, &schema, &params, &|_| None)
+            .expect("HIR access planning succeeds");
         assert!(plan.output_cardinality > 0.0);
         assert!(plan.cost.0 >= 0.0);
         let [left_loop, right_loop] = plan.loops.as_slice() else {
@@ -1053,5 +1088,37 @@ mod tests {
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
         assert!(plan.predicates[0].consumed);
+    }
+
+    #[test]
+    fn source_less_query_block_keeps_predicates_without_access_loops() {
+        let document = document(vec![source()]);
+        let block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: Some(hir::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                    "1".into(),
+                ))),
+                grouping: None,
+            },
+        );
+        let plan = HirPlanContext::new(&document)
+            .plan_query_block(
+                &block,
+                &[],
+                &[],
+                7.0,
+                &Schema::default(),
+                &CostModelParams::default(),
+                &|_| None,
+            )
+            .expect("source-less query block plans");
+
+        assert!(plan.loops.is_empty());
+        assert_eq!(plan.predicates.len(), 1);
+        assert!(!plan.predicates[0].consumed);
+        assert_eq!(plan.output_cardinality, 7.0);
+        assert_eq!(plan.cost, Cost(0.0));
     }
 }

@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Query-block planning now has one resolved-HIR entry point that owns planner
+  scratch construction. Source-less SELECT and VALUES blocks produce empty-loop
+  plans while retaining predicates, cardinality, and zero access cost.
 - Final HIR B-tree plans own their predicates after access selection, including
   consumption state. Residual filters therefore survive planning instead of
   remaining in mutable caller scratch state.
