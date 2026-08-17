@@ -156,26 +156,7 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(query_id)
             .expect("validated HIR query exists");
-        let mut dependencies = Vec::new();
-        for block in &query.blocks {
-            let Some(from) = &block.from else {
-                continue;
-            };
-            for source in
-                core::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
-            {
-                match &self.definition(source).kind {
-                    hir::SourceKind::Derived(dependency) => dependencies.push(*dependency),
-                    hir::SourceKind::Cte(cte) => {
-                        self.append_cte_dependencies(*cte, &mut dependencies)
-                    }
-                    _ => {}
-                }
-            }
-        }
-        dependencies.sort_unstable();
-        dependencies.dedup();
-        for dependency in dependencies {
+        for dependency in self.document.direct_query_dependencies(query_id) {
             self.plan_query_tree(dependency, schema, params, planned, active)?;
         }
 
@@ -220,20 +201,6 @@ impl<'a> HirPlanContext<'a> {
         usage: &[ColumnUsage],
     ) -> Result<HirPlannedSource> {
         planned_source_from_definition(self.definition(source), join_info, usage)
-    }
-
-    fn append_cte_dependencies(&self, cte: hir::CteId, dependencies: &mut Vec<QueryId>) {
-        let definition = self
-            .document
-            .cte(cte)
-            .expect("validated HIR contains referenced CTE");
-        match &definition.body {
-            hir::CteBody::Query(query) => dependencies.push(*query),
-            hir::CteBody::Recursive(recursive) => {
-                dependencies.push(recursive.seed);
-                dependencies.extend(recursive.arms.iter().map(|arm| arm.query));
-            }
-        }
     }
 
     fn cte_materialization(
@@ -967,7 +934,7 @@ mod tests {
                 CteId, DatabaseId, DatabaseSnapshot, IndexCoverage, Join, JoinConstraint, JoinKind,
                 OrderTerm, Output, OutputId, Query, QueryBlock, QueryBlockBody, QueryBlockId,
                 QueryId, QueryRoot, RecursiveArm, RecursiveCte, SourceColumn, SourceKind,
-                SourceOwner, TypeFact, UsingColumn,
+                SourceOwner, SubqueryExpr, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
@@ -1784,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_hir_query_plan_plans_derived_query_before_its_scan() {
+    fn owned_hir_query_plan_plans_query_dependencies_before_their_owner() {
         let root_query = QueryId::new(0);
         let child_query = QueryId::new(1);
         let root_block_id = QueryBlockId::new(root_query, 0);
@@ -1900,6 +1867,36 @@ mod tests {
             HirSourceAccess::Derived { query } if query == child_query
         ));
         assert!(root.cost.0 > child.cost.0);
+
+        let mut subquery_document = plan.document.as_ref().clone();
+        let subquery = QueryId::new(subquery_document.queries.len());
+        let subquery_block = QueryBlockId::new(subquery, 0);
+        let mut subquery_definition = subquery_document.queries[child_query.index()].clone();
+        subquery_definition.id = subquery;
+        subquery_definition.parent = Some(root_query);
+        subquery_definition.first = subquery_block;
+        subquery_definition.blocks[0].id = subquery_block;
+        subquery_definition.blocks[0].outputs[0].id = OutputId::query(subquery_block, 0);
+        subquery_definition.output = vec![OutputId::query(subquery_block, 0)];
+        subquery_document.queries.push(subquery_definition);
+        let QueryBlockBody::Select { filter, .. } =
+            &mut subquery_document.queries[root_query.index()].blocks[0].body
+        else {
+            panic!("root query is SELECT");
+        };
+        *filter = Some(hir::Expr::Subquery(SubqueryExpr::Exists(subquery)));
+        subquery_document
+            .validate()
+            .expect("expression subquery HIR is valid");
+        let subquery_plan = HirQueryPlan::build(
+            Arc::new(subquery_document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("expression subquery plans from HIR");
+        assert!(subquery_plan.planned_query(subquery).is_some());
+        assert!(subquery_plan.planned_query(root_query).is_some());
 
         let cte_id = CteId::new(0);
         let mut cte_document = plan.document.as_ref().clone();

@@ -40,6 +40,54 @@ impl ColumnUsageCollector {
 }
 
 impl HirDocument {
+    /// Return every query whose plan is needed directly by this query. This
+    /// includes query-backed FROM sources and subqueries in expressions, but
+    /// does not descend into those query definitions.
+    pub(crate) fn direct_query_dependencies(&self, id: QueryId) -> Vec<QueryId> {
+        let Some(query) = self.query(id) else {
+            return Vec::new();
+        };
+        let mut dependencies = HashSet::default();
+        visit_query_parts(self, query, &mut |part| match part {
+            QueryPart::Source(source) => match &source.kind {
+                SourceKind::Derived(query) => {
+                    dependencies.insert(*query);
+                }
+                SourceKind::Cte(cte) => {
+                    let cte = self.cte(*cte).expect("validated HIR query CTE must exist");
+                    match &cte.body {
+                        CteBody::Query(query) => {
+                            dependencies.insert(*query);
+                        }
+                        CteBody::Recursive(recursive) => {
+                            dependencies.insert(recursive.seed);
+                            dependencies.extend(recursive.arms.iter().map(|arm| arm.query));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            QueryPart::Expression(expression) => {
+                expression.walk(&mut |expression| {
+                    let Expr::Subquery(subquery) = expression else {
+                        return;
+                    };
+                    let query = match subquery {
+                        SubqueryExpr::Scalar { query, .. }
+                        | SubqueryExpr::Row { query }
+                        | SubqueryExpr::In { query, .. }
+                        | SubqueryExpr::Exists(query) => *query,
+                    };
+                    dependencies.insert(query);
+                });
+            }
+        });
+
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort_unstable();
+        dependencies
+    }
+
     /// Visit every source needed to evaluate one expression in its owning
     /// query. Output references follow their resolved expression; subqueries
     /// contribute their validated outer captures rather than their local
@@ -80,6 +128,120 @@ impl HirDocument {
             return Vec::new();
         };
         query.direct_captures(|source| self.source(source))
+    }
+}
+
+enum QueryPart<'hir> {
+    Source(&'hir Source),
+    Expression(&'hir Expr),
+}
+
+fn visit_query_parts<'hir>(
+    document: &'hir HirDocument,
+    query: &'hir Query,
+    visit: &mut impl FnMut(QueryPart<'hir>),
+) {
+    for block in &query.blocks {
+        if let Some(from) = &block.from {
+            visit_from_parts(document, from, visit);
+        }
+        for output in &block.outputs {
+            visit(QueryPart::Expression(&output.expr));
+        }
+        match &block.body {
+            QueryBlockBody::Select {
+                filter, grouping, ..
+            } => {
+                if let Some(filter) = filter {
+                    visit(QueryPart::Expression(filter));
+                }
+                if let Some(grouping) = grouping {
+                    for key in &grouping.keys {
+                        visit(QueryPart::Expression(key));
+                    }
+                    if let Some(having) = &grouping.having {
+                        visit(QueryPart::Expression(having));
+                    }
+                }
+            }
+            QueryBlockBody::Values { rows } => {
+                for expression in rows.iter().flatten() {
+                    visit(QueryPart::Expression(expression));
+                }
+            }
+        }
+        for window in &block.windows {
+            for expression in &window.partition_by {
+                visit(QueryPart::Expression(expression));
+            }
+            for term in &window.order_by {
+                visit(QueryPart::Expression(&term.expr));
+            }
+            visit_window_bound_part(&window.frame.start, visit);
+            if let Some(end) = &window.frame.end {
+                visit_window_bound_part(end, visit);
+            }
+        }
+    }
+    for term in &query.order_by {
+        visit(QueryPart::Expression(&term.expr));
+    }
+    if let Some(limit) = &query.limit {
+        visit(QueryPart::Expression(&limit.limit));
+        if let Some(offset) = &limit.offset {
+            visit(QueryPart::Expression(offset));
+        }
+    }
+}
+
+fn visit_from_parts<'hir>(
+    document: &'hir HirDocument,
+    from: &'hir From,
+    visit: &mut impl FnMut(QueryPart<'hir>),
+) {
+    let mut pending = vec![from];
+    while let Some(from) = pending.pop() {
+        for id in core::iter::once(from.first).chain(from.joins.iter().map(|join| join.right)) {
+            let source = document
+                .source(id)
+                .expect("validated HIR query source must exist");
+            visit(QueryPart::Source(source));
+            match &source.kind {
+                SourceKind::TableFunction { arguments, .. } => {
+                    for argument in arguments {
+                        visit(QueryPart::Expression(argument));
+                    }
+                }
+                SourceKind::FromGroup(group) => {
+                    pending.push(&group.from);
+                    for column in &group.columns {
+                        visit(QueryPart::Expression(column));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for join in &from.joins {
+            match &join.constraint {
+                JoinConstraint::None => {}
+                JoinConstraint::On(expression) => visit(QueryPart::Expression(expression)),
+                JoinConstraint::Using(columns) | JoinConstraint::Natural(columns) => {
+                    for column in columns {
+                        visit(QueryPart::Expression(&column.left));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn visit_window_bound_part<'hir>(
+    bound: &'hir WindowFrameBound,
+    visit: &mut impl FnMut(QueryPart<'hir>),
+) {
+    if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
+    {
+        visit(QueryPart::Expression(expression));
     }
 }
 

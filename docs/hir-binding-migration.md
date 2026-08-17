@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Expression subqueries now participate in HIR query dependency planning.
+  Scalar, row, EXISTS, and IN subqueries are planned before their owning query
+  through the iterative HIR expression walker; their resolved expression shape
+  and comparison rules remain in the semantic document.
 - Recursive CTE seed and arm queries now plan before their owner. The outer
   recursive source and each occurrence-local queue input retain `CteId`
   directly; queue ordering, comparison collations, compound operators, and
