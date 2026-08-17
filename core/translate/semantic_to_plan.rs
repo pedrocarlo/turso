@@ -702,11 +702,6 @@ impl<'a> HirPlanContext<'a> {
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<Option<HirQueryBlockPlan>> {
-        if !input.groups.is_empty() {
-            return Err(LimboError::InternalError(
-                "FROM-group access planning is not implemented".to_string(),
-            ));
-        }
         let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
         let mut base_rows = Vec::with_capacity(input.sources.len());
         let mut source_costs = Vec::with_capacity(input.sources.len());
@@ -1703,6 +1698,74 @@ mod tests {
         assert!(layout.outer_join_may_null_extend(inner_left));
         assert!(layout.outer_join_may_null_extend(inner_right));
         assert!(!layout.full_join_may_null_extend(inner_left));
+    }
+
+    #[test]
+    fn owned_hir_query_plan_plans_parenthesized_from_group() {
+        let outer = SourceId::new(0);
+        let inner_left = SourceId::new(1);
+        let inner_right = SourceId::new(2);
+        let group = SourceId::new(3);
+        let group_from = hir::From {
+            first: inner_left,
+            joins: vec![Join {
+                right: inner_right,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::None,
+            }],
+        };
+        let mut document = document(vec![
+            source_with_id(0, "outer_items"),
+            source_with_id(1, "inner_left"),
+            source_with_id(2, "inner_right"),
+            group_source(3, group_from),
+        ]);
+        let mut block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        block.from = Some(hir::From {
+            first: outer,
+            joins: vec![Join {
+                right: group,
+                kind: JoinKind::Left,
+                constraint: JoinConstraint::On(binary(
+                    hir::Expr::column(outer, 0),
+                    Operator::Equals,
+                    hir::Expr::column(inner_right, 0),
+                )),
+            }],
+        });
+        add_query(&mut document, &block);
+
+        let plan = HirQueryPlan::build(
+            Arc::new(document),
+            block.id.query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("parenthesized FROM group plans from HIR");
+        let [block_plan] = plan
+            .planned_query(block.id.query)
+            .expect("query is planned")
+            .blocks
+            .as_slice()
+        else {
+            panic!("query has one block");
+        };
+
+        assert_eq!(block_plan.loops.len(), 3);
+        assert_eq!(block_plan.loops[0].source, outer);
+        assert!(block_plan.loops[1..]
+            .iter()
+            .all(|planned| planned.source == inner_left || planned.source == inner_right));
+        assert_eq!(block_plan.predicates.len(), 1);
+        assert_eq!(block_plan.predicates[0].from_outer_join, Some(group));
+        assert!(!block_plan.predicates[0].consumed);
     }
 
     #[test]

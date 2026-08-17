@@ -1371,6 +1371,31 @@ impl<'a> HirFromLayout<'a> {
         self.join_may_null_extend(source, true)
     }
 
+    /// An outer-join predicate owned by a group can run only when the current
+    /// source completes that group. Requiring the current source to be inside
+    /// the group prevents the predicate from becoming ready again later.
+    pub(crate) fn predicate_owner_ready(
+        &self,
+        owner: hir::SourceId,
+        joined: &TableMask,
+        current: usize,
+    ) -> bool {
+        if self.source_position(owner) == Some(current) {
+            return true;
+        }
+
+        self.groups
+            .iter()
+            .find(|group| group.source == owner)
+            .is_some_and(|group| {
+                group.source_range.contains(&current)
+                    && group
+                        .source_range
+                        .clone()
+                        .all(|position| joined.get(position))
+            })
+    }
+
     fn join_may_null_extend(&self, source: hir::SourceId, full_only: bool) -> bool {
         let Some(position) = self.source_position(source) else {
             return false;

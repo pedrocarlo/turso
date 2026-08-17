@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Parenthesized FROM groups now pass through complete HIR access planning.
+  Outer-join predicates owned by a group become ready only when the current
+  physical leaf completes that group, including nested and single-leaf groups;
+  they remain residual predicates rather than unsafe leaf access constraints.
 - HIR planner input now walks parenthesized FROM groups recursively. Physical
   leaves stay flat for the existing join planner, while nested group ranges,
   parent boundaries, join kinds, and outer-join predicate ownership remain

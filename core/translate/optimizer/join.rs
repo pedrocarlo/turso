@@ -1958,6 +1958,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     let first = hir_join_step(
         document,
         sources,
+        &layout,
         constraints,
         where_clause,
         &predicate_work,
@@ -2029,6 +2030,7 @@ pub(crate) fn compute_hir_greedy_join_order(
             let step = hir_join_step(
                 document,
                 sources,
+                &layout,
                 constraints,
                 where_clause,
                 &predicate_work,
@@ -2100,6 +2102,7 @@ pub(crate) fn compute_hir_greedy_join_order(
 fn hir_join_step(
     document: &HirDocument,
     sources: &[HirPlanSource],
+    layout: &HirFromLayout<'_>,
     constraints: &[HirTableConstraints],
     where_clause: &[HirWhereTerm],
     predicate_work: &[PredicateWorkInfo],
@@ -2114,15 +2117,14 @@ fn hir_join_step(
     params: &CostModelParams,
 ) -> Result<HirJoinStep> {
     let source = &sources[source_position];
-    let source_id = source.source();
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(source_position)?;
-    let ready_where = ready_predicate_work(
+    let ready_where = ready_predicate_work_by_owner(
         where_clause,
         predicate_work,
         &joined_mask,
         source_position,
-        source_id,
+        |owner| layout.predicate_owner_ready(owner, &joined_mask, source_position),
     );
     let base_row_count = base_table_rows
         .get(source_position)
@@ -2680,6 +2682,18 @@ fn ready_predicate_work<'work, E, S: Copy + PartialEq>(
     rhs_position: usize,
     rhs_source: S,
 ) -> SmallVec<[(usize, usize); 4]> {
+    ready_predicate_work_by_owner(terms, work, joined_mask, rhs_position, |owner| {
+        owner == rhs_source
+    })
+}
+
+fn ready_predicate_work_by_owner<'work, E, S: Copy>(
+    terms: &[PredicateTerm<E, S>],
+    work: impl IntoIterator<Item = &'work PredicateWorkInfo>,
+    joined_mask: &TableMask,
+    rhs_position: usize,
+    owner_is_ready: impl Fn(S) -> bool,
+) -> SmallVec<[(usize, usize); 4]> {
     terms
         .iter()
         .zip(work)
@@ -2689,7 +2703,7 @@ fn ready_predicate_work<'work, E, S: Copy + PartialEq>(
                 return None;
             }
             let ready = match term.from_outer_join {
-                Some(source) => source == rhs_source,
+                Some(owner) => owner_is_ready(owner),
                 None => {
                     info.table_mask.get(rhs_position)
                         && joined_mask.contains_all_set_bits_of(&info.table_mask)
@@ -3062,6 +3076,81 @@ mod tests {
     }
 
     #[test]
+    fn hir_group_predicate_owner_is_ready_only_when_current_leaf_completes_group() -> Result<()> {
+        let sources = (0..3)
+            .map(|id| {
+                HirPlanSource::BTree(_create_hir_source(
+                    _create_btree_table(
+                        &format!("source_{id}"),
+                        _create_column_list(&["value"], Type::Integer),
+                    ),
+                    None,
+                    SourceId::new(id),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let outer_group = SourceId::new(10);
+        let first_leaf_group = SourceId::new(11);
+        let last_leaf_group = SourceId::new(12);
+        let groups = vec![
+            HirFromGroupBoundary {
+                source: first_leaf_group,
+                parent: Some(outer_group),
+                source_range: 1..2,
+                join_info: None,
+            },
+            HirFromGroupBoundary {
+                source: last_leaf_group,
+                parent: Some(outer_group),
+                source_range: 2..3,
+                join_info: None,
+            },
+            HirFromGroupBoundary {
+                source: outer_group,
+                parent: None,
+                source_range: 1..3,
+                join_info: None,
+            },
+        ];
+        let layout = HirFromLayout::new(&sources, &groups);
+        let terms = [HirWhereTerm {
+            expr: hir::Expr::Literal(ast::Literal::Numeric("1".into())),
+            from_outer_join: Some(outer_group),
+            consumed: false,
+        }];
+        let work = [PredicateWorkInfo {
+            table_mask: TableMask::default(),
+            extra_steps: 1,
+        }];
+
+        let mut joined = TableMask::default();
+        joined.set(1)?;
+        assert!(layout.predicate_owner_ready(first_leaf_group, &joined, 1));
+        assert!(!layout.predicate_owner_ready(outer_group, &joined, 1));
+        assert!(
+            ready_predicate_work_by_owner(&terms, &work, &joined, 1, |owner| {
+                layout.predicate_owner_ready(owner, &joined, 1)
+            })
+            .is_empty()
+        );
+
+        joined.set(2)?;
+        assert!(layout.predicate_owner_ready(last_leaf_group, &joined, 2));
+        assert!(layout.predicate_owner_ready(outer_group, &joined, 2));
+        assert_eq!(
+            ready_predicate_work_by_owner(&terms, &work, &joined, 2, |owner| {
+                layout.predicate_owner_ready(owner, &joined, 2)
+            })
+            .as_slice(),
+            [(0, 1)]
+        );
+        assert!(!layout.predicate_owner_ready(outer_group, &joined, 0));
+        assert!(layout.predicate_owner_ready(SourceId::new(0), &joined, 0));
+        assert!(!layout.predicate_owner_ready(SourceId::new(99), &joined, 2));
+        Ok(())
+    }
+
+    #[test]
     fn later_hir_join_step_uses_constraints_from_joined_sources() -> Result<()> {
         let first = SourceId::new(0);
         let second = SourceId::new(1);
@@ -3119,9 +3208,11 @@ mod tests {
         let mut lhs_mask = TableMask::default();
         lhs_mask.set(0)?;
         let predicate_work = build_hir_predicate_work(&document, &from, &where_clause)?;
+        let layout = HirFromLayout::new(&sources, &[]);
         let step = hir_join_step(
             &document,
             &sources,
+            &layout,
             &constraints,
             &where_clause,
             &predicate_work,
