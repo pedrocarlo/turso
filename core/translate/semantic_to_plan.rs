@@ -93,6 +93,14 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) cost: Cost,
 }
 
+/// Access choices and estimates shared by query blocks and DML scans.
+struct HirAccessPlan {
+    loops: Vec<HirPlannedLoop>,
+    predicates: Vec<HirWhereTerm>,
+    output_cardinality: f64,
+    cost: Cost,
+}
+
 /// One selected source loop in physical join order, still using HIR
 /// expressions and document-local source identity.
 pub(crate) struct HirPlannedLoop {
@@ -665,19 +673,26 @@ impl<'a> HirPlanContext<'a> {
             order_by,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         );
-        self.plan_source_access(
-            block.id,
-            input,
-            order_target.as_ref(),
-            initial_cardinality,
-            schema,
-            params,
-            query_estimate,
-        )?
-        .ok_or_else(|| {
-            LimboError::InternalError(
-                "query block with FROM produced no B-tree access plan".to_string(),
-            )
+        let access = self
+            .plan_source_access(
+                input,
+                order_target.as_ref(),
+                initial_cardinality,
+                schema,
+                params,
+                query_estimate,
+            )?
+            .ok_or_else(|| {
+                LimboError::InternalError(
+                    "query block with FROM produced no B-tree access plan".to_string(),
+                )
+            })?;
+        Ok(HirQueryBlockPlan {
+            block: block.id,
+            loops: access.loops,
+            predicates: access.predicates,
+            output_cardinality: access.output_cardinality,
+            cost: access.cost,
         })
     }
 
@@ -687,14 +702,13 @@ impl<'a> HirPlanContext<'a> {
     #[allow(clippy::too_many_arguments)]
     fn plan_source_access(
         &self,
-        block: QueryBlockId,
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
-    ) -> Result<Option<HirQueryBlockPlan>> {
+    ) -> Result<Option<HirAccessPlan>> {
         let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
         let mut base_rows = Vec::with_capacity(input.sources.len());
         let mut source_costs = Vec::with_capacity(input.sources.len());
@@ -849,8 +863,7 @@ impl<'a> HirPlanContext<'a> {
             prior_sources.set(source_position)?;
         }
 
-        Ok(Some(HirQueryBlockPlan {
-            block,
+        Ok(Some(HirAccessPlan {
             loops,
             predicates: input.predicates,
             output_cardinality: result.best_plan.output_cardinality,
