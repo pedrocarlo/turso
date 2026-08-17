@@ -100,6 +100,12 @@ pub(crate) enum HirSourceAccess {
         query: QueryId,
         materialization: HirCteMaterialization,
     },
+    RecursiveCte {
+        cte: hir::CteId,
+    },
+    RecursiveInput {
+        cte: hir::CteId,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +130,7 @@ impl<'a> HirPlanContext<'a> {
             .expect("validated HIR contains referenced source")
     }
 
-    /// Plan derived-query dependencies before their owning query so source
+    /// Plan query-backed dependencies before their owning query so source
     /// scans can use the child's output and work estimates.
     fn plan_query_tree(
         &self,
@@ -142,7 +148,7 @@ impl<'a> HirPlanContext<'a> {
         }
         if !active.insert(query_id) {
             return Err(LimboError::InternalError(format!(
-                "derived HIR query dependency cycle at {query_id}"
+                "HIR query dependency cycle at {query_id}"
             )));
         }
 
@@ -160,7 +166,9 @@ impl<'a> HirPlanContext<'a> {
             {
                 match &self.definition(source).kind {
                     hir::SourceKind::Derived(dependency) => dependencies.push(*dependency),
-                    hir::SourceKind::Cte(cte) => dependencies.push(self.cte_query(*cte)?),
+                    hir::SourceKind::Cte(cte) => {
+                        self.append_cte_dependencies(*cte, &mut dependencies)
+                    }
                     _ => {}
                 }
             }
@@ -214,16 +222,17 @@ impl<'a> HirPlanContext<'a> {
         planned_source_from_definition(self.definition(source), join_info, usage)
     }
 
-    fn cte_query(&self, cte: hir::CteId) -> Result<QueryId> {
+    fn append_cte_dependencies(&self, cte: hir::CteId, dependencies: &mut Vec<QueryId>) {
         let definition = self
             .document
             .cte(cte)
             .expect("validated HIR contains referenced CTE");
         match &definition.body {
-            hir::CteBody::Query(query) => Ok(*query),
-            hir::CteBody::Recursive(_) => Err(LimboError::InternalError(format!(
-                "recursive CTE {cte} cannot be planned as a non-recursive HIR source"
-            ))),
+            hir::CteBody::Query(query) => dependencies.push(*query),
+            hir::CteBody::Recursive(recursive) => {
+                dependencies.push(recursive.seed);
+                dependencies.extend(recursive.arms.iter().map(|arm| arm.query));
+            }
         }
     }
 
@@ -372,23 +381,40 @@ impl<'a> HirPlanContext<'a> {
                 join_info,
             }),
             hir::SourceKind::Cte(cte) => {
-                let query = self.cte_query(*cte)?;
-                let owner = match self.definition(source).owner {
-                    hir::SourceOwner::QueryBlock(block) => block.query,
-                    owner => {
-                        return Err(LimboError::InternalError(format!(
-                            "CTE HIR source {source} has non-query owner {owner:?}"
-                        )));
+                let definition = self
+                    .document
+                    .cte(*cte)
+                    .expect("validated HIR contains referenced CTE");
+                match &definition.body {
+                    hir::CteBody::Query(query) => {
+                        let owner = match self.definition(source).owner {
+                            hir::SourceOwner::QueryBlock(block) => block.query,
+                            owner => {
+                                return Err(LimboError::InternalError(format!(
+                                    "CTE HIR source {source} has non-query owner {owner:?}"
+                                )));
+                            }
+                        };
+                        Ok(HirPlanSource::Cte {
+                            source,
+                            cte: *cte,
+                            query: *query,
+                            materialization: self.cte_materialization(owner, *cte, *query),
+                            join_info,
+                        })
                     }
-                };
-                Ok(HirPlanSource::Cte {
-                    source,
-                    cte: *cte,
-                    query,
-                    materialization: self.cte_materialization(owner, *cte, query),
-                    join_info,
-                })
+                    hir::CteBody::Recursive(_) => Ok(HirPlanSource::RecursiveCte {
+                        source,
+                        cte: *cte,
+                        join_info,
+                    }),
+                }
             }
+            hir::SourceKind::RecursiveInput(cte) => Ok(HirPlanSource::RecursiveInput {
+                source,
+                cte: *cte,
+                join_info,
+            }),
             _ => Err(LimboError::InternalError(format!(
                 "source {source} cannot be planned as a query source"
             ))),
@@ -500,6 +526,11 @@ impl<'a> HirPlanContext<'a> {
                         row_count: *row_count,
                     },
                     HirPlanSource::Cte { source, .. } => HirConstraintSource::Cte {
+                        source: *source,
+                        row_count: *row_count,
+                    },
+                    HirPlanSource::RecursiveCte { source, .. }
+                    | HirPlanSource::RecursiveInput { source, .. } => HirConstraintSource::Cte {
                         source: *source,
                         row_count: *row_count,
                     },
@@ -618,6 +649,14 @@ impl<'a> HirPlanContext<'a> {
                     ));
                     source_costs.push(child.cost);
                 }
+                HirPlanSource::RecursiveCte { .. } => {
+                    base_rows.push(RowCountEstimate::hardcoded_fallback(params));
+                    source_costs.push(Cost(0.0));
+                }
+                HirPlanSource::RecursiveInput { .. } => {
+                    base_rows.push(RowCountEstimate::AnalyzeStats(1.0));
+                    source_costs.push(Cost(0.0));
+                }
             }
         }
         let constraints =
@@ -686,6 +725,29 @@ impl<'a> HirPlanContext<'a> {
                         query: *query,
                         materialization: *materialization,
                     }
+                }
+                HirPlanSource::RecursiveCte { cte, .. } => {
+                    if !matches!(
+                        access_methods[access_method_position].params,
+                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
+                    ) {
+                        return Err(LimboError::InternalError(
+                            "recursive CTE HIR source selected a non-subquery access method"
+                                .to_string(),
+                        ));
+                    }
+                    HirSourceAccess::RecursiveCte { cte: *cte }
+                }
+                HirPlanSource::RecursiveInput { cte, .. } => {
+                    if !matches!(
+                        access_methods[access_method_position].params,
+                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
+                    ) {
+                        return Err(LimboError::InternalError(
+                            "recursive CTE input selected a non-subquery access method".to_string(),
+                        ));
+                    }
+                    HirSourceAccess::RecursiveInput { cte: *cte }
                 }
             };
             loops.push(HirPlannedLoop {
@@ -904,7 +966,8 @@ mod tests {
                 ComparisonComponent, ComparisonSemantics, CompoundArm, Cte, CteBody, CteColumn,
                 CteId, DatabaseId, DatabaseSnapshot, IndexCoverage, Join, JoinConstraint, JoinKind,
                 OrderTerm, Output, OutputId, Query, QueryBlock, QueryBlockBody, QueryBlockId,
-                QueryId, QueryRoot, SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
+                QueryId, QueryRoot, RecursiveArm, RecursiveCte, SourceColumn, SourceKind,
+                SourceOwner, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
@@ -1883,6 +1946,83 @@ mod tests {
                 query,
                 materialization: HirCteMaterialization::Explicit,
             } if cte == cte_id && query == child_query
+        ));
+
+        let mut recursive_document = cte_plan.document.as_ref().clone();
+        let arm_query = QueryId::new(recursive_document.queries.len());
+        let arm_block_id = QueryBlockId::new(arm_query, 0);
+        let input_source = SourceId::new(recursive_document.sources.len());
+        let mut input_definition = recursive_document.sources[source_id.index()].clone();
+        input_definition.id = input_source;
+        input_definition.owner = SourceOwner::QueryBlock(arm_block_id);
+        input_definition.name = "numbers".to_string();
+        input_definition.kind = SourceKind::RecursiveInput(cte_id);
+        recursive_document.sources.push(input_definition);
+
+        let mut arm_block = QueryBlock::new(
+            arm_block_id,
+            QueryBlockBody::Select {
+                distinctness: None,
+                filter: None,
+                grouping: None,
+            },
+        );
+        arm_block.from = Some(hir::From {
+            first: input_source,
+            joins: Vec::new(),
+        });
+        let mut arm_output =
+            recursive_document.queries[child_query.index()].blocks[0].outputs[0].clone();
+        arm_output.id = OutputId::query(arm_block_id, 0);
+        arm_output.expr = hir::Expr::column(input_source, 0);
+        arm_block.outputs.push(arm_output);
+        recursive_document.queries.push(Query {
+            id: arm_query,
+            parent: Some(root_query),
+            captures: Vec::new(),
+            reachable_ctes: vec![cte_id],
+            first: arm_block_id,
+            blocks: vec![arm_block],
+            compounds: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            output: vec![OutputId::query(arm_block_id, 0)],
+        });
+        recursive_document.ctes[cte_id.index()].body = CteBody::Recursive(RecursiveCte {
+            seed: child_query,
+            arms: vec![RecursiveArm {
+                operator: CompoundOperator::UnionAll,
+                query: arm_query,
+            }],
+            input_sources: vec![input_source],
+            comparison_collations: vec![None],
+            queue_order: Vec::new(),
+            limit: None,
+        });
+        recursive_document
+            .validate()
+            .expect("recursive CTE source HIR is valid");
+        let recursive_plan = HirQueryPlan::build(
+            Arc::new(recursive_document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("recursive CTE source plans from HIR");
+        assert!(recursive_plan.planned_query(child_query).is_some());
+        let recursive_arm = recursive_plan
+            .planned_query(arm_query)
+            .expect("recursive arm query is planned");
+        assert!(matches!(
+            recursive_arm.blocks[0].loops[0].access,
+            HirSourceAccess::RecursiveInput { cte } if cte == cte_id
+        ));
+        let recursive_root = recursive_plan
+            .planned_query(root_query)
+            .expect("recursive CTE owner query is planned");
+        assert!(matches!(
+            recursive_root.blocks[0].loops[0].access,
+            HirSourceAccess::RecursiveCte { cte } if cte == cte_id
         ));
 
         cte_document.ctes[cte_id.index()].materialized = Materialized::Any;

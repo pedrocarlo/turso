@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Recursive CTE seed and arm queries now plan before their owner. The outer
+  recursive source and each occurrence-local queue input retain `CteId`
+  directly; queue ordering, comparison collations, compound operators, and
+  LIMIT remain owned by HIR without a fake table identity or legacy recursive
+  plan.
 - HIR planning now resolves non-recursive CTE materialization into explicit
   `PerReference`, `Shared`, or `Explicit` policy. Reference counting stops at
   CTE-body boundaries, outer captures prevent sharing, and `NOT MATERIALIZED`

@@ -1361,34 +1361,56 @@ pub(crate) enum HirPlanSource {
         materialization: HirCteMaterialization,
         join_info: Option<HirJoinInfo>,
     },
+    RecursiveCte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
+    RecursiveInput {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        join_info: Option<HirJoinInfo>,
+    },
 }
 
 impl HirPlanSource {
     pub(crate) fn source(&self) -> crate::translate::semantic::hir::SourceId {
         match self {
             Self::BTree(source) => source.internal_id,
-            Self::Derived { source, .. } | Self::Cte { source, .. } => *source,
+            Self::Derived { source, .. }
+            | Self::Cte { source, .. }
+            | Self::RecursiveCte { source, .. }
+            | Self::RecursiveInput { source, .. } => *source,
         }
     }
 
     pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
         match self {
             Self::BTree(source) => source.join_info.as_ref(),
-            Self::Derived { join_info, .. } | Self::Cte { join_info, .. } => join_info.as_ref(),
+            Self::Derived { join_info, .. }
+            | Self::Cte { join_info, .. }
+            | Self::RecursiveCte { join_info, .. }
+            | Self::RecursiveInput { join_info, .. } => join_info.as_ref(),
         }
     }
 
     pub(crate) fn btree(&self) -> Option<&HirPlannedSource> {
         match self {
             Self::BTree(source) => Some(source),
-            Self::Derived { .. } | Self::Cte { .. } => None,
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
         }
     }
 
     pub(crate) fn btree_mut(&mut self) -> Option<&mut HirPlannedSource> {
         match self {
             Self::BTree(source) => Some(source),
-            Self::Derived { .. } | Self::Cte { .. } => None,
+            Self::Derived { .. }
+            | Self::Cte { .. }
+            | Self::RecursiveCte { .. }
+            | Self::RecursiveInput { .. } => None,
         }
     }
 }
