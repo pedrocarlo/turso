@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- B-tree candidate scoring now runs one loop for legacy and HIR constraints.
+  Source-specific order matching sits behind a small source trait; HIR keeps
+  resolved source IDs and borrowed expressions through index choice.
 - HIR expressions now share one iterative frame traversal for preorder walks
   and postorder folds. Partial-index selectivity uses the fold directly instead
   of maintaining its own traversal tasks and result stack.

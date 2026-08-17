@@ -45,8 +45,9 @@ use super::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
     order::{
-        btree_access_order_consumed, subquery_intrinsic_order_consumed, ColumnTarget,
-        EqualityPrefixScope, OrderTarget,
+        btree_access_order_consumed, hir_btree_access_order_consumed,
+        subquery_intrinsic_order_consumed, ColumnTarget, EqualityPrefixScope, HirOrderSource,
+        OrderConsumption, OrderTarget,
     },
     AvailableIndexes,
 };
@@ -98,6 +99,61 @@ impl AccessSource for HirAccessSource<'_> {
 
     fn index_is_covering(&self, index: &Index) -> bool {
         self.planned.index_is_covering(self.definition, index)
+    }
+}
+
+pub(super) trait BtreeCandidateSource<I, O>: AccessSource {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget<I, O>,
+        schema: &Schema,
+    ) -> Result<OrderConsumption>;
+}
+
+impl BtreeCandidateSource<TableInternalId, *const ast::Expr> for JoinedTable {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget,
+        schema: &Schema,
+    ) -> Result<OrderConsumption> {
+        Ok(btree_access_order_consumed(
+            self,
+            iter_dir,
+            index,
+            constraint_refs,
+            order_target,
+            0,
+            schema,
+            EqualityPrefixScope::AnyEquality,
+        ))
+    }
+}
+
+impl<'a> BtreeCandidateSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a> {
+    fn order_consumed(
+        &self,
+        iter_dir: IterationDirection,
+        index: Option<&Index>,
+        constraint_refs: &[RangeConstraintRef],
+        order_target: &OrderTarget<hir::SourceId, &'a hir::Expr>,
+        schema: &Schema,
+    ) -> Result<OrderConsumption> {
+        hir_btree_access_order_consumed(
+            &HirOrderSource::new(self.planned, self.definition),
+            iter_dir,
+            index,
+            constraint_refs,
+            order_target,
+            0,
+            schema,
+            EqualityPrefixScope::AnyEquality,
+        )
     }
 }
 
@@ -241,12 +297,12 @@ pub(super) enum BranchReadMode {
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
-pub(super) fn choose_best_btree_candidate(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+pub(super) fn choose_best_btree_candidate<C, I, O>(
+    rhs_source: &impl BtreeCandidateSource<I, O>,
+    rhs_constraints: &TableConstraints<C, I>,
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
-    maybe_order_target: Option<&OrderTarget>,
+    maybe_order_target: Option<&OrderTarget<I, O>>,
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
@@ -260,7 +316,7 @@ pub(super) fn choose_best_btree_candidate(
     let mut best_cost = if has_rowid_candidate {
         estimate_cost_for_scan_or_seek(
             None,
-            &[],
+            &rhs_constraints.constraints,
             &[],
             input_cardinality,
             base_row_count,
@@ -298,11 +354,11 @@ pub(super) fn choose_best_btree_candidate(
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
+                covering: rhs_source.index_is_covering(index),
                 column_count: index.columns.len(),
                 rows_per_leaf_page: rows_per_leaf_page_for_index(
                     index.columns.len(),
-                    &rhs_table.table,
+                    rhs_source.table(),
                     params.rows_per_table_page,
                 ),
             },
@@ -322,29 +378,25 @@ pub(super) fn choose_best_btree_candidate(
                 // this specific access path can emit rows ordered after its seek
                 // key; final global ORDER BY validation is stricter and only
                 // skips globally constant prefixes.
-                let all_same_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Forwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
+                let all_same_direction = rhs_source
+                    .order_consumed(
+                        IterationDirection::Forwards,
+                        candidate.index.as_deref(),
+                        &usable_constraint_refs,
+                        order_target,
+                        schema,
+                    )?
+                    .consumed
                     == order_target.columns.len();
-                let all_opposite_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Backwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
+                let all_opposite_direction = rhs_source
+                    .order_consumed(
+                        IterationDirection::Backwards,
+                        candidate.index.as_deref(),
+                        &usable_constraint_refs,
+                        order_target,
+                        schema,
+                    )?
+                    .consumed
                     == order_target.columns.len();
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
@@ -369,7 +421,7 @@ pub(super) fn choose_best_btree_candidate(
             };
 
         let analyze_ctx = AnalyzeCtx {
-            table_name: rhs_table.table.get_name(),
+            table_name: rhs_source.table().get_name(),
             index: candidate.index.as_ref(),
             stats: analyze_stats,
         };
@@ -810,7 +862,7 @@ pub fn find_best_access_method_for_join_order(
             params,
         ),
         Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
+            cost: estimate_cost_for_scan_or_seek::<ast::Expr>(
                 None,
                 &[],
                 &[],
@@ -966,7 +1018,7 @@ fn find_best_access_method_for_btree(
                 base_row_count,
                 None,
             );
-            let scan_cost = estimate_cost_for_scan_or_seek(
+            let scan_cost = estimate_cost_for_scan_or_seek::<ast::Expr>(
                 None,
                 &[],
                 &[],
@@ -1137,7 +1189,7 @@ fn find_best_access_method_for_vtab(
             };
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost`.
-                cost: estimate_cost_for_scan_or_seek(
+                cost: estimate_cost_for_scan_or_seek::<ast::Expr>(
                     None,
                     &[],
                     &[],
@@ -1598,7 +1650,7 @@ fn find_best_access_method_for_subquery(
     use super::constraints::ConstraintRef;
     let maybe_order_target = planning_context.maybe_order_target;
 
-    let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
+    let coroutine_scan_cost = estimate_cost_for_scan_or_seek::<ast::Expr>(
         None,
         &[],
         &[],
@@ -1807,8 +1859,16 @@ fn find_best_access_method_for_subquery(
                 None,
             )
         };
-    let one_pass_scan_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], 1.0, base_row_count, false, params, None);
+    let one_pass_scan_cost = estimate_cost_for_scan_or_seek::<ast::Expr>(
+        None,
+        &[],
+        &[],
+        1.0,
+        base_row_count,
+        false,
+        params,
+        None,
+    );
     let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
     let seek_setup_cost = if table_materialization_required || can_direct_materialize_index {
         // Both table-backed materialization and direct-index materialization avoid

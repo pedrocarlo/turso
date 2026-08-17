@@ -3987,13 +3987,14 @@ mod tests {
         );
         let table = hir_planned_source(source, &table);
 
+        let params = CostModelParams::default();
         let constraints = hir_table_constraints_for_source(
             &document,
             &from,
             &[term],
             &table,
             &Schema::new(),
-            &CostModelParams::default(),
+            &params,
             &|_| None,
         )?;
 
@@ -4011,6 +4012,63 @@ mod tests {
         assert_eq!(candidate.refs[0].constraint_vec_pos, 0);
         assert_eq!(candidate.refs[0].index_col_pos, 0);
         assert!(constraints.constraints[0].expr.is_none());
+
+        let scan_constraints = hir_table_constraints_for_source(
+            &document,
+            &from,
+            &[],
+            &table,
+            &Schema::new(),
+            &params,
+            &|_| None,
+        )?;
+        let target_expression = hir_binary(
+            hir::Expr::column(source, 0),
+            ast::Operator::Add,
+            hir::Expr::column(source, 1),
+        );
+        let order_target: crate::translate::optimizer::order::HirOrderTarget<'_> =
+            crate::translate::optimizer::order::OrderTarget {
+                columns: vec![crate::translate::optimizer::order::ColumnOrder {
+                    source,
+                    target: crate::translate::optimizer::order::ColumnTarget::Expr(
+                        &target_expression,
+                    ),
+                    order: SortOrder::Desc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                }],
+                purpose: crate::translate::optimizer::order::OrderTargetPurpose::EliminatesSort(
+                    crate::translate::optimizer::order::EliminatesSortBy::Order,
+                ),
+            };
+        let access_source = crate::translate::optimizer::access_method::HirAccessSource::new(
+            &table,
+            document
+                .source(source)
+                .expect("test document contains HIR source"),
+        );
+        let chosen = crate::translate::optimizer::access_method::choose_best_btree_candidate(
+            &access_source,
+            &scan_constraints,
+            &TableMask::default(),
+            source.index(),
+            Some(&order_target),
+            &Schema::new(),
+            &crate::stats::AnalyzeStats::default(),
+            1.0,
+            crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(10_000.0),
+            &params,
+        )?
+        .expect("HIR constraints produce a B-tree candidate");
+        assert!(chosen
+            .index
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(value, &index)));
+        assert_eq!(
+            chosen.iter_dir,
+            crate::translate::plan::IterationDirection::Backwards
+        );
         Ok(())
     }
 
@@ -4095,6 +4153,41 @@ mod tests {
         assert_eq!(
             accepted_partial.partial_index_selectivity,
             Some(params.sel_range * params.sel_range)
+        );
+
+        let access_source = crate::translate::optimizer::access_method::HirAccessSource::new(
+            &table,
+            document
+                .source(source)
+                .expect("test document contains HIR source"),
+        );
+        let base_row_count =
+            crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(10_000.0);
+        let chosen = crate::translate::optimizer::access_method::choose_best_btree_candidate(
+            &access_source,
+            &accepted,
+            &TableMask::default(),
+            source.index(),
+            None,
+            &Schema::new(),
+            &crate::stats::AnalyzeStats::default(),
+            1.0,
+            base_row_count,
+            &params,
+        )?
+        .expect("HIR constraints produce a B-tree candidate");
+        assert!(chosen
+            .index
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(value, &index)));
+        assert_eq!(
+            chosen.base_row_count,
+            crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(
+                10_000.0
+                    * accepted_partial
+                        .partial_index_selectivity
+                        .expect("partial index carries selectivity")
+            )
         );
 
         let rejected = hir_table_constraints_for_source(
