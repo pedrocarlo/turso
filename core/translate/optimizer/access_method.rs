@@ -557,8 +557,8 @@ pub(super) fn choose_best_btree_candidate<C, I, O>(
     Ok(Some(best_choice))
 }
 
-fn consumed_where_terms_from_constraint_refs(
-    constraints: &[Constraint],
+fn consumed_where_terms_from_constraint_refs<E>(
+    constraints: &[Constraint<E>],
     constraint_refs: &[RangeConstraintRef],
 ) -> Result<BitSet<usize>> {
     let mut consumed = BitSet::default();
@@ -576,6 +576,76 @@ fn consumed_where_terms_from_constraint_refs(
         }
     }
     Ok(consumed)
+}
+
+/// Turn a chosen B-tree candidate into the access method consumed by join
+/// planning. Candidate discovery is representation-specific; these physical
+/// row-count and consumed-predicate facts are not.
+pub(super) fn build_btree_access_method<E, S>(
+    source: &impl AccessSource,
+    constraints: &TableConstraints<E, S>,
+    chosen: ChosenBtreeCandidate,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let ChosenBtreeCandidate {
+        iter_dir,
+        index,
+        constraint_refs,
+        base_row_count,
+        partial_index_predicate_terms,
+        cost,
+    } = chosen;
+    let estimated_rows_per_outer_row = if constraint_refs.is_empty() {
+        *base_row_count
+    } else {
+        let index_info = match index.as_ref() {
+            Some(index) => IndexInfo {
+                unique: index.unique,
+                covering: source.index_is_covering(index),
+                column_count: index.columns.len(),
+                rows_per_leaf_page: rows_per_leaf_page_for_index(
+                    index.columns.len(),
+                    source.table(),
+                    params.rows_per_table_page,
+                ),
+            },
+            None => IndexInfo {
+                unique: true,
+                covering: true,
+                column_count: 1,
+                rows_per_leaf_page: params.rows_per_table_page,
+            },
+        };
+        let analyze_ctx = AnalyzeCtx {
+            table_name: source.table().get_name(),
+            index: index.as_ref(),
+            stats: analyze_stats,
+        };
+        estimate_rows_per_seek(
+            index_info,
+            &constraints.constraints,
+            &constraint_refs,
+            base_row_count,
+            Some(&analyze_ctx),
+        )
+    };
+    let mut consumed_where_terms =
+        consumed_where_terms_from_constraint_refs(&constraints.constraints, &constraint_refs)?;
+    for term_idx in partial_index_predicate_terms {
+        consumed_where_terms.set(term_idx)?;
+    }
+    Ok(AccessMethod {
+        cost,
+        estimated_rows_per_outer_row,
+        consumed_where_terms,
+        params: AccessMethodParams::BTreeTable {
+            iter_dir,
+            index,
+            build_index: false,
+            constraint_refs: constraint_refs.into_vec(),
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -917,59 +987,9 @@ fn find_best_access_method_for_btree(
     )?
     .expect("btree candidate selection must always consider the rowid candidate");
 
-    let access_base_row_count = best.base_row_count;
-    let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
-        *access_base_row_count
-    } else {
-        let index_info = match best.index.as_ref() {
-            Some(index) => IndexInfo {
-                unique: index.unique,
-                covering: rhs_table.index_is_covering(index),
-                column_count: index.columns.len(),
-                rows_per_leaf_page: rows_per_leaf_page_for_index(
-                    index.columns.len(),
-                    &rhs_table.table,
-                    params.rows_per_table_page,
-                ),
-            },
-            None => IndexInfo {
-                unique: true,
-                covering: true,
-                column_count: 1,
-                rows_per_leaf_page: params.rows_per_table_page,
-            },
-        };
-        let analyze_ctx = AnalyzeCtx {
-            table_name: rhs_table.table.get_name(),
-            index: best.index.as_ref(),
-            stats: analyze_stats,
-        };
-        estimate_rows_per_seek(
-            index_info,
-            &rhs_constraints.constraints,
-            &best.constraint_refs,
-            access_base_row_count,
-            Some(&analyze_ctx),
-        )
-    };
-    let mut consumed_where_terms = consumed_where_terms_from_constraint_refs(
-        &rhs_constraints.constraints,
-        &best.constraint_refs,
-    )?;
-    for term_idx in best.partial_index_predicate_terms {
-        consumed_where_terms.set(term_idx)?;
-    }
-    let mut best_access_method = AccessMethod {
-        cost: best.cost,
-        estimated_rows_per_outer_row,
-        consumed_where_terms,
-        params: AccessMethodParams::BTreeTable {
-            iter_dir: best.iter_dir,
-            index: best.index,
-            build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
-        },
-    };
+    let best_iter_dir = best.iter_dir;
+    let mut best_access_method =
+        build_btree_access_method(rhs_table, rhs_constraints, best, analyze_stats, params)?;
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
@@ -1042,7 +1062,7 @@ fn find_best_access_method_for_btree(
                     &constraint_refs,
                 )?,
                 params: AccessMethodParams::BTreeTable {
-                    iter_dir: best.iter_dir,
+                    iter_dir: best_iter_dir,
                     index: None,
                     build_index: true,
                     constraint_refs: Vec::new(),

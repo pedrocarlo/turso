@@ -4213,6 +4213,28 @@ mod tests {
                         .selectivity
             )
         );
+        let access_method = crate::translate::optimizer::access_method::build_btree_access_method(
+            &access_source,
+            &accepted,
+            chosen,
+            &crate::stats::AnalyzeStats::default(),
+            &params,
+        )?;
+        assert_eq!(
+            (&access_method.consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(matches!(
+            &access_method.params,
+            crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable {
+                index: Some(chosen_index),
+                build_index: false,
+                constraint_refs,
+                ..
+            } if Arc::ptr_eq(chosen_index, &index) && !constraint_refs.is_empty()
+        ));
 
         let rejected = hir_table_constraints_for_source(
             &document,

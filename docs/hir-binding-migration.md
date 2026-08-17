@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Chosen B-tree candidates now become planner access methods through one
+  expression-representation-neutral builder. Legacy and HIR constraints share
+  covering, rows-per-seek, consumed-predicate, direction, and index facts.
 - Partial-index candidates now retain the query predicate terms that proved
   them usable. Ordinary B-tree and `IN` access selection consume those frozen
   term positions instead of rebinding and rewriting the schema predicate after
