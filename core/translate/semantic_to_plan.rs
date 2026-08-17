@@ -13,8 +13,8 @@ use super::{
         CostModelParams, HirBtreeOperation, HirVirtualTableOperation,
     },
     plan::{
-        ColumnUsedMask, HirCteMaterialization, HirJoinInfo, HirPlanSource, HirPlannedSource,
-        HirWhereTerm, PredicateExpr,
+        ColumnUsedMask, HirCteMaterialization, HirFromGroupBoundary, HirJoinInfo, HirPlanSource,
+        HirPlannedSource, HirWhereTerm, PredicateExpr,
     },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
@@ -24,7 +24,6 @@ use crate::{
     LimboError, Result,
 };
 use rustc_hash::FxHashSet as HashSet;
-use std::ops::Range;
 
 enum HirFromItem<'a> {
     Source(SourceId),
@@ -90,16 +89,6 @@ pub(crate) struct HirQueryBlockPlanInput {
     pub(crate) sources: Vec<HirPlanSource>,
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) predicates: Vec<HirWhereTerm>,
-}
-
-/// Structural boundary for a parenthesized FROM group. The physical leaves
-/// remain in `HirQueryBlockPlanInput::sources`; this records their nesting
-/// without inventing a runtime source for the group.
-pub(crate) struct HirFromGroupBoundary {
-    pub(crate) source: SourceId,
-    pub(crate) parent: Option<SourceId>,
-    pub(crate) source_range: Range<usize>,
-    pub(crate) join_info: Option<HirJoinInfo>,
 }
 
 /// Access choices for one resolved HIR query block.
@@ -770,6 +759,7 @@ impl<'a> HirPlanContext<'a> {
             self.document,
             from,
             &input.sources,
+            &input.groups,
             &constraints,
             &input.predicates,
             &base_rows,

@@ -35,8 +35,9 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, HirPlanSource, HirWhereTerm, JoinOrderMember, JoinedTable,
-            NonFromClauseSubquery, PredicateTerm, SubqueryState, TableReferences, WhereTerm,
+            HashJoinKey, HashJoinType, HirFromGroupBoundary, HirPlanSource, HirWhereTerm,
+            JoinOrderMember, JoinedTable, NonFromClauseSubquery, PredicateTerm, SubqueryState,
+            TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, table_mask_from_hir_expr, TableMask},
         semantic::hir::{self, HirDocument},
@@ -1831,6 +1832,82 @@ struct HirJoinStep {
     access_method: AccessMethod,
 }
 
+/// Keeps flattened FROM-group leaves together while the greedy planner chooses
+/// their access order. This preserves syntactic join barriers without making a
+/// group into a runtime source.
+struct HirJoinBoundaries<'a> {
+    groups: &'a [HirFromGroupBoundary],
+    ordering_restrictions: &'a JoinOrderingRestrictions,
+}
+
+impl HirJoinBoundaries<'_> {
+    fn allows_candidate(&self, source_position: usize, joined: &TableMask) -> bool {
+        for group in self.groups {
+            let started = group
+                .source_range
+                .clone()
+                .any(|position| joined.get(position));
+            let complete = group
+                .source_range
+                .clone()
+                .all(|position| joined.get(position));
+
+            if started && !complete && !group.source_range.contains(&source_position) {
+                return false;
+            }
+
+            if !started && group.source_range.contains(&source_position) {
+                let group_requires_outer_prefix = group
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join| hir_join_kind_is_ordering_constrained(join.kind));
+                let nested_group_requires_outer_prefix = self.groups.iter().any(|nested| {
+                    group.source_range.start <= nested.source_range.start
+                        && nested.source_range.end <= group.source_range.end
+                        && nested
+                            .join_info
+                            .as_ref()
+                            .is_some_and(|join| hir_join_kind_is_ordering_constrained(join.kind))
+                });
+                let leaf_requires_outer_source = group.source_range.clone().any(|position| {
+                    self.ordering_restrictions
+                        .required_lhs(position)
+                        .is_some_and(|required| {
+                            required.iter().any(|required_position| {
+                                !group.source_range.contains(&required_position)
+                                    && !joined.get(required_position)
+                            })
+                        })
+                });
+                if ((group_requires_outer_prefix || nested_group_requires_outer_prefix)
+                    && (0..group.source_range.start).any(|position| !joined.get(position)))
+                    || leaf_requires_outer_source
+                {
+                    return false;
+                }
+            }
+
+            if !complete
+                && source_position >= group.source_range.end
+                && group
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|join| join.kind == hir::JoinKind::Full)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn hir_join_kind_is_ordering_constrained(kind: hir::JoinKind) -> bool {
+    matches!(
+        kind,
+        hir::JoinKind::Cross | hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+    )
+}
+
 /// Build a left-deep HIR join plan using the greedy B-tree rules.
 ///
 /// This is the HIR counterpart of [`compute_greedy_join_order`] for the
@@ -1842,6 +1919,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     document: &HirDocument,
     from: &hir::From,
     sources: &[HirPlanSource],
+    groups: &[HirFromGroupBoundary],
     constraints: &[HirTableConstraints],
     where_clause: &[HirWhereTerm],
     base_table_rows: &[RowCountEstimate],
@@ -1858,6 +1936,10 @@ pub(crate) fn compute_hir_greedy_join_order(
     }
 
     let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
+    let boundaries = HirJoinBoundaries {
+        groups,
+        ordering_restrictions: &ordering_restrictions,
+    };
     let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
     let first_position = find_best_hir_starting_source(
         document,
@@ -1866,6 +1948,7 @@ pub(crate) fn compute_hir_greedy_join_order(
         base_table_rows,
         source_costs,
         &ordering_restrictions,
+        &boundaries,
         analyze_stats,
         params,
     )?;
@@ -1909,6 +1992,9 @@ pub(crate) fn compute_hir_greedy_join_order(
     while !remaining.is_empty() {
         let mut has_connected_candidate = false;
         for position in &remaining {
+            if !boundaries.allows_candidate(position, &joined_mask) {
+                continue;
+            }
             if let Some(required) = ordering_restrictions.required_lhs(position) {
                 if !joined_mask.contains_all_set_bits_of(required) {
                     continue;
@@ -1925,6 +2011,9 @@ pub(crate) fn compute_hir_greedy_join_order(
 
         let mut best: Option<(usize, AccessMethod, f64, Cost)> = None;
         for position in &remaining {
+            if !boundaries.allows_candidate(position, &joined_mask) {
+                continue;
+            }
             if let Some(required) = ordering_restrictions.required_lhs(position) {
                 if !joined_mask.contains_all_set_bits_of(required) {
                     continue;
@@ -2176,6 +2265,7 @@ fn find_best_hir_starting_source(
     base_table_rows: &[RowCountEstimate],
     source_costs: &[Cost],
     ordering_restrictions: &JoinOrderingRestrictions,
+    boundaries: &HirJoinBoundaries<'_>,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<usize> {
@@ -2197,8 +2287,12 @@ fn find_best_hir_starting_source(
         },
     )?;
 
+    let empty = TableMask::default();
     let mut best: Option<(usize, f64)> = None;
     for position in 0..sources.len() {
+        if !boundaries.allows_candidate(position, &empty) {
+            continue;
+        }
         if ordering_restrictions.required_lhs(position).is_some() {
             continue;
         }
@@ -2680,8 +2774,8 @@ mod tests {
                 cost_params::DEFAULT_PARAMS,
             },
             plan::{
-                ColumnUsedMask, HirJoinInfo, HirPlannedSource, IterationDirection, JoinInfo,
-                JoinType, Operation, TableReferences, WhereTerm,
+                ColumnUsedMask, HirFromGroupBoundary, HirJoinInfo, HirPlannedSource,
+                IterationDirection, JoinInfo, JoinType, Operation, TableReferences, WhereTerm,
             },
             semantic::hir::{self, IndexHint, JoinKind, SourceId},
         },
@@ -3144,6 +3238,7 @@ mod tests {
             &document,
             &from,
             &sources,
+            &[],
             &constraints,
             &where_clause,
             &[
@@ -3189,6 +3284,84 @@ mod tests {
                 ..
             }
         )));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_group_boundary_requires_left_side_then_finishes_group() -> Result<()> {
+        let groups = [HirFromGroupBoundary {
+            source: SourceId::new(10),
+            parent: None,
+            source_range: 1..3,
+            join_info: Some(HirJoinInfo {
+                kind: JoinKind::Left,
+            }),
+        }];
+        let restrictions = JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        };
+        let boundaries = HirJoinBoundaries {
+            groups: &groups,
+            ordering_restrictions: &restrictions,
+        };
+
+        let empty = TableMask::default();
+        assert!(boundaries.allows_candidate(0, &empty));
+        assert!(!boundaries.allows_candidate(1, &empty));
+        assert!(!boundaries.allows_candidate(2, &empty));
+
+        let left: TableMask = [0].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &left));
+        assert!(boundaries.allows_candidate(2, &left));
+
+        let started: TableMask = [0, 2].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &started));
+        assert!(!boundaries.allows_candidate(3, &started));
+
+        let complete: TableMask = [0, 1, 2].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(3, &complete));
+        Ok(())
+    }
+
+    #[test]
+    fn hir_group_nested_boundary_waits_for_outer_prerequisites() -> Result<()> {
+        let outer = SourceId::new(10);
+        let groups = [
+            HirFromGroupBoundary {
+                source: SourceId::new(11),
+                parent: Some(outer),
+                source_range: 2..4,
+                join_info: Some(HirJoinInfo {
+                    kind: JoinKind::Left,
+                }),
+            },
+            HirFromGroupBoundary {
+                source: outer,
+                parent: None,
+                source_range: 1..4,
+                join_info: None,
+            },
+        ];
+        let restrictions = JoinOrderingRestrictions {
+            illegal_lhs_by_rhs: None,
+            required_lhs_by_table: None,
+        };
+        let boundaries = HirJoinBoundaries {
+            groups: &groups,
+            ordering_restrictions: &restrictions,
+        };
+
+        let empty = TableMask::default();
+        assert!(!boundaries.allows_candidate(1, &empty));
+
+        let outer_left: TableMask = [0].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(1, &outer_left));
+
+        let outer_started: TableMask = [0, 1].into_iter().try_collect()?;
+        assert!(boundaries.allows_candidate(2, &outer_started));
+        assert!(boundaries.allows_candidate(3, &outer_started));
+        assert!(!boundaries.allows_candidate(4, &outer_started));
         Ok(())
     }
 

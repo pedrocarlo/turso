@@ -28,7 +28,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
+use std::{cmp::Ordering, marker::PhantomData, ops::Range, sync::Arc};
 use turso_parser::ast::{
     self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
@@ -1323,6 +1323,15 @@ pub type JoinedTable =
 #[derive(Debug, Clone)]
 pub(crate) struct HirJoinInfo {
     pub(crate) kind: crate::translate::semantic::hir::JoinKind,
+}
+
+/// Structural boundary for a parenthesized FROM group. Physical leaves remain
+/// in the flat source list; this records their nesting and join position.
+pub(crate) struct HirFromGroupBoundary {
+    pub(crate) source: crate::translate::semantic::hir::SourceId,
+    pub(crate) parent: Option<crate::translate::semantic::hir::SourceId>,
+    pub(crate) source_range: Range<usize>,
+    pub(crate) join_info: Option<HirJoinInfo>,
 }
 
 /// Source used by HIR planning without parser expressions or planner IDs.

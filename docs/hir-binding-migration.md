@@ -107,6 +107,10 @@ Completed:
   leaves stay flat for the existing join planner, while nested group ranges,
   parent boundaries, join kinds, and outer-join predicate ownership remain
   explicit without a fake group cursor or a copied join tree.
+- Greedy HIR join ordering now accepts those group boundaries. Constrained
+  groups wait for their left side, nested prerequisites cannot deadlock an
+  active parent group, and a started group finishes before planning continues
+  outside it. Access selection still operates on the same flat physical leaves.
 - Temporary scope columns are now named and stored as expression bindings.
   Parenthesized FROM-group names resolve directly to their inner HIR column or
   merged-column expression, so the group source is only join structure and
