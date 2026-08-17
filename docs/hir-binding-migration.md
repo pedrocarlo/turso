@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Greedy HIR B-tree planning now builds a complete left-deep `JoinN`. It uses
+  the existing ordering restrictions, connected-source preference,
+  cross-product penalty, cardinality formula, and access-method arena without
+  converting resolved expressions back to parser expressions.
 - HIR B-tree join-step selection now accepts the mask of sources already
   joined. Later sources can therefore use resolved join constraints for index
   seeks and automatic indexes; the first-source entry point is only the empty

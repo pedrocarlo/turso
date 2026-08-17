@@ -130,20 +130,16 @@ fn constraint_output_multipliers<E, S>(
 }
 
 /// Return the row count after one table and its ready filters.
-fn rows_after_join(
+fn rows_after_join<E, S>(
     input_cardinality: f64,
     method: &AccessMethod,
-    rhs_constraints: &TableConstraints,
+    rhs_constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     rhs_mask: TableMask,
-    rhs_table: &JoinedTable,
+    is_semi_or_anti: bool,
     params: &CostModelParams,
 ) -> f64 {
-    if rhs_table
-        .join_info
-        .as_ref()
-        .is_some_and(|join_info| join_info.is_semi_or_anti())
-    {
+    if is_semi_or_anti {
         return input_cardinality;
     }
     let remaining_filter_selectivity = constraint_output_multipliers(
@@ -268,7 +264,10 @@ pub(super) fn count_subquery_calls_for_plan(
             &constraints[*table_number],
             &prior_tables,
             table_mask,
-            &joined_tables[*table_number],
+            joined_tables[*table_number]
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_semi_or_anti()),
             params,
         );
         prior_tables.set(*table_number)?;
@@ -928,7 +927,10 @@ fn join_lhs_and_rhs<'a>(
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
-        &joined_tables[rhs_table_number],
+        joined_tables[rhs_table_number]
+            .join_info
+            .as_ref()
+            .is_some_and(|join_info| join_info.is_semi_or_anti()),
         params,
     );
 
@@ -1900,6 +1902,182 @@ pub(crate) fn hir_first_join_step(
     )
 }
 
+/// Build a left-deep HIR join plan using the greedy B-tree rules.
+///
+/// This is the HIR counterpart of [`compute_greedy_join_order`] for the
+/// ordinary B-tree access paths already supported by HIR planning. Hash joins,
+/// virtual tables, and multi-index plans remain on the legacy path for now.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn compute_hir_greedy_btree_join_order(
+    document: &HirDocument,
+    from: &hir::From,
+    sources: &[HirPlannedSource],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    base_table_rows: &[RowCountEstimate],
+    order_target: Option<&HirOrderTarget<'_>>,
+    initial_input_cardinality: f64,
+    access_methods_arena: &mut Vec<AccessMethod>,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<Option<BestJoinOrderResult>> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
+    let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
+    let first_position = find_best_starting_source(
+        sources.iter().map(|source| {
+            HirAccessSource::new(
+                source,
+                document
+                    .source(source.internal_id)
+                    .expect("validated HIR contains referenced source"),
+            )
+        }),
+        constraints,
+        base_table_rows,
+        &ordering_restrictions,
+        analyze_stats,
+        params,
+    )?;
+
+    let mut remaining: TableMask = (0..sources.len()).try_collect()?;
+    let mut joined_mask = TableMask::default();
+    let first = hir_btree_join_step(
+        document,
+        sources,
+        constraints,
+        where_clause,
+        &predicate_work,
+        base_table_rows,
+        order_target,
+        first_position,
+        &joined_mask,
+        initial_input_cardinality,
+        schema,
+        analyze_stats,
+        params,
+    )?;
+    let mut first_mask = TableMask::default();
+    first_mask.set(first_position)?;
+    let mut output_cardinality = rows_after_join(
+        initial_input_cardinality,
+        &first.access_method,
+        &constraints[first_position],
+        &joined_mask,
+        first_mask,
+        false,
+        params,
+    );
+    let mut cost = first.access_method.cost;
+    access_methods_arena.push(first.access_method);
+    let mut data = vec![(first_position, access_methods_arena.len() - 1)];
+    joined_mask.set(first_position)?;
+    remaining.clear(first_position);
+
+    while !remaining.is_empty() {
+        let mut has_connected_candidate = false;
+        for position in &remaining {
+            if let Some(required) = ordering_restrictions.required_lhs(position) {
+                if !joined_mask.contains_all_set_bits_of(required) {
+                    continue;
+                }
+            }
+            let connected = predicate_work.iter().any(|work| {
+                work.table_mask.get(position) && work.table_mask.intersects(&joined_mask)
+            });
+            if connected {
+                has_connected_candidate = true;
+                break;
+            }
+        }
+
+        let mut best: Option<(usize, AccessMethod, f64, Cost)> = None;
+        for position in &remaining {
+            if let Some(required) = ordering_restrictions.required_lhs(position) {
+                if !joined_mask.contains_all_set_bits_of(required) {
+                    continue;
+                }
+            }
+            let connected = predicate_work.iter().any(|work| {
+                work.table_mask.get(position) && work.table_mask.intersects(&joined_mask)
+            });
+            if has_connected_candidate && !connected {
+                continue;
+            }
+
+            let step = hir_btree_join_step(
+                document,
+                sources,
+                constraints,
+                where_clause,
+                &predicate_work,
+                base_table_rows,
+                order_target,
+                position,
+                &joined_mask,
+                output_cardinality,
+                schema,
+                analyze_stats,
+                params,
+            )?;
+            let mut method = step.access_method;
+            if !connected {
+                let base_rows = base_table_rows
+                    .get(position)
+                    .copied()
+                    .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+                let self_selectivity =
+                    build_self_constraint_selectivity(&constraints[position], position);
+                method.cost =
+                    method.cost + Cost(output_cardinality * *base_rows * self_selectivity);
+            }
+
+            let candidate_cost = cost + method.cost;
+            let mut rhs_mask = TableMask::default();
+            rhs_mask.set(position)?;
+            let candidate_cardinality = rows_after_join(
+                output_cardinality,
+                &method,
+                &constraints[position],
+                &joined_mask,
+                rhs_mask,
+                false,
+                params,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, _, best_cost)| candidate_cost < *best_cost)
+            {
+                best = Some((position, method, candidate_cardinality, candidate_cost));
+            }
+        }
+
+        let (position, method, cardinality, next_cost) = best.ok_or_else(|| {
+            LimboError::PlanningError("Greedy HIR join ordering: no valid next source".to_string())
+        })?;
+        access_methods_arena.push(method);
+        data.push((position, access_methods_arena.len() - 1));
+        joined_mask.set(position)?;
+        remaining.clear(position);
+        output_cardinality = cardinality;
+        cost = next_cost;
+    }
+
+    Ok(Some(BestJoinOrderResult {
+        best_plan: JoinN {
+            data,
+            output_cardinality,
+            cost,
+        },
+        best_ordered_plan: None,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hir_btree_join_step(
     document: &HirDocument,
@@ -2781,44 +2959,12 @@ mod tests {
             from_outer_join: None,
             consumed: false,
         }];
+        let constraints = vec![
+            _hir_empty_constraints(first),
+            _hir_auto_index_constraints(second, 0, 0)?,
+        ];
         let mut lhs_mask = TableMask::default();
         lhs_mask.set(0)?;
-        let constraints = vec![
-            HirTableConstraints {
-                table_id: first,
-                constraints: Vec::new(),
-                candidates: Vec::new(),
-                temporary_index_terms: SmallVec::new(),
-            },
-            HirTableConstraints {
-                table_id: second,
-                constraints: vec![Constraint {
-                    where_clause_pos: (0, BinaryExprSide::Rhs),
-                    operator: ConstraintOperator::from(Operator::Equals),
-                    table_col_pos: Some(0),
-                    expr: None,
-                    constraining_expr: None,
-                    lhs_mask: lhs_mask.try_clone()?,
-                    selectivity: DEFAULT_PARAMS.sel_eq_unindexed,
-                    usable: true,
-                    is_rowid: false,
-                    comparison_affinity: Some(crate::vdbe::affinity::Affinity::Integer),
-                    comparison_collation: None,
-                    null_matching: false,
-                }],
-                candidates: vec![ConstraintUseCandidate {
-                    index: None,
-                    refs: Vec::new(),
-                    partial_index: None,
-                }],
-                temporary_index_terms: smallvec::smallvec![ConstraintRef {
-                    constraint_vec_pos: 0,
-                    index_col_pos: 0,
-                    sort_order: ast::SortOrder::Asc,
-                    nulls_order: ast::NullsOrder::First,
-                }],
-            },
-        ];
         let predicate_work = build_hir_predicate_work(&document, &from, &where_clause)?;
         let step = hir_btree_join_step(
             &document,
@@ -2853,6 +2999,132 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn greedy_hir_join_order_respects_ordering_and_uses_join_constraints() -> Result<()> {
+        let first = SourceId::new(0);
+        let second = SourceId::new(1);
+        let third = SourceId::new(2);
+        let mut second_source = _create_hir_source(
+            _create_btree_table("second", _create_column_list(&["value"], Type::Integer)),
+            Some(JoinKind::Left),
+            second,
+        );
+        second_source.col_used_mask.set(0)?;
+        let mut third_source = _create_hir_source(
+            _create_btree_table("third", _create_column_list(&["value"], Type::Integer)),
+            Some(JoinKind::Inner),
+            third,
+        );
+        third_source.col_used_mask.set(0)?;
+        let sources = vec![
+            _create_hir_source(
+                _create_btree_table("first", _create_column_list(&["value"], Type::Integer)),
+                None,
+                first,
+            ),
+            second_source,
+            third_source,
+        ];
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: first,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![
+                _create_hir_definition("first", first),
+                _create_hir_definition("second", second),
+                _create_hir_definition("third", third),
+            ],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let from = hir::From {
+            first,
+            joins: vec![
+                hir::Join {
+                    right: second,
+                    kind: JoinKind::Left,
+                    constraint: hir::JoinConstraint::None,
+                },
+                hir::Join {
+                    right: third,
+                    kind: JoinKind::Inner,
+                    constraint: hir::JoinConstraint::None,
+                },
+            ],
+        };
+        let equality = |lhs, rhs| {
+            HirWhereTerm::from(hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::column(lhs, 0)),
+                operator: Operator::Equals,
+                rhs: Box::new(hir::Expr::column(rhs, 0)),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })
+        };
+        let where_clause = vec![equality(second, first), equality(third, second)];
+        let constraints = vec![
+            _hir_empty_constraints(first),
+            _hir_auto_index_constraints(second, 0, 0)?,
+            _hir_auto_index_constraints(third, 1, 1)?,
+        ];
+        let mut access_methods = Vec::new();
+        let result = compute_hir_greedy_btree_join_order(
+            &document,
+            &from,
+            &sources,
+            &constraints,
+            &where_clause,
+            &[
+                RowCountEstimate::AnalyzeStats(1_000.0),
+                RowCountEstimate::AnalyzeStats(1.0),
+                RowCountEstimate::AnalyzeStats(10_000.0),
+            ],
+            None,
+            1.0,
+            &mut access_methods,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+        )?
+        .expect("three HIR sources produce a join plan");
+
+        assert_eq!(
+            result.best_plan.table_numbers().collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let chosen = result
+            .best_plan
+            .best_access_methods()
+            .map(|index| &access_methods[index])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (&chosen[1].consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            (&chosen[2].consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(chosen[1..].iter().all(|method| matches!(
+            method.params,
+            AccessMethodParams::BTreeTable {
+                build_index: true,
+                ..
+            }
+        )));
         Ok(())
     }
 
@@ -4355,6 +4627,52 @@ mod tests {
             index_coverage: hir::IndexCoverage::Selective,
             index_method_patterns: Vec::new(),
         }
+    }
+
+    fn _hir_empty_constraints(source: SourceId) -> HirTableConstraints {
+        HirTableConstraints {
+            table_id: source,
+            constraints: Vec::new(),
+            candidates: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
+        }
+    }
+
+    fn _hir_auto_index_constraints(
+        source: SourceId,
+        where_clause_position: usize,
+        lhs_position: usize,
+    ) -> Result<HirTableConstraints> {
+        let mut lhs_mask = TableMask::default();
+        lhs_mask.set(lhs_position)?;
+        Ok(HirTableConstraints {
+            table_id: source,
+            constraints: vec![Constraint {
+                where_clause_pos: (where_clause_position, BinaryExprSide::Rhs),
+                operator: ConstraintOperator::from(Operator::Equals),
+                table_col_pos: Some(0),
+                expr: None,
+                constraining_expr: None,
+                lhs_mask,
+                selectivity: DEFAULT_PARAMS.sel_eq_unindexed,
+                usable: true,
+                is_rowid: false,
+                comparison_affinity: Some(crate::vdbe::affinity::Affinity::Integer),
+                comparison_collation: None,
+                null_matching: false,
+            }],
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+                partial_index: None,
+            }],
+            temporary_index_terms: smallvec::smallvec![ConstraintRef {
+                constraint_vec_pos: 0,
+                index_col_pos: 0,
+                sort_order: ast::SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            }],
+        })
     }
 
     fn costing_constraints<E, S>(table_id: S) -> TableConstraints<E, S> {
