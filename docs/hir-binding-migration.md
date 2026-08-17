@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Compound SELECT arms now receive HIR access plans while their final ORDER BY
+  remains query-level. Operators, arm IDs, ordering, and limits stay in the
+  owned semantic document instead of being copied into another query shape.
 - Ordinary SELECT and VALUES queries now have an owned HIR query-plan entry
   point. The plan retains the semantic document and plans its blocks directly
   from document-local query and source identities.

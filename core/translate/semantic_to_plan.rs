@@ -81,9 +81,9 @@ impl<'a> HirPlanContext<'a> {
             .expect("validated HIR contains referenced source")
     }
 
-    /// Plan every block in one ordinary resolved SELECT or VALUES query.
-    /// Compound-query coordination remains separate because its ORDER BY and
-    /// duplicate-removal rules apply across arms rather than per block.
+    /// Plan every block in one resolved query. A compound query's ORDER BY
+    /// applies after its arms are combined, so it is not an access-order target
+    /// for any individual arm.
     fn plan_query(
         &self,
         query_id: QueryId,
@@ -94,18 +94,17 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(query_id)
             .expect("validated HIR query exists");
-        if !query.compounds.is_empty() {
-            return Err(LimboError::InternalError(
-                "compound HIR query requires compound planning".to_string(),
-            ));
-        }
-
+        let block_order_by = query
+            .compounds
+            .is_empty()
+            .then_some(query.order_by.as_slice())
+            .unwrap_or_default();
         let query_rows = |_| None;
         query
             .blocks
             .iter()
             .map(|block| {
-                self.plan_query_block(block, &query.order_by, 1.0, schema, params, &query_rows)
+                self.plan_query_block(block, block_order_by, 1.0, schema, params, &query_rows)
             })
             .collect()
     }
@@ -499,15 +498,15 @@ mod tests {
             optimizer::cost::RowCountEstimate,
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
-                ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
-                JoinConstraint, JoinKind, OrderTerm, Output, OutputId, Query, QueryBlock,
+                ComparisonComponent, ComparisonSemantics, CompoundArm, DatabaseId, IndexCoverage,
+                Join, JoinConstraint, JoinKind, OrderTerm, Output, OutputId, Query, QueryBlock,
                 QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SourceColumn, SourceKind,
                 SourceOwner, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
     };
-    use turso_parser::ast::{NullsOrder, Operator, SortOrder};
+    use turso_parser::ast::{CompoundOperator, NullsOrder, Operator, SortOrder};
 
     fn resolved_table(name: &str) -> hir::ResolvedTable {
         let columns = vec![
@@ -1242,5 +1241,62 @@ mod tests {
         assert!(plan.blocks[0].predicates.is_empty());
         assert_eq!(plan.blocks[0].output_cardinality, 1.0);
         assert_eq!(plan.blocks[0].cost, Cost(0.0));
+    }
+
+    #[test]
+    fn owned_hir_query_plan_plans_compound_arms_without_arm_ordering() {
+        let query_id = QueryId::new(0);
+        let first_id = QueryBlockId::new(query_id, 0);
+        let second_id = QueryBlockId::new(query_id, 1);
+        let value = || QueryBlockBody::Values {
+            rows: vec![vec![hir::Expr::Literal(
+                turso_parser::ast::Literal::Numeric("1".into()),
+            )]],
+        };
+        let first = QueryBlock::new(first_id, value());
+        let second = QueryBlock::new(second_id, value());
+        let mut document = document(vec![source()]);
+        document.root = hir::HirRoot::Query(QueryRoot { query: query_id });
+        document.queries.push(Query {
+            id: query_id,
+            parent: None,
+            captures: Vec::new(),
+            reachable_ctes: Vec::new(),
+            blocks: vec![first, second],
+            first: first_id,
+            compounds: vec![CompoundArm {
+                operator: CompoundOperator::UnionAll,
+                block: second_id,
+            }],
+            order_by: vec![OrderTerm {
+                expr: hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into())),
+                order: SortOrder::Desc,
+                nulls: None,
+                type_fact: TypeFact::known(Type::Integer),
+                collation: None,
+            }],
+            limit: None,
+            output: Vec::new(),
+        });
+        let document = Arc::new(document);
+
+        let plan = HirQueryPlan::build(
+            document.clone(),
+            query_id,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("compound query arms plan from HIR");
+
+        assert_eq!(
+            plan.blocks
+                .iter()
+                .map(|block| block.block)
+                .collect::<Vec<_>>(),
+            [first_id, second_id]
+        );
+        let query = plan.document.query(query_id).expect("query remains owned");
+        assert_eq!(query.compounds.len(), 1);
+        assert_eq!(query.order_by.len(), 1);
     }
 }
