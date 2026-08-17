@@ -320,20 +320,24 @@ pub(crate) enum HirConstraintSource<'a> {
         source: hir::SourceId,
         row_count: RowCountEstimate,
     },
+    Cte {
+        source: hir::SourceId,
+        row_count: RowCountEstimate,
+    },
 }
 
 impl<'a> HirConstraintSource<'a> {
     fn source(self) -> hir::SourceId {
         match self {
             Self::BTree(source) => source.internal_id,
-            Self::Derived { source, .. } => source,
+            Self::Derived { source, .. } | Self::Cte { source, .. } => source,
         }
     }
 
     fn btree(self) -> Option<&'a HirPlannedSource> {
         match self {
             Self::BTree(source) => Some(source),
-            Self::Derived { .. } => None,
+            Self::Derived { .. } | Self::Cte { .. } => None,
         }
     }
 
@@ -345,7 +349,7 @@ impl<'a> HirConstraintSource<'a> {
                 .and_then(|stats| stats.row_count)
                 .unwrap_or(params.rows_per_table_fallback as u64)
                 as f64,
-            Self::Derived { row_count, .. } => *row_count,
+            Self::Derived { row_count, .. } | Self::Cte { row_count, .. } => *row_count,
         }
     }
 
@@ -550,7 +554,7 @@ fn hir_binary_constraints_for_term(
                     is_rowid,
                 )
             }
-            HirConstraintSource::Derived { .. } => {
+            HirConstraintSource::Derived { .. } | HirConstraintSource::Cte { .. } => {
                 hir_estimate_scan_constraint_selectivity(part.operator, null_matching, params)
             }
         };

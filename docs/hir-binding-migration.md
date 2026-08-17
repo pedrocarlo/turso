@@ -103,6 +103,11 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Non-recursive CTE sources now retain their `CteId`, body `QueryId`, and
+  materialization choice in HIR planning. The body is planned before each
+  referencing query block, and CTE scans reuse the resolved query-backed
+  constraint, cardinality, and cost path without synthetic legacy subquery
+  tables.
 - Derived-query scans now collect resolved binary and `IN` constraints through
   the same HIR extractor as B-tree sources. They use child-query row estimates
   for generic filter selectivity but cannot produce index or automatic-index

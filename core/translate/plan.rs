@@ -1337,13 +1337,20 @@ pub(crate) type HirPlannedSource = PlannedSource<
 
 /// One resolved HIR source as seen by join planning.
 ///
-/// B-tree sources carry physical access metadata. Derived sources already
-/// point at their planned query, so they do not need a synthetic table.
+/// B-tree sources carry physical access metadata. Query-backed sources point
+/// at their planned query, so they do not need a synthetic table.
 pub(crate) enum HirPlanSource {
     BTree(HirPlannedSource),
     Derived {
         source: crate::translate::semantic::hir::SourceId,
         query: crate::translate::semantic::hir::QueryId,
+        join_info: Option<HirJoinInfo>,
+    },
+    Cte {
+        source: crate::translate::semantic::hir::SourceId,
+        cte: crate::translate::semantic::hir::CteId,
+        query: crate::translate::semantic::hir::QueryId,
+        materialized: ast::Materialized,
         join_info: Option<HirJoinInfo>,
     },
 }
@@ -1352,28 +1359,28 @@ impl HirPlanSource {
     pub(crate) fn source(&self) -> crate::translate::semantic::hir::SourceId {
         match self {
             Self::BTree(source) => source.internal_id,
-            Self::Derived { source, .. } => *source,
+            Self::Derived { source, .. } | Self::Cte { source, .. } => *source,
         }
     }
 
     pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
         match self {
             Self::BTree(source) => source.join_info.as_ref(),
-            Self::Derived { join_info, .. } => join_info.as_ref(),
+            Self::Derived { join_info, .. } | Self::Cte { join_info, .. } => join_info.as_ref(),
         }
     }
 
     pub(crate) fn btree(&self) -> Option<&HirPlannedSource> {
         match self {
             Self::BTree(source) => Some(source),
-            Self::Derived { .. } => None,
+            Self::Derived { .. } | Self::Cte { .. } => None,
         }
     }
 
     pub(crate) fn btree_mut(&mut self) -> Option<&mut HirPlannedSource> {
         match self {
             Self::BTree(source) => Some(source),
-            Self::Derived { .. } => None,
+            Self::Derived { .. } | Self::Cte { .. } => None,
         }
     }
 }

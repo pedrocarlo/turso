@@ -91,7 +91,14 @@ pub(crate) struct HirPlannedLoop {
 /// Selected access for one resolved HIR source.
 pub(crate) enum HirSourceAccess {
     BTree(HirBtreeOperation),
-    Derived { query: QueryId },
+    Derived {
+        query: QueryId,
+    },
+    Cte {
+        cte: hir::CteId,
+        query: QueryId,
+        materialized: turso_parser::ast::Materialized,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -150,8 +157,10 @@ impl<'a> HirPlanContext<'a> {
             for source in
                 core::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
             {
-                if let hir::SourceKind::Derived(dependency) = &self.definition(source).kind {
-                    dependencies.push(*dependency);
+                match &self.definition(source).kind {
+                    hir::SourceKind::Derived(dependency) => dependencies.push(*dependency),
+                    hir::SourceKind::Cte(cte) => dependencies.push(self.cte_query(*cte)?),
+                    _ => {}
                 }
             }
         }
@@ -204,6 +213,19 @@ impl<'a> HirPlanContext<'a> {
         planned_source_from_definition(self.definition(source), join_info, usage)
     }
 
+    fn cte_query(&self, cte: hir::CteId) -> Result<QueryId> {
+        let definition = self
+            .document
+            .cte(cte)
+            .expect("validated HIR contains referenced CTE");
+        match &definition.body {
+            hir::CteBody::Query(query) => Ok(*query),
+            hir::CteBody::Recursive(_) => Err(LimboError::InternalError(format!(
+                "recursive CTE {cte} cannot be planned as a non-recursive HIR source"
+            ))),
+        }
+    }
+
     fn plan_source(
         &self,
         source: SourceId,
@@ -219,6 +241,19 @@ impl<'a> HirPlanContext<'a> {
                 query: *query,
                 join_info,
             }),
+            hir::SourceKind::Cte(cte) => {
+                let definition = self
+                    .document
+                    .cte(*cte)
+                    .expect("validated HIR contains referenced CTE");
+                Ok(HirPlanSource::Cte {
+                    source,
+                    cte: *cte,
+                    query: self.cte_query(*cte)?,
+                    materialized: definition.materialized.clone(),
+                    join_info,
+                })
+            }
             _ => Err(LimboError::InternalError(format!(
                 "source {source} cannot be planned as a query source"
             ))),
@@ -329,6 +364,10 @@ impl<'a> HirPlanContext<'a> {
                         source: *source,
                         row_count: *row_count,
                     },
+                    HirPlanSource::Cte { source, .. } => HirConstraintSource::Cte {
+                        source: *source,
+                        row_count: *row_count,
+                    },
                 };
                 hir_constraints_for_source(
                     self.document,
@@ -431,6 +470,19 @@ impl<'a> HirPlanContext<'a> {
                     ));
                     source_costs.push(child.cost);
                 }
+                HirPlanSource::Cte {
+                    source, cte, query, ..
+                } => {
+                    let child = query_estimate(*query).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "CTE HIR source {source} for {cte} references unplanned query {query}"
+                        ))
+                    })?;
+                    base_rows.push(RowCountEstimate::AnalyzeStats(
+                        child.output_cardinality.max(1.0),
+                    ));
+                    source_costs.push(child.cost);
+                }
             }
         }
         let constraints =
@@ -479,6 +531,26 @@ impl<'a> HirPlanContext<'a> {
                         ));
                     }
                     HirSourceAccess::Derived { query: *query }
+                }
+                HirPlanSource::Cte {
+                    cte,
+                    query,
+                    materialized,
+                    ..
+                } => {
+                    if !matches!(
+                        access_methods[access_method_position].params,
+                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
+                    ) {
+                        return Err(LimboError::InternalError(
+                            "CTE HIR source selected a non-subquery access method".to_string(),
+                        ));
+                    }
+                    HirSourceAccess::Cte {
+                        cte: *cte,
+                        query: *query,
+                        materialized: materialized.clone(),
+                    }
                 }
             };
             loops.push(HirPlannedLoop {
@@ -694,15 +766,15 @@ mod tests {
             optimizer::cost::RowCountEstimate,
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
-                ComparisonComponent, ComparisonSemantics, CompoundArm, DatabaseId,
-                DatabaseSnapshot, IndexCoverage, Join, JoinConstraint, JoinKind, OrderTerm, Output,
-                OutputId, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-                SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
+                ComparisonComponent, ComparisonSemantics, CompoundArm, Cte, CteBody, CteColumn,
+                CteId, DatabaseId, DatabaseSnapshot, IndexCoverage, Join, JoinConstraint, JoinKind,
+                OrderTerm, Output, OutputId, Query, QueryBlock, QueryBlockBody, QueryBlockId,
+                QueryId, QueryRoot, SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
     };
-    use turso_parser::ast::{CompoundOperator, NullsOrder, Operator, SortOrder};
+    use turso_parser::ast::{CompoundOperator, Materialized, NullsOrder, Operator, SortOrder};
 
     fn resolved_table(name: &str) -> hir::ResolvedTable {
         let columns = vec![
@@ -1630,6 +1702,50 @@ mod tests {
             HirSourceAccess::Derived { query } if query == child_query
         ));
         assert!(root.cost.0 > child.cost.0);
+
+        let cte_id = CteId::new(0);
+        let mut cte_document = plan.document.as_ref().clone();
+        cte_document.sources[source_id.index()].kind = SourceKind::Cte(cte_id);
+        cte_document.queries[root_query.index()].reachable_ctes = vec![cte_id];
+        let source_column = &cte_document.sources[source_id.index()].columns[0];
+        cte_document.ctes.push(Cte {
+            id: cte_id,
+            name: "numbers".to_string(),
+            columns: vec![CteColumn {
+                name: source_column.name.clone(),
+                type_fact: source_column.type_fact.clone(),
+                affinity: source_column.affinity,
+                has_affinity: source_column.has_affinity,
+                collation: source_column.collation.clone(),
+            }],
+            materialized: Materialized::Yes,
+            body: CteBody::Query(child_query),
+        });
+        cte_document
+            .validate()
+            .expect("non-recursive CTE query HIR is valid");
+        let cte_plan = HirQueryPlan::build(
+            Arc::new(cte_document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("non-recursive CTE source plans from HIR");
+        let cte_root = cte_plan
+            .planned_query(root_query)
+            .expect("CTE root query is planned");
+        assert_eq!(cte_root.output_cardinality, 0.2);
+        let [cte_loop] = cte_root.blocks[0].loops.as_slice() else {
+            panic!("CTE source produces one scan loop");
+        };
+        assert!(matches!(
+            cte_loop.access,
+            HirSourceAccess::Cte {
+                cte,
+                query,
+                materialized: Materialized::Yes,
+            } if cte == cte_id && query == child_query
+        ));
 
         let table_source_id = SourceId::new(1);
         let mut table_source = source_with_id(1, "items");

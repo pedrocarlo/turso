@@ -2058,7 +2058,7 @@ fn hir_join_step(
             base_row_count,
             params,
         )?,
-        HirPlanSource::Derived { .. } => {
+        HirPlanSource::Derived { .. } | HirPlanSource::Cte { .. } => {
             let rows = *base_row_count;
             let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
                 None,
