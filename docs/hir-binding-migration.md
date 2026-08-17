@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Selected B-tree access methods now pass through one representation-generic
+  application path. Legacy AST and HIR planning share automatic-index
+  materialization, scan/seek/rowid/IN construction, and predicate-consumption
+  rules; only expression extraction differs.
 - Automatic-index construction now consumes a generic planned source. HIR
   supplies its resolved source identity, physical table, and frozen column-use
   mask directly; building the index no longer requires `JoinedTable`.

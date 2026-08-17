@@ -2218,7 +2218,7 @@ impl RangeConstraintRef {
 }
 
 impl HirConstraint {
-    fn get_hir_constraining_expr(
+    pub(super) fn get_hir_constraining_expr(
         &self,
         where_clause: &[HirWhereTerm],
     ) -> (ast::Operator, hir::Expr, Affinity) {
@@ -2506,12 +2506,6 @@ pub(super) fn partial_index_predicate_terms(
     Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
-}
-
-pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
-    let index = index?;
-    index.where_clause.as_ref()?;
-    Some(index.as_ref())
 }
 
 pub(super) fn can_use_partial_index(

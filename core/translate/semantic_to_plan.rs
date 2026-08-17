@@ -3,11 +3,12 @@
 use super::{
     optimizer::{
         access_method::AccessMethod,
+        apply_hir_selected_btree_access,
         constraints::{hir_table_constraints_for_source, HirTableConstraints},
         hir_base_row_estimates,
         join::{compute_hir_greedy_btree_join_order, JoinN},
         order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
-        CostModelParams,
+        CostModelParams, HirBtreeOperation,
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, Operation, PredicateExpr},
     semantic::hir::{self, ColumnUsage, HirDocument, QueryId, SourceId},
@@ -25,6 +26,15 @@ pub(crate) struct HirBTreePlan {
     pub(crate) constraints: Vec<HirTableConstraints>,
     pub(crate) access_methods: Vec<AccessMethod>,
     pub(crate) join: JoinN,
+    pub(crate) loops: Vec<HirPlannedLoop>,
+}
+
+/// One selected source loop in physical join order, still using HIR
+/// expressions and document-local source identity.
+pub(crate) struct HirPlannedLoop {
+    pub(crate) source: SourceId,
+    pub(crate) source_position: usize,
+    pub(crate) access: HirBtreeOperation,
 }
 
 /// State shared while one HIR document is converted into plan nodes.
@@ -173,7 +183,7 @@ impl<'a> HirPlanContext<'a> {
     pub(crate) fn plan_btree_access(
         &self,
         from: &hir::From,
-        input: &HirQueryBlockPlanInput,
+        input: &mut HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         initial_cardinality: f64,
         schema: &Schema,
@@ -198,10 +208,33 @@ impl<'a> HirPlanContext<'a> {
             params,
         )?;
 
-        Ok(result.map(|result| HirBTreePlan {
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let mut prior_sources = crate::translate::planner::TableMask::default();
+        let mut loops = Vec::with_capacity(input.sources.len());
+        for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
+            let access = apply_hir_selected_btree_access(
+                &input.sources[source_position],
+                &constraints[source_position],
+                &mut input.predicates,
+                &mut access_methods[access_method_position],
+                &prior_sources,
+                source_position,
+            )?;
+            loops.push(HirPlannedLoop {
+                source: input.sources[source_position].internal_id,
+                source_position,
+                access,
+            });
+            prior_sources.set(source_position)?;
+        }
+
+        Ok(Some(HirBTreePlan {
             constraints,
             access_methods,
             join: result.best_plan,
+            loops,
         }))
     }
 
@@ -366,10 +399,7 @@ mod tests {
         sync::Arc,
         translate::collate::CollationSeq,
         translate::{
-            optimizer::{
-                build_hir_seek_def_from_constraints, constraints::usable_constraints_for_lhs_mask,
-                cost::RowCountEstimate, ephemeral_index_build,
-            },
+            optimizer::cost::RowCountEstimate,
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
                 ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -945,7 +975,7 @@ mod tests {
         ];
 
         let context = HirPlanContext::new(&document);
-        let input = context
+        let mut input = context
             .query_block_input(&block, &[], &usage)
             .expect("query block input converts");
 
@@ -994,7 +1024,7 @@ mod tests {
         let plan = context
             .plan_btree_access(
                 block.from.as_ref().expect("test block has FROM"),
-                &input,
+                &mut input,
                 None,
                 1.0,
                 &schema,
@@ -1015,22 +1045,30 @@ mod tests {
 
         let right_constraints = &plan.constraints[1];
         assert!(!right_constraints.temporary_index_terms.is_empty());
-        let mut prior_sources = crate::translate::planner::TableMask::default();
-        prior_sources.set(0).expect("first source fits table mask");
-        let seek_terms = usable_constraints_for_lhs_mask(
-            &right_constraints.constraints,
-            &right_constraints.temporary_index_terms,
-            &prior_sources,
-            1,
+        let [left_loop, right_loop] = plan.loops.as_slice() else {
+            panic!("two sources produce two planned loops");
+        };
+        assert_eq!(left_loop.source, left);
+        assert_eq!(left_loop.source_position, 0);
+        assert_eq!(right_loop.source, right);
+        assert_eq!(right_loop.source_position, 1);
+        let HirBtreeOperation::Seek {
+            index: Some(index),
+            seek_def,
+        } = &right_loop.access
+        else {
+            panic!("right source uses its selected automatic-index seek");
+        };
+        assert!(index.ephemeral);
+        assert_eq!(
+            index
+                .columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .collect::<Vec<_>>(),
+            [0]
         );
-        let seek = build_hir_seek_def_from_constraints(
-            &right_constraints.constraints,
-            &seek_terms,
-            crate::translate::plan::IterationDirection::Forwards,
-            &input.predicates,
-        )
-        .expect("resolved join constraint builds an HIR seek");
-        let Some((operator, expression, affinity)) = &seek.prefix[0].eq else {
+        let Some((operator, expression, affinity)) = &seek_def.prefix[0].eq else {
             panic!("join equality becomes the seek prefix");
         };
         assert_eq!(*operator, Operator::Equals);
@@ -1039,18 +1077,6 @@ mod tests {
             expression,
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
-
-        let ephemeral = ephemeral_index_build(&input.sources[1], &seek_terms)
-            .expect("resolved HIR source builds a temporary index");
-        assert_eq!(ephemeral.name, "ephemeral_right_items_s1");
-        assert!(ephemeral.ephemeral);
-        assert_eq!(
-            ephemeral
-                .columns
-                .iter()
-                .map(|column| column.pos_in_table)
-                .collect::<Vec<_>>(),
-            [0]
-        );
+        assert!(input.predicates[0].consumed);
     }
 }
