@@ -1824,82 +1824,11 @@ fn compute_greedy_join_order<'a>(
     }))
 }
 
-/// Choose the first source for greedy HIR join planning with the same scoring
-/// and ordering rules used by parser-expression planning.
-pub(crate) fn hir_best_starting_source(
-    document: &HirDocument,
-    sources: &[HirPlannedSource],
-    constraints: &[HirTableConstraints],
-    base_table_rows: &[RowCountEstimate],
-    analyze_stats: &AnalyzeStats,
-    params: &CostModelParams,
-) -> Result<usize> {
-    let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
-    find_best_starting_source(
-        sources.iter().map(|source| {
-            HirAccessSource::new(
-                source,
-                document
-                    .source(source.internal_id)
-                    .expect("validated HIR contains referenced source"),
-            )
-        }),
-        constraints,
-        base_table_rows,
-        &ordering_restrictions,
-        analyze_stats,
-        params,
-    )
-}
-
-/// First source and access method chosen by greedy HIR join planning.
+/// One candidate source and access method during greedy HIR join planning.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct HirJoinStep {
-    pub(crate) source_position: usize,
-    pub(crate) access_method: AccessMethod,
-}
-
-/// Choose the first HIR source and its B-tree access method.
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn hir_first_join_step(
-    document: &HirDocument,
-    from: &hir::From,
-    sources: &[HirPlannedSource],
-    constraints: &[HirTableConstraints],
-    where_clause: &[HirWhereTerm],
-    base_table_rows: &[RowCountEstimate],
-    order_target: Option<&HirOrderTarget<'_>>,
-    initial_input_cardinality: f64,
-    schema: &Schema,
-    analyze_stats: &AnalyzeStats,
-    params: &CostModelParams,
-) -> Result<HirJoinStep> {
-    let source_position = hir_best_starting_source(
-        document,
-        sources,
-        constraints,
-        base_table_rows,
-        analyze_stats,
-        params,
-    )?;
-    let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
-    hir_btree_join_step(
-        document,
-        sources,
-        constraints,
-        where_clause,
-        &predicate_work,
-        base_table_rows,
-        order_target,
-        source_position,
-        &TableMask::default(),
-        initial_input_cardinality,
-        schema,
-        analyze_stats,
-        params,
-    )
+struct HirJoinStep {
+    source_position: usize,
+    access_method: AccessMethod,
 }
 
 /// Build a left-deep HIR join plan using the greedy B-tree rules.
@@ -1962,6 +1891,7 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
         analyze_stats,
         params,
     )?;
+    let first_position = first.source_position;
     let mut first_mask = TableMask::default();
     first_mask.set(first_position)?;
     let mut output_cardinality = rows_after_join(
@@ -2025,6 +1955,7 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
                 analyze_stats,
                 params,
             )?;
+            let position = step.source_position;
             let mut method = step.access_method;
             if !connected {
                 let base_rows = base_table_rows

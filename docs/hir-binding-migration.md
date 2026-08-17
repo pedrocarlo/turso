@@ -109,12 +109,11 @@ Completed:
   converting resolved expressions back to parser expressions.
 - HIR B-tree join-step selection now accepts the mask of sources already
   joined. Later sources can therefore use resolved join constraints for index
-  seeks and automatic indexes; the first-source entry point is only the empty
-  left-hand-side wrapper around the same step.
-- The first greedy HIR join step now selects both the starting source and its
-  ordinary B-tree access method. It applies ready-predicate cost using resolved
-  source dependencies and returns the existing planner `AccessMethod` without
-  parser expressions, resolver state, or `TableReferences`.
+  seeks and automatic indexes; complete HIR join planning supplies an empty
+  left-hand side for its chosen starting source.
+- Greedy HIR planning selects the starting source and every ordinary B-tree
+  access method through one complete-plan entry point. The temporary public
+  first-step scaffold has been removed.
 - Ready-predicate masks, loop ownership, and residual expression work now flow
   through one representation-neutral join helper. HIR derives the inputs from
   resolved source dependencies and its iterative expression walker; only the

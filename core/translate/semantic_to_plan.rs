@@ -318,7 +318,8 @@ mod tests {
         translate::collate::CollationSeq,
         translate::{
             optimizer::{
-                cost::RowCountEstimate, hir_base_row_estimates, join::hir_first_join_step,
+                cost::RowCountEstimate, hir_base_row_estimates,
+                join::compute_hir_greedy_btree_join_order,
             },
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
@@ -938,7 +939,8 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1.0),
             ]
         );
-        let first = hir_first_join_step(
+        let mut access_methods = Vec::new();
+        let result = compute_hir_greedy_btree_join_order(
             &document,
             block.from.as_ref().expect("test block has FROM"),
             &input.sources,
@@ -947,15 +949,17 @@ mod tests {
             &base_rows,
             None,
             1.0,
+            &mut access_methods,
             &schema,
             &AnalyzeStats::default(),
             &params,
         )
-        .expect("HIR first join step is selected");
-        assert_eq!(first.source_position, 0);
-        assert!(matches!(
-            first.access_method.params,
+        .expect("HIR join planning succeeds")
+        .expect("two HIR sources produce a join plan");
+        assert_eq!(result.best_plan.table_numbers().collect::<Vec<_>>(), [0, 1]);
+        assert!(result.best_plan.best_access_methods().all(|index| matches!(
+            access_methods[index].params,
             crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable { .. }
-        ));
+        )));
     }
 }
