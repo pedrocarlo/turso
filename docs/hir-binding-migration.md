@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Ordinary B-tree access selection now has one source-generic entry point that
+  both chooses the candidate and builds its planner `AccessMethod`. Legacy and
+  HIR callers no longer need representation-specific glue between those steps.
 - Chosen B-tree candidates now become planner access methods through one
   expression-representation-neutral builder. Legacy and HIR constraints share
   covering, rows-per-seek, consumed-predicate, direction, and index facts.

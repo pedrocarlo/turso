@@ -4213,11 +4213,16 @@ mod tests {
                         .selectivity
             )
         );
-        let access_method = crate::translate::optimizer::access_method::build_btree_access_method(
+        let access_method = crate::translate::optimizer::access_method::choose_btree_access_method(
             &access_source,
             &accepted,
-            chosen,
+            &TableMask::default(),
+            source.index(),
+            None,
+            &Schema::new(),
             &crate::stats::AnalyzeStats::default(),
+            1.0,
+            base_row_count,
             &params,
         )?;
         assert_eq!(

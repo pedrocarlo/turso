@@ -649,6 +649,37 @@ pub(super) fn build_btree_access_method<E, S>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Choose and build the best ordinary B-tree access method for one source.
+pub(super) fn choose_btree_access_method<C, I, O>(
+    source: &impl BtreeCandidateSource<I, O>,
+    constraints: &TableConstraints<C, I>,
+    lhs_mask: &TableMask,
+    source_position: usize,
+    order_target: Option<&OrderTarget<I, O>>,
+    schema: &Schema,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let chosen = choose_best_btree_candidate(
+        source,
+        constraints,
+        lhs_mask,
+        source_position,
+        order_target,
+        schema,
+        analyze_stats,
+        input_cardinality,
+        base_row_count,
+        params,
+    )?
+    .expect("B-tree candidate selection always includes a scan candidate");
+
+    build_btree_access_method(source, constraints, chosen, analyze_stats, params)
+}
+
+#[allow(clippy::too_many_arguments)]
 /// Evaluate whether an `IN (...)` predicate should replace the ordinary btree
 /// access path with repeated equality seeks.
 ///
@@ -973,7 +1004,7 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
-    let best = choose_best_btree_candidate(
+    let mut best_access_method = choose_btree_access_method(
         rhs_table,
         rhs_constraints,
         lhs_mask,
@@ -984,12 +1015,15 @@ fn find_best_access_method_for_btree(
         input_cardinality,
         base_row_count,
         params,
-    )?
-    .expect("btree candidate selection must always consider the rowid candidate");
-
-    let best_iter_dir = best.iter_dir;
-    let mut best_access_method =
-        build_btree_access_method(rhs_table, rhs_constraints, best, analyze_stats, params)?;
+    )?;
+    let AccessMethodParams::BTreeTable {
+        iter_dir: best_iter_dir,
+        ..
+    } = &best_access_method.params
+    else {
+        unreachable!("ordinary B-tree selection returns BTreeTable access")
+    };
+    let best_iter_dir = *best_iter_dir;
     let mut best_cost_with_filters =
         cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
 
