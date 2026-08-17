@@ -13,9 +13,34 @@ use super::{
         },
     },
     plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
-    semantic::hir::{self, ColumnUsage, HirDocument, QueryId, SourceId},
+    semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
-use crate::{LimboError, Result, schema::Schema};
+use crate::{LimboError, Result, schema::Schema, sync::Arc};
+
+/// Planned form of one resolved query. The semantic document stays alive so
+/// source and output identities remain resolvable without copying definitions.
+pub(crate) struct HirQueryPlan {
+    pub(crate) document: Arc<HirDocument>,
+    pub(crate) query: QueryId,
+    pub(crate) blocks: Vec<HirQueryBlockPlan>,
+}
+
+impl HirQueryPlan {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build(
+        document: Arc<HirDocument>,
+        query: QueryId,
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> Result<Self> {
+        let blocks = HirPlanContext::new(&document).plan_query(query, schema, params)?;
+        Ok(Self {
+            document,
+            query,
+            blocks,
+        })
+    }
+}
 
 /// Resolved source and predicate input for one query block.
 pub(crate) struct HirQueryBlockPlanInput {
@@ -25,6 +50,7 @@ pub(crate) struct HirQueryBlockPlanInput {
 
 /// B-tree access choices for one resolved HIR query block.
 pub(crate) struct HirQueryBlockPlan {
+    pub(crate) block: QueryBlockId,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) output_cardinality: f64,
@@ -53,6 +79,35 @@ impl<'a> HirPlanContext<'a> {
         self.document
             .source(id)
             .expect("validated HIR contains referenced source")
+    }
+
+    /// Plan every block in one ordinary resolved SELECT or VALUES query.
+    /// Compound-query coordination remains separate because its ORDER BY and
+    /// duplicate-removal rules apply across arms rather than per block.
+    fn plan_query(
+        &self,
+        query_id: QueryId,
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> Result<Vec<HirQueryBlockPlan>> {
+        let query = self
+            .document
+            .query(query_id)
+            .expect("validated HIR query exists");
+        if !query.compounds.is_empty() {
+            return Err(LimboError::InternalError(
+                "compound HIR query requires compound planning".to_string(),
+            ));
+        }
+
+        let query_rows = |_| None;
+        query
+            .blocks
+            .iter()
+            .map(|block| {
+                self.plan_query_block(block, &query.order_by, 1.0, schema, params, &query_rows)
+            })
+            .collect()
     }
 
     /// Build planner source metadata without resolving names, allocating a
@@ -188,6 +243,7 @@ impl<'a> HirPlanContext<'a> {
         let input = self.query_block_input(block, order_by, &usage)?;
         let Some(from) = &block.from else {
             return Ok(HirQueryBlockPlan {
+                block: block.id,
                 loops: Vec::new(),
                 predicates: input.predicates,
                 output_cardinality: initial_cardinality,
@@ -199,6 +255,7 @@ impl<'a> HirPlanContext<'a> {
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         );
         self.plan_btree_access(
+            block.id,
             from,
             input,
             order_target.as_ref(),
@@ -220,6 +277,7 @@ impl<'a> HirPlanContext<'a> {
     #[allow(clippy::too_many_arguments)]
     fn plan_btree_access(
         &self,
+        block: QueryBlockId,
         from: &hir::From,
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
@@ -269,6 +327,7 @@ impl<'a> HirPlanContext<'a> {
         }
 
         Ok(Some(HirQueryBlockPlan {
+            block,
             loops,
             predicates: input.predicates,
             output_cardinality: result.best_plan.output_cardinality,
@@ -1074,9 +1133,16 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1.0),
             ]
         );
-        let plan = context
-            .plan_query_block(&block, &[], 1.0, &schema, &params, &|_| None)
-            .expect("HIR access planning succeeds");
+        let query_id = block.id.query;
+        let document = Arc::new(document);
+        let query_plan = HirQueryPlan::build(document.clone(), query_id, &schema, &params)
+            .expect("HIR query planning succeeds");
+        assert!(Arc::ptr_eq(&query_plan.document, &document));
+        assert_eq!(query_plan.query, query_id);
+        let [plan] = query_plan.blocks.as_slice() else {
+            panic!("ordinary SELECT has one planned block");
+        };
+        assert_eq!(plan.block, block.id);
         assert!(plan.output_cardinality > 0.0);
         assert!(plan.cost.0 >= 0.0);
         let [left_loop, right_loop] = plan.loops.as_slice() else {
@@ -1144,5 +1210,37 @@ mod tests {
         assert!(!plan.predicates[0].consumed);
         assert_eq!(plan.output_cardinality, 7.0);
         assert_eq!(plan.cost, Cost(0.0));
+    }
+
+    #[test]
+    fn owned_hir_query_plan_plans_values_block() {
+        let mut document = document(vec![source()]);
+        let block = QueryBlock::new(
+            QueryBlockId::new(QueryId::new(0), 0),
+            QueryBlockBody::Values {
+                rows: vec![vec![hir::Expr::Literal(
+                    turso_parser::ast::Literal::Numeric("1".into()),
+                )]],
+            },
+        );
+        add_query(&mut document, &block);
+        let document = Arc::new(document);
+
+        let plan = HirQueryPlan::build(
+            document.clone(),
+            block.id.query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("VALUES query plans from HIR");
+
+        assert!(Arc::ptr_eq(&plan.document, &document));
+        assert_eq!(plan.query, block.id.query);
+        assert_eq!(plan.blocks.len(), 1);
+        assert_eq!(plan.blocks[0].block, block.id);
+        assert!(plan.blocks[0].loops.is_empty());
+        assert!(plan.blocks[0].predicates.is_empty());
+        assert_eq!(plan.blocks[0].output_cardinality, 1.0);
+        assert_eq!(plan.blocks[0].cost, Cost(0.0));
     }
 }
