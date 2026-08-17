@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- `IN`-seek selection now returns the final planner `AccessMethod` through one
+  expression-representation-neutral entry point. Legacy and HIR paths share
+  consumed predicates, affinity, index identity, row estimates, and cost.
 - Ordinary B-tree access selection now has one source-generic entry point that
   both chooses the candidate and builds its planner `AccessMethod`. Legacy and
   HIR callers no longer need representation-specific glue between those steps.

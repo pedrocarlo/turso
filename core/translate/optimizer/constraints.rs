@@ -3465,21 +3465,33 @@ mod tests {
                 .expect("test document contains HIR source"),
         );
 
-        let chosen = crate::translate::optimizer::access_method::choose_best_in_seek_candidate(
-            &access_source,
-            &constraints,
-            &TableMask::default(),
-            1.0,
-            crate::translate::optimizer::cost::RowCountEstimate::hardcoded_fallback(&params),
-            &params,
-            crate::translate::optimizer::cost::Cost(f64::INFINITY),
-            crate::translate::optimizer::access_method::BranchReadMode::RowIdOnly,
-        )?
-        .expect("HIR rowid IN constraint drives existing chooser");
+        let access_method =
+            crate::translate::optimizer::access_method::choose_in_seek_access_method(
+                &access_source,
+                &constraints,
+                &TableMask::default(),
+                1.0,
+                crate::translate::optimizer::cost::RowCountEstimate::hardcoded_fallback(&params),
+                &params,
+                crate::translate::optimizer::cost::Cost(f64::INFINITY),
+                crate::translate::optimizer::access_method::BranchReadMode::RowIdOnly,
+            )?
+            .expect("HIR rowid IN constraint drives existing chooser");
 
-        assert!(chosen.index.is_none());
-        assert_eq!(chosen.affinity, Affinity::Integer);
-        assert_eq!(chosen.constraint_idx, 3);
+        assert_eq!(
+            (&access_method.consumed_where_terms)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [3]
+        );
+        assert!(matches!(
+            access_method.params,
+            crate::translate::optimizer::access_method::AccessMethodParams::InSeek {
+                index: None,
+                affinity: Affinity::Integer,
+                where_term_idx: 3,
+            }
+        ));
         Ok(())
     }
 

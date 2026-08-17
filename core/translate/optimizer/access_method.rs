@@ -703,7 +703,7 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
     let rhs_table = rhs_source.table();
     let Table::BTree(btree) = rhs_table else {
         return Err(LimboError::InternalError(
-            "consider_in_seek_access_method called on non-BTree table".into(),
+            "IN-seek candidate selection called on non-BTree table".into(),
         ));
     };
 
@@ -825,41 +825,46 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
     Ok(best_in_seek)
 }
 
-fn consider_in_seek_access_method(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+fn build_in_seek_access_method(chosen: ChosenInSeekCandidate) -> Result<AccessMethod> {
+    let mut consumed_where_terms: BitSet<usize> =
+        iter::once(chosen.constraint_idx).try_collect()?;
+    for term_idx in chosen.partial_index_predicate_terms {
+        consumed_where_terms.set(term_idx)?;
+    }
+    Ok(AccessMethod {
+        cost: chosen.cost,
+        estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
+        consumed_where_terms,
+        params: AccessMethodParams::InSeek {
+            index: chosen.index,
+            affinity: chosen.affinity,
+            where_term_idx: chosen.constraint_idx,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn choose_in_seek_access_method<E, S>(
+    source: &impl AccessSource,
+    constraints: &TableConstraints<E, S>,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
     best_cost: Cost,
+    read_mode: BranchReadMode,
 ) -> Result<Option<AccessMethod>> {
     choose_best_in_seek_candidate(
-        rhs_table,
-        rhs_constraints,
+        source,
+        constraints,
         lhs_mask,
         input_cardinality,
         base_row_count,
         params,
         best_cost,
-        BranchReadMode::FullRow,
+        read_mode,
     )?
-    .map(|chosen| -> Result<AccessMethod> {
-        let mut consumed_where_terms = iter::once(chosen.constraint_idx).try_collect()?;
-        for term_idx in chosen.partial_index_predicate_terms {
-            consumed_where_terms.set(term_idx)?;
-        }
-        Ok(AccessMethod {
-            cost: chosen.cost,
-            estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-            consumed_where_terms,
-            params: AccessMethodParams::InSeek {
-                index: chosen.index,
-                affinity: chosen.affinity,
-                where_term_idx: chosen.constraint_idx,
-            },
-        })
-    })
+    .map(build_in_seek_access_method)
     .transpose()
 }
 
@@ -1116,7 +1121,7 @@ fn find_best_access_method_for_btree(
     // Skip alternative access methods (in-seek, multi-index) when INDEXED BY or NOT INDEXED
     // is specified — the user explicitly requested a specific index or no index.
     if rhs_table.indexed.is_none() && rhs_table.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(in_seek_method) = consider_in_seek_access_method(
+        if let Some(in_seek_method) = choose_in_seek_access_method(
             rhs_table,
             rhs_constraints,
             lhs_mask,
@@ -1124,6 +1129,7 @@ fn find_best_access_method_for_btree(
             base_row_count,
             params,
             best_cost_with_filters,
+            BranchReadMode::FullRow,
         )? {
             replace_if_cheaper(
                 &mut best_access_method,
