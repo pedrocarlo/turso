@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Seek definitions, keys, and range constraints now accept either parser or
+  HIR expressions. The legacy plan keeps parser expressions through default
+  type parameters, while HIR planning can keep resolved expressions without
+  changing physical lowering.
 - HIR query-block B-tree planning now has one boundary that collects resolved
   constraints, derives ANALYZE row estimates, owns the access-method arena, and
   returns the complete `JoinN`. Callers no longer assemble those planning steps
