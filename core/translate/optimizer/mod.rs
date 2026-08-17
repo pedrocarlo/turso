@@ -1923,7 +1923,7 @@ fn register_index_expression_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(
+pub(crate) fn base_row_estimate(
     schema: &Schema,
     table: &Table,
     params: &cost_params::CostModelParams,
@@ -1983,17 +1983,6 @@ fn base_row_estimate(
         },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
-}
-
-pub(crate) fn hir_base_row_estimates(
-    sources: &[HirPlannedSource],
-    schema: &Schema,
-    params: &CostModelParams,
-) -> Vec<RowCountEstimate> {
-    sources
-        .iter()
-        .map(|source| base_row_estimate(schema, &source.table, params))
-        .collect()
 }
 
 /// Read a group count from ANALYZE for a simple list of table columns.

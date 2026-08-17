@@ -2,18 +2,19 @@
 
 use super::{
     optimizer::{
-        apply_hir_selected_btree_access,
+        apply_hir_selected_btree_access, base_row_estimate,
         constraints::{hir_table_constraints_for_source, HirTableConstraints},
-        cost::{estimate_cost_for_scan_or_seek, Cost, RowCountEstimate},
-        hir_base_row_estimates,
-        join::compute_hir_greedy_btree_join_order,
+        cost::{Cost, RowCountEstimate},
+        join::compute_hir_greedy_join_order,
         order::{
             ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
             OrderTargetPurpose,
         },
         CostModelParams, HirBtreeOperation,
     },
-    plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
+    plan::{
+        ColumnUsedMask, HirJoinInfo, HirPlanSource, HirPlannedSource, HirWhereTerm, PredicateExpr,
+    },
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
 use crate::{schema::Schema, sync::Arc, LimboError, Result};
@@ -66,11 +67,11 @@ impl HirQueryPlan {
 
 /// Resolved source and predicate input for one query block.
 pub(crate) struct HirQueryBlockPlanInput {
-    pub(crate) sources: Vec<HirPlannedSource>,
+    pub(crate) sources: Vec<HirPlanSource>,
     pub(crate) predicates: Vec<HirWhereTerm>,
 }
 
-/// B-tree access choices for one resolved HIR query block.
+/// Access choices for one resolved HIR query block.
 pub(crate) struct HirQueryBlockPlan {
     pub(crate) block: QueryBlockId,
     pub(crate) loops: Vec<HirPlannedLoop>,
@@ -203,6 +204,27 @@ impl<'a> HirPlanContext<'a> {
         planned_source_from_definition(self.definition(source), join_info, usage)
     }
 
+    fn plan_source(
+        &self,
+        source: SourceId,
+        join_info: Option<HirJoinInfo>,
+        usage: &[ColumnUsage],
+    ) -> Result<HirPlanSource> {
+        match &self.definition(source).kind {
+            hir::SourceKind::Table(_) => self
+                .source(source, join_info, usage)
+                .map(HirPlanSource::BTree),
+            hir::SourceKind::Derived(query) => Ok(HirPlanSource::Derived {
+                source,
+                query: *query,
+                join_info,
+            }),
+            _ => Err(LimboError::InternalError(format!(
+                "source {source} cannot be planned as a query source"
+            ))),
+        }
+    }
+
     /// Assemble planner input from resolved HIR without repeating binding.
     pub(crate) fn query_block_input(
         &self,
@@ -216,9 +238,11 @@ impl<'a> HirPlanContext<'a> {
         };
 
         if let Some(from) = &block.from {
-            input.sources.push(self.source(from.first, None, usage)?);
+            input
+                .sources
+                .push(self.plan_source(from.first, None, usage)?);
             for join in &from.joins {
-                input.sources.push(self.source(
+                input.sources.push(self.plan_source(
                     join.right,
                     Some(HirJoinInfo { kind: join.kind }),
                     usage,
@@ -291,8 +315,8 @@ impl<'a> HirPlanContext<'a> {
         input
             .sources
             .iter()
-            .map(|source| {
-                hir_table_constraints_for_source(
+            .map(|source| match source {
+                HirPlanSource::BTree(source) => hir_table_constraints_for_source(
                     self.document,
                     from,
                     &input.predicates,
@@ -300,7 +324,13 @@ impl<'a> HirPlanContext<'a> {
                     schema,
                     params,
                     query_rows,
-                )
+                ),
+                HirPlanSource::Derived { source, .. } => Ok(HirTableConstraints {
+                    table_id: *source,
+                    constraints: Vec::new(),
+                    candidates: Vec::new(),
+                    temporary_index_terms: Default::default(),
+                }),
             })
             .collect()
     }
@@ -336,43 +366,12 @@ impl<'a> HirPlanContext<'a> {
             });
         };
 
-        if from.joins.is_empty() {
-            if let hir::SourceKind::Derived(query) = &self.definition(from.first).kind {
-                let mut predicates = Vec::new();
-                if let hir::QueryBlockBody::Select {
-                    filter: Some(filter),
-                    ..
-                } = &block.body
-                {
-                    append_predicates(&mut predicates, filter, None);
-                }
-                return self.plan_derived_scan(
-                    block.id,
-                    from.first,
-                    *query,
-                    predicates,
-                    initial_cardinality,
-                    params,
-                    query_estimate,
-                );
-            }
-        }
-        if core::iter::once(from.first)
-            .chain(from.joins.iter().map(|join| join.right))
-            .any(|source| !matches!(self.definition(source).kind, hir::SourceKind::Table(_)))
-        {
-            return Err(LimboError::InternalError(
-                "mixed HIR source planning is not implemented".to_string(),
-            ));
-        }
-
         let input = self.query_block_input(block, order_by, &usage)?;
         let order_target = self.order_target(
             order_by,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         );
-        let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
-        self.plan_btree_access(
+        self.plan_source_access(
             block.id,
             from,
             input,
@@ -380,7 +379,7 @@ impl<'a> HirPlanContext<'a> {
             initial_cardinality,
             schema,
             params,
-            &query_rows,
+            query_estimate,
         )?
         .ok_or_else(|| {
             LimboError::InternalError(
@@ -389,54 +388,11 @@ impl<'a> HirPlanContext<'a> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn plan_derived_scan(
-        &self,
-        block: QueryBlockId,
-        source: SourceId,
-        query: QueryId,
-        predicates: Vec<HirWhereTerm>,
-        initial_cardinality: f64,
-        params: &CostModelParams,
-        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
-    ) -> Result<HirQueryBlockPlan> {
-        let child = query_estimate(query).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "derived HIR source {source} references unplanned query {query}"
-            ))
-        })?;
-        let child_rows = child.output_cardinality.max(1.0);
-        let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
-            None,
-            &[],
-            &[],
-            initial_cardinality,
-            RowCountEstimate::AnalyzeStats(child_rows),
-            false,
-            params,
-            None,
-        );
-        let reexecution_cost =
-            Cost((initial_cardinality - 1.0).max(0.0) * child_rows * params.cpu_cost_per_seek);
-
-        Ok(HirQueryBlockPlan {
-            block,
-            loops: vec![HirPlannedLoop {
-                source,
-                source_position: 0,
-                access: HirSourceAccess::Derived { query },
-            }],
-            predicates,
-            output_cardinality: initial_cardinality * child_rows,
-            cost: scan_cost + reexecution_cost + Cost(initial_cardinality * child.cost.0),
-        })
-    }
-
-    /// Choose B-tree access methods and a complete join order directly from
+    /// Choose source access methods and a complete join order directly from
     /// resolved HIR. This keeps the planning boundary free of parser-era table
-    /// identities and bound AST expressions.
+    /// identities, synthetic subquery tables, and bound AST expressions.
     #[allow(clippy::too_many_arguments)]
-    fn plan_btree_access(
+    fn plan_source_access(
         &self,
         block: QueryBlockId,
         from: &hir::From,
@@ -445,18 +401,40 @@ impl<'a> HirPlanContext<'a> {
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
-        query_rows: &dyn Fn(QueryId) -> Option<f64>,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<Option<HirQueryBlockPlan>> {
-        let constraints = self.constraints(from, &input, schema, params, query_rows)?;
-        let base_rows = hir_base_row_estimates(&input.sources, schema, params);
+        let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
+        let constraints = self.constraints(from, &input, schema, params, &query_rows)?;
+        let mut base_rows = Vec::with_capacity(input.sources.len());
+        let mut source_costs = Vec::with_capacity(input.sources.len());
+        for source in &input.sources {
+            match source {
+                HirPlanSource::BTree(source) => {
+                    base_rows.push(base_row_estimate(schema, &source.table, params));
+                    source_costs.push(Cost(0.0));
+                }
+                HirPlanSource::Derived { source, query, .. } => {
+                    let child = query_estimate(*query).ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "derived HIR source {source} references unplanned query {query}"
+                        ))
+                    })?;
+                    base_rows.push(RowCountEstimate::AnalyzeStats(
+                        child.output_cardinality.max(1.0),
+                    ));
+                    source_costs.push(child.cost);
+                }
+            }
+        }
         let mut access_methods = Vec::new();
-        let result = compute_hir_greedy_btree_join_order(
+        let result = compute_hir_greedy_join_order(
             self.document,
             from,
             &input.sources,
             &constraints,
             &input.predicates,
             &base_rows,
+            &source_costs,
             order_target,
             initial_cardinality,
             &mut access_methods,
@@ -471,18 +449,33 @@ impl<'a> HirPlanContext<'a> {
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
-            let access = apply_hir_selected_btree_access(
-                &input.sources[source_position],
-                &constraints[source_position],
-                &mut input.predicates,
-                &mut access_methods[access_method_position],
-                &prior_sources,
-                source_position,
-            )?;
+            let access = match &input.sources[source_position] {
+                HirPlanSource::BTree(source) => {
+                    HirSourceAccess::BTree(apply_hir_selected_btree_access(
+                        source,
+                        &constraints[source_position],
+                        &mut input.predicates,
+                        &mut access_methods[access_method_position],
+                        &prior_sources,
+                        source_position,
+                    )?)
+                }
+                HirPlanSource::Derived { query, .. } => {
+                    if !matches!(
+                        access_methods[access_method_position].params,
+                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
+                    ) {
+                        return Err(LimboError::InternalError(
+                            "derived HIR source selected a non-subquery access method".to_string(),
+                        ));
+                    }
+                    HirSourceAccess::Derived { query: *query }
+                }
+            };
             loops.push(HirPlannedLoop {
-                source: input.sources[source_position].internal_id,
+                source: input.sources[source_position].source(),
                 source_position,
-                access: HirSourceAccess::BTree(access),
+                access,
             });
             prior_sources.set(source_position)?;
         }
@@ -549,7 +542,7 @@ impl<'a> HirPlanContext<'a> {
 
     fn register_expression_index_usage(
         &self,
-        sources: &mut [HirPlannedSource],
+        sources: &mut [HirPlanSource],
         expression: &hir::Expr,
     ) -> Result<()> {
         let Some((source, columns)) = expression.single_source_column_usage() else {
@@ -557,7 +550,8 @@ impl<'a> HirPlanContext<'a> {
         };
         let Some(planned) = sources
             .iter_mut()
-            .find(|planned| planned.internal_id == source)
+            .find(|planned| planned.source() == source)
+            .and_then(HirPlanSource::btree_mut)
         else {
             // Outer-query reads are planned by their owning query.
             return Ok(());
@@ -691,10 +685,10 @@ mod tests {
             optimizer::cost::RowCountEstimate,
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
-                ComparisonComponent, ComparisonSemantics, CompoundArm, DatabaseId, IndexCoverage,
-                Join, JoinConstraint, JoinKind, OrderTerm, Output, OutputId, Query, QueryBlock,
-                QueryBlockBody, QueryBlockId, QueryId, QueryRoot, SourceColumn, SourceKind,
-                SourceOwner, TypeFact, UsingColumn,
+                ComparisonComponent, ComparisonSemantics, CompoundArm, DatabaseId,
+                DatabaseSnapshot, IndexCoverage, Join, JoinConstraint, JoinKind, OrderTerm, Output,
+                OutputId, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
+                SourceColumn, SourceKind, SourceOwner, TypeFact, UsingColumn,
             },
         },
         vdbe::affinity::Affinity,
@@ -1103,6 +1097,9 @@ mod tests {
             .query_block_input(&block, &order_by, &usage)
             .expect("query block input converts");
         let mut planned = input.sources.into_iter().next().expect("source is planned");
+        let HirPlanSource::BTree(planned) = &mut planned else {
+            panic!("table source carries B-tree planning metadata");
+        };
 
         // Output and ORDER BY use the same expression, so registration deduplicates them.
         assert_eq!(planned.expression_index_usages.len(), 1);
@@ -1177,19 +1174,17 @@ mod tests {
             input
                 .sources
                 .iter()
-                .map(|source| source.internal_id)
+                .map(HirPlanSource::source)
                 .collect::<Vec<_>>(),
             vec![left, right]
         );
-        assert!(input.sources[0].join_info.is_none());
-        let join = input.sources[1].join_info.as_ref().unwrap();
+        assert!(input.sources[0].join_info().is_none());
+        let join = input.sources[1].join_info().unwrap();
         assert_eq!(join.kind, JoinKind::Right);
         assert_eq!(input.predicates.len(), 3);
-        assert!(
-            input.predicates[..2]
-                .iter()
-                .all(|predicate| predicate.from_outer_join == Some(right))
-        );
+        assert!(input.predicates[..2]
+            .iter()
+            .all(|predicate| predicate.from_outer_join == Some(right)));
         assert_eq!(input.predicates[2].from_outer_join, None);
         assert!(matches!(
             &input.predicates[0].expr,
@@ -1283,10 +1278,7 @@ mod tests {
             .query_block_input(&block, &[], &usage)
             .expect("query block input converts");
 
-        assert_eq!(
-            input.sources[1].join_info.as_ref().unwrap().kind,
-            JoinKind::Left
-        );
+        assert_eq!(input.sources[1].join_info().unwrap().kind, JoinKind::Left);
         assert_eq!(input.predicates.len(), 1);
         assert_eq!(input.predicates[0].from_outer_join, Some(right));
         let hir::Expr::Binary {
@@ -1317,7 +1309,17 @@ mod tests {
             .analyze_stats
             .table_stats_mut("right_items")
             .row_count = Some(1);
-        let base_rows = hir_base_row_estimates(&input.sources, &schema, &params);
+        let base_rows = input
+            .sources
+            .iter()
+            .map(|source| {
+                base_row_estimate(
+                    &schema,
+                    &source.btree().expect("test source is a table").table,
+                    &params,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             base_rows,
             [
@@ -1604,5 +1606,62 @@ mod tests {
             HirSourceAccess::Derived { query } if query == child_query
         ));
         assert!(root.cost.0 > child.cost.0);
+
+        let table_source_id = SourceId::new(1);
+        let mut table_source = source_with_id(1, "items");
+        table_source.owner = SourceOwner::QueryBlock(root_block_id);
+        let mut mixed_document = plan.document.as_ref().clone();
+        mixed_document.databases.push(DatabaseSnapshot {
+            database: DatabaseId::new(0),
+            schema_version: 0,
+        });
+        mixed_document.sources.push(table_source);
+        let root_block = &mut mixed_document.queries[root_query.index()].blocks[0];
+        root_block.from = Some(hir::From {
+            first: table_source_id,
+            joins: vec![Join {
+                right: source_id,
+                kind: JoinKind::Inner,
+                constraint: JoinConstraint::On(hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::column(table_source_id, 0)),
+                    operator: Operator::Equals,
+                    rhs: Box::new(hir::Expr::column(source_id, 0)),
+                    array_concat: false,
+                    custom: None,
+                    comparison: Some(ComparisonSemantics {
+                        components: vec![ComparisonComponent {
+                            affinity: Affinity::Integer,
+                            collation: None,
+                            array: false,
+                        }],
+                    }),
+                }),
+            }],
+        });
+        mixed_document
+            .validate()
+            .expect("mixed table and derived query HIR is valid");
+        let mixed_plan = HirQueryPlan::build(
+            Arc::new(mixed_document),
+            root_query,
+            &Schema::default(),
+            &CostModelParams::default(),
+        )
+        .expect("table and derived source join plans from HIR");
+        let mixed_root = mixed_plan
+            .planned_query(root_query)
+            .expect("mixed root query is planned");
+        assert_eq!(mixed_root.blocks[0].loops.len(), 2);
+        assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
+            source_loop.source == table_source_id
+                && matches!(source_loop.access, HirSourceAccess::BTree(_))
+        }));
+        assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
+            source_loop.source == source_id
+                && matches!(
+                    source_loop.access,
+                    HirSourceAccess::Derived { query } if query == child_query
+                )
+        }));
     }
 }

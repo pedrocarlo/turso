@@ -28,15 +28,15 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, hir_where_expr_steps, rows_per_leaf_page_for_index,
-                where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+                estimate_cost_for_scan_or_seek, estimate_rows_per_seek, hir_where_expr_steps,
+                rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, HashJoinType, HirPlannedSource, HirWhereTerm, JoinOrderMember,
-            JoinedTable, NonFromClauseSubquery, PredicateTerm, SubqueryState, TableReferences,
-            WhereTerm,
+            HashJoinKey, HashJoinType, HirPlanSource, HirWhereTerm, JoinOrderMember, JoinedTable,
+            NonFromClauseSubquery, PredicateTerm, SubqueryState, TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, table_mask_from_hir_expr, TableMask},
         semantic::hir::{self, HirDocument},
@@ -1172,10 +1172,10 @@ fn legacy_join_ordering_restrictions(
 
 /// Build HIR restrictions with the same code used by the legacy join planner.
 pub(crate) fn hir_join_ordering_restrictions(
-    sources: &[HirPlannedSource],
+    sources: &[HirPlanSource],
 ) -> Result<JoinOrderingRestrictions> {
     join_ordering_restrictions(sources, |source| {
-        let kind = source.join_info.as_ref().map(|join| join.kind);
+        let kind = source.join_info().map(|join| join.kind);
         JoinOrderingFacts {
             constrained: matches!(
                 kind,
@@ -1838,13 +1838,14 @@ struct HirJoinStep {
 /// virtual tables, and multi-index plans remain on the legacy path for now.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn compute_hir_greedy_btree_join_order(
+pub(crate) fn compute_hir_greedy_join_order(
     document: &HirDocument,
     from: &hir::From,
-    sources: &[HirPlannedSource],
+    sources: &[HirPlanSource],
     constraints: &[HirTableConstraints],
     where_clause: &[HirWhereTerm],
     base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
     order_target: Option<&HirOrderTarget<'_>>,
     initial_input_cardinality: f64,
     access_methods_arena: &mut Vec<AccessMethod>,
@@ -1858,17 +1859,12 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
 
     let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
     let predicate_work = build_hir_predicate_work(document, from, where_clause)?;
-    let first_position = find_best_starting_source(
-        sources.iter().map(|source| {
-            HirAccessSource::new(
-                source,
-                document
-                    .source(source.internal_id)
-                    .expect("validated HIR contains referenced source"),
-            )
-        }),
+    let first_position = find_best_hir_starting_source(
+        document,
+        sources,
         constraints,
         base_table_rows,
+        source_costs,
         &ordering_restrictions,
         analyze_stats,
         params,
@@ -1876,13 +1872,14 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
 
     let mut remaining: TableMask = (0..sources.len()).try_collect()?;
     let mut joined_mask = TableMask::default();
-    let first = hir_btree_join_step(
+    let first = hir_join_step(
         document,
         sources,
         constraints,
         where_clause,
         &predicate_work,
         base_table_rows,
+        source_costs,
         order_target,
         first_position,
         &joined_mask,
@@ -1940,13 +1937,14 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
                 continue;
             }
 
-            let step = hir_btree_join_step(
+            let step = hir_join_step(
                 document,
                 sources,
                 constraints,
                 where_clause,
                 &predicate_work,
                 base_table_rows,
+                source_costs,
                 order_target,
                 position,
                 &joined_mask,
@@ -2010,13 +2008,14 @@ pub(crate) fn compute_hir_greedy_btree_join_order(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn hir_btree_join_step(
+fn hir_join_step(
     document: &HirDocument,
-    sources: &[HirPlannedSource],
+    sources: &[HirPlanSource],
     constraints: &[HirTableConstraints],
     where_clause: &[HirWhereTerm],
     predicate_work: &[PredicateWorkInfo],
     base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
     order_target: Option<&HirOrderTarget<'_>>,
     source_position: usize,
     lhs_mask: &TableMask,
@@ -2026,6 +2025,7 @@ fn hir_btree_join_step(
     params: &CostModelParams,
 ) -> Result<HirJoinStep> {
     let source = &sources[source_position];
+    let source_id = source.source();
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(source_position)?;
     let ready_where = ready_predicate_work(
@@ -2033,30 +2033,57 @@ fn hir_btree_join_step(
         predicate_work,
         &joined_mask,
         source_position,
-        source.internal_id,
+        source_id,
     );
     let base_row_count = base_table_rows
         .get(source_position)
         .copied()
         .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-    let mut access_method = choose_single_btree_access_method(
-        &HirAccessSource::new(
-            source,
-            document
-                .source(source.internal_id)
-                .expect("validated HIR contains referenced source"),
-        ),
-        &constraints[source_position],
-        lhs_mask,
-        source_position,
-        order_target,
-        &ready_where,
-        schema,
-        analyze_stats,
-        input_cardinality,
-        base_row_count,
-        params,
-    )?;
+    let mut access_method = match source {
+        HirPlanSource::BTree(source) => choose_single_btree_access_method(
+            &HirAccessSource::new(
+                source,
+                document
+                    .source(source.internal_id)
+                    .expect("validated HIR contains referenced source"),
+            ),
+            &constraints[source_position],
+            lhs_mask,
+            source_position,
+            order_target,
+            &ready_where,
+            schema,
+            analyze_stats,
+            input_cardinality,
+            base_row_count,
+            params,
+        )?,
+        HirPlanSource::Derived { .. } => {
+            let rows = *base_row_count;
+            let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+                None,
+            );
+            let reexecution_cost =
+                Cost((input_cardinality - 1.0).max(0.0) * rows * params.cpu_cost_per_seek);
+            AccessMethod {
+                cost: scan_cost
+                    + reexecution_cost
+                    + Cost(input_cardinality * source_costs[source_position].0),
+                estimated_rows_per_outer_row: rows,
+                consumed_where_terms: Default::default(),
+                params: AccessMethodParams::Subquery {
+                    iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                },
+            }
+        }
+    };
     add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
 
     Ok(HirJoinStep {
@@ -2116,6 +2143,51 @@ where
     Ok(best.expect("no valid starting table").0)
 }
 
+fn find_best_hir_starting_source(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    constraints: &[HirTableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    source_costs: &[Cost],
+    ordering_restrictions: &JoinOrderingRestrictions,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+) -> Result<usize> {
+    let multipliers = compute_indexed_seek_benefits_optional(
+        sources.len(),
+        constraints,
+        base_table_rows,
+        ordering_restrictions,
+        analyze_stats,
+        params,
+        |position| {
+            let source = sources[position].btree()?;
+            Some(HirAccessSource::new(
+                source,
+                document
+                    .source(source.internal_id)
+                    .expect("validated HIR contains referenced source"),
+            ))
+        },
+    )?;
+
+    let mut best: Option<(usize, f64)> = None;
+    for position in 0..sources.len() {
+        if ordering_restrictions.required_lhs(position).is_some() {
+            continue;
+        }
+        let source_work = source_costs[position].0 + *base_table_rows[position];
+        let score = source_work
+            * build_self_constraint_selectivity(&constraints[position], position)
+            * multipliers[position];
+        if best.is_none_or(|(_, best_score)| score < best_score) {
+            best = Some((position, score));
+        }
+    }
+
+    Ok(best.expect("no valid starting HIR source").0)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct IndexedSeekBenefit {
     /// measures how much choosing this table first enables indexed seeks on other tables.
@@ -2151,16 +2223,43 @@ where
     I::IntoIter: ExactSizeIterator,
     I::Item: AccessSource,
 {
-    let sources = sources.into_iter();
+    let sources: Vec<_> = sources.into_iter().collect();
     let num_sources = constraints.len();
     turso_assert_eq!(sources.len(), num_sources);
+    compute_indexed_seek_benefits_optional(
+        num_sources,
+        constraints,
+        base_table_rows,
+        ordering_restrictions,
+        analyze_stats,
+        params,
+        |position| Some(&sources[position]),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_indexed_seek_benefits_optional<E, S, A>(
+    num_sources: usize,
+    constraints: &[TableConstraints<E, S>],
+    base_table_rows: &[RowCountEstimate],
+    ordering_restrictions: &JoinOrderingRestrictions,
+    analyze_stats: &AnalyzeStats,
+    params: &CostModelParams,
+    mut access_source: impl FnMut(usize) -> Option<A>,
+) -> Result<Vec<f64>>
+where
+    A: AccessSource,
+{
     let mut benefits = vec![IndexedSeekBenefit::default(); num_sources];
 
     let mut total_constant_score = 0.0;
     let mut constant_scores = vec![0.0; num_sources];
     let empty_lhs_mask = TableMask::default();
 
-    for (rhs, rhs_source) in sources.enumerate() {
+    for rhs in 0..num_sources {
+        let Some(rhs_source) = access_source(rhs) else {
+            continue;
+        };
         let rhs_constraints = &constraints[rhs];
         let rhs_base_rows = base_table_rows[rhs];
 
@@ -2853,7 +2952,10 @@ mod tests {
         let first_source = _create_hir_source(first_table, None, first);
         let mut second_source = _create_hir_source(second_table, Some(JoinKind::Inner), second);
         second_source.col_used_mask.set(0)?;
-        let sources = vec![first_source, second_source];
+        let sources = vec![first_source, second_source]
+            .into_iter()
+            .map(HirPlanSource::BTree)
+            .collect::<Vec<_>>();
         let document = HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
@@ -2897,7 +2999,7 @@ mod tests {
         let mut lhs_mask = TableMask::default();
         lhs_mask.set(0)?;
         let predicate_work = build_hir_predicate_work(&document, &from, &where_clause)?;
-        let step = hir_btree_join_step(
+        let step = hir_join_step(
             &document,
             &sources,
             &constraints,
@@ -2907,6 +3009,7 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1_000.0),
                 RowCountEstimate::AnalyzeStats(10_000.0),
             ],
+            &[Cost(0.0); 2],
             None,
             1,
             &lhs_mask,
@@ -2958,7 +3061,10 @@ mod tests {
             ),
             second_source,
             third_source,
-        ];
+        ]
+        .into_iter()
+        .map(HirPlanSource::BTree)
+        .collect::<Vec<_>>();
         let document = HirDocument {
             snapshot: hir::CatalogSnapshot::from_id(0),
             databases: Vec::new(),
@@ -3008,7 +3114,7 @@ mod tests {
             _hir_auto_index_constraints(third, 1, 1)?,
         ];
         let mut access_methods = Vec::new();
-        let result = compute_hir_greedy_btree_join_order(
+        let result = compute_hir_greedy_join_order(
             &document,
             &from,
             &sources,
@@ -3019,6 +3125,7 @@ mod tests {
                 RowCountEstimate::AnalyzeStats(1.0),
                 RowCountEstimate::AnalyzeStats(10_000.0),
             ],
+            &[Cost(0.0); 3],
             None,
             1.0,
             &mut access_methods,
@@ -4744,7 +4851,8 @@ mod tests {
         assert!(ast_score > 0.0);
 
         let ast_ordering = legacy_join_ordering_restrictions(std::slice::from_ref(&ast_source))?;
-        let hir_ordering = hir_join_ordering_restrictions(std::slice::from_ref(&hir_planned))?;
+        let hir_plan_source = HirPlanSource::BTree(hir_planned.clone());
+        let hir_ordering = hir_join_ordering_restrictions(std::slice::from_ref(&hir_plan_source))?;
         let ast_start = find_best_starting_source(
             std::iter::once(&ast_source),
             std::slice::from_ref(&ast_constraints),
@@ -4843,7 +4951,10 @@ mod tests {
                     Some(JoinKind::Inner),
                     SourceId::new(2),
                 ),
-            ];
+            ]
+            .into_iter()
+            .map(HirPlanSource::BTree)
+            .collect::<Vec<_>>();
 
             let legacy = legacy_join_ordering_restrictions(&legacy_sources)?;
             let hir = hir_join_ordering_restrictions(&hir_sources)?;
@@ -4869,7 +4980,10 @@ mod tests {
                 Some(JoinKind::Right),
                 SourceId::new(1),
             ),
-        ];
+        ]
+        .into_iter()
+        .map(HirPlanSource::BTree)
+        .collect::<Vec<_>>();
         let restrictions = hir_join_ordering_restrictions(&sources)?;
 
         assert!(restrictions.allows_order(&[0, 1])?);

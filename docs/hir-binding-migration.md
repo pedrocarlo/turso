@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- One HIR join input now represents physical B-tree and derived-query sources
+  explicitly. Mixed joins use the same greedy ordering, connectivity,
+  cross-product, and predicate-work loop; derived scans compete using their
+  child row and cost estimates without a synthetic `FromClauseSubquery`.
 - Derived `FROM` sources now retain their child `QueryId` in the final source
   loop. Query planning visits the child first, then uses its output cardinality
   and cost with the existing coroutine-scan formula; no legacy

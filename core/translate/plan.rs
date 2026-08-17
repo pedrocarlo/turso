@@ -1335,6 +1335,49 @@ pub(crate) type HirPlannedSource = PlannedSource<
     (),
 >;
 
+/// One resolved HIR source as seen by join planning.
+///
+/// B-tree sources carry physical access metadata. Derived sources already
+/// point at their planned query, so they do not need a synthetic table.
+pub(crate) enum HirPlanSource {
+    BTree(HirPlannedSource),
+    Derived {
+        source: crate::translate::semantic::hir::SourceId,
+        query: crate::translate::semantic::hir::QueryId,
+        join_info: Option<HirJoinInfo>,
+    },
+}
+
+impl HirPlanSource {
+    pub(crate) fn source(&self) -> crate::translate::semantic::hir::SourceId {
+        match self {
+            Self::BTree(source) => source.internal_id,
+            Self::Derived { source, .. } => *source,
+        }
+    }
+
+    pub(crate) fn join_info(&self) -> Option<&HirJoinInfo> {
+        match self {
+            Self::BTree(source) => source.join_info.as_ref(),
+            Self::Derived { join_info, .. } => join_info.as_ref(),
+        }
+    }
+
+    pub(crate) fn btree(&self) -> Option<&HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. } => None,
+        }
+    }
+
+    pub(crate) fn btree_mut(&mut self) -> Option<&mut HirPlannedSource> {
+        match self {
+            Self::BTree(source) => Some(source),
+            Self::Derived { .. } => None,
+        }
+    }
+}
+
 impl<I, H, E, J, O, N> PlannedSource<I, H, E, J, O, N> {
     /// Apply shared covering-index rules while letting each expression
     /// representation decide whether an expression key matches.
