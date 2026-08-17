@@ -4042,7 +4042,7 @@ mod tests {
                         nulls_order: ast::NullsOrder::First,
                     },
                 ],
-                partial_index_selectivity: None,
+                partial_index: None,
             }],
             temporary_index_terms: SmallVec::new(),
         }

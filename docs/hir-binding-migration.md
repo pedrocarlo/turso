@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Partial-index candidates now retain the query predicate terms that proved
+  them usable. Ordinary B-tree and `IN` access selection consume those frozen
+  term positions instead of rebinding and rewriting the schema predicate after
+  choosing an index.
 - B-tree candidate scoring now runs one loop for legacy and HIR constraints.
   Source-specific order matching sits behind a small source trait; HIR keeps
   resolved source IDs and borrowed expressions through index choice.

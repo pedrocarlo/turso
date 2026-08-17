@@ -12,8 +12,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
-    RangeConstraintRef,
+    BinaryExprSide, Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -268,6 +267,7 @@ pub(super) struct ChosenBtreeCandidate {
     pub(super) index: Option<Arc<Index>>,
     pub(super) constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
     pub(super) base_row_count: RowCountEstimate,
+    pub(super) partial_index_predicate_terms: SmallVec<[usize; 4]>,
     pub(super) cost: Cost,
 }
 
@@ -278,6 +278,7 @@ pub(super) struct ChosenInSeekCandidate {
     pub(super) constraint_idx: usize,
     pub(super) cost: Cost,
     pub(super) estimated_rows_per_outer_row: f64,
+    pub(super) partial_index_predicate_terms: SmallVec<[usize; 4]>,
 }
 
 /// Describes what a caller needs to read from a branch-local scan.
@@ -332,6 +333,7 @@ pub(super) fn choose_best_btree_candidate<C, I, O>(
         index: None,
         constraint_refs: SmallVec::new(),
         base_row_count,
+        partial_index_predicate_terms: SmallVec::new(),
         cost: best_cost,
     };
     let mut best_adjusted_output = f64::MAX;
@@ -430,10 +432,11 @@ pub(super) fn choose_best_btree_candidate<C, I, O>(
         // accordingly so the cost model recognizes the partial index as cheaper
         // than a full table scan.
         let candidate_base_row_count = candidate
-            .partial_index_selectivity
-            .map(|selectivity| {
+            .partial_index
+            .as_ref()
+            .map(|partial_index| {
                 RowCountEstimate::AnalyzeStats(
-                    (*base_row_count * selectivity.clamp(1e-6, 1.0)).max(1.0),
+                    (*base_row_count * partial_index.selectivity.clamp(1e-6, 1.0)).max(1.0),
                 )
             })
             .unwrap_or(base_row_count);
@@ -540,6 +543,12 @@ pub(super) fn choose_best_btree_candidate<C, I, O>(
                 index: candidate.index.clone(),
                 constraint_refs: usable_constraint_refs,
                 base_row_count: candidate_base_row_count,
+                partial_index_predicate_terms: candidate
+                    .partial_index
+                    .as_ref()
+                    .map_or_else(SmallVec::new, |partial_index| {
+                        partial_index.predicate_terms.clone()
+                    }),
                 cost,
             };
         }
@@ -567,20 +576,6 @@ fn consumed_where_terms_from_constraint_refs(
         }
     }
     Ok(consumed)
-}
-
-fn consume_partial_index_predicate_terms(
-    consumed: &mut BitSet<usize>,
-    index: &Index,
-    rhs_table: &JoinedTable,
-    where_clause: &[WhereTerm],
-) -> Result<()> {
-    let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
-        .expect("selected partial index predicate must be implied by query");
-    for term_idx in predicate_terms {
-        consumed.set(term_idx)?;
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,6 +711,12 @@ pub(super) fn choose_best_in_seek_candidate<E, S>(
                 constraint_idx: constraint.where_clause_pos.0,
                 cost: in_cost,
                 estimated_rows_per_outer_row: (constraint.selectivity * base).max(1.0),
+                partial_index_predicate_terms: candidate
+                    .partial_index
+                    .as_ref()
+                    .map_or_else(SmallVec::new, |partial_index| {
+                        partial_index.predicate_terms.clone()
+                    }),
             });
         }
     }
@@ -743,10 +744,14 @@ fn consider_in_seek_access_method(
         BranchReadMode::FullRow,
     )?
     .map(|chosen| -> Result<AccessMethod> {
+        let mut consumed_where_terms = iter::once(chosen.constraint_idx).try_collect()?;
+        for term_idx in chosen.partial_index_predicate_terms {
+            consumed_where_terms.set(term_idx)?;
+        }
         Ok(AccessMethod {
             cost: chosen.cost,
             estimated_rows_per_outer_row: chosen.estimated_rows_per_outer_row,
-            consumed_where_terms: iter::once(chosen.constraint_idx).try_collect()?,
+            consumed_where_terms,
             params: AccessMethodParams::InSeek {
                 index: chosen.index,
                 affinity: chosen.affinity,
@@ -951,13 +956,8 @@ fn find_best_access_method_for_btree(
         &rhs_constraints.constraints,
         &best.constraint_refs,
     )?;
-    if let Some(index) = partial_index(best.index.as_ref()) {
-        consume_partial_index_predicate_terms(
-            &mut consumed_where_terms,
-            index,
-            rhs_table,
-            where_clause,
-        )?;
+    for term_idx in best.partial_index_predicate_terms {
+        consumed_where_terms.set(term_idx)?;
     }
     let mut best_access_method = AccessMethod {
         cost: best.cost,
@@ -1071,17 +1071,6 @@ fn find_best_access_method_for_btree(
             params,
             best_cost_with_filters,
         )? {
-            let mut in_seek_method = in_seek_method;
-            if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
-                if let Some(index) = partial_index(index.as_ref()) {
-                    consume_partial_index_predicate_terms(
-                        &mut in_seek_method.consumed_where_terms,
-                        index,
-                        rhs_table,
-                        where_clause,
-                    )?;
-                }
-            }
             replace_if_cheaper(
                 &mut best_access_method,
                 &mut best_cost_with_filters,

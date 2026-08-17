@@ -2236,7 +2236,7 @@ fn enforce_indexed_by_hints(
                     cs.candidates.push(ConstraintUseCandidate {
                         index: Some(forced_index),
                         refs: Vec::new(),
-                        partial_index_selectivity: None,
+                        partial_index: None,
                     });
                 }
             }

@@ -275,14 +275,22 @@ pub struct ConstraintRef {
 /// }
 ///
 #[derive(Debug)]
+pub struct PartialIndexCandidate {
+    /// Fraction of table rows physically stored in the index.
+    pub selectivity: f64,
+    /// Query predicate terms that prove the partial-index predicate.
+    pub predicate_terms: SmallVec<[usize; 4]>,
+}
+
+#[derive(Debug)]
 pub struct ConstraintUseCandidate {
     /// The index that may be used to satisfy the constraints. If none, the table's rowid index is used.
     pub index: Option<Arc<Index>>,
     /// References to the constraints that may be used as an access path for the index.
     /// Refs are sorted by [ConstraintRef::index_col_pos]
     pub refs: Vec<ConstraintRef>,
-    /// Fraction of table rows stored in this partial index.
-    pub partial_index_selectivity: Option<f64>,
+    /// Facts established while accepting a partial-index candidate.
+    pub partial_index: Option<PartialIndexCandidate>,
 }
 
 #[derive(Debug)]
@@ -1037,30 +1045,35 @@ pub(crate) fn hir_table_constraints_for_source(
         if index.index_method.is_some() {
             continue;
         }
-        let partial_index_selectivity = if index.where_clause.is_some() {
+        let partial_index = if index.where_clause.is_some() {
             let predicate = expressions.predicate.as_ref().ok_or_else(|| {
                 crate::LimboError::InternalError(format!(
                     "HIR metadata for partial index {} has no predicate",
                     index.name
                 ))
             })?;
-            if hir_partial_index_predicate_terms(from, source, predicate, where_clause).is_none() {
+            let Some(predicate_terms) =
+                hir_partial_index_predicate_terms(from, source, predicate, where_clause)
+            else {
                 continue;
-            }
-            Some(hir_partial_index_selectivity(
-                predicate,
-                table,
-                source_definition,
-                schema,
-                params,
-            ))
+            };
+            Some(PartialIndexCandidate {
+                selectivity: hir_partial_index_selectivity(
+                    predicate,
+                    table,
+                    source_definition,
+                    schema,
+                    params,
+                ),
+                predicate_terms,
+            })
         } else {
             None
         };
         candidates.push(ConstraintUseCandidate {
             index: Some(expressions.index.handle()),
             refs: Vec::new(),
-            partial_index_selectivity,
+            partial_index,
         });
     }
     let mut table_constraints = HirTableConstraints {
@@ -1072,7 +1085,7 @@ pub(crate) fn hir_table_constraints_for_source(
     table_constraints.candidates.push(ConstraintUseCandidate {
         index: None,
         refs: Vec::new(),
-        partial_index_selectivity: None,
+        partial_index: None,
     });
 
     let rowid_alias_column = table
@@ -1453,21 +1466,32 @@ pub fn constraints_from_where_clause(
                         .iter()
                         // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
                         // pattern matching rather than btree index scans
-                        .filter(|index| index.index_method.is_none())
-                        .map(|index| ConstraintUseCandidate {
-                            index: Some(index.clone()),
-                            refs: Vec::new(),
-                            partial_index_selectivity: index.where_clause.as_deref().map(
-                                |predicate| {
-                                    estimate_partial_index_where_selectivity(
+                        .filter_map(|index| {
+                            if index.index_method.is_some() {
+                                return None;
+                            }
+                            let partial_index = match index.where_clause.as_deref() {
+                                Some(predicate) => Some(PartialIndexCandidate {
+                                    selectivity: estimate_partial_index_where_selectivity(
                                         predicate,
                                         table_reference,
                                         schema,
                                         available_indexes,
                                         params,
-                                    )
-                                },
-                            ),
+                                    ),
+                                    predicate_terms: partial_index_predicate_terms(
+                                        index,
+                                        table_reference,
+                                        where_clause,
+                                    )?,
+                                }),
+                                None => None,
+                            };
+                            Some(ConstraintUseCandidate {
+                                index: Some(index.clone()),
+                                refs: Vec::new(),
+                                partial_index,
+                            })
                         })
                         .collect()
                 }),
@@ -1476,7 +1500,7 @@ pub fn constraints_from_where_clause(
         cs.candidates.push(ConstraintUseCandidate {
             index: None,
             refs: Vec::new(),
-            partial_index_selectivity: None,
+            partial_index: None,
         });
 
         let index_for_column = |column_pos| {
@@ -2027,11 +2051,11 @@ pub fn constraints_from_where_clause(
                         }
                     }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
-                        if candidate.index.as_ref().is_some_and(|i| {
-                            Arc::ptr_eq(index, i)
-                                && (index.where_clause.is_none()
-                                    || can_use_partial_index(index, table_reference, where_clause))
-                        }) {
+                        if candidate
+                            .index
+                            .as_ref()
+                            .is_some_and(|i| Arc::ptr_eq(index, i))
+                        {
                             Some(candidate)
                         } else {
                             None
@@ -2052,21 +2076,6 @@ pub fn constraints_from_where_clause(
             // Sort by index_col_pos, ascending -- index columns must be consumed in contiguous order.
             candidate.refs.sort_by_key(|cref| cref.index_col_pos);
         }
-        cs.candidates.retain(|c| {
-            if let Some(idx) = &c.index {
-                if idx.where_clause.is_some()
-                    && c.refs.is_empty()
-                    && !can_use_partial_index(idx, table_reference, where_clause)
-                {
-                    // A partial index with no column constraints can still drive a
-                    // scan, but only if every conjunct of its WHERE clause is implied
-                    // by the query's WHERE. Otherwise it would skip rows the query
-                    // needs.
-                    return false;
-                }
-            }
-            true
-        });
         cs.temporary_index_terms = automatic_index_terms(&table_reference.table, &cs)
             .into_iter()
             .filter(|term| {
@@ -3441,7 +3450,7 @@ mod tests {
             candidates: vec![ConstraintUseCandidate {
                 index: None,
                 refs: Vec::new(),
-                partial_index_selectivity: None,
+                partial_index: None,
             }],
             temporary_index_terms: SmallVec::new(),
         };
@@ -4151,8 +4160,20 @@ mod tests {
             })
             .expect("implied partial index remains a candidate");
         assert_eq!(
-            accepted_partial.partial_index_selectivity,
+            accepted_partial
+                .partial_index
+                .as_ref()
+                .map(|partial_index| partial_index.selectivity),
             Some(params.sel_range * params.sel_range)
+        );
+        assert_eq!(
+            accepted_partial
+                .partial_index
+                .as_ref()
+                .expect("partial index carries facts")
+                .predicate_terms
+                .as_slice(),
+            [1, 2]
         );
 
         let access_source = crate::translate::optimizer::access_method::HirAccessSource::new(
@@ -4180,13 +4201,16 @@ mod tests {
             .index
             .as_ref()
             .is_some_and(|value| Arc::ptr_eq(value, &index)));
+        assert_eq!(chosen.partial_index_predicate_terms.as_slice(), [1, 2]);
         assert_eq!(
             chosen.base_row_count,
             crate::translate::optimizer::cost::RowCountEstimate::AnalyzeStats(
                 10_000.0
                     * accepted_partial
-                        .partial_index_selectivity
-                        .expect("partial index carries selectivity")
+                        .partial_index
+                        .as_ref()
+                        .expect("partial index carries facts")
+                        .selectivity
             )
         );
 
