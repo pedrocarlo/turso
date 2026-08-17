@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Final HIR B-tree plans retain only selected loops, output cardinality, and
+  cost. Constraint arenas, candidate access methods, and dynamic-programming
+  join state stay local to planning and are dropped at the handoff boundary.
 - HIR planned sources no longer carry a placeholder legacy `Operation`.
   Selected HIR access lives only on the final planned loop; parser-expression
   sources retain their existing operation field through the shared source

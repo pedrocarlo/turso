@@ -2,11 +2,11 @@
 
 use super::{
     optimizer::{
-        access_method::AccessMethod,
         apply_hir_selected_btree_access,
         constraints::{hir_table_constraints_for_source, HirTableConstraints},
+        cost::Cost,
         hir_base_row_estimates,
-        join::{compute_hir_greedy_btree_join_order, JoinN},
+        join::compute_hir_greedy_btree_join_order,
         order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
         CostModelParams, HirBtreeOperation,
     },
@@ -23,10 +23,9 @@ pub(crate) struct HirQueryBlockPlanInput {
 
 /// B-tree access choices for one resolved HIR query block.
 pub(crate) struct HirBTreePlan {
-    pub(crate) constraints: Vec<HirTableConstraints>,
-    pub(crate) access_methods: Vec<AccessMethod>,
-    pub(crate) join: JoinN,
     pub(crate) loops: Vec<HirPlannedLoop>,
+    pub(crate) output_cardinality: f64,
+    pub(crate) cost: Cost,
 }
 
 /// One selected source loop in physical join order, still using HIR
@@ -231,10 +230,9 @@ impl<'a> HirPlanContext<'a> {
         }
 
         Ok(Some(HirBTreePlan {
-            constraints,
-            access_methods,
-            join: result.best_plan,
             loops,
+            output_cardinality: result.best_plan.output_cardinality,
+            cost: result.best_plan.cost,
         }))
     }
 
@@ -1033,18 +1031,8 @@ mod tests {
             )
             .expect("HIR access planning succeeds")
             .expect("two HIR sources produce an access plan");
-        assert_eq!(plan.constraints.len(), 2);
-        assert_eq!(plan.constraints[0].table_id, left);
-        assert_eq!(plan.constraints[1].table_id, right);
-        assert!(!plan.constraints[1].constraints.is_empty());
-        assert_eq!(plan.join.table_numbers().collect::<Vec<_>>(), [0, 1]);
-        assert!(plan.join.best_access_methods().all(|index| matches!(
-            plan.access_methods[index].params,
-            crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable { .. }
-        )));
-
-        let right_constraints = &plan.constraints[1];
-        assert!(!right_constraints.temporary_index_terms.is_empty());
+        assert!(plan.output_cardinality > 0.0);
+        assert!(plan.cost.0 >= 0.0);
         let [left_loop, right_loop] = plan.loops.as_slice() else {
             panic!("two sources produce two planned loops");
         };
