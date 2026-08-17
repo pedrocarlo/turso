@@ -24,6 +24,7 @@ pub(crate) struct HirQueryBlockPlanInput {
 /// B-tree access choices for one resolved HIR query block.
 pub(crate) struct HirBTreePlan {
     pub(crate) loops: Vec<HirPlannedLoop>,
+    pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -173,14 +174,14 @@ impl<'a> HirPlanContext<'a> {
     pub(crate) fn plan_btree_access(
         &self,
         from: &hir::From,
-        input: &mut HirQueryBlockPlanInput,
+        mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         initial_cardinality: f64,
         schema: &Schema,
         params: &CostModelParams,
         query_rows: &dyn Fn(QueryId) -> Option<f64>,
     ) -> Result<Option<HirBTreePlan>> {
-        let constraints = self.constraints(from, input, schema, params, query_rows)?;
+        let constraints = self.constraints(from, &input, schema, params, query_rows)?;
         let base_rows = hir_base_row_estimates(&input.sources, schema, params);
         let mut access_methods = Vec::new();
         let result = compute_hir_greedy_btree_join_order(
@@ -222,6 +223,7 @@ impl<'a> HirPlanContext<'a> {
 
         Ok(Some(HirBTreePlan {
             loops,
+            predicates: input.predicates,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
@@ -958,7 +960,7 @@ mod tests {
         ];
 
         let context = HirPlanContext::new(&document);
-        let mut input = context
+        let input = context
             .query_block_input(&block, &[], &usage)
             .expect("query block input converts");
 
@@ -1007,7 +1009,7 @@ mod tests {
         let plan = context
             .plan_btree_access(
                 block.from.as_ref().expect("test block has FROM"),
-                &mut input,
+                input,
                 None,
                 1.0,
                 &schema,
@@ -1050,6 +1052,6 @@ mod tests {
             expression,
             hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
         ));
-        assert!(input.predicates[0].consumed);
+        assert!(plan.predicates[0].consumed);
     }
 }

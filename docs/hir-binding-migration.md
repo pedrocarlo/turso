@@ -103,6 +103,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Final HIR B-tree plans own their predicates after access selection, including
+  consumption state. Residual filters therefore survive planning instead of
+  remaining in mutable caller scratch state.
 - HIR planned sources no longer clone source names, aliases, or USING column
   names into parser-era planner fields. The HIR document remains their owner;
   physical join planning keeps only the resolved join kind.
