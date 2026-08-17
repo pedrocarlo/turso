@@ -366,7 +366,10 @@ mod tests {
         sync::Arc,
         translate::collate::CollationSeq,
         translate::{
-            optimizer::cost::RowCountEstimate,
+            optimizer::{
+                build_hir_seek_def_from_constraints, constraints::usable_constraints_for_lhs_mask,
+                cost::RowCountEstimate,
+            },
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression,
                 ComparisonComponent, ComparisonSemantics, DatabaseId, IndexCoverage, Join,
@@ -992,5 +995,32 @@ mod tests {
             plan.access_methods[index].params,
             crate::translate::optimizer::access_method::AccessMethodParams::BTreeTable { .. }
         )));
+
+        let right_constraints = &plan.constraints[1];
+        assert!(!right_constraints.temporary_index_terms.is_empty());
+        let mut prior_sources = crate::translate::planner::TableMask::default();
+        prior_sources.set(0).expect("first source fits table mask");
+        let seek_terms = usable_constraints_for_lhs_mask(
+            &right_constraints.constraints,
+            &right_constraints.temporary_index_terms,
+            &prior_sources,
+            1,
+        );
+        let seek = build_hir_seek_def_from_constraints(
+            &right_constraints.constraints,
+            &seek_terms,
+            crate::translate::plan::IterationDirection::Forwards,
+            &input.predicates,
+        )
+        .expect("resolved join constraint builds an HIR seek");
+        let Some((operator, expression, affinity)) = &seek.prefix[0].eq else {
+            panic!("join equality becomes the seek prefix");
+        };
+        assert_eq!(*operator, Operator::Equals);
+        assert_eq!(*affinity, Affinity::Integer);
+        assert!(matches!(
+            expression,
+            hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
+        ));
     }
 }

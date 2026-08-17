@@ -2174,6 +2174,25 @@ impl<E> SeekRangeConstraint<E> {
 }
 
 impl RangeConstraintRef {
+    fn map_seek_range<E>(
+        &self,
+        mut get: impl FnMut(usize) -> (ast::Operator, E, Affinity),
+    ) -> SeekRangeConstraint<E> {
+        if let Some(ref eq) = self.eq {
+            return SeekRangeConstraint::new_eq(
+                self.sort_order,
+                self.nulls_order,
+                get(eq.constraint_pos),
+            );
+        }
+        SeekRangeConstraint::new_range(
+            self.sort_order,
+            self.nulls_order,
+            self.lower_bound.map(&mut get),
+            self.upper_bound.map(get),
+        )
+    }
+
     /// Convert the [RangeConstraintRef] to a [SeekRangeConstraint] usable in a [crate::translate::plan::SeekDef::key].
     pub fn as_seek_range_constraint(
         &self,
@@ -2182,27 +2201,66 @@ impl RangeConstraintRef {
         referenced_tables: Option<&TableReferences>,
         resolver: Option<&Resolver>,
     ) -> SeekRangeConstraint {
-        if let Some(ref eq) = self.eq {
-            return SeekRangeConstraint::new_eq(
-                self.sort_order,
-                self.nulls_order,
-                constraints[eq.constraint_pos].get_constraining_expr(
-                    where_clause,
-                    referenced_tables,
-                    resolver,
-                ),
-            );
+        self.map_seek_range(|position| {
+            constraints[position].get_constraining_expr(where_clause, referenced_tables, resolver)
+        })
+    }
+
+    pub(crate) fn as_hir_seek_range_constraint(
+        &self,
+        constraints: &[HirConstraint],
+        where_clause: &[HirWhereTerm],
+    ) -> SeekRangeConstraint<hir::Expr> {
+        self.map_seek_range(|position| {
+            constraints[position].get_hir_constraining_expr(where_clause)
+        })
+    }
+}
+
+impl HirConstraint {
+    fn get_hir_constraining_expr(
+        &self,
+        where_clause: &[HirWhereTerm],
+    ) -> (ast::Operator, hir::Expr, Affinity) {
+        if let Some(constraining) = &self.constraining_expr {
+            return constraining.clone();
         }
-        SeekRangeConstraint::new_range(
-            self.sort_order,
-            self.nulls_order,
-            self.lower_bound.map(|x| {
-                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
-            }),
-            self.upper_bound.map(|x| {
-                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
-            }),
+
+        let (term_position, side) = self.where_clause_pos;
+        let hir::Expr::Binary { lhs, rhs, .. } = &where_clause[term_position].expr else {
+            panic!("expected HIR seek constraint to reference a binary expression");
+        };
+        let expression = match side {
+            BinaryExprSide::Lhs => lhs.as_ref(),
+            BinaryExprSide::Rhs => rhs.as_ref(),
+        };
+        let mut affinity = self.comparison_affinity.unwrap_or(Affinity::Blob);
+        if hir_expr_needs_no_affinity_change(affinity, expression) {
+            affinity = Affinity::Blob;
+        }
+        (
+            self.operator
+                .as_ast_operator()
+                .expect("HIR seek constraints use comparison operators"),
+            expression.clone(),
+            affinity,
         )
+    }
+}
+
+fn hir_expr_needs_no_affinity_change(affinity: Affinity, expression: &hir::Expr) -> bool {
+    if matches!(affinity, Affinity::Blob | Affinity::None) {
+        return true;
+    }
+    match expression {
+        hir::Expr::Literal(literal) => match literal {
+            ast::Literal::Numeric(_) => affinity.is_numeric(),
+            ast::Literal::String(_) => affinity == Affinity::Text,
+            ast::Literal::Blob(_) => true,
+            _ => false,
+        },
+        hir::Expr::RowId(_) => affinity.is_numeric(),
+        _ => false,
     }
 }
 

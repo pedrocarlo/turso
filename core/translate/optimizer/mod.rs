@@ -2,10 +2,10 @@ use super::{
     collate::get_collseq_from_expr,
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, HirPlannedSource, InSeekSource, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
-        Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate,
-        TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, HirPlannedSource, HirSeekDef, HirWhereTerm, InSeekSource,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinType, JoinedTable, MinMaxDef,
+        MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan,
+        SetOperation, SimpleAggregate, TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
@@ -26,7 +26,8 @@ use crate::{
         optimizer::{
             access_method::{AccessMethod, AccessMethodParams},
             constraints::{
-                ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
+                ConstraintUseCandidate, HirConstraint, RangeConstraintRef, SeekRangeConstraint,
+                TableConstraints,
             },
             cost::RowCountEstimate,
             multi_index::MultiIndexBranchAccessParams,
@@ -3712,29 +3713,6 @@ pub fn build_seek_def_from_constraints(
     referenced_tables: Option<&TableReferences>,
     resolver: Option<&Resolver>,
 ) -> Result<SeekDef> {
-    if constraint_refs.is_empty() {
-        // Zero-prefix seeks are used for extremum scans over an already ordered
-        // source: start at one end of the cursor and stop after the first
-        // qualifying row.
-        let (start_op, end_op) = match iter_dir {
-            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
-            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
-        };
-        return Ok(SeekDef {
-            prefix: Vec::new(),
-            iter_dir,
-            start: SeekKey {
-                last_component: SeekKeyComponent::None,
-                op: start_op,
-                affinity: Affinity::Blob,
-            },
-            end: SeekKey {
-                last_component: SeekKeyComponent::None,
-                op: end_op,
-                affinity: Affinity::Blob,
-            },
-        });
-    }
     // Extract the key values and operators
     let key = constraint_refs
         .iter()
@@ -3745,6 +3723,20 @@ pub fn build_seek_def_from_constraints(
 
     let seek_def = build_seek_def(iter_dir, key)?;
     Ok(seek_def)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_hir_seek_def_from_constraints(
+    constraints: &[HirConstraint],
+    constraint_refs: &[RangeConstraintRef],
+    iter_dir: IterationDirection,
+    where_clause: &[HirWhereTerm],
+) -> Result<HirSeekDef> {
+    let key = constraint_refs
+        .iter()
+        .map(|constraint| constraint.as_hir_seek_range_constraint(constraints, where_clause))
+        .collect();
+    build_seek_def(iter_dir, key)
 }
 
 /// Build a [SeekDef] for a given [SeekRangeConstraint] and [IterationDirection].
@@ -3772,11 +3764,33 @@ pub fn build_seek_def_from_constraints(
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
 /// So when you see e.g. a SeekOp::GT below for a descending index, it actually means that we are seeking the first row where the index key is LESS than the seek key.
 ///
-fn build_seek_def(
+fn build_seek_def<E>(
     iter_dir: IterationDirection,
-    mut key: Vec<SeekRangeConstraint>,
-) -> Result<SeekDef> {
-    turso_assert!(!key.is_empty());
+    mut key: Vec<SeekRangeConstraint<E>>,
+) -> Result<SeekDef<E>> {
+    if key.is_empty() {
+        // Zero-prefix seeks are used for extremum scans over an already ordered
+        // source: start at one end of the cursor and stop after the first
+        // qualifying row.
+        let (start_op, end_op) = match iter_dir {
+            IterationDirection::Forwards => (SeekOp::GE { eq_only: true }, SeekOp::GT),
+            IterationDirection::Backwards => (SeekOp::LE { eq_only: true }, SeekOp::LT),
+        };
+        return Ok(SeekDef {
+            prefix: Vec::new(),
+            iter_dir,
+            start: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: start_op,
+                affinity: Affinity::Blob,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::None,
+                op: end_op,
+                affinity: Affinity::Blob,
+            },
+        });
+    }
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -3809,7 +3823,7 @@ fn build_seek_def(
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
     let has_prefix = !key.is_empty();
-    let apply_null_boundaries = |start: &mut SeekKey, end: &mut SeekKey| {
+    let apply_null_boundaries = |start: &mut SeekKey<E>, end: &mut SeekKey<E>| {
         // Sometimes we must add an extra NULL to the key on purpose.
         // We do this so scans over composite indexes match SQLite exactly.
         //

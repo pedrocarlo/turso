@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Seek construction now shares the existing direction, range, equality, and
+  NULL-boundary algorithm across parser and HIR expressions. HIR extracts seek
+  values and frozen comparison affinity directly from resolved predicates;
+  resolver and `TableReferences` are absent from that entry point.
 - Seek definitions, keys, and range constraints now accept either parser or
   HIR expressions. The legacy plan keeps parser expressions through default
   type parameters, while HIR planning can keep resolved expressions without
