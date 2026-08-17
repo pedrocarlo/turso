@@ -4523,7 +4523,7 @@ mod tests {
         let name = table.name.clone();
         let table = Table::BTree(table);
         HirPlannedSource {
-            op: Operation::default_scan_for(&table),
+            op: (),
             table,
             identifier: name,
             internal_id,

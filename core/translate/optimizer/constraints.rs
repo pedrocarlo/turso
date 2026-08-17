@@ -3358,7 +3358,7 @@ mod tests {
 
     fn hir_planned_source(source: hir::SourceId, table: &JoinedTable) -> HirPlannedSource {
         HirPlannedSource {
-            op: table.op.clone(),
+            op: (),
             table: table.table.clone(),
             identifier: table.identifier.clone(),
             internal_id: source,

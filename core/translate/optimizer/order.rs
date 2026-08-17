@@ -1,29 +1,29 @@
 use crate::schema::Table;
 use crate::turso_assert_greater_than_or_equal;
 use crate::{
-    LimboError, Result,
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
-        collate::{CollationSeq, get_collseq_from_expr},
+        collate::{get_collseq_from_expr, CollationSeq},
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
-            RangeConstraintRef, TableConstraints, usable_constraints_for_lhs_mask,
+            usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
             GroupBy, HashJoinType, HirPlannedSource, IterationDirection, JoinedTable, Operation,
             Plan, Scan, SimpleAggregate, TableReferences,
         },
-        planner::{TableMask, table_mask_from_expr},
+        planner::{table_mask_from_expr, TableMask},
         semantic::hir,
     },
     util::exprs_are_equivalent,
+    LimboError, Result,
 };
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{
     access_method::AccessMethod,
-    cost::{IndexInfo, is_unique_point_lookup},
+    cost::{is_unique_point_lookup, IndexInfo},
     join::JoinN,
 };
 
@@ -1252,7 +1252,7 @@ mod tests {
         schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, IndexColumn, Type},
         sync::Arc,
         translate::{
-            plan::{ColumnUsedMask, HirPlannedSource, Operation},
+            plan::{ColumnUsedMask, HirPlannedSource},
             semantic::hir::{
                 CatalogObject, CatalogObjectId, CatalogSnapshot, ColumnReadExpression, DatabaseId,
                 Expr, IndexCoverage, IndexExpressions, IndexHint, Source, SourceColumn, SourceId,
@@ -1371,7 +1371,7 @@ mod tests {
             index_method_patterns: Vec::new(),
         };
         let planned = HirPlannedSource {
-            op: Operation::default_scan_for(&table),
+            op: (),
             table,
             identifier: "items".to_string(),
             internal_id: source_id,

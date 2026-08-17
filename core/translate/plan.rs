@@ -1281,9 +1281,9 @@ impl<N> JoinInfo<N> {
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { join_type: JoinType::Inner, using: vec![] }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct PlannedSource<I, H, E, J> {
+pub struct PlannedSource<I, H, E, J, O = Operation> {
     /// The operation that this source performs.
-    pub op: Operation,
+    pub op: O,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -1332,9 +1332,10 @@ pub(crate) type HirPlannedSource = PlannedSource<
     crate::translate::semantic::hir::IndexHint,
     crate::translate::semantic::hir::Expr,
     HirJoinInfo,
+    (),
 >;
 
-impl<I, H, E, J> PlannedSource<I, H, E, J> {
+impl<I, H, E, J, O> PlannedSource<I, H, E, J, O> {
     /// Apply shared covering-index rules while letting each expression
     /// representation decide whether an expression key matches.
     fn index_is_covering_with(
@@ -1464,6 +1465,7 @@ impl
         crate::translate::semantic::hir::IndexHint,
         crate::translate::semantic::hir::Expr,
         HirJoinInfo,
+        (),
     >
 {
     pub(crate) fn register_expression_index_usage(

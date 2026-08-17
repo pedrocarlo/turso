@@ -10,7 +10,7 @@ use super::{
         order::{ColumnOrder, ColumnTarget, HirOrderTarget, OrderTarget, OrderTargetPurpose},
         CostModelParams, HirBtreeOperation,
     },
-    plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, Operation, PredicateExpr},
+    plan::{ColumnUsedMask, HirJoinInfo, HirPlannedSource, HirWhereTerm, PredicateExpr},
     semantic::hir::{self, ColumnUsage, HirDocument, QueryId, SourceId},
 };
 use crate::{schema::Schema, LimboError, Result};
@@ -362,7 +362,7 @@ fn planned_source_from_definition(
     let (col_used_mask, column_use_counts) = column_usage(source.id, usage)?;
 
     Ok(HirPlannedSource {
-        op: Operation::default_scan_for(table.value()),
+        op: (),
         table: table.value().clone(),
         identifier: source.alias.as_ref().unwrap_or(&source.name).clone(),
         internal_id: source.id,

@@ -103,6 +103,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- HIR planned sources no longer carry a placeholder legacy `Operation`.
+  Selected HIR access lives only on the final planned loop; parser-expression
+  sources retain their existing operation field through the shared source
+  type's default parameter.
 - Selected B-tree access methods now pass through one representation-generic
   application path. Legacy AST and HIR planning share automatic-index
   materialization, scan/seek/rowid/IN construction, and predicate-consumption
