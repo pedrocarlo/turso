@@ -13,6 +13,7 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
+        semantic::hir::SourceId,
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -48,19 +49,27 @@ use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
+/// The resolved source that owns a cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorOwner {
+    /// Parser-AST identity used by the legacy translator.
+    TableReference(TableInternalId),
+    /// Document-local identity used by HIR lowering.
+    Source(SourceId),
+}
+
 /// A key that uniquely identifies a cursor.
-/// The key is a pair of table reference id and index.
+/// The key is a pair of source identity and index.
 /// The index is only provided when the cursor is an index cursor.
 #[derive(Debug, Clone)]
 pub struct CursorKey {
-    /// The table reference that the cursor is associated with.
+    /// The source that the cursor is associated with.
     /// We cannot use e.g. the table query identifier (e.g. 'users' or 'u')
     /// because it might be ambiguous, e.g. this silly example:
     /// `SELECT * FROM t WHERE EXISTS (SELECT * from t)` <-- two different cursors, which 't' should we use as key?
-    ///  TableInternalIds are unique within a program, since there is one id per table reference.
-    pub table_reference_id: TableInternalId,
+    pub owner: CursorOwner,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The combination of source identity and index is enough to disambiguate.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
@@ -69,7 +78,7 @@ pub struct CursorKey {
 impl CursorKey {
     pub fn table(table_reference_id: TableInternalId) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: None,
             is_build: false,
         }
@@ -77,7 +86,7 @@ impl CursorKey {
 
     pub fn index(table_reference_id: TableInternalId, index: Arc<Index>) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: Some(index),
             is_build: false,
         }
@@ -87,14 +96,30 @@ impl CursorKey {
     /// This creates a separate cursor from the regular table cursor.
     pub fn hash_build(table_reference_id: TableInternalId) -> Self {
         Self {
-            table_reference_id,
+            owner: CursorOwner::TableReference(table_reference_id),
             index: None,
             is_build: true,
         }
     }
 
+    pub fn source(source: SourceId) -> Self {
+        Self {
+            owner: CursorOwner::Source(source),
+            index: None,
+            is_build: false,
+        }
+    }
+
+    pub fn source_index(source: SourceId, index: Arc<Index>) -> Self {
+        Self {
+            owner: CursorOwner::Source(source),
+            index: Some(index),
+            is_build: false,
+        }
+    }
+
     pub fn equals(&self, other: &CursorKey) -> bool {
-        if self.table_reference_id != other.table_reference_id {
+        if self.owner != other.owner {
             return false;
         }
         if self.is_build != other.is_build {
@@ -1830,9 +1855,11 @@ impl ProgramBuilder {
         // Index cursor lookups are not overridden because when a cursor override is active,
         // the calling code (translate_expr) should skip index logic entirely.
         if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                return Some(cursor_id);
+            if let CursorOwner::TableReference(table_reference_id) = key.owner {
+                let table_id: usize = table_reference_id.into();
+                if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
+                    return Some(cursor_id);
+                }
             }
         }
         self.cursor_ref
@@ -1861,8 +1888,9 @@ impl ProgramBuilder {
         table_ref_id: TableInternalId,
     ) -> Option<CursorID> {
         self.cursor_ref.iter().position(|(k, _)| {
-            k.as_ref()
-                .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+            k.as_ref().is_some_and(|k| {
+                k.owner == CursorOwner::TableReference(table_ref_id) && k.index.is_some()
+            })
         })
     }
 
@@ -2328,5 +2356,57 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn program() -> ProgramBuilder {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0))
+    }
+
+    #[test]
+    fn legacy_and_hir_cursor_owners_do_not_collide() {
+        let mut program = program();
+        let table = TableInternalId::from(0);
+        let source = SourceId::new(0);
+
+        let table_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::table(table), CursorType::Sorter);
+        let source_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
+
+        assert_ne!(table_cursor, source_cursor);
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::table(table)),
+            table_cursor
+        );
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::source(source)),
+            source_cursor
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_override_does_not_affect_hir_source() {
+        let mut program = program();
+        let table = TableInternalId::from(0);
+        let source = SourceId::new(0);
+        let source_cursor =
+            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
+        let override_cursor = program.alloc_cursor_id(CursorType::Sorter);
+
+        program.set_cursor_override(table, override_cursor);
+
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::table(table)),
+            override_cursor
+        );
+        assert_eq!(
+            program.resolve_cursor_id(&CursorKey::source(source)),
+            source_cursor
+        );
     }
 }
