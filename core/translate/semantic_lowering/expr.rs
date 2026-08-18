@@ -72,6 +72,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 }
             },
             hir::Expr::IsNull(_) | hir::Expr::NotNull(_) => self.program.alloc_register(),
+            hir::Expr::Collate { .. } => context.target,
             hir::Expr::Binary { lhs, rhs, .. } => {
                 if matches!(context.binary_operands, BinaryOperands::Unallocated) {
                     context.binary_operands = if lhs.equivalent(rhs) {
@@ -112,6 +113,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             }
             hir::Expr::IsNull(_) => self.emit_null_test(NullTest::IsNull, target, children),
             hir::Expr::NotNull(_) => self.emit_null_test(NullTest::NotNull, target, children),
+            hir::Expr::Collate { .. } => {
+                let [value] = children else {
+                    unreachable!("COLLATE has one lowered child")
+                };
+                debug_assert_eq!(*value, target);
+                Ok(target)
+            }
             hir::Expr::Binary {
                 operator: Operator::Concat,
                 array_concat,
@@ -783,6 +791,51 @@ mod tests {
                 Insn::Integer { value: 0, dest: 8 }
             ));
         }
+    }
+
+    #[test]
+    fn collate_lowers_only_its_child_and_comparison_uses_resolved_metadata() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let expression = hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Collate {
+                expr: Box::new(hir::Expr::Literal(Literal::String("'left'".to_string()))),
+                collation: collation.clone(),
+            }),
+            operator: Operator::Equals,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'right'".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: Some(hir::ComparisonSemantics {
+                components: vec![hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Text,
+                    collation: Some(collation),
+                    array: false,
+                }],
+            }),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            &program.insns[..2],
+            [
+                (Insn::String8 { value, dest: 1 }, _),
+                (Insn::String8 { dest: 2, .. }, _),
+            ] if value == "left"
+        ));
+        assert!(matches!(
+            program.insns[3].0,
+            Insn::Eq {
+                collation: Some(crate::translate::collate::CollationSeq::NoCase),
+                ..
+            }
+        ));
+        assert_eq!(program.curr_collation_ctx(), None);
     }
 
     #[derive(Clone, Copy)]
