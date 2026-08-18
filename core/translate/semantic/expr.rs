@@ -726,6 +726,20 @@ fn require_exact_arguments(function: &Func, count: usize, expected: usize) -> Re
     Ok(())
 }
 
+fn require_at_most_arguments(function: &Func, count: usize, maximum: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count > maximum {
+        crate::bail_parse_error!(
+            "{} function called with more than {} arguments",
+            function,
+            maximum
+        );
+    }
+    Ok(())
+}
+
 fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
     let count = input.argument_count();
     match function {
@@ -755,6 +769,13 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Replace) if count != 3 => {
             crate::bail_parse_error!("wrong number of arguments to function {}()", function)
         }
+        Func::Scalar(
+            ScalarFunc::Trim
+            | ScalarFunc::LTrim
+            | ScalarFunc::RTrim
+            | ScalarFunc::Round
+            | ScalarFunc::Unhex,
+        ) => require_at_most_arguments(function, count, 2),
         #[cfg(all(feature = "fs", not(target_family = "wasm")))]
         Func::Scalar(ScalarFunc::LoadExtension) => require_exact_arguments(function, count, 1),
         #[cfg(feature = "json")]
@@ -4647,6 +4668,37 @@ mod tests {
             )
             .expect("valid fixed-arity call binds");
             assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn one_or_two_argument_rules_are_checked_during_semantic_analysis() {
+        for function in ["trim", "ltrim", "rtrim", "round", "unhex"] {
+            for (arguments, expected) in [
+                ("", format!("{function} function with no arguments")),
+                (
+                    "1, 2, 3",
+                    format!("{function} function called with more than 2 arguments"),
+                ),
+            ] {
+                let error = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect_err("invalid one-or-two argument call fails during semantic analysis");
+                assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+            }
+
+            for arguments in ["1", "1, 2"] {
+                let analyzed = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect("valid one-or-two argument call binds");
+                assert!(matches!(analyzed, Expr::Function(_)));
+            }
         }
     }
 
