@@ -140,7 +140,32 @@ fn lowers_as_plain_function(function: &Func) -> bool {
             | ScalarFunc::StringToArray
             | ScalarFunc::ArrayToString
             | ScalarFunc::ArrayOverlap
-            | ScalarFunc::ArrayContainsAll,
+            | ScalarFunc::ArrayContainsAll
+            | ScalarFunc::TestUintEncode
+            | ScalarFunc::TestUintDecode
+            | ScalarFunc::TestUintAdd
+            | ScalarFunc::TestUintSub
+            | ScalarFunc::TestUintMul
+            | ScalarFunc::TestUintDiv
+            | ScalarFunc::TestUintLt
+            | ScalarFunc::TestUintEq
+            | ScalarFunc::StringReverse
+            | ScalarFunc::Gcd
+            | ScalarFunc::Lcm
+            | ScalarFunc::Repeat
+            | ScalarFunc::Lpad
+            | ScalarFunc::Rpad
+            | ScalarFunc::BooleanToInt
+            | ScalarFunc::IntToBoolean
+            | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::NumericEncode
+            | ScalarFunc::NumericDecode
+            | ScalarFunc::NumericAdd
+            | ScalarFunc::NumericSub
+            | ScalarFunc::NumericMul
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericLt
+            | ScalarFunc::NumericEq,
         ) => true,
         #[cfg(feature = "json")]
         Func::Json(function) => !function.is_internal(),
@@ -4311,6 +4336,9 @@ mod tests {
             (ScalarFunc::Char, 2),
             (ScalarFunc::GetByte, 2),
             (ScalarFunc::ArraySlice, 3),
+            (ScalarFunc::StringReverse, 1),
+            (ScalarFunc::Gcd, 2),
+            (ScalarFunc::NumericEncode, 3),
         ] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
