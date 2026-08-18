@@ -2,7 +2,10 @@ use std::ops::ControlFlow;
 
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
-use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
+use crate::vdbe::{
+    builder::ProgramBuilder,
+    insn::{CmpInsFlags, Insn},
+};
 use crate::{LimboError, Numeric, Result, Value};
 use turso_parser::ast::{Literal, Operator, UnaryOperator};
 
@@ -111,6 +114,19 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 operator,
                 array_concat: false,
                 custom: None,
+                comparison: Some(comparison),
+                ..
+            } => self.emit_scalar_comparison(
+                *operator,
+                comparison,
+                context.binary_operands,
+                target,
+                children,
+            ),
+            hir::Expr::Binary {
+                operator,
+                array_concat: false,
+                custom: None,
                 comparison: None,
                 ..
             } => self.emit_binary(*operator, context.binary_operands, target, children),
@@ -122,6 +138,145 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn emit_scalar_comparison(
+        &mut self,
+        operator: Operator,
+        comparison: &hir::ComparisonSemantics,
+        operands: BinaryOperands,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
+        let [component] = comparison.components.as_slice() else {
+            return Err(LimboError::InternalError(
+                "HIR scalar comparison must have one component".to_string(),
+            ));
+        };
+        let (lhs, rhs) = match operands {
+            BinaryOperands::Shared(register) => {
+                debug_assert_eq!(children, [register]);
+                (register, register)
+            }
+            BinaryOperands::Pair { lhs, rhs } => {
+                debug_assert_eq!(children, [lhs, rhs]);
+                (lhs, rhs)
+            }
+            BinaryOperands::Unallocated => {
+                unreachable!("binary expression allocated operand registers")
+            }
+        };
+        let base_flags = CmpInsFlags::default().with_affinity(component.affinity);
+        let comparison_flags = if component.array {
+            base_flags.array_cmp()
+        } else {
+            base_flags
+        };
+        let collation = component
+            .collation
+            .as_ref()
+            .map(|resolved| *resolved.value());
+        let if_true_label = self.program.allocate_label();
+        let (instruction, null_equal) = match operator {
+            Operator::Equals => (
+                Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::NotEquals => (
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::Less => (
+                Insn::Lt {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::LessEquals => (
+                Insn::Le {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::Greater => (
+                Insn::Gt {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::GreaterEquals => (
+                Insn::Ge {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: comparison_flags,
+                    collation,
+                },
+                false,
+            ),
+            Operator::Is => (
+                Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: base_flags.null_eq(),
+                    collation,
+                },
+                true,
+            ),
+            Operator::IsNot => (
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    target_pc: if_true_label,
+                    flags: base_flags.null_eq(),
+                    collation,
+                },
+                true,
+            ),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR comparison lowering is not implemented for {operator:?}"
+                )));
+            }
+        };
+        if null_equal {
+            expr::functions::wrap_eval_jump_expr(self.program, instruction, target, if_true_label);
+        } else {
+            expr::functions::wrap_eval_jump_expr_zero_or_null(
+                self.program,
+                instruction,
+                target,
+                if_true_label,
+                lhs,
+                rhs,
+            );
+        }
+        Ok(target)
+    }
+
     fn emit_concat(
         &mut self,
         operands: BinaryOperands,
@@ -509,6 +664,29 @@ mod tests {
         ShiftRight,
     }
 
+    #[derive(Clone, Copy)]
+    enum ExpectedComparisonInsn {
+        Eq,
+        Ne,
+        Lt,
+        Le,
+        Gt,
+        Ge,
+    }
+
+    fn comparison_expression(operator: Operator, component: hir::ComparisonComponent) -> hir::Expr {
+        hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            operator,
+            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: Some(hir::ComparisonSemantics {
+                components: vec![component],
+            }),
+        }
+    }
+
     #[test]
     fn ordinary_binary_lowering_keeps_existing_register_and_opcode_shape() {
         let cases = [
@@ -636,6 +814,159 @@ mod tests {
                 )),
             }
         }
+    }
+
+    #[test]
+    fn scalar_comparison_lowering_keeps_existing_opcode_and_null_shape() {
+        let cases = [
+            (Operator::Equals, ExpectedComparisonInsn::Eq, false),
+            (Operator::NotEquals, ExpectedComparisonInsn::Ne, false),
+            (Operator::Less, ExpectedComparisonInsn::Lt, false),
+            (Operator::LessEquals, ExpectedComparisonInsn::Le, false),
+            (Operator::Greater, ExpectedComparisonInsn::Gt, false),
+            (Operator::GreaterEquals, ExpectedComparisonInsn::Ge, false),
+            (Operator::Is, ExpectedComparisonInsn::Eq, true),
+            (Operator::IsNot, ExpectedComparisonInsn::Ne, true),
+        ];
+
+        for (operator, expected, null_equal) in cases {
+            let expression = comparison_expression(
+                operator,
+                hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Numeric,
+                    collation: None,
+                    array: false,
+                },
+            );
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..3],
+                [
+                    (Insn::Integer { value: 2, dest: 1 }, _),
+                    (Insn::Integer { value: 3, dest: 2 }, _),
+                    (Insn::Integer { value: 1, dest: 8 }, _),
+                ]
+            ));
+            let flags = match (expected, &program.insns[3].0) {
+                (
+                    ExpectedComparisonInsn::Eq,
+                    Insn::Eq {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                )
+                | (
+                    ExpectedComparisonInsn::Ne,
+                    Insn::Ne {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                )
+                | (
+                    ExpectedComparisonInsn::Lt,
+                    Insn::Lt {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                )
+                | (
+                    ExpectedComparisonInsn::Le,
+                    Insn::Le {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                )
+                | (
+                    ExpectedComparisonInsn::Gt,
+                    Insn::Gt {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                )
+                | (
+                    ExpectedComparisonInsn::Ge,
+                    Insn::Ge {
+                        lhs: 1,
+                        rhs: 2,
+                        flags,
+                        collation: None,
+                        ..
+                    },
+                ) => flags,
+                _ => panic!("comparison uses expected instruction"),
+            };
+            assert_eq!(
+                flags.get_affinity(),
+                crate::vdbe::affinity::Affinity::Numeric
+            );
+            assert_eq!(flags.has_nulleq(), null_equal);
+            assert!(!flags.has_array_cmp());
+            if null_equal {
+                assert!(matches!(
+                    program.insns[4].0,
+                    Insn::Integer { value: 0, dest: 8 }
+                ));
+            } else {
+                assert!(matches!(
+                    program.insns[4].0,
+                    Insn::ZeroOrNull {
+                        rg1: 1,
+                        rg2: 2,
+                        dest: 8
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_comparison_uses_resolved_array_and_collation_metadata() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let expression = comparison_expression(
+            Operator::Equals,
+            hir::ComparisonComponent {
+                affinity: crate::vdbe::affinity::Affinity::Text,
+                collation: Some(collation),
+                array: true,
+            },
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        let Insn::Eq {
+            flags, collation, ..
+        } = &program.insns[3].0
+        else {
+            panic!("equals comparison emits Eq")
+        };
+        assert_eq!(flags.get_affinity(), crate::vdbe::affinity::Affinity::Text);
+        assert!(flags.has_array_cmp());
+        assert_eq!(
+            *collation,
+            Some(crate::translate::collate::CollationSeq::NoCase)
+        );
     }
 
     #[test]

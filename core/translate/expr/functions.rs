@@ -146,7 +146,7 @@ pub(super) fn translate_function(
     Ok(target_register)
 }
 
-pub(super) fn wrap_eval_jump_expr(
+pub(crate) fn wrap_eval_jump_expr(
     program: &mut ProgramBuilder,
     insn: Insn,
     target_register: usize,
@@ -164,7 +164,7 @@ pub(super) fn wrap_eval_jump_expr(
     program.preassign_label_to_next_insn(if_true_label);
 }
 
-pub(super) fn wrap_eval_jump_expr_zero_or_null(
+pub(crate) fn wrap_eval_jump_expr_zero_or_null(
     program: &mut ProgramBuilder,
     insn: Insn,
     target_register: usize,
