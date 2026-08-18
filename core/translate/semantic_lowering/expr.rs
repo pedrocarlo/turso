@@ -107,13 +107,24 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     return Ok(ControlFlow::Break(()));
                 }
             }
-            hir::Expr::Binary { lhs, rhs, .. } => {
+            hir::Expr::Binary {
+                lhs,
+                rhs,
+                comparison,
+                ..
+            } => {
                 if matches!(context.registers, ExprRegisters::None) {
+                    let width = comparison
+                        .as_ref()
+                        .map_or(1, |comparison| comparison.components.len());
                     let operands = if lhs.equivalent(rhs) {
-                        BinaryOperands::Shared(self.program.alloc_register())
+                        BinaryOperands::Shared(self.program.alloc_registers(width))
                     } else {
-                        let lhs = self.program.alloc_registers(2);
-                        BinaryOperands::Pair { lhs, rhs: lhs + 1 }
+                        let lhs = self.program.alloc_registers(width * 2);
+                        BinaryOperands::Pair {
+                            lhs,
+                            rhs: lhs + width,
+                        }
                     };
                     context.registers = ExprRegisters::Binary(operands);
                 }
@@ -186,6 +197,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     _ => unreachable!("BETWEEN has three children"),
                 }
             }
+            hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
         Ok(ControlFlow::Continue(LoweringContext::new(target)))
@@ -262,7 +274,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 custom: None,
                 comparison: Some(comparison),
                 ..
-            } => self.emit_scalar_comparison(
+            } => self.emit_binary_comparison(
                 *operator,
                 comparison,
                 binary_registers(context.registers),
@@ -325,6 +337,14 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         dest: target,
                     }
                 });
+                Ok(target)
+            }
+            hir::Expr::Row(values) => {
+                debug_assert_eq!(children.len(), values.len());
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == target + index));
                 Ok(target)
             }
             _ => Err(LimboError::InternalError(
@@ -405,7 +425,7 @@ impl ExprLowerer<'_> {
         Ok(target)
     }
 
-    fn emit_scalar_comparison(
+    fn emit_binary_comparison(
         &mut self,
         operator: Operator,
         comparison: &hir::ComparisonSemantics,
@@ -423,7 +443,12 @@ impl ExprLowerer<'_> {
                 (lhs, rhs)
             }
         };
-        self.emit_comparison(operator, comparison, lhs, rhs, target)
+        if comparison.components.len() == 1 {
+            self.emit_comparison(operator, comparison, lhs, rhs, target)
+        } else {
+            self.emit_row_comparison(operator, &comparison.components, lhs, rhs, target)?;
+            Ok(target)
+        }
     }
 
     fn emit_comparison(
@@ -550,6 +575,202 @@ impl ExprLowerer<'_> {
             );
         }
         Ok(target)
+    }
+
+    fn emit_row_comparison(
+        &mut self,
+        operator: Operator,
+        components: &[hir::ComparisonComponent],
+        lhs_start: usize,
+        rhs_start: usize,
+        target: usize,
+    ) -> Result<()> {
+        enum Ordering {
+            Less,
+            Greater,
+        }
+
+        let mut emit_equality = |target: usize, null_equal: bool| {
+            let null_seen = if null_equal {
+                None
+            } else {
+                let register = self.program.alloc_register();
+                self.program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: register,
+                });
+                Some(register)
+            };
+
+            let done = self.program.allocate_label();
+            for (index, component) in components.iter().enumerate() {
+                let next = self.program.allocate_label();
+                let lhs = lhs_start + index;
+                let rhs = rhs_start + index;
+                self.program.emit_insn(Insn::Eq {
+                    lhs,
+                    rhs,
+                    target_pc: next,
+                    flags: if null_equal {
+                        CmpInsFlags::default()
+                            .null_eq()
+                            .with_affinity(component.affinity)
+                    } else {
+                        CmpInsFlags::default().with_affinity(component.affinity)
+                    },
+                    collation: component
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value()),
+                });
+                if null_equal {
+                    self.program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target,
+                    });
+                    self.program.emit_insn(Insn::Goto { target_pc: done });
+                } else {
+                    let mark_null = self.program.allocate_label();
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: lhs,
+                        target_pc: mark_null,
+                    });
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: rhs,
+                        target_pc: mark_null,
+                    });
+                    self.program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target,
+                    });
+                    self.program.emit_insn(Insn::Goto { target_pc: done });
+                    self.program.preassign_label_to_next_insn(mark_null);
+                    self.program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: null_seen.expect("null tracking register must exist"),
+                    });
+                }
+                self.program.preassign_label_to_next_insn(next);
+            }
+            self.program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target,
+            });
+            if !null_equal {
+                let finish = self.program.allocate_label();
+                self.program.emit_insn(Insn::IfNot {
+                    reg: null_seen.expect("null tracking register must exist"),
+                    target_pc: finish,
+                    jump_if_null: true,
+                });
+                self.program.emit_insn(Insn::Null {
+                    dest: target,
+                    dest_end: None,
+                });
+                self.program.preassign_label_to_next_insn(finish);
+            }
+            self.program.preassign_label_to_next_insn(done);
+        };
+
+        let emit_ordering =
+            |program: &mut ProgramBuilder, ordering: Ordering, include_equal: bool| {
+                let done = program.allocate_label();
+                let null_result = program.allocate_label();
+                for (index, component) in components.iter().enumerate() {
+                    let next = program.allocate_label();
+                    let lhs = lhs_start + index;
+                    let rhs = rhs_start + index;
+                    let flags = CmpInsFlags::default().with_affinity(component.affinity);
+                    let collation = component
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value());
+                    program.emit_insn(Insn::IsNull {
+                        reg: lhs,
+                        target_pc: null_result,
+                    });
+                    program.emit_insn(Insn::IsNull {
+                        reg: rhs,
+                        target_pc: null_result,
+                    });
+                    program.emit_insn(Insn::Eq {
+                        lhs,
+                        rhs,
+                        target_pc: next,
+                        flags,
+                        collation,
+                    });
+                    let if_true = program.allocate_label();
+                    program.emit_insn(match ordering {
+                        Ordering::Less => Insn::Lt {
+                            lhs,
+                            rhs,
+                            target_pc: if_true,
+                            flags,
+                            collation,
+                        },
+                        Ordering::Greater => Insn::Gt {
+                            lhs,
+                            rhs,
+                            target_pc: if_true,
+                            flags,
+                            collation,
+                        },
+                    });
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target,
+                    });
+                    program.emit_insn(Insn::Goto { target_pc: done });
+                    program.preassign_label_to_next_insn(if_true);
+                    program.emit_insn(Insn::Integer {
+                        value: 1,
+                        dest: target,
+                    });
+                    program.emit_insn(Insn::Goto { target_pc: done });
+                    program.preassign_label_to_next_insn(next);
+                }
+                program.emit_insn(Insn::Integer {
+                    value: if include_equal { 1 } else { 0 },
+                    dest: target,
+                });
+                program.emit_insn(Insn::Goto { target_pc: done });
+                program.preassign_label_to_next_insn(null_result);
+                program.emit_insn(Insn::Null {
+                    dest: target,
+                    dest_end: None,
+                });
+                program.preassign_label_to_next_insn(done);
+            };
+
+        match operator {
+            Operator::Equals => emit_equality(target, false),
+            Operator::NotEquals => {
+                emit_equality(target, false);
+                self.program.emit_insn(Insn::Not {
+                    reg: target,
+                    dest: target,
+                });
+            }
+            Operator::Is => emit_equality(target, true),
+            Operator::IsNot => {
+                emit_equality(target, true);
+                self.program.emit_insn(Insn::Not {
+                    reg: target,
+                    dest: target,
+                });
+            }
+            Operator::Less => emit_ordering(self.program, Ordering::Less, false),
+            Operator::LessEquals => emit_ordering(self.program, Ordering::Less, true),
+            Operator::Greater => emit_ordering(self.program, Ordering::Greater, false),
+            Operator::GreaterEquals => emit_ordering(self.program, Ordering::Greater, true),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR row comparison lowering is not implemented for {operator:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn emit_concat(
@@ -1172,6 +1393,26 @@ mod tests {
         }
     }
 
+    fn row_comparison_expression(
+        operator: Operator,
+        components: Vec<hir::ComparisonComponent>,
+    ) -> hir::Expr {
+        hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::String("'a'".to_string())),
+                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+            ])),
+            operator,
+            rhs: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::String("'b'".to_string())),
+                hir::Expr::Literal(Literal::Numeric("3".to_string())),
+            ])),
+            array_concat: false,
+            custom: None,
+            comparison: Some(hir::ComparisonSemantics { components }),
+        }
+    }
+
     #[test]
     fn ordinary_binary_lowering_keeps_existing_register_and_opcode_shape() {
         let cases = [
@@ -1465,6 +1706,167 @@ mod tests {
             program.insns[5].0,
             Insn::Le { lhs: 1, rhs: 1, .. }
         ));
+    }
+
+    #[test]
+    fn row_comparison_uses_consecutive_registers_and_resolved_component_facts() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let expression = row_comparison_expression(
+            Operator::Less,
+            vec![
+                hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Text,
+                    collation: Some(collation),
+                    array: false,
+                },
+                hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Numeric,
+                    collation: None,
+                    array: false,
+                },
+            ],
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            &program.insns[..4],
+            [
+                (Insn::String8 { dest: 1, .. }, _),
+                (Insn::Integer { value: 2, dest: 2 }, _),
+                (Insn::String8 { dest: 3, .. }, _),
+                (Insn::Integer { value: 3, dest: 4 }, _),
+            ]
+        ));
+
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Lt {
+                    lhs,
+                    rhs,
+                    flags,
+                    collation,
+                    ..
+                } => Some((*lhs, *rhs, flags.get_affinity(), *collation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comparisons,
+            vec![
+                (
+                    1,
+                    3,
+                    crate::vdbe::affinity::Affinity::Text,
+                    Some(crate::translate::collate::CollationSeq::NoCase),
+                ),
+                (2, 4, crate::vdbe::affinity::Affinity::Numeric, None,),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_equality_preserves_null_and_is_uses_null_equal() {
+        for (operator, null_equal) in [(Operator::Equals, false), (Operator::Is, true)] {
+            let expression = row_comparison_expression(
+                operator,
+                vec![
+                    hir::ComparisonComponent {
+                        affinity: crate::vdbe::affinity::Affinity::Text,
+                        collation: None,
+                        array: false,
+                    },
+                    hir::ComparisonComponent {
+                        affinity: crate::vdbe::affinity::Affinity::Numeric,
+                        collation: None,
+                        array: false,
+                    },
+                ],
+            );
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            let equality_flags = program
+                .insns
+                .iter()
+                .filter_map(|(instruction, _)| match instruction {
+                    Insn::Eq { flags, .. } => Some(flags),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(equality_flags.len(), 2);
+            assert!(equality_flags
+                .iter()
+                .all(|flags| flags.has_nulleq() == null_equal));
+            assert_eq!(
+                program.insns.iter().any(|(instruction, _)| matches!(
+                    instruction,
+                    Insn::Null {
+                        dest: 8,
+                        dest_end: None,
+                    }
+                )),
+                !null_equal
+            );
+        }
+    }
+
+    #[test]
+    fn row_ordering_emits_each_component_in_lexicographic_order() {
+        for (operator, inclusive) in [
+            (Operator::Less, false),
+            (Operator::LessEquals, true),
+            (Operator::Greater, false),
+            (Operator::GreaterEquals, true),
+        ] {
+            let expression = row_comparison_expression(
+                operator,
+                vec![
+                    hir::ComparisonComponent {
+                        affinity: crate::vdbe::affinity::Affinity::Text,
+                        collation: None,
+                        array: false,
+                    },
+                    hir::ComparisonComponent {
+                        affinity: crate::vdbe::affinity::Affinity::Numeric,
+                        collation: None,
+                        array: false,
+                    },
+                ],
+            );
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            let equality_pairs = program
+                .insns
+                .iter()
+                .filter_map(|(instruction, _)| match instruction {
+                    Insn::Eq { lhs, rhs, .. } => Some((*lhs, *rhs)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(equality_pairs, vec![(1, 3), (2, 4)]);
+            let ordering_pairs = program
+                .insns
+                .iter()
+                .filter_map(|(instruction, _)| match instruction {
+                    Insn::Lt { lhs, rhs, .. } | Insn::Gt { lhs, rhs, .. } => Some((*lhs, *rhs)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ordering_pairs, vec![(1, 3), (2, 4)]);
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Integer { value, dest: 8 } if *value == i64::from(inclusive)
+            )));
+        }
     }
 
     #[test]
