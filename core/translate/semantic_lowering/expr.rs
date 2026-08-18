@@ -16,6 +16,11 @@ enum BinaryOperands {
     Pair { lhs: usize, rhs: usize },
 }
 
+enum NullTest {
+    IsNull,
+    NotNull,
+}
+
 struct LoweringContext {
     target: usize,
     binary_operands: BinaryOperands,
@@ -66,6 +71,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     self.program.alloc_register()
                 }
             },
+            hir::Expr::IsNull(_) | hir::Expr::NotNull(_) => self.program.alloc_register(),
             hir::Expr::Binary { lhs, rhs, .. } => {
                 if matches!(context.binary_operands, BinaryOperands::Unallocated) {
                     context.binary_operands = if lhs.equivalent(rhs) {
@@ -104,6 +110,8 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
             }
+            hir::Expr::IsNull(_) => self.emit_null_test(NullTest::IsNull, target, children),
+            hir::Expr::NotNull(_) => self.emit_null_test(NullTest::NotNull, target, children),
             hir::Expr::Binary {
                 operator: Operator::Concat,
                 array_concat,
@@ -146,6 +154,30 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn emit_null_test(
+        &mut self,
+        test: NullTest,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
+        let [value] = children else {
+            unreachable!("NULL test has one lowered child")
+        };
+        let if_true_label = self.program.allocate_label();
+        let instruction = match test {
+            NullTest::IsNull => Insn::IsNull {
+                reg: *value,
+                target_pc: if_true_label,
+            },
+            NullTest::NotNull => Insn::NotNull {
+                reg: *value,
+                target_pc: if_true_label,
+            },
+        };
+        expr::functions::wrap_eval_jump_expr(self.program, instruction, target, if_true_label);
+        Ok(target)
+    }
+
     fn emit_array_binary(
         &mut self,
         operator: Operator,
@@ -704,6 +736,53 @@ mod tests {
                 _
             )]
         ));
+    }
+
+    #[test]
+    fn null_test_lowering_keeps_existing_sequence_for_nested_expressions() {
+        for is_null in [true, false] {
+            let value = hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                operator: Operator::Add,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            };
+            let expression = if is_null {
+                hir::Expr::IsNull(Box::new(value))
+            } else {
+                hir::Expr::NotNull(Box::new(value))
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..4],
+                [
+                    (Insn::Integer { value: 2, dest: 2 }, _),
+                    (Insn::Integer { value: 3, dest: 3 }, _),
+                    (
+                        Insn::Add {
+                            lhs: 2,
+                            rhs: 3,
+                            dest: 1
+                        },
+                        _
+                    ),
+                    (Insn::Integer { value: 1, dest: 8 }, _),
+                ]
+            ));
+            if is_null {
+                assert!(matches!(program.insns[4].0, Insn::IsNull { reg: 1, .. }));
+            } else {
+                assert!(matches!(program.insns[4].0, Insn::NotNull { reg: 1, .. }));
+            }
+            assert!(matches!(
+                program.insns[5].0,
+                Insn::Integer { value: 0, dest: 8 }
+            ));
+        }
     }
 
     #[derive(Clone, Copy)]
