@@ -23,6 +23,7 @@ struct BetweenRegisters {
     value: usize,
     start: usize,
     end: usize,
+    width: usize,
     lower: usize,
     upper: usize,
 }
@@ -147,23 +148,30 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 ..
             } => {
                 if matches!(context.registers, ExprRegisters::None) {
-                    let value = self.program.alloc_register();
+                    let width = start_comparison.components.len();
+                    if width == 0 {
+                        return Err(LimboError::InternalError(
+                            "HIR BETWEEN comparison has no components".to_string(),
+                        ));
+                    }
+                    let value = self.program.alloc_registers(width);
                     let lower = self.program.alloc_register();
                     let start_register = if expr.equivalent(start) {
                         value
                     } else {
-                        self.program.alloc_register()
+                        self.program.alloc_registers(width)
                     };
                     let upper = self.program.alloc_register();
                     let end_register = if expr.equivalent(end) {
                         value
                     } else {
-                        self.program.alloc_register()
+                        self.program.alloc_registers(width)
                     };
                     context.registers = ExprRegisters::Between(BetweenRegisters {
                         value,
                         start: start_register,
                         end: end_register,
+                        width,
                         lower,
                         upper,
                     });
@@ -171,6 +179,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 let ExprRegisters::Between(registers) = context.registers else {
                     unreachable!("BETWEEN registers were allocated")
                 };
+                debug_assert_eq!(registers.width, start_comparison.components.len());
                 match child_index {
                     0 => registers.value,
                     1 if registers.start == registers.value => {
@@ -313,6 +322,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 let ExprRegisters::Between(registers) = context.registers else {
                     unreachable!("BETWEEN registers were allocated")
                 };
+                debug_assert_eq!(registers.width, end_comparison.components.len());
                 self.emit_comparison(
                     if *negated {
                         Operator::Greater
@@ -443,12 +453,7 @@ impl ExprLowerer<'_> {
                 (lhs, rhs)
             }
         };
-        if comparison.components.len() == 1 {
-            self.emit_comparison(operator, comparison, lhs, rhs, target)
-        } else {
-            self.emit_row_comparison(operator, &comparison.components, lhs, rhs, target)?;
-            Ok(target)
-        }
+        self.emit_comparison(operator, comparison, lhs, rhs, target)
     }
 
     fn emit_comparison(
@@ -459,10 +464,28 @@ impl ExprLowerer<'_> {
         rhs: usize,
         target: usize,
     ) -> Result<usize> {
+        match comparison.components.as_slice() {
+            [] => Err(LimboError::InternalError(
+                "HIR comparison has no components".to_string(),
+            )),
+            [_] => self.emit_scalar_comparison(operator, comparison, lhs, rhs, target),
+            components => {
+                self.emit_row_comparison(operator, components, lhs, rhs, target)?;
+                Ok(target)
+            }
+        }
+    }
+
+    fn emit_scalar_comparison(
+        &mut self,
+        operator: Operator,
+        comparison: &hir::ComparisonSemantics,
+        lhs: usize,
+        rhs: usize,
+        target: usize,
+    ) -> Result<usize> {
         let [component] = comparison.components.as_slice() else {
-            return Err(LimboError::InternalError(
-                "HIR scalar comparison must have one component".to_string(),
-            ));
+            unreachable!("scalar comparison has one component")
         };
         let base_flags = CmpInsFlags::default().with_affinity(component.affinity);
         let comparison_flags = if component.array {
@@ -1596,6 +1619,18 @@ mod tests {
         }
     }
 
+    fn numeric_row_comparison(width: usize) -> hir::ComparisonSemantics {
+        hir::ComparisonSemantics {
+            components: (0..width)
+                .map(|_| hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Numeric,
+                    collation: None,
+                    array: false,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn scalar_between_lowering_keeps_existing_comparison_order() {
         for negated in [false, true] {
@@ -1706,6 +1741,212 @@ mod tests {
             program.insns[5].0,
             Insn::Le { lhs: 1, rhs: 1, .. }
         ));
+    }
+
+    #[test]
+    fn row_between_uses_register_ranges_resolved_facts_and_existing_order() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let comparison = hir::ComparisonSemantics {
+            components: vec![
+                hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Text,
+                    collation: Some(collation),
+                    array: false,
+                },
+                hir::ComparisonComponent {
+                    affinity: crate::vdbe::affinity::Affinity::Numeric,
+                    collation: None,
+                    array: false,
+                },
+            ],
+        };
+        let expression = hir::Expr::Between {
+            expr: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("20".to_string())),
+                hir::Expr::Literal(Literal::Numeric("21".to_string())),
+            ])),
+            negated: false,
+            start: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("10".to_string())),
+                hir::Expr::Literal(Literal::Numeric("11".to_string())),
+            ])),
+            end: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("30".to_string())),
+                hir::Expr::Literal(Literal::Numeric("31".to_string())),
+            ])),
+            start_comparison: comparison.clone(),
+            end_comparison: comparison,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 12).unwrap();
+        let value_destinations = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Integer { value, dest } if matches!(*value, 10 | 11 | 20 | 21 | 30 | 31) => {
+                    Some(*dest)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_destinations, vec![1, 2, 4, 5, 7, 8]);
+
+        let lower_position = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Gt { .. }))
+            .expect("lower comparison is emitted");
+        let end_position = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Integer { value: 30, dest: 7 })
+            })
+            .expect("end row is evaluated");
+        assert!(lower_position < end_position);
+
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Gt {
+                    lhs,
+                    rhs,
+                    flags,
+                    collation,
+                    ..
+                }
+                | Insn::Lt {
+                    lhs,
+                    rhs,
+                    flags,
+                    collation,
+                    ..
+                } => Some((*lhs, *rhs, flags.get_affinity(), *collation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comparisons,
+            vec![
+                (
+                    1,
+                    4,
+                    crate::vdbe::affinity::Affinity::Text,
+                    Some(crate::translate::collate::CollationSeq::NoCase)
+                ),
+                (2, 5, crate::vdbe::affinity::Affinity::Numeric, None),
+                (
+                    1,
+                    7,
+                    crate::vdbe::affinity::Affinity::Text,
+                    Some(crate::translate::collate::CollationSeq::NoCase)
+                ),
+                (2, 8, crate::vdbe::affinity::Affinity::Numeric, None),
+            ]
+        );
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::And {
+                lhs: 3,
+                rhs: 6,
+                dest: 12,
+            })
+        ));
+    }
+
+    #[test]
+    fn row_not_between_uses_less_greater_and_or() {
+        let expression = hir::Expr::Between {
+            expr: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+                hir::Expr::Literal(Literal::Numeric("3".to_string())),
+            ])),
+            negated: true,
+            start: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+            ])),
+            end: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("4".to_string())),
+                hir::Expr::Literal(Literal::Numeric("4".to_string())),
+            ])),
+            start_comparison: numeric_row_comparison(2),
+            end_comparison: numeric_row_comparison(2),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 12).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Lt { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Gt { .. }))
+                .count(),
+            2
+        );
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Or {
+                lhs: 3,
+                rhs: 6,
+                dest: 12,
+            })
+        ));
+    }
+
+    #[test]
+    fn row_between_reuses_equivalent_value_ranges() {
+        let value = hir::Expr::Row(vec![
+            hir::Expr::Literal(Literal::Numeric("7".to_string())),
+            hir::Expr::Literal(Literal::Numeric("8".to_string())),
+        ]);
+        let expression = hir::Expr::Between {
+            expr: Box::new(value.clone()),
+            negated: false,
+            start: Box::new(value.clone()),
+            end: Box::new(value),
+            start_comparison: numeric_row_comparison(2),
+            end_comparison: numeric_row_comparison(2),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 12).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(
+                    instruction,
+                    Insn::Integer { value: 7 | 8, .. }
+                ))
+                .count(),
+            2
+        );
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Gt { lhs, rhs, .. } | Insn::Lt { lhs, rhs, .. } => Some((lhs, rhs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(comparisons.len(), 4);
+        assert!(comparisons.into_iter().all(|(lhs, rhs)| lhs == rhs));
     }
 
     #[test]
