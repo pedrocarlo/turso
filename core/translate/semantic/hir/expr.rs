@@ -1,6 +1,8 @@
 //! Resolved expression trees.
 
+use std::convert::Infallible;
 use std::num::NonZeroU32;
+use std::ops::ControlFlow;
 
 use smallvec::SmallVec;
 use turso_parser::ast::{
@@ -405,25 +407,91 @@ pub enum Expr {
     },
 }
 
-struct ExprFrame<'expr, T> {
+struct ExprFrame<'expr, C, T> {
     expression: &'expr Expr,
+    context: C,
     next_child: usize,
     child_values: SmallVec<[T; 3]>,
 }
 
-impl<'expr, T> ExprFrame<'expr, T> {
-    fn new(expression: &'expr Expr) -> Self {
+pub(crate) trait ExprVisitor<C, T, E> {
+    fn pre_order(
+        &mut self,
+        parent: &Expr,
+        context: &C,
+        child_index: usize,
+        child: &Expr,
+    ) -> Result<ControlFlow<(), C>, E>;
+
+    fn post_order(&mut self, expression: &Expr, context: C, children: &[T]) -> Result<T, E>;
+}
+
+struct WalkVisitor<'a, F> {
+    visit: &'a mut F,
+}
+
+impl<F: FnMut(&Expr)> ExprVisitor<(), (), Infallible> for WalkVisitor<'_, F> {
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &(),
+        _child_index: usize,
+        child: &Expr,
+    ) -> Result<ControlFlow<(), ()>, Infallible> {
+        (self.visit)(child);
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        _expression: &Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<(), Infallible> {
+        Ok(())
+    }
+}
+
+struct FoldVisitor<'a, F> {
+    fold: &'a mut F,
+}
+
+impl<T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<(), T, Infallible> for FoldVisitor<'_, F> {
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &(),
+        _child_index: usize,
+        _child: &Expr,
+    ) -> Result<ControlFlow<(), ()>, Infallible> {
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &Expr,
+        _context: (),
+        children: &[T],
+    ) -> Result<T, Infallible> {
+        Ok((self.fold)(expression, children))
+    }
+}
+
+impl<'expr, C, T> ExprFrame<'expr, C, T> {
+    fn new(expression: &'expr Expr, context: C) -> Self {
         Self {
             expression,
+            context,
             next_child: 0,
             child_values: SmallVec::new(),
         }
     }
 
-    fn next_child(&mut self) -> Option<&'expr Expr> {
-        let child = self.expression.child(self.next_child)?;
+    fn next_child(&mut self) -> Option<(usize, &'expr Expr)> {
+        let index = self.next_child;
+        let child = self.expression.child(index)?;
         self.next_child += 1;
-        Some(child)
+        Some((index, child))
     }
 }
 
@@ -809,16 +877,11 @@ impl Expr {
     /// Visit this expression and every expression it owns. References to
     /// outputs and subqueries remain references; their definitions are walked
     /// by the query that owns them.
-    pub(crate) fn walk<'expr>(&'expr self, visitor: &mut impl FnMut(&'expr Expr)) {
+    pub(crate) fn walk(&self, visitor: &mut impl FnMut(&Expr)) {
         visitor(self);
-        let mut frames = vec![ExprFrame::<()>::new(self)];
-        while let Some(frame) = frames.last_mut() {
-            let Some(child) = frame.next_child() else {
-                frames.pop();
-                continue;
-            };
-            visitor(child);
-            frames.push(ExprFrame::new(child));
+        let result = self.visit((), &mut WalkVisitor { visit: visitor });
+        if let Err(error) = result {
+            match error {}
         }
     }
 
@@ -826,21 +889,38 @@ impl Expr {
     /// Child values keep expression-child order, letting callers handle nodes
     /// whose result depends on more than one child.
     pub(crate) fn fold<T>(&self, folder: &mut impl FnMut(&Expr, &[T]) -> T) -> T {
-        let mut frames = vec![ExprFrame::new(self)];
+        match self.visit((), &mut FoldVisitor { fold: folder }) {
+            Ok(value) => value,
+            Err(error) => match error {},
+        }
+    }
+
+    /// Visit an expression iteratively with callbacks before each child and
+    /// after all selected children. The pre-order callback chooses the
+    /// context for a child or skips that child. The post-order callback
+    /// reduces completed child values into the current node's value.
+    pub(crate) fn visit<C, T, E>(
+        &self,
+        root_context: C,
+        visitor: &mut impl ExprVisitor<C, T, E>,
+    ) -> Result<T, E> {
+        let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
-            if let Some(child) = frames
-                .last_mut()
-                .expect("root expression frame exists")
-                .next_child()
-            {
-                frames.push(ExprFrame::new(child));
+            let frame = frames.last_mut().expect("root expression frame exists");
+            if let Some((index, child)) = frame.next_child() {
+                match visitor.pre_order(frame.expression, &frame.context, index, child)? {
+                    ControlFlow::Continue(context) => {
+                        frames.push(ExprFrame::new(child, context));
+                    }
+                    ControlFlow::Break(()) => {}
+                }
                 continue;
             }
 
             let frame = frames.pop().expect("completed expression frame exists");
-            let value = folder(frame.expression, &frame.child_values);
+            let value = visitor.post_order(frame.expression, frame.context, &frame.child_values)?;
             let Some(parent) = frames.last_mut() else {
-                return value;
+                return Ok(value);
             };
             parent.child_values.push(value);
         }
