@@ -12,10 +12,26 @@ use crate::vdbe::{
 use crate::{LimboError, Numeric, Result, Value};
 use turso_parser::ast::{Literal, Operator, UnaryOperator};
 
+#[derive(Clone, Copy)]
 enum BinaryOperands {
-    Unallocated,
     Shared(usize),
     Pair { lhs: usize, rhs: usize },
+}
+
+#[derive(Clone, Copy)]
+struct BetweenRegisters {
+    value: usize,
+    start: usize,
+    end: usize,
+    lower: usize,
+    upper: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ExprRegisters {
+    None,
+    Binary(BinaryOperands),
+    Between(BetweenRegisters),
 }
 
 enum NullTest {
@@ -25,16 +41,23 @@ enum NullTest {
 
 struct LoweringContext {
     target: usize,
-    binary_operands: BinaryOperands,
+    registers: ExprRegisters,
 }
 
 impl LoweringContext {
     const fn new(target: usize) -> Self {
         Self {
             target,
-            binary_operands: BinaryOperands::Unallocated,
+            registers: ExprRegisters::None,
         }
     }
+}
+
+fn binary_registers(registers: ExprRegisters) -> BinaryOperands {
+    let ExprRegisters::Binary(operands) = registers else {
+        unreachable!("binary operand registers were allocated")
+    };
+    operands
 }
 
 struct ExprLowerer<'a> {
@@ -85,23 +108,82 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 }
             }
             hir::Expr::Binary { lhs, rhs, .. } => {
-                if matches!(context.binary_operands, BinaryOperands::Unallocated) {
-                    context.binary_operands = if lhs.equivalent(rhs) {
+                if matches!(context.registers, ExprRegisters::None) {
+                    let operands = if lhs.equivalent(rhs) {
                         BinaryOperands::Shared(self.program.alloc_register())
                     } else {
                         let lhs = self.program.alloc_registers(2);
                         BinaryOperands::Pair { lhs, rhs: lhs + 1 }
                     };
+                    context.registers = ExprRegisters::Binary(operands);
                 }
-                match (&context.binary_operands, child_index) {
-                    (BinaryOperands::Shared(register), 0) => *register,
-                    (BinaryOperands::Shared(_), 1) => return Ok(ControlFlow::Break(())),
-                    (BinaryOperands::Pair { lhs, .. }, 0) => *lhs,
-                    (BinaryOperands::Pair { rhs, .. }, 1) => *rhs,
-                    (BinaryOperands::Unallocated, _) => {
-                        unreachable!("binary operand registers were allocated")
+                match (context.registers, child_index) {
+                    (ExprRegisters::Binary(BinaryOperands::Shared(register)), 0) => register,
+                    (ExprRegisters::Binary(BinaryOperands::Shared(_)), 1) => {
+                        return Ok(ControlFlow::Break(()));
                     }
+                    (ExprRegisters::Binary(BinaryOperands::Pair { lhs, .. }), 0) => lhs,
+                    (ExprRegisters::Binary(BinaryOperands::Pair { rhs, .. }), 1) => rhs,
                     (_, _) => unreachable!("binary expression has two children"),
+                }
+            }
+            hir::Expr::Between {
+                expr,
+                negated,
+                start,
+                end,
+                start_comparison,
+                ..
+            } => {
+                if matches!(context.registers, ExprRegisters::None) {
+                    let value = self.program.alloc_register();
+                    let lower = self.program.alloc_register();
+                    let start_register = if expr.equivalent(start) {
+                        value
+                    } else {
+                        self.program.alloc_register()
+                    };
+                    let upper = self.program.alloc_register();
+                    let end_register = if expr.equivalent(end) {
+                        value
+                    } else {
+                        self.program.alloc_register()
+                    };
+                    context.registers = ExprRegisters::Between(BetweenRegisters {
+                        value,
+                        start: start_register,
+                        end: end_register,
+                        lower,
+                        upper,
+                    });
+                }
+                let ExprRegisters::Between(registers) = context.registers else {
+                    unreachable!("BETWEEN registers were allocated")
+                };
+                match child_index {
+                    0 => registers.value,
+                    1 if registers.start == registers.value => {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    1 => registers.start,
+                    2 => {
+                        self.emit_comparison(
+                            if *negated {
+                                Operator::Less
+                            } else {
+                                Operator::GreaterEquals
+                            },
+                            start_comparison,
+                            registers.value,
+                            registers.start,
+                            registers.lower,
+                        )?;
+                        if registers.end == registers.value {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        registers.end
+                    }
+                    _ => unreachable!("BETWEEN has three children"),
                 }
             }
             _ => return Ok(ControlFlow::Break(())),
@@ -168,7 +250,12 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 custom: None,
                 comparison: None,
                 ..
-            } => self.emit_concat(context.binary_operands, target, children, *array_concat),
+            } => self.emit_concat(
+                binary_registers(context.registers),
+                target,
+                children,
+                *array_concat,
+            ),
             hir::Expr::Binary {
                 operator,
                 array_concat: false,
@@ -178,7 +265,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             } => self.emit_scalar_comparison(
                 *operator,
                 comparison,
-                context.binary_operands,
+                binary_registers(context.registers),
                 target,
                 children,
             ),
@@ -188,14 +275,58 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 custom: None,
                 comparison: None,
                 ..
-            } => self.emit_array_binary(*operator, context.binary_operands, target, children),
+            } => self.emit_array_binary(
+                *operator,
+                binary_registers(context.registers),
+                target,
+                children,
+            ),
             hir::Expr::Binary {
                 operator,
                 array_concat: false,
                 custom: None,
                 comparison: None,
                 ..
-            } => self.emit_binary(*operator, context.binary_operands, target, children),
+            } => self.emit_binary(
+                *operator,
+                binary_registers(context.registers),
+                target,
+                children,
+            ),
+            hir::Expr::Between {
+                negated,
+                end_comparison,
+                ..
+            } => {
+                let ExprRegisters::Between(registers) = context.registers else {
+                    unreachable!("BETWEEN registers were allocated")
+                };
+                self.emit_comparison(
+                    if *negated {
+                        Operator::Greater
+                    } else {
+                        Operator::LessEquals
+                    },
+                    end_comparison,
+                    registers.value,
+                    registers.end,
+                    registers.upper,
+                )?;
+                self.program.emit_insn(if *negated {
+                    Insn::Or {
+                        lhs: registers.lower,
+                        rhs: registers.upper,
+                        dest: target,
+                    }
+                } else {
+                    Insn::And {
+                        lhs: registers.lower,
+                        rhs: registers.upper,
+                        dest: target,
+                    }
+                });
+                Ok(target)
+            }
             _ => Err(LimboError::InternalError(
                 "HIR expression lowering is not implemented for this expression".to_string(),
             )),
@@ -256,9 +387,6 @@ impl ExprLowerer<'_> {
                 debug_assert_eq!(rhs, lhs + 1);
                 lhs
             }
-            BinaryOperands::Unallocated => {
-                unreachable!("binary expression allocated operand registers")
-            }
         };
         let function = match operator {
             Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -285,11 +413,6 @@ impl ExprLowerer<'_> {
         target: usize,
         children: &[usize],
     ) -> Result<usize> {
-        let [component] = comparison.components.as_slice() else {
-            return Err(LimboError::InternalError(
-                "HIR scalar comparison must have one component".to_string(),
-            ));
-        };
         let (lhs, rhs) = match operands {
             BinaryOperands::Shared(register) => {
                 debug_assert_eq!(children, [register]);
@@ -299,9 +422,22 @@ impl ExprLowerer<'_> {
                 debug_assert_eq!(children, [lhs, rhs]);
                 (lhs, rhs)
             }
-            BinaryOperands::Unallocated => {
-                unreachable!("binary expression allocated operand registers")
-            }
+        };
+        self.emit_comparison(operator, comparison, lhs, rhs, target)
+    }
+
+    fn emit_comparison(
+        &mut self,
+        operator: Operator,
+        comparison: &hir::ComparisonSemantics,
+        lhs: usize,
+        rhs: usize,
+        target: usize,
+    ) -> Result<usize> {
+        let [component] = comparison.components.as_slice() else {
+            return Err(LimboError::InternalError(
+                "HIR scalar comparison must have one component".to_string(),
+            ));
         };
         let base_flags = CmpInsFlags::default().with_affinity(component.affinity);
         let comparison_flags = if component.array {
@@ -432,9 +568,6 @@ impl ExprLowerer<'_> {
                 debug_assert_eq!(children, [lhs, rhs]);
                 (lhs, rhs)
             }
-            BinaryOperands::Unallocated => {
-                unreachable!("binary expression allocated operand registers")
-            }
         };
         let instruction = if array_concat {
             Insn::ArrayConcat {
@@ -468,9 +601,6 @@ impl ExprLowerer<'_> {
             BinaryOperands::Pair { lhs, rhs } => {
                 debug_assert_eq!(children, [lhs, rhs]);
                 (lhs, rhs)
-            }
-            BinaryOperands::Unallocated => {
-                unreachable!("binary expression allocated operand registers")
             }
         };
         let instruction = match operator {
@@ -1213,6 +1343,128 @@ mod tests {
             };
             assert_eq!(actual, &expected);
         }
+    }
+
+    fn numeric_comparison() -> hir::ComparisonSemantics {
+        hir::ComparisonSemantics {
+            components: vec![hir::ComparisonComponent {
+                affinity: crate::vdbe::affinity::Affinity::Numeric,
+                collation: None,
+                array: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn scalar_between_lowering_keeps_existing_comparison_order() {
+        for negated in [false, true] {
+            let expression = hir::Expr::Between {
+                expr: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                negated,
+                start: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                end: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                start_comparison: numeric_comparison(),
+                end_comparison: numeric_comparison(),
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..3],
+                [
+                    (Insn::Integer { value: 2, dest: 1 }, _),
+                    (Insn::Integer { value: 1, dest: 3 }, _),
+                    (Insn::Integer { value: 1, dest: 2 }, _),
+                ]
+            ));
+            if negated {
+                assert!(matches!(
+                    program.insns[3].0,
+                    Insn::Lt { lhs: 1, rhs: 3, .. }
+                ));
+            } else {
+                assert!(matches!(
+                    program.insns[3].0,
+                    Insn::Ge { lhs: 1, rhs: 3, .. }
+                ));
+            }
+            assert!(matches!(
+                program.insns[4].0,
+                Insn::ZeroOrNull {
+                    rg1: 1,
+                    rg2: 3,
+                    dest: 2,
+                }
+            ));
+            assert!(matches!(
+                &program.insns[5..7],
+                [
+                    (Insn::Integer { value: 3, dest: 5 }, _),
+                    (Insn::Integer { value: 1, dest: 4 }, _),
+                ]
+            ));
+            if negated {
+                assert!(matches!(
+                    program.insns[7].0,
+                    Insn::Gt { lhs: 1, rhs: 5, .. }
+                ));
+                assert!(matches!(
+                    program.insns[9].0,
+                    Insn::Or {
+                        lhs: 2,
+                        rhs: 4,
+                        dest: 8,
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    program.insns[7].0,
+                    Insn::Le { lhs: 1, rhs: 5, .. }
+                ));
+                assert!(matches!(
+                    program.insns[9].0,
+                    Insn::And {
+                        lhs: 2,
+                        rhs: 4,
+                        dest: 8,
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_between_reuses_equivalent_value_bounds() {
+        let value = hir::Expr::Literal(Literal::Numeric("7".to_string()));
+        let expression = hir::Expr::Between {
+            expr: Box::new(value.clone()),
+            negated: false,
+            start: Box::new(value.clone()),
+            end: Box::new(value),
+            start_comparison: numeric_comparison(),
+            end_comparison: numeric_comparison(),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| {
+                    matches!(instruction, Insn::Integer { value: 7, .. })
+                })
+                .count(),
+            1
+        );
+        assert!(matches!(
+            program.insns[2].0,
+            Insn::Ge { lhs: 1, rhs: 1, .. }
+        ));
+        assert!(matches!(
+            program.insns[5].0,
+            Insn::Le { lhs: 1, rhs: 1, .. }
+        ));
     }
 
     #[test]
