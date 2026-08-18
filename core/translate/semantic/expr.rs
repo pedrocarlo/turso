@@ -712,17 +712,47 @@ fn validate_json_arguments(function: &JsonFunc, count: usize) -> Result<()> {
     }
 }
 
-#[cfg(feature = "json")]
-fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
-    if let Func::Json(function) = function {
-        validate_json_arguments(function, input.argument_count())?;
+fn require_exact_arguments(function: &Func, count: usize, expected: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count != expected {
+        crate::bail_parse_error!(
+            "{} function called with not exactly {} arguments",
+            function,
+            expected
+        );
     }
     Ok(())
 }
 
-#[cfg(not(feature = "json"))]
-fn validate_scalar_arguments(_: &Func, _: &FunctionInput) -> Result<()> {
-    Ok(())
+fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
+    match function {
+        Func::Scalar(
+            ScalarFunc::Abs
+            | ScalarFunc::Lower
+            | ScalarFunc::Upper
+            | ScalarFunc::Length
+            | ScalarFunc::OctetLength
+            | ScalarFunc::Typeof
+            | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
+            | ScalarFunc::UnistrQuote
+            | ScalarFunc::Quote
+            | ScalarFunc::RandomBlob
+            | ScalarFunc::Sign
+            | ScalarFunc::Soundex
+            | ScalarFunc::ZeroBlob
+            | ScalarFunc::SequenceWatermark,
+        ) => require_exact_arguments(function, input.argument_count(), 1),
+        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+        Func::Scalar(ScalarFunc::LoadExtension) => {
+            require_exact_arguments(function, input.argument_count(), 1)
+        }
+        #[cfg(feature = "json")]
+        Func::Json(function) => validate_json_arguments(function, input.argument_count()),
+        _ => Ok(()),
+    }
 }
 
 struct ExprFrame<'a> {
@@ -4517,6 +4547,51 @@ mod tests {
             error.to_string(),
             "Parse error: misuse of aggregate function sum()"
         );
+    }
+
+    #[test]
+    fn fixed_unary_argument_rules_are_checked_during_semantic_analysis() {
+        for function in [
+            "abs",
+            "lower",
+            "upper",
+            "length",
+            "octet_length",
+            "typeof",
+            "unicode",
+            "unistr",
+            "unistr_quote",
+            "quote",
+            "randomblob",
+            "sign",
+            "soundex",
+            "zeroblob",
+            "sequence_watermark_experimental",
+        ] {
+            for (arguments, expected) in [
+                ("", format!("{function} function with no arguments")),
+                (
+                    "1, 2",
+                    format!("{function} function called with not exactly 1 arguments"),
+                ),
+            ] {
+                let error = analyze_expression(
+                    &expression(&format!("SELECT {function}({arguments})")),
+                    &Scope::default(),
+                    ExprPolicy::select(DoubleQuotedDml::Enabled),
+                )
+                .expect_err("invalid unary call fails during semantic analysis");
+                assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+            }
+        }
+
+        let analyzed = analyze_expression(
+            &expression("SELECT abs(1)"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("valid unary call binds");
+        assert!(matches!(analyzed, Expr::Function(_)));
     }
 
     #[cfg(feature = "json")]
