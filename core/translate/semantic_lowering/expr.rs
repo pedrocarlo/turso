@@ -1,5 +1,7 @@
 use std::ops::ControlFlow;
 
+#[cfg(feature = "json")]
+use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
@@ -527,6 +529,24 @@ impl ExprLowerer<'_> {
                 rhs,
                 dest: target,
             },
+            #[cfg(feature = "json")]
+            operator @ (Operator::ArrowRight | Operator::ArrowRightShift) => {
+                let function = match operator {
+                    Operator::ArrowRight => JsonFunc::JsonArrowExtract,
+                    Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
+                    _ => unreachable!("JSON arrow operator was matched"),
+                };
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: lhs,
+                    dest: target,
+                    func: FuncCtx {
+                        func: Func::Json(function),
+                        arg_count: 2,
+                    },
+                });
+                return Ok(target);
+            }
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "HIR binary lowering is not implemented for {operator:?}"
@@ -1148,6 +1168,50 @@ mod tests {
                     }
                 )),
             }
+        }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_arrow_lowering_keeps_existing_function_and_register_shape() {
+        for (operator, expected) in [
+            (Operator::ArrowRight, JsonFunc::JsonArrowExtract),
+            (Operator::ArrowRightShift, JsonFunc::JsonArrowShiftExtract),
+        ] {
+            let expression = hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::String(
+                    "'{\"value\": 3}'".to_string(),
+                ))),
+                operator,
+                rhs: Box::new(hir::Expr::Literal(Literal::String("'$.value'".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..2],
+                [
+                    (Insn::String8 { dest: 1, .. }, _),
+                    (Insn::String8 { dest: 2, .. }, _),
+                ]
+            ));
+            let Insn::Function {
+                constant_mask: 0,
+                start_reg: 1,
+                dest: 8,
+                func:
+                    FuncCtx {
+                        func: Func::Json(actual),
+                        arg_count: 2,
+                    },
+            } = &program.insns[2].0
+            else {
+                panic!("JSON arrow emits its resolved built-in function")
+            };
+            assert_eq!(actual, &expected);
         }
     }
 
