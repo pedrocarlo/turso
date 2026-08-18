@@ -125,7 +125,22 @@ fn lowers_as_plain_function(function: &Func) -> bool {
     match function {
         Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_) => true,
         Func::Scalar(
-            ScalarFunc::Char
+            ScalarFunc::Abs
+            | ScalarFunc::Lower
+            | ScalarFunc::Upper
+            | ScalarFunc::Length
+            | ScalarFunc::OctetLength
+            | ScalarFunc::Typeof
+            | ScalarFunc::Unicode
+            | ScalarFunc::Unistr
+            | ScalarFunc::UnistrQuote
+            | ScalarFunc::Quote
+            | ScalarFunc::RandomBlob
+            | ScalarFunc::Sign
+            | ScalarFunc::Soundex
+            | ScalarFunc::ZeroBlob
+            | ScalarFunc::SequenceWatermark
+            | ScalarFunc::Char
             | ScalarFunc::Printf
             | ScalarFunc::GetByte
             | ScalarFunc::SetByte
@@ -167,6 +182,8 @@ fn lowers_as_plain_function(function: &Func) -> bool {
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq,
         ) => true,
+        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+        Func::Scalar(ScalarFunc::LoadExtension) => true,
         #[cfg(feature = "json")]
         Func::Json(function) => !function.is_internal(),
         _ => false,
@@ -4336,6 +4353,8 @@ mod tests {
             (ScalarFunc::Char, 2),
             (ScalarFunc::GetByte, 2),
             (ScalarFunc::ArraySlice, 3),
+            (ScalarFunc::Abs, 1),
+            (ScalarFunc::SequenceWatermark, 1),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
