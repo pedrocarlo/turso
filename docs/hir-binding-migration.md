@@ -122,6 +122,9 @@ Completed:
   predicate, index hint, column-use counts, and target `SourceId` flow directly
   into the shared access planner without `TableReferences`, binding, rewriting,
   or parser-expression conversion.
+- Top-level UPDATE now uses resolved HIR for target and `FROM` access selection.
+  The NEW-row pseudo-source remains semantic write state and never becomes a
+  physical scan source.
 - HIR planning now starts from the owned document rather than a caller-supplied
   query ID. Query, DML, and trigger roots plan every reachable query once, while
   documents without query work produce an empty query-plan list.

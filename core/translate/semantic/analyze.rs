@@ -7014,6 +7014,82 @@ mod tests {
     }
 
     #[test]
+    fn update_root_uses_hir_access_planning() {
+        use crate::translate::{
+            optimizer::SelectedBtreeOperation,
+            semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        };
+
+        let schema = schema_with_items();
+        let document =
+            analyze_sql_with_schema(&schema, "UPDATE items SET value = 'new' WHERE rowid = 1")
+                .expect("UPDATE binds");
+        document.validate().expect("UPDATE produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE produces UPDATE root");
+        };
+        let target = update.target;
+        let new_source = update.new_source;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("UPDATE plans from resolved HIR");
+        let HirRootPlan::Update(access) = &plan.root else {
+            panic!("UPDATE produces UPDATE access plan");
+        };
+        let [target_loop] = access.loops.as_slice() else {
+            panic!("UPDATE has one target loop");
+        };
+        assert_eq!(target_loop.source, target);
+        assert_ne!(target_loop.source, new_source);
+        assert!(matches!(
+            &target_loop.access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
+                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+            }) if value == "1"
+        ));
+
+        let schema = schema_with_join_tables();
+        let document = analyze_sql_with_schema(
+            &schema,
+            "UPDATE items SET value = categories.label \
+             FROM categories WHERE items.rowid = categories.id",
+        )
+        .expect("UPDATE FROM binds");
+        document
+            .validate()
+            .expect("UPDATE FROM produces closed HIR");
+        let HirRoot::Update(update) = &document.root else {
+            panic!("UPDATE FROM produces UPDATE root");
+        };
+        let target = update.target;
+        let new_source = update.new_source;
+        let from = update
+            .from
+            .as_ref()
+            .expect("UPDATE FROM is preserved")
+            .first;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("UPDATE FROM plans from resolved HIR");
+        let HirRootPlan::Update(access) = &plan.root else {
+            panic!("UPDATE FROM produces UPDATE access plan");
+        };
+        assert_eq!(access.loops.len(), 2);
+        assert!(access.loops.iter().any(|planned| planned.source == target));
+        assert!(access.loops.iter().any(|planned| planned.source == from));
+        assert!(access
+            .loops
+            .iter()
+            .all(|planned| planned.source != new_source));
+    }
+
+    #[test]
     fn delete_root_uses_hir_access_planning() {
         use crate::translate::{
             optimizer::SelectedBtreeOperation,

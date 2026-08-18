@@ -53,7 +53,7 @@ pub(crate) struct HirPlan {
 pub(crate) enum HirRootPlan {
     Query,
     Insert,
-    Update,
+    Update(HirAccessPlan),
     Delete(HirAccessPlan),
     Trigger,
     SchemaExpressions,
@@ -186,13 +186,41 @@ impl<'a> HirPlanContext<'a> {
         match &self.document.root {
             hir::HirRoot::Query(_) => Ok(HirRootPlan::Query),
             hir::HirRoot::Insert(_) => Ok(HirRootPlan::Insert),
-            hir::HirRoot::Update(_) => Ok(HirRootPlan::Update),
+            hir::HirRoot::Update(update) => self
+                .plan_update(update, schema, params, query_estimate)
+                .map(HirRootPlan::Update),
             hir::HirRoot::Delete(delete) => self
                 .plan_delete(delete, schema, params, query_estimate)
                 .map(HirRootPlan::Delete),
             hir::HirRoot::Trigger(_) => Ok(HirRootPlan::Trigger),
             hir::HirRoot::SchemaExpressions(_) => Ok(HirRootPlan::SchemaExpressions),
         }
+    }
+
+    fn plan_update(
+        &self,
+        update: &hir::Update,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirAccessPlan> {
+        let usage = update.direct_column_usage(|source| self.document.source(source));
+        let mut input = HirQueryBlockPlanInput {
+            sources: vec![self.plan_source(update.target, None, &usage)?],
+            groups: Vec::new(),
+            predicates: Vec::new(),
+        };
+        if let Some(from) = &update.from {
+            self.append_from(from, HirFromContext::default(), &mut input, &usage)?;
+        }
+        if let Some(predicate) = &update.predicate {
+            append_predicates(&mut input.predicates, predicate, None);
+        }
+
+        self.plan_source_access(input, None, 1.0, schema, params, query_estimate)?
+            .ok_or_else(|| {
+                LimboError::InternalError("UPDATE target produced no access plan".to_string())
+            })
     }
 
     fn plan_delete(

@@ -30,10 +30,6 @@ impl ColumnUsageCollector {
             .sort_unstable_by_key(|usage| (usage.reference.source.index(), usage.reference.column));
         usage
     }
-
-    fn into_reads(self) -> impl Iterator<Item = ColumnRef> {
-        self.into_usage().into_iter().map(|usage| usage.reference)
-    }
 }
 
 impl HirDocument {
@@ -376,12 +372,12 @@ impl Query {
 }
 
 impl Update {
-    /// Return every table column read directly by the UPDATE root. Nested
-    /// queries own their reads and are visited separately by the analyzer.
-    pub(crate) fn direct_column_reads<'source>(
+    /// Count every table column read directly by the UPDATE root. Nested
+    /// queries own their usage and are visited separately by later phases.
+    pub(crate) fn direct_column_usage<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
-    ) -> impl Iterator<Item = ColumnRef> {
+    ) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
         if let Some(from) = &self.from {
             collect_from_column_reads(from, &mut reads, source_by_id);
@@ -406,7 +402,18 @@ impl Update {
             }
         }
 
-        reads.into_reads()
+        reads.into_usage()
+    }
+
+    /// Return every table column read directly by the UPDATE root. Nested
+    /// queries own their reads and are visited separately by the analyzer.
+    pub(crate) fn direct_column_reads<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+    ) -> impl Iterator<Item = ColumnRef> {
+        self.direct_column_usage(source_by_id)
+            .into_iter()
+            .map(|usage| usage.reference)
     }
 }
 
