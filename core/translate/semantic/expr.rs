@@ -19,6 +19,9 @@ use crate::{
     LimboError, Result,
 };
 
+#[cfg(feature = "json")]
+use crate::function::JsonFunc;
+
 /// Clause rules that change expression name visibility.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExprPolicy {
@@ -661,6 +664,65 @@ fn normalize_scalar_input(
             unreachable!("ordered-set functions are aggregate functions")
         }
     }
+}
+
+#[cfg(feature = "json")]
+fn validate_json_arguments(function: &JsonFunc, count: usize) -> Result<()> {
+    let require_exact = |expected| {
+        if count == 0 {
+            crate::bail_parse_error!("{} function with no arguments", function);
+        }
+        if count != expected {
+            crate::bail_parse_error!(
+                "{} function called with not exactly {} arguments",
+                function,
+                expected
+            );
+        }
+        Ok(())
+    };
+    let require_max = |maximum| {
+        if count == 0 {
+            crate::bail_parse_error!("{} function with no arguments", function);
+        }
+        if count > maximum {
+            crate::bail_parse_error!(
+                "{} function called with more than {} arguments",
+                function,
+                maximum
+            );
+        }
+        Ok(())
+    };
+
+    match function {
+        JsonFunc::Json | JsonFunc::Jsonb | JsonFunc::JsonValid | JsonFunc::JsonQuote => {
+            require_exact(1)
+        }
+        JsonFunc::JsonErrorPosition if count != 1 => {
+            crate::bail_parse_error!("{} function with not exactly 1 argument", function)
+        }
+        JsonFunc::JsonErrorPosition => Ok(()),
+        JsonFunc::JsonPatch | JsonFunc::JsonbPatch => require_exact(2),
+        JsonFunc::JsonArrayLength | JsonFunc::JsonType | JsonFunc::JsonPretty => require_max(2),
+        JsonFunc::JsonObject | JsonFunc::JsonbObject if count % 2 != 0 => {
+            crate::bail_parse_error!("{} function requires an even number of arguments", function)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(feature = "json")]
+fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
+    if let Func::Json(function) = function {
+        validate_json_arguments(function, input.argument_count())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "json"))]
+fn validate_scalar_arguments(_: &Func, _: &FunctionInput) -> Result<()> {
+    Ok(())
 }
 
 struct ExprFrame<'a> {
@@ -2487,6 +2549,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         } else {
             (input, filter)
         };
+        if matches!(binding, FunctionBinding::Scalar) {
+            validate_scalar_arguments(&function, &input)?;
+        }
         let special_operation =
             match self.resolve_custom_type_operation(&function, &input, expected_type)? {
                 Some((operation, result_type)) => {
@@ -4452,6 +4517,62 @@ mod tests {
             error.to_string(),
             "Parse error: misuse of aggregate function sum()"
         );
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_argument_rules_are_checked_during_semantic_analysis() {
+        for sql in [
+            "SELECT json_object()",
+            "SELECT json_object('key', 1)",
+            "SELECT json_pretty('{}')",
+            "SELECT json_pretty('{}', '  ')",
+            "SELECT json_array()",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid JSON call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+
+        for (sql, expected) in [
+            ("SELECT json()", "json function with no arguments"),
+            (
+                "SELECT json(1, 2)",
+                "json function called with not exactly 1 arguments",
+            ),
+            (
+                "SELECT json_error_position()",
+                "json_error_position function with not exactly 1 argument",
+            ),
+            (
+                "SELECT json_patch(1)",
+                "json_patch function called with not exactly 2 arguments",
+            ),
+            (
+                "SELECT json_array_length()",
+                "json_array_length function with no arguments",
+            ),
+            (
+                "SELECT json_pretty(1, 2, 3)",
+                "json_pretty function called with more than 2 arguments",
+            ),
+            (
+                "SELECT json_object('key')",
+                "json_object function requires an even number of arguments",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid JSON call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
     }
 
     #[test]
