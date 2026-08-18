@@ -1,5 +1,6 @@
 use std::ops::ControlFlow;
 
+use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
 use crate::vdbe::{
@@ -124,6 +125,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 children,
             ),
             hir::Expr::Binary {
+                operator: operator @ (Operator::ArrayContains | Operator::ArrayOverlap),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+                ..
+            } => self.emit_array_binary(*operator, context.binary_operands, target, children),
+            hir::Expr::Binary {
                 operator,
                 array_concat: false,
                 custom: None,
@@ -138,6 +146,55 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn emit_array_binary(
+        &mut self,
+        operator: Operator,
+        operands: BinaryOperands,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
+        let start_reg = match operands {
+            BinaryOperands::Shared(source) => {
+                debug_assert_eq!(children, [source]);
+                let start = self.program.alloc_registers(2);
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: source,
+                    dst_reg: start,
+                    extra_amount: 0,
+                });
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: source,
+                    dst_reg: start + 1,
+                    extra_amount: 0,
+                });
+                start
+            }
+            BinaryOperands::Pair { lhs, rhs } => {
+                debug_assert_eq!(children, [lhs, rhs]);
+                debug_assert_eq!(rhs, lhs + 1);
+                lhs
+            }
+            BinaryOperands::Unallocated => {
+                unreachable!("binary expression allocated operand registers")
+            }
+        };
+        let function = match operator {
+            Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
+            Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
+            _ => unreachable!("array binary operator was matched by the caller"),
+        };
+        self.program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg,
+            dest: target,
+            func: FuncCtx {
+                func: Func::Scalar(function),
+                arg_count: 2,
+            },
+        });
+        Ok(target)
+    }
+
     fn emit_scalar_comparison(
         &mut self,
         operator: Operator,
@@ -967,6 +1024,80 @@ mod tests {
             *collation,
             Some(crate::translate::collate::CollationSeq::NoCase)
         );
+    }
+
+    #[test]
+    fn array_binary_lowering_keeps_existing_function_and_register_shape() {
+        for operator in [Operator::ArrayContains, Operator::ArrayOverlap] {
+            for shared in [false, true] {
+                let rhs = if shared { "2" } else { "3" };
+                let expression = hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    operator,
+                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric(rhs.to_string()))),
+                    array_concat: false,
+                    custom: None,
+                    comparison: None,
+                };
+                let mut program = program();
+
+                assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+                let function_index = if shared {
+                    assert!(matches!(
+                        &program.insns[..3],
+                        [
+                            (Insn::Integer { value: 2, dest: 1 }, _),
+                            (
+                                Insn::Copy {
+                                    src_reg: 1,
+                                    dst_reg: 2,
+                                    extra_amount: 0
+                                },
+                                _
+                            ),
+                            (
+                                Insn::Copy {
+                                    src_reg: 1,
+                                    dst_reg: 3,
+                                    extra_amount: 0
+                                },
+                                _
+                            ),
+                        ]
+                    ));
+                    3
+                } else {
+                    assert!(matches!(
+                        &program.insns[..2],
+                        [
+                            (Insn::Integer { value: 2, dest: 1 }, _),
+                            (Insn::Integer { value: 3, dest: 2 }, _),
+                        ]
+                    ));
+                    2
+                };
+                let expected_start = if shared { 2 } else { 1 };
+                let Insn::Function {
+                    constant_mask: 0,
+                    start_reg,
+                    dest: 8,
+                    func:
+                        FuncCtx {
+                            func: Func::Scalar(function),
+                            arg_count: 2,
+                        },
+                } = &program.insns[function_index].0
+                else {
+                    panic!("array operator emits scalar function")
+                };
+                assert_eq!(*start_reg, expected_start);
+                assert!(matches!(
+                    (operator, function),
+                    (Operator::ArrayContains, ScalarFunc::ArrayContainsAll)
+                        | (Operator::ArrayOverlap, ScalarFunc::ArrayOverlap)
+                ));
+            }
+        }
     }
 
     #[test]
