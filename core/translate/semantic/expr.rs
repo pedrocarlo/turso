@@ -727,6 +727,7 @@ fn require_exact_arguments(function: &Func, count: usize, expected: usize) -> Re
 }
 
 fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
+    let count = input.argument_count();
     match function {
         Func::Scalar(
             ScalarFunc::Abs
@@ -744,13 +745,20 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
             | ScalarFunc::Soundex
             | ScalarFunc::ZeroBlob
             | ScalarFunc::SequenceWatermark,
-        ) => require_exact_arguments(function, input.argument_count(), 1),
-        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-        Func::Scalar(ScalarFunc::LoadExtension) => {
-            require_exact_arguments(function, input.argument_count(), 1)
+        ) => require_exact_arguments(function, count, 1),
+        Func::Scalar(ScalarFunc::Hex) if count != 1 => {
+            crate::bail_parse_error!("hex function must have exactly 1 argument")
         }
+        Func::Scalar(ScalarFunc::Instr) if count != 2 => {
+            crate::bail_parse_error!("{} function must have two argument", function)
+        }
+        Func::Scalar(ScalarFunc::Replace) if count != 3 => {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", function)
+        }
+        #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+        Func::Scalar(ScalarFunc::LoadExtension) => require_exact_arguments(function, count, 1),
         #[cfg(feature = "json")]
-        Func::Json(function) => validate_json_arguments(function, input.argument_count()),
+        Func::Json(function) => validate_json_arguments(function, count),
         _ => Ok(()),
     }
 }
@@ -4592,6 +4600,54 @@ mod tests {
         )
         .expect("valid unary call binds");
         assert!(matches!(analyzed, Expr::Function(_)));
+    }
+
+    #[test]
+    fn fixed_ordinary_argument_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            (
+                "SELECT timediff()",
+                "wrong number of arguments to function timediff()",
+            ),
+            (
+                "SELECT timediff(1)",
+                "wrong number of arguments to function timediff()",
+            ),
+            ("SELECT hex()", "hex function must have exactly 1 argument"),
+            ("SELECT nullif(1)", "no such function: nullif"),
+            (
+                "SELECT instr(1, 2, 3)",
+                "instr function must have two argument",
+            ),
+            (
+                "SELECT replace(1, 2)",
+                "wrong number of arguments to function replace()",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid fixed-arity call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in [
+            "SELECT timediff(1, 2)",
+            "SELECT hex(1)",
+            "SELECT nullif(1, 2)",
+            "SELECT instr(1, 2)",
+            "SELECT replace(1, 2, 3)",
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid fixed-arity call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
     }
 
     #[cfg(feature = "json")]
