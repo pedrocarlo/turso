@@ -150,6 +150,8 @@ fn lowers_as_plain_function(function: &Func) -> bool {
             | ScalarFunc::RTrim
             | ScalarFunc::Round
             | ScalarFunc::Unhex
+            | ScalarFunc::Min
+            | ScalarFunc::Max
             | ScalarFunc::Char
             | ScalarFunc::Printf
             | ScalarFunc::GetByte
@@ -4375,6 +4377,8 @@ mod tests {
             (ScalarFunc::RTrim, 1),
             (ScalarFunc::Round, 2),
             (ScalarFunc::Unhex, 2),
+            (ScalarFunc::Min, 2),
+            (ScalarFunc::Max, 3),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
