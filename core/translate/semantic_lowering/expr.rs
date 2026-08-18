@@ -73,6 +73,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             },
             hir::Expr::IsNull(_) | hir::Expr::NotNull(_) => self.program.alloc_register(),
             hir::Expr::Collate { .. } => context.target,
+            hir::Expr::Cast { .. } => {
+                if child_index == 0 {
+                    context.target
+                } else {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
             hir::Expr::Binary { lhs, rhs, .. } => {
                 if matches!(context.binary_operands, BinaryOperands::Unallocated) {
                     context.binary_operands = if lhs.equivalent(rhs) {
@@ -118,6 +125,23 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     unreachable!("COLLATE has one lowered child")
                 };
                 debug_assert_eq!(*value, target);
+                Ok(target)
+            }
+            hir::Expr::Cast {
+                target: cast_target,
+                ..
+            } if cast_target.programs.apply_builtin_affinity
+                && cast_target.programs.encode.is_empty()
+                && cast_target.programs.domain.is_none() =>
+            {
+                let [value] = children else {
+                    unreachable!("built-in CAST has one lowered child")
+                };
+                debug_assert_eq!(*value, target);
+                self.program.emit_insn(Insn::Cast {
+                    reg: target,
+                    affinity: cast_target.affinity,
+                });
                 Ok(target)
             }
             hir::Expr::Binary {
@@ -836,6 +860,62 @@ mod tests {
             }
         ));
         assert_eq!(program.curr_collation_ctx(), None);
+    }
+
+    #[test]
+    fn builtin_cast_uses_resolved_affinity_and_skips_type_parameters() {
+        for affinity in [
+            crate::vdbe::affinity::Affinity::Numeric,
+            crate::vdbe::affinity::Affinity::Text,
+        ] {
+            let expression = hir::Expr::Cast {
+                expr: Box::new(hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    operator: Operator::Add,
+                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    array_concat: false,
+                    custom: None,
+                    comparison: None,
+                }),
+                target: hir::TypeName {
+                    name: "resolved".to_string(),
+                    parameters: vec![hir::Expr::Literal(Literal::Numeric("99".to_string()))],
+                    array_dimensions: 0,
+                    type_fact: TypeFact::dynamic(),
+                    affinity,
+                    programs: hir::BoundCastPrograms {
+                        encode: Vec::new(),
+                        domain: None,
+                        apply_builtin_affinity: true,
+                    },
+                },
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                program.insns.as_slice(),
+                [
+                    (Insn::Integer { value: 2, dest: 1 }, _),
+                    (Insn::Integer { value: 3, dest: 2 }, _),
+                    (
+                        Insn::Add {
+                            lhs: 1,
+                            rhs: 2,
+                            dest: 8
+                        },
+                        _
+                    ),
+                    (
+                        Insn::Cast {
+                            reg: 8,
+                            affinity: emitted_affinity
+                        },
+                        _
+                    ),
+                ] if *emitted_affinity == affinity
+            ));
+        }
     }
 
     #[derive(Clone, Copy)]
