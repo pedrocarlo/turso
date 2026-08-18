@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{Func, FuncCtx, ScalarFunc};
+use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc};
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
 use crate::vdbe::{
@@ -471,7 +471,10 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && matches!(call.function.value(), Func::External(_) | Func::Dialect(_)) =>
+                    && matches!(
+                        call.function.value(),
+                        Func::External(_) | Func::Dialect(_) | Func::Math(_)
+                    ) =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -870,7 +873,10 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && matches!(call.function.value(), Func::External(_) | Func::Dialect(_)) =>
+                    && matches!(
+                        call.function.value(),
+                        Func::External(_) | Func::Dialect(_) | Func::Math(_)
+                    ) =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -890,15 +896,20 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 debug_assert!(children
                     .windows(2)
                     .all(|registers| registers[1] == registers[0] + 1));
-                expr::emit_function_call(
-                    self.program,
-                    FuncCtx {
+                let start_reg = match call.function.value() {
+                    Func::Math(function) if matches!(function.arity(), MathFuncArity::Nullary) => 0,
+                    _ if children.is_empty() => target,
+                    _ => children[0],
+                };
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg,
+                    dest: target,
+                    func: FuncCtx {
                         func: call.function.value().clone(),
                         arg_count: values.len(),
                     },
-                    children,
-                    target,
-                )?;
+                });
                 Ok(target)
             }
             hir::Expr::Row(values) => {
@@ -4150,6 +4161,64 @@ mod tests {
                 _,
             )]
         ));
+    }
+
+    #[test]
+    fn math_functions_keep_legacy_argument_registers() {
+        use crate::function::MathFunc;
+
+        let cases = [
+            (MathFunc::Pi, Vec::new(), 0, 0),
+            (
+                MathFunc::Sqrt,
+                vec![hir::Expr::Literal(Literal::Numeric("4".to_string()))],
+                1,
+                1,
+            ),
+            (
+                MathFunc::Pow,
+                vec![
+                    hir::Expr::Literal(Literal::Numeric("2".to_string())),
+                    hir::Expr::Literal(Literal::Numeric("3".to_string())),
+                ],
+                1,
+                2,
+            ),
+            (
+                MathFunc::Log,
+                vec![hir::Expr::Literal(Literal::Numeric("8".to_string()))],
+                1,
+                1,
+            ),
+            (
+                MathFunc::Log,
+                vec![
+                    hir::Expr::Literal(Literal::Numeric("2".to_string())),
+                    hir::Expr::Literal(Literal::Numeric("8".to_string())),
+                ],
+                1,
+                2,
+            ),
+        ];
+
+        for (function, arguments, expected_start, expected_count) in cases {
+            let mut program = program();
+            let expression = ordinary_scalar_call(Func::Math(function), arguments);
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.last().map(|(instruction, _)| instruction),
+                Some(Insn::Function {
+                    constant_mask: 0,
+                    start_reg,
+                    dest: 8,
+                    func: FuncCtx {
+                        func: Func::Math(_),
+                        arg_count,
+                    },
+                }) if *start_reg == expected_start && *arg_count == expected_count
+            ));
+        }
     }
 
     #[test]
