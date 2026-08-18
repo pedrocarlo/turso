@@ -74,6 +74,7 @@ enum ExprRegisters {
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
     RaiseMessage(usize),
+    Function(usize),
 }
 
 enum NullTest {
@@ -467,6 +468,35 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 };
                 message
             }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::External(_) | Func::Dialect(_)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has argument ordering".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers =
+                        ExprRegisters::Function(self.program.alloc_registers(values.len()));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("function argument registers were allocated")
+                };
+                start + child_index
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -835,6 +865,40 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::External(_) | Func::Dialect(_)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid lowered arguments".to_string(),
+                    ));
+                }
+                debug_assert!(children
+                    .windows(2)
+                    .all(|registers| registers[1] == registers[0] + 1));
+                expr::emit_function_call(
+                    self.program,
+                    FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: values.len(),
+                    },
+                    children,
+                    target,
+                )?;
                 Ok(target)
             }
             hir::Expr::Row(values) => {
@@ -1669,6 +1733,20 @@ mod tests {
             None,
             crate::sync::Arc::new(function),
         )
+    }
+
+    fn ordinary_scalar_call(function: Func, values: Vec<hir::Expr>) -> hir::Expr {
+        hir::Expr::Function(hir::FunctionCall {
+            function: resolved_function(function),
+            evaluation: hir::FunctionEvaluation::Scalar,
+            arguments: hir::FunctionArguments::Expressions {
+                values,
+                distinctness: None,
+                order_by: Vec::new(),
+            },
+            result_type: TypeFact::dynamic(),
+            operation: hir::FunctionOperation::Ordinary,
+        })
     }
 
     fn resolved_type(kind: crate::schema::TypeDefKind) -> hir::ResolvedType {
@@ -4000,6 +4078,98 @@ mod tests {
         let mut program = program();
         translate_expr(&mut program, &expression, 4).unwrap();
         assert_eq!(program.insns.len(), 19_999);
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn dialect_scalar_function_uses_consecutive_argument_registers() {
+        let expression = ordinary_scalar_call(
+            Func::Dialect("catalog_value".to_string()),
+            vec![
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    operator: Operator::Add,
+                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    array_concat: false,
+                    custom: None,
+                    comparison: None,
+                },
+            ],
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 1, dest: 1 }, _),
+                (Insn::Integer { value: 2, dest: 3 }, _),
+                (Insn::Integer { value: 3, dest: 4 }, _),
+                (
+                    Insn::Add {
+                        lhs: 3,
+                        rhs: 4,
+                        dest: 2,
+                    },
+                    _,
+                ),
+                (
+                    Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx {
+                            func: Func::Dialect(name),
+                            arg_count: 2,
+                        },
+                    },
+                    _,
+                ),
+            ] if name == "catalog_value"
+        ));
+    }
+
+    #[test]
+    fn zero_argument_dialect_function_keeps_legacy_start_register() {
+        let expression =
+            ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), Vec::new());
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Function {
+                    start_reg: 8,
+                    dest: 8,
+                    func: FuncCtx { arg_count: 0, .. },
+                    ..
+                },
+                _,
+            )]
+        ));
+    }
+
+    #[test]
+    fn nested_dialect_functions_do_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression =
+                ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), vec![expression]);
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
+                .count(),
+            10_000
+        );
 
         std::mem::forget(expression);
     }
