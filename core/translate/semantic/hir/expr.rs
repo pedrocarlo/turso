@@ -13,6 +13,7 @@ use super::{
     ResolvedCollation, ResolvedFunction, ResolvedSequence, ResolvedTable, ResolvedType, SourceId,
     TypeFact, WindowId,
 };
+use crate::parameters::ParameterSpelling;
 use crate::sync::Arc;
 use crate::util::check_literal_equivalency;
 use crate::vdbe::affinity::Affinity;
@@ -20,7 +21,7 @@ use crate::vdbe::affinity::Affinity;
 #[derive(Clone, Debug)]
 pub struct Parameter {
     pub index: NonZeroU32,
-    pub name: Option<String>,
+    pub spelling: ParameterSpelling,
     pub type_fact: TypeFact,
 }
 

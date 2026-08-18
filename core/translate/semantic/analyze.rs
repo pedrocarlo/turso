@@ -2389,20 +2389,22 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
+        use crate::parameters::ParameterSpelling;
+
         let expected = [
-            (1, None),
-            (3, None),
-            (4, Some(":named")),
-            (4, Some(":named")),
-            (5, Some("@other")),
+            (1, ParameterSpelling::Anonymous),
+            (3, ParameterSpelling::Numbered),
+            (4, ParameterSpelling::Named(":named".to_string())),
+            (4, ParameterSpelling::Named(":named".to_string())),
+            (5, ParameterSpelling::Named("@other".to_string())),
         ];
 
-        for (output, (index, name)) in outputs.iter().zip(expected) {
+        for (output, (index, spelling)) in outputs.iter().zip(expected) {
             let Expr::Parameter(parameter) = &output.expr else {
                 panic!("parser variable becomes HIR parameter");
             };
             assert_eq!(parameter.index.get(), index);
-            assert_eq!(parameter.name.as_deref(), name);
+            assert_eq!(parameter.spelling, spelling);
             assert!(parameter.type_fact.storage.is_none());
             assert!(parameter.type_fact.declared.is_none());
             assert!(!output.has_affinity);

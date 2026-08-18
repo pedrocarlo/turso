@@ -7,7 +7,7 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
-    parameters::Parameters,
+    parameters::{ParameterSpelling, Parameters},
     schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
@@ -626,21 +626,35 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
-    /// Register an `ast::Variable` in the parameter list. Returns the
-    /// `NonZeroUsize` index for use in `Insn::Variable`.
-    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
-        let index = usize::try_from(variable.index.get())
+    /// Register a parameter whose index and spelling were fixed before
+    /// bytecode lowering.
+    pub fn register_parameter(
+        &mut self,
+        index: std::num::NonZeroU32,
+        spelling: &ParameterSpelling,
+    ) -> NonZeroUsize {
+        let index = usize::try_from(index.get())
             .expect("u32 variable index must fit into usize")
             .try_into()
             .expect("variable index must be non-zero");
-        if let Some(name) = variable.name.as_deref() {
-            self.parameters.push_named_at(name, index);
-        } else if variable.numbered {
-            self.parameters.push_numbered(index);
-        } else {
-            self.parameters.push_index(index);
+        match spelling {
+            ParameterSpelling::Anonymous => self.parameters.push_index(index),
+            ParameterSpelling::Numbered => self.parameters.push_numbered(index),
+            ParameterSpelling::Named(name) => self.parameters.push_named_at(name, index),
         }
-        index
+    }
+
+    /// Register an `ast::Variable` in the parameter list. Returns the
+    /// `NonZeroUsize` index for use in `Insn::Variable`.
+    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
+        let spelling = if let Some(name) = variable.name.as_deref() {
+            ParameterSpelling::Named(name.to_owned())
+        } else if variable.numbered {
+            ParameterSpelling::Numbered
+        } else {
+            ParameterSpelling::Anonymous
+        };
+        self.register_parameter(variable.index, &spelling)
     }
 
     /// Run a nested emission scope without leaking its result-column register base

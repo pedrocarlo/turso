@@ -1972,7 +1972,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 self.resolve_atomic_expr(
                     hir::Expr::Parameter(hir::Parameter {
                         index: variable.index,
-                        name: variable.name.as_deref().map(str::to_owned),
+                        spelling: match variable.name.as_deref() {
+                            Some(name) => {
+                                crate::parameters::ParameterSpelling::Named(name.to_owned())
+                            }
+                            None if variable.numbered => {
+                                crate::parameters::ParameterSpelling::Numbered
+                            }
+                            None => crate::parameters::ParameterSpelling::Anonymous,
+                        },
                         type_fact: hir::TypeFact::dynamic(),
                     }),
                     scope,
