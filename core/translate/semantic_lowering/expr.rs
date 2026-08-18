@@ -121,9 +121,23 @@ fn comparison_collation(
         .map(|collation| *collation.value())
 }
 
-fn lowers_as_plain_function(function: &Func) -> bool {
+#[derive(Clone, Copy)]
+enum EmptyArgumentStart {
+    UseTarget,
+    UseZero,
+    UseNextRegister,
+    ReserveOneRegister,
+}
+
+fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
     match function {
-        Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_) => true,
+        Func::External(_) | Func::Dialect(_) | Func::Vector(_) => {
+            Some(EmptyArgumentStart::UseTarget)
+        }
+        Func::Math(function) if matches!(function.arity(), MathFuncArity::Nullary) => {
+            Some(EmptyArgumentStart::UseZero)
+        }
+        Func::Math(_) => Some(EmptyArgumentStart::UseTarget),
         Func::Scalar(
             ScalarFunc::Abs
             | ScalarFunc::Lower
@@ -193,12 +207,16 @@ fn lowers_as_plain_function(function: &Func) -> bool {
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq,
-        ) => true,
+        ) => Some(EmptyArgumentStart::UseNextRegister),
         #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-        Func::Scalar(ScalarFunc::LoadExtension) => true,
+        Func::Scalar(ScalarFunc::LoadExtension) => Some(EmptyArgumentStart::UseNextRegister),
         #[cfg(feature = "json")]
-        Func::Json(function) => !function.is_internal(),
-        _ => false,
+        Func::Json(JsonFunc::JsonRemove) => Some(EmptyArgumentStart::ReserveOneRegister),
+        #[cfg(feature = "json")]
+        Func::Json(function) if !function.is_internal() => {
+            Some(EmptyArgumentStart::UseNextRegister)
+        }
+        _ => None,
     }
 }
 
@@ -552,7 +570,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && lowers_as_plain_function(call.function.value()) =>
+                    && plain_function_lowering(call.function.value()).is_some() =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -951,7 +969,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && lowers_as_plain_function(call.function.value()) =>
+                    && plain_function_lowering(call.function.value()).is_some() =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -971,17 +989,17 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 debug_assert!(children
                     .windows(2)
                     .all(|registers| registers[1] == registers[0] + 1));
-                let start_reg = match call.function.value() {
-                    Func::Math(function) if matches!(function.arity(), MathFuncArity::Nullary) => 0,
-                    #[cfg(feature = "json")]
-                    Func::Json(JsonFunc::JsonRemove) if children.is_empty() => {
-                        self.program.alloc_register()
+                let lowering = plain_function_lowering(call.function.value())
+                    .expect("plain function lowering was checked by the match guard");
+                let start_reg = if let Some(start) = children.first() {
+                    *start
+                } else {
+                    match lowering {
+                        EmptyArgumentStart::UseTarget => target,
+                        EmptyArgumentStart::UseZero => 0,
+                        EmptyArgumentStart::UseNextRegister => self.program.alloc_registers(0),
+                        EmptyArgumentStart::ReserveOneRegister => self.program.alloc_register(),
                     }
-                    #[cfg(feature = "json")]
-                    Func::Json(_) if children.is_empty() => self.program.alloc_registers(0),
-                    Func::Scalar(_) if children.is_empty() => self.program.alloc_registers(0),
-                    _ if children.is_empty() => target,
-                    _ => children[0],
                 };
                 self.program.emit_insn(Insn::Function {
                     constant_mask: 0,
