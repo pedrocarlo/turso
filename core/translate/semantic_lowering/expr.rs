@@ -121,6 +121,15 @@ fn comparison_collation(
         .map(|collation| *collation.value())
 }
 
+fn lowers_as_plain_function(function: &Func) -> bool {
+    match function {
+        Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_) => true,
+        #[cfg(feature = "json")]
+        Func::Json(function) => !function.is_internal(),
+        _ => false,
+    }
+}
+
 struct ExprLowerer<'a> {
     program: &'a mut ProgramBuilder,
 }
@@ -471,10 +480,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && matches!(
-                        call.function.value(),
-                        Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_)
-                    ) =>
+                    && lowers_as_plain_function(call.function.value()) =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -873,10 +879,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
-                    && matches!(
-                        call.function.value(),
-                        Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_)
-                    ) =>
+                    && lowers_as_plain_function(call.function.value()) =>
             {
                 let hir::FunctionArguments::Expressions {
                     values,
@@ -898,6 +901,12 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     .all(|registers| registers[1] == registers[0] + 1));
                 let start_reg = match call.function.value() {
                     Func::Math(function) if matches!(function.arity(), MathFuncArity::Nullary) => 0,
+                    #[cfg(feature = "json")]
+                    Func::Json(JsonFunc::JsonRemove) if children.is_empty() => {
+                        self.program.alloc_register()
+                    }
+                    #[cfg(feature = "json")]
+                    Func::Json(_) if children.is_empty() => self.program.alloc_registers(0),
                     _ if children.is_empty() => target,
                     _ => children[0],
                 };
@@ -4257,6 +4266,95 @@ mod tests {
                 }) if *arg_count == argument_count
             ));
         }
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_functions_preserve_empty_and_nonempty_register_shapes() {
+        let mut empty_array_program = program();
+        let expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonArray), Vec::new());
+
+        translate_expr(&mut empty_array_program, &expression, 8).unwrap();
+        assert!(matches!(
+            empty_array_program.insns.as_slice(),
+            [(
+                Insn::Function {
+                    start_reg: 1,
+                    dest: 8,
+                    func: FuncCtx { arg_count: 0, .. },
+                    ..
+                },
+                _,
+            )]
+        ));
+        assert_eq!(empty_array_program.alloc_register(), 1);
+
+        let mut empty_remove_program = program();
+        let expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonRemove), Vec::new());
+
+        translate_expr(&mut empty_remove_program, &expression, 8).unwrap();
+        assert!(matches!(
+            empty_remove_program.insns.as_slice(),
+            [(
+                Insn::Function {
+                    start_reg: 1,
+                    dest: 8,
+                    func: FuncCtx { arg_count: 0, .. },
+                    ..
+                },
+                _,
+            )]
+        ));
+        assert_eq!(empty_remove_program.alloc_register(), 2);
+
+        let mut object_program = program();
+        let expression = ordinary_scalar_call(
+            Func::Json(JsonFunc::JsonObject),
+            vec![
+                hir::Expr::Literal(Literal::String("'key'".to_string())),
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+            ],
+        );
+
+        translate_expr(&mut object_program, &expression, 8).unwrap();
+        assert!(matches!(
+            object_program.insns.as_slice(),
+            [
+                (Insn::String8 { dest: 1, .. }, _),
+                (Insn::Integer { dest: 2, .. }, _),
+                (
+                    Insn::Function {
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx { arg_count: 2, .. },
+                        ..
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn nested_json_functions_do_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::String("'value'".to_string()));
+        for _ in 0..10_000 {
+            expression = ordinary_scalar_call(Func::Json(JsonFunc::JsonQuote), vec![expression]);
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
     }
 
     #[test]
