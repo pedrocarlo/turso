@@ -145,6 +145,11 @@ fn lowers_as_plain_function(function: &Func) -> bool {
             | ScalarFunc::Nullif
             | ScalarFunc::Instr
             | ScalarFunc::Replace
+            | ScalarFunc::Trim
+            | ScalarFunc::LTrim
+            | ScalarFunc::RTrim
+            | ScalarFunc::Round
+            | ScalarFunc::Unhex
             | ScalarFunc::Char
             | ScalarFunc::Printf
             | ScalarFunc::GetByte
@@ -4365,6 +4370,11 @@ mod tests {
             (ScalarFunc::Nullif, 2),
             (ScalarFunc::Instr, 2),
             (ScalarFunc::Replace, 3),
+            (ScalarFunc::Trim, 1),
+            (ScalarFunc::LTrim, 2),
+            (ScalarFunc::RTrim, 1),
+            (ScalarFunc::Round, 2),
+            (ScalarFunc::Unhex, 2),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
