@@ -124,6 +124,24 @@ fn comparison_collation(
 fn lowers_as_plain_function(function: &Func) -> bool {
     match function {
         Func::External(_) | Func::Dialect(_) | Func::Math(_) | Func::Vector(_) => true,
+        Func::Scalar(
+            ScalarFunc::Char
+            | ScalarFunc::Printf
+            | ScalarFunc::GetByte
+            | ScalarFunc::SetByte
+            | ScalarFunc::ArrayLength
+            | ScalarFunc::ArrayAppend
+            | ScalarFunc::ArrayPrepend
+            | ScalarFunc::ArrayCat
+            | ScalarFunc::ArrayRemove
+            | ScalarFunc::ArrayContains
+            | ScalarFunc::ArrayPosition
+            | ScalarFunc::ArraySlice
+            | ScalarFunc::StringToArray
+            | ScalarFunc::ArrayToString
+            | ScalarFunc::ArrayOverlap
+            | ScalarFunc::ArrayContainsAll,
+        ) => true,
         #[cfg(feature = "json")]
         Func::Json(function) => !function.is_internal(),
         _ => false,
@@ -907,6 +925,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     }
                     #[cfg(feature = "json")]
                     Func::Json(_) if children.is_empty() => self.program.alloc_registers(0),
+                    Func::Scalar(_) if children.is_empty() => self.program.alloc_registers(0),
                     _ if children.is_empty() => target,
                     _ => children[0],
                 };
@@ -4261,6 +4280,58 @@ mod tests {
                     dest: 8,
                     func: FuncCtx {
                         func: Func::Vector(_),
+                        arg_count,
+                    },
+                }) if *arg_count == argument_count
+            ));
+        }
+    }
+
+    #[test]
+    fn plain_builtin_functions_use_legacy_argument_registers() {
+        let mut empty_program = program();
+        let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Char), Vec::new());
+
+        translate_expr(&mut empty_program, &expression, 8).unwrap();
+        assert!(matches!(
+            empty_program.insns.as_slice(),
+            [(
+                Insn::Function {
+                    start_reg: 1,
+                    dest: 8,
+                    func: FuncCtx { arg_count: 0, .. },
+                    ..
+                },
+                _,
+            )]
+        ));
+        assert_eq!(empty_program.alloc_register(), 1);
+
+        for (function, argument_count) in [
+            (ScalarFunc::Char, 2),
+            (ScalarFunc::GetByte, 2),
+            (ScalarFunc::ArraySlice, 3),
+        ] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression = ordinary_scalar_call(Func::Scalar(function), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(program.insns[..argument_count].iter().enumerate().all(
+                |(index, (instruction, _))| {
+                    matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+                }
+            ));
+            assert!(matches!(
+                program.insns.last().map(|(instruction, _)| instruction),
+                Some(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: 1,
+                    dest: 8,
+                    func: FuncCtx {
+                        func: Func::Scalar(_),
                         arg_count,
                     },
                 }) if *arg_count == argument_count
