@@ -8,6 +8,7 @@ use crate::util::parse_numeric_literal;
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
+    BranchOffset,
 };
 use crate::{LimboError, Numeric, Result, Value};
 use turso_parser::ast::{Literal, Operator, UnaryOperator};
@@ -29,10 +30,19 @@ struct BetweenRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct CaseRegisters {
+    base: Option<usize>,
+    when: usize,
+    return_label: BranchOffset,
+    next_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
     Binary(BinaryOperands),
     Between(BetweenRegisters),
+    Case(CaseRegisters),
 }
 
 enum NullTest {
@@ -206,6 +216,46 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     _ => unreachable!("BETWEEN has three children"),
                 }
             }
+            hir::Expr::Case {
+                base,
+                when_then,
+                base_comparisons,
+                ..
+            } => {
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Case(CaseRegisters {
+                        base: base.as_ref().map(|_| self.program.alloc_register()),
+                        when: self.program.alloc_register(),
+                        return_label: self.program.allocate_label(),
+                        next_label: self.program.allocate_label(),
+                    });
+                }
+                let ExprRegisters::Case(registers) = &mut context.registers else {
+                    unreachable!("CASE registers were allocated")
+                };
+                let pair_start = usize::from(base.is_some());
+                if child_index < pair_start {
+                    registers.base.expect("simple CASE has a base register")
+                } else if child_index < pair_start + when_then.len() * 2 {
+                    let pair_child = child_index - pair_start;
+                    let pair_index = pair_child / 2;
+                    if pair_child % 2 == 0 {
+                        if pair_index > 0 {
+                            self.finish_case_arm(registers);
+                        }
+                        registers.when
+                    } else {
+                        self.emit_case_test(registers, base_comparisons.get(pair_index))?;
+                        context.target
+                    }
+                } else {
+                    debug_assert!(when_then.len() * 2 + pair_start == child_index);
+                    if !when_then.is_empty() {
+                        self.finish_case_arm(registers);
+                    }
+                    context.target
+                }
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -349,6 +399,27 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 });
                 Ok(target)
             }
+            hir::Expr::Case {
+                when_then,
+                else_expr,
+                ..
+            } => {
+                let ExprRegisters::Case(mut registers) = context.registers else {
+                    unreachable!("CASE registers were allocated")
+                };
+                if else_expr.is_none() {
+                    if !when_then.is_empty() {
+                        self.finish_case_arm(&mut registers);
+                    }
+                    self.program.emit_insn(Insn::Null {
+                        dest: target,
+                        dest_end: None,
+                    });
+                }
+                self.program
+                    .preassign_label_to_next_insn(registers.return_label);
+                Ok(target)
+            }
             hir::Expr::Row(values) => {
                 debug_assert_eq!(children.len(), values.len());
                 debug_assert!(children
@@ -365,6 +436,66 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn finish_case_arm(&mut self, registers: &mut CaseRegisters) {
+        self.program.emit_insn(Insn::Goto {
+            target_pc: registers.return_label,
+        });
+        self.program
+            .preassign_label_to_next_insn(registers.next_label);
+        registers.next_label = self.program.allocate_label();
+    }
+
+    fn emit_case_test(
+        &mut self,
+        registers: &CaseRegisters,
+        comparison: Option<&hir::ComparisonSemantics>,
+    ) -> Result<()> {
+        match (registers.base, comparison) {
+            (None, None) => {
+                self.program.emit_insn(Insn::IfNot {
+                    reg: registers.when,
+                    target_pc: registers.next_label,
+                    jump_if_null: true,
+                });
+            }
+            (Some(base), Some(comparison)) => {
+                let [component] = comparison.components.as_slice() else {
+                    return Err(LimboError::InternalError(
+                        "simple CASE comparison must have one component".to_string(),
+                    ));
+                };
+                let flags = CmpInsFlags::default()
+                    .with_affinity(component.affinity)
+                    .jump_if_null();
+                self.program.emit_insn(Insn::Ne {
+                    lhs: base,
+                    rhs: registers.when,
+                    target_pc: registers.next_label,
+                    flags: if component.array {
+                        flags.array_cmp()
+                    } else {
+                        flags
+                    },
+                    collation: component
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value()),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(LimboError::InternalError(
+                    "searched CASE contains comparison metadata".to_string(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(LimboError::InternalError(
+                    "simple CASE is missing comparison metadata".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn emit_null_test(
         &mut self,
         test: NullTest,
@@ -1376,6 +1507,167 @@ mod tests {
                 ] if *emitted_affinity == affinity
             ));
         }
+    }
+
+    #[test]
+    fn simple_case_evaluates_base_once_and_uses_resolved_comparisons() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let expression = hir::Expr::Case {
+            base: Some(Box::new(hir::Expr::Literal(Literal::Numeric(
+                "99".to_string(),
+            )))),
+            when_then: vec![
+                (
+                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                    hir::Expr::Literal(Literal::String("'one'".to_string())),
+                ),
+                (
+                    hir::Expr::Literal(Literal::Numeric("2".to_string())),
+                    hir::Expr::Literal(Literal::String("'two'".to_string())),
+                ),
+            ],
+            else_expr: Some(Box::new(hir::Expr::Literal(Literal::String(
+                "'other'".to_string(),
+            )))),
+            base_comparisons: vec![
+                hir::ComparisonSemantics {
+                    components: vec![hir::ComparisonComponent {
+                        affinity: crate::vdbe::affinity::Affinity::Text,
+                        collation: Some(collation),
+                        array: false,
+                    }],
+                },
+                numeric_comparison(),
+            ],
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| {
+                    matches!(instruction, Insn::Integer { value: 99, .. })
+                })
+                .count(),
+            1
+        );
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Ne {
+                    lhs,
+                    rhs,
+                    flags,
+                    collation,
+                    ..
+                } => Some((
+                    *lhs,
+                    *rhs,
+                    flags.get_affinity(),
+                    flags.has_jump_if_null(),
+                    *collation,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comparisons,
+            vec![
+                (
+                    1,
+                    2,
+                    crate::vdbe::affinity::Affinity::Text,
+                    true,
+                    Some(crate::translate::collate::CollationSeq::NoCase),
+                ),
+                (1, 2, crate::vdbe::affinity::Affinity::Numeric, true, None,),
+            ]
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Goto { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn searched_case_uses_if_not_and_missing_else_writes_null() {
+        let expression = hir::Expr::Case {
+            base: None,
+            when_then: vec![
+                (
+                    hir::Expr::Literal(Literal::Null),
+                    hir::Expr::Literal(Literal::String("'null'".to_string())),
+                ),
+                (
+                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                    hir::Expr::Literal(Literal::String("'true'".to_string())),
+                ),
+            ],
+            else_expr: None,
+            base_comparisons: Vec::new(),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        let tests = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::IfNot {
+                    reg, jump_if_null, ..
+                } => Some((*reg, *jump_if_null)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tests, vec![(1, true), (1, true)]);
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Null {
+                dest: 8,
+                dest_end: None,
+            })
+        ));
+    }
+
+    #[test]
+    fn case_lowering_does_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::Case {
+                base: None,
+                when_then: vec![(
+                    hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                    expression,
+                )],
+                else_expr: Some(Box::new(hir::Expr::Literal(Literal::Null))),
+                base_comparisons: Vec::new(),
+            };
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
     }
 
     #[derive(Clone, Copy)]
