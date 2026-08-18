@@ -118,6 +118,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Trigger predicates and commands now have ordered HIR planner roots. SELECT
+  commands retain their `QueryId`; UPDATE and DELETE commands reuse resolved
+  target access planning without turning trigger OLD/NEW pseudo-sources into
+  physical scans.
 - Top-level DELETE now uses resolved HIR for target access selection. Its
   predicate, index hint, column-use counts, and target `SourceId` flow directly
   into the shared access planner without `TableReferences`, binding, rewriting,

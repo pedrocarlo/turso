@@ -6376,6 +6376,10 @@ mod tests {
 
     #[test]
     fn trigger_program_binds_predicate_and_ordered_commands_once() {
+        use crate::translate::semantic_to_plan::{
+            HirPlan, HirRootPlan, HirTriggerCommandPlan, HirTriggerPlan,
+        };
+
         let schema = schema_with_writable_table();
         let document = analyze_trigger_program_with_schema(
             &schema,
@@ -6448,6 +6452,49 @@ mod tests {
             });
         assert!(delete_reads.contains(&delete.target));
         assert!(delete_reads.contains(&old_source));
+
+        let select_query = *query_id;
+        let update_target = update.target;
+        let delete_target = delete.target;
+        document
+            .validate()
+            .expect("whole trigger program produces closed HIR");
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("whole trigger program plans from resolved HIR");
+        let HirRootPlan::Trigger(HirTriggerPlan::Program(commands)) = &plan.root else {
+            panic!("trigger program produces ordered command plans");
+        };
+        assert_eq!(commands.len(), 4);
+        let HirTriggerCommandPlan::Select(planned_query) = &commands[0] else {
+            panic!("first trigger command plan is SELECT");
+        };
+        assert!(matches!(commands[1], HirTriggerCommandPlan::Insert));
+        let HirTriggerCommandPlan::Update(update_access) = &commands[2] else {
+            panic!("third trigger command plan is UPDATE");
+        };
+        let HirTriggerCommandPlan::Delete(delete_access) = &commands[3] else {
+            panic!("fourth trigger command plan is DELETE");
+        };
+        assert_eq!(*planned_query, select_query);
+        assert!(plan
+            .queries
+            .iter()
+            .any(|planned| planned.query == select_query));
+        for (access, target) in [
+            (update_access, update_target),
+            (delete_access, delete_target),
+        ] {
+            assert_eq!(access.loops.len(), 1);
+            assert_eq!(access.loops[0].source, target);
+            assert!(access
+                .loops
+                .iter()
+                .all(|planned| planned.source != new_source && planned.source != old_source));
+        }
     }
 
     #[test]

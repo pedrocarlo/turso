@@ -55,8 +55,24 @@ pub(crate) enum HirRootPlan {
     Insert,
     Update(HirAccessPlan),
     Delete(HirAccessPlan),
-    Trigger,
+    Trigger(HirTriggerPlan),
     SchemaExpressions,
+}
+
+/// Planner facts for one trigger body. Expressions remain owned by HIR; this
+/// records only command access plans and their source order.
+pub(crate) enum HirTriggerPlan {
+    Predicate,
+    Command(HirTriggerCommandPlan),
+    Program(Vec<HirTriggerCommandPlan>),
+}
+
+/// Planner facts for one command inside a trigger body.
+pub(crate) enum HirTriggerCommandPlan {
+    Select(QueryId),
+    Insert,
+    Update(HirAccessPlan),
+    Delete(HirAccessPlan),
 }
 
 /// Access plans and estimates for one query in the owned HIR document.
@@ -192,8 +208,50 @@ impl<'a> HirPlanContext<'a> {
             hir::HirRoot::Delete(delete) => self
                 .plan_delete(delete, schema, params, query_estimate)
                 .map(HirRootPlan::Delete),
-            hir::HirRoot::Trigger(_) => Ok(HirRootPlan::Trigger),
+            hir::HirRoot::Trigger(trigger) => self
+                .plan_trigger(trigger, schema, params, query_estimate)
+                .map(HirRootPlan::Trigger),
             hir::HirRoot::SchemaExpressions(_) => Ok(HirRootPlan::SchemaExpressions),
+        }
+    }
+
+    fn plan_trigger(
+        &self,
+        trigger: &hir::TriggerRoot,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirTriggerPlan> {
+        match &trigger.body {
+            hir::TriggerBody::Predicate(_) => Ok(HirTriggerPlan::Predicate),
+            hir::TriggerBody::Command(command) => self
+                .plan_trigger_command(command, schema, params, query_estimate)
+                .map(HirTriggerPlan::Command),
+            hir::TriggerBody::Program(program) => program
+                .commands
+                .iter()
+                .map(|command| self.plan_trigger_command(command, schema, params, query_estimate))
+                .collect::<Result<Vec<_>>>()
+                .map(HirTriggerPlan::Program),
+        }
+    }
+
+    fn plan_trigger_command(
+        &self,
+        command: &hir::TriggerCommand,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirTriggerCommandPlan> {
+        match command {
+            hir::TriggerCommand::Select(query) => Ok(HirTriggerCommandPlan::Select(*query)),
+            hir::TriggerCommand::Insert(_) => Ok(HirTriggerCommandPlan::Insert),
+            hir::TriggerCommand::Update(update) => self
+                .plan_update(update, schema, params, query_estimate)
+                .map(HirTriggerCommandPlan::Update),
+            hir::TriggerCommand::Delete(delete) => self
+                .plan_delete(delete, schema, params, query_estimate)
+                .map(HirTriggerCommandPlan::Delete),
         }
     }
 
