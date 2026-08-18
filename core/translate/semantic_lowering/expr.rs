@@ -56,6 +56,12 @@ struct LikeRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct SubscriptRegisters {
+    base: usize,
+    index: usize,
+}
+
+#[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
     Binary(BinaryOperands),
@@ -63,6 +69,8 @@ enum ExprRegisters {
     Case(CaseRegisters),
     InList(InListRegisters),
     Like(LikeRegisters),
+    Array(usize),
+    Subscript(SubscriptRegisters),
 }
 
 enum NullTest {
@@ -400,6 +408,32 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     (_, _) => unreachable!("LIKE-family expression has at most three children"),
                 }
             }
+            hir::Expr::Array(elements) => {
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers =
+                        ExprRegisters::Array(self.program.alloc_registers(elements.len()));
+                }
+                let ExprRegisters::Array(start) = context.registers else {
+                    unreachable!("array element registers were allocated")
+                };
+                start + child_index
+            }
+            hir::Expr::Subscript { .. } => {
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Subscript(SubscriptRegisters {
+                        base: self.program.alloc_register(),
+                        index: self.program.alloc_register(),
+                    });
+                }
+                let ExprRegisters::Subscript(registers) = context.registers else {
+                    unreachable!("subscript registers were allocated")
+                };
+                match child_index {
+                    0 => registers.base,
+                    1 => registers.index,
+                    _ => unreachable!("subscript has two children"),
+                }
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -660,6 +694,35 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         dest: target,
                     });
                 }
+                Ok(target)
+            }
+            hir::Expr::Array(elements) => {
+                let start = match context.registers {
+                    ExprRegisters::Array(start) => start,
+                    ExprRegisters::None if elements.is_empty() => self.program.alloc_registers(0),
+                    _ => unreachable!("array element registers were allocated"),
+                };
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == start + index));
+                self.program.emit_insn(Insn::MakeArray {
+                    start_reg: start,
+                    count: elements.len(),
+                    dest: target,
+                });
+                Ok(target)
+            }
+            hir::Expr::Subscript { .. } => {
+                let ExprRegisters::Subscript(registers) = context.registers else {
+                    unreachable!("subscript registers were allocated")
+                };
+                debug_assert_eq!(children, [registers.base, registers.index]);
+                self.program.emit_insn(Insn::ArrayElement {
+                    array_reg: registers.base,
+                    index_reg: registers.index,
+                    dest: target,
+                });
                 Ok(target)
             }
             hir::Expr::Row(values) => {
@@ -2285,6 +2348,125 @@ mod tests {
                 .insns
                 .iter()
                 .filter(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn empty_array_uses_the_existing_make_array_opcode() {
+        let mut program = program();
+
+        translate_expr(&mut program, &hir::Expr::Array(Vec::new()), 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::MakeArray {
+                    start_reg: 1,
+                    count: 0,
+                    dest: 8,
+                },
+                _,
+            )]
+        ));
+    }
+
+    #[test]
+    fn array_elements_use_consecutive_registers() {
+        let expression = hir::Expr::Array(vec![
+            hir::Expr::Literal(Literal::Numeric("1".to_string())),
+            hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                operator: Operator::Add,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            },
+        ]);
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 1, dest: 1 }, _),
+                (Insn::Integer { value: 2, dest: 3 }, _),
+                (Insn::Integer { value: 3, dest: 4 }, _),
+                (
+                    Insn::Add {
+                        lhs: 3,
+                        rhs: 4,
+                        dest: 2,
+                    },
+                    _,
+                ),
+                (
+                    Insn::MakeArray {
+                        start_reg: 1,
+                        count: 2,
+                        dest: 8,
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn subscript_uses_separate_base_and_index_registers() {
+        let expression = hir::Expr::Subscript {
+            base: Box::new(hir::Expr::Array(vec![
+                hir::Expr::Literal(Literal::Numeric("10".to_string())),
+                hir::Expr::Literal(Literal::Numeric("20".to_string())),
+            ])),
+            index: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 10, dest: 3 }, _),
+                (Insn::Integer { value: 20, dest: 4 }, _),
+                (
+                    Insn::MakeArray {
+                        start_reg: 3,
+                        count: 2,
+                        dest: 1,
+                    },
+                    _,
+                ),
+                (Insn::Integer { value: 1, dest: 2 }, _),
+                (
+                    Insn::ArrayElement {
+                        array_reg: 1,
+                        index_reg: 2,
+                        dest: 8,
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn nested_array_lowering_does_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::Array(vec![expression]);
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::MakeArray { .. }))
                 .count(),
             10_000
         );
