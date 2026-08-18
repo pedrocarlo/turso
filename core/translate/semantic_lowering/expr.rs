@@ -38,11 +38,24 @@ struct CaseRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct InListRegisters {
+    lhs: usize,
+    rhs: usize,
+    width: usize,
+    null_flag: usize,
+    result: usize,
+    match_label: BranchOffset,
+    false_label: BranchOffset,
+    null_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
     Binary(BinaryOperands),
     Between(BetweenRegisters),
     Case(CaseRegisters),
+    InList(InListRegisters),
 }
 
 enum NullTest {
@@ -69,6 +82,24 @@ fn binary_registers(registers: ExprRegisters) -> BinaryOperands {
         unreachable!("binary operand registers were allocated")
     };
     operands
+}
+
+fn comparison_flags(component: &hir::ComparisonComponent) -> CmpInsFlags {
+    let flags = CmpInsFlags::default().with_affinity(component.affinity);
+    if component.array {
+        flags.array_cmp()
+    } else {
+        flags
+    }
+}
+
+fn comparison_collation(
+    component: &hir::ComparisonComponent,
+) -> Option<crate::translate::collate::CollationSeq> {
+    component
+        .collation
+        .as_ref()
+        .map(|collation| *collation.value())
 }
 
 struct ExprLowerer<'a> {
@@ -256,6 +287,74 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     context.target
                 }
             }
+            hir::Expr::InList {
+                values,
+                comparisons,
+                ..
+            } => {
+                if values.is_empty() {
+                    if child_index == 0 {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    unreachable!("empty IN list only has its skipped left operand")
+                }
+                if comparisons.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "HIR IN list has mismatched values and comparisons".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    let width = comparisons[0].components.len();
+                    if width == 0
+                        || comparisons
+                            .iter()
+                            .any(|comparison| comparison.components.len() != width)
+                    {
+                        return Err(LimboError::InternalError(
+                            "HIR IN list has invalid comparison widths".to_string(),
+                        ));
+                    }
+                    let false_label = self.program.allocate_label();
+                    let null_label = self.program.allocate_label();
+                    let result = self.program.alloc_register();
+                    self.program.emit_no_constant_insn(Insn::Null {
+                        dest: result,
+                        dest_end: None,
+                    });
+                    let lhs = self.program.alloc_registers(width);
+                    let match_label = self.program.allocate_label();
+                    let null_flag = self.program.alloc_register();
+                    context.registers = ExprRegisters::InList(InListRegisters {
+                        lhs,
+                        rhs: 0,
+                        width,
+                        null_flag,
+                        result,
+                        match_label,
+                        false_label,
+                        null_label,
+                    });
+                }
+                let ExprRegisters::InList(registers) = &mut context.registers else {
+                    unreachable!("IN list registers were allocated")
+                };
+                match child_index {
+                    0 => registers.lhs,
+                    value_child => {
+                        if value_child == 1 {
+                            self.program.emit_insn(Insn::BitAnd {
+                                lhs: registers.lhs,
+                                rhs: registers.lhs,
+                                dest: registers.null_flag,
+                            });
+                        } else {
+                            self.finish_in_list_value(registers, &comparisons[value_child - 2])?;
+                        }
+                        registers.rhs = self.program.alloc_registers(registers.width);
+                        registers.rhs
+                    }
+                }
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -420,6 +519,63 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     .preassign_label_to_next_insn(registers.return_label);
                 Ok(target)
             }
+            hir::Expr::InList {
+                negated,
+                values,
+                comparisons,
+                ..
+            } => {
+                if values.is_empty() {
+                    debug_assert!(children.is_empty());
+                    self.program.emit_insn(Insn::Integer {
+                        value: i64::from(*negated),
+                        dest: target,
+                    });
+                    return Ok(target);
+                }
+                let ExprRegisters::InList(registers) = context.registers else {
+                    unreachable!("IN list registers were allocated")
+                };
+                debug_assert_eq!(children.len(), values.len() + 1);
+                debug_assert_eq!(children[0], registers.lhs);
+                self.finish_in_list_value(
+                    &registers,
+                    comparisons.last().expect("non-empty IN has a comparison"),
+                )?;
+                self.program.emit_insn(Insn::IsNull {
+                    reg: registers.null_flag,
+                    target_pc: registers.null_label,
+                });
+                self.program.emit_insn(Insn::Goto {
+                    target_pc: registers.false_label,
+                });
+                self.program
+                    .preassign_label_to_next_insn(registers.match_label);
+                self.program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: registers.result,
+                });
+                self.program
+                    .preassign_label_to_next_insn(registers.false_label);
+                self.program.emit_insn(Insn::AddImm {
+                    register: registers.result,
+                    value: 0,
+                });
+                if *negated {
+                    self.program.emit_insn(Insn::Not {
+                        reg: registers.result,
+                        dest: registers.result,
+                    });
+                }
+                self.program
+                    .preassign_label_to_next_insn(registers.null_label);
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: registers.result,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                Ok(target)
+            }
             hir::Expr::Row(values) => {
                 debug_assert_eq!(children.len(), values.len());
                 debug_assert!(children
@@ -436,6 +592,59 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn finish_in_list_value(
+        &mut self,
+        registers: &InListRegisters,
+        comparison: &hir::ComparisonSemantics,
+    ) -> Result<()> {
+        if comparison.components.len() != registers.width {
+            return Err(LimboError::InternalError(
+                "HIR IN comparison width changed between values".to_string(),
+            ));
+        }
+        self.program.emit_insn(Insn::BitAnd {
+            lhs: registers.null_flag,
+            rhs: registers.rhs,
+            dest: registers.null_flag,
+        });
+        match comparison.components.as_slice() {
+            [] => unreachable!("IN comparison width was checked"),
+            [component] => {
+                self.program.emit_insn(Insn::Eq {
+                    lhs: registers.lhs,
+                    rhs: registers.rhs,
+                    target_pc: registers.match_label,
+                    flags: comparison_flags(component),
+                    collation: comparison_collation(component),
+                });
+            }
+            components => {
+                let skip_label = self.program.allocate_label();
+                for (index, component) in components.iter().enumerate() {
+                    if index + 1 == components.len() {
+                        self.program.emit_insn(Insn::Eq {
+                            lhs: registers.lhs + index,
+                            rhs: registers.rhs + index,
+                            target_pc: registers.match_label,
+                            flags: comparison_flags(component),
+                            collation: comparison_collation(component),
+                        });
+                    } else {
+                        self.program.emit_insn(Insn::Ne {
+                            lhs: registers.lhs + index,
+                            rhs: registers.rhs + index,
+                            target_pc: skip_label,
+                            flags: comparison_flags(component),
+                            collation: comparison_collation(component),
+                        });
+                    }
+                }
+                self.program.preassign_label_to_next_insn(skip_label);
+            }
+        }
+        Ok(())
+    }
+
     fn finish_case_arm(&mut self, registers: &mut CaseRegisters) {
         self.program.emit_insn(Insn::Goto {
             target_pc: registers.return_label,
@@ -1663,6 +1872,158 @@ mod tests {
                 .insns
                 .iter()
                 .filter(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn empty_in_list_skips_its_left_operand() {
+        for (negated, expected) in [(false, 0), (true, 1)] {
+            let expression = hir::Expr::InList {
+                lhs: Box::new(hir::Expr::Parameter(hir::Parameter {
+                    index: NonZeroU32::new(1).unwrap(),
+                    spelling: ParameterSpelling::Anonymous,
+                    type_fact: TypeFact::dynamic(),
+                })),
+                negated,
+                values: Vec::new(),
+                comparisons: Vec::new(),
+            };
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(Insn::Integer { value, dest: 8 }, _)] if *value == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn scalar_in_list_uses_resolved_comparisons_and_tracks_nulls() {
+        let collation = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::translate::collate::CollationSeq::NoCase),
+        );
+        let comparison = hir::ComparisonSemantics {
+            components: vec![hir::ComparisonComponent {
+                affinity: crate::vdbe::affinity::Affinity::Text,
+                collation: Some(collation),
+                array: true,
+            }],
+        };
+        let expression = hir::Expr::InList {
+            lhs: Box::new(hir::Expr::Literal(Literal::String("'a'".to_string()))),
+            negated: true,
+            values: vec![
+                hir::Expr::Literal(Literal::String("'b'".to_string())),
+                hir::Expr::Literal(Literal::Null),
+            ],
+            comparisons: vec![comparison.clone(), comparison],
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::BitAnd { .. }))
+                .count(),
+            3
+        );
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Eq {
+                    flags, collation, ..
+                } => Some((flags.get_affinity(), flags.has_array_cmp(), *collation)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            comparisons,
+            vec![
+                (
+                    crate::vdbe::affinity::Affinity::Text,
+                    true,
+                    Some(crate::translate::collate::CollationSeq::NoCase),
+                );
+                2
+            ]
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::IsNull { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Not { .. })));
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Copy {
+                dst_reg: 8,
+                extra_amount: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn row_in_list_compares_each_component() {
+        let expression = hir::Expr::InList {
+            lhs: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+            ])),
+            negated: false,
+            values: vec![hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::Numeric("3".to_string())),
+                hir::Expr::Literal(Literal::Numeric("4".to_string())),
+            ])],
+            comparisons: vec![numeric_row_comparison(2)],
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        let comparisons = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Ne { lhs, rhs, .. } => Some(("ne", *lhs, *rhs)),
+                Insn::Eq { lhs, rhs, .. } => Some(("eq", *lhs, *rhs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(comparisons, vec![("ne", 2, 5), ("eq", 3, 6)]);
+    }
+
+    #[test]
+    fn nested_in_list_lowering_does_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::InList {
+                lhs: Box::new(expression),
+                negated: false,
+                values: vec![hir::Expr::Literal(Literal::Numeric("1".to_string()))],
+                comparisons: vec![numeric_comparison()],
+            };
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Eq { .. }))
                 .count(),
             10_000
         );
