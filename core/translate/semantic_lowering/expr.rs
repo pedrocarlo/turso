@@ -71,6 +71,7 @@ enum ExprRegisters {
     Like(LikeRegisters),
     Array(usize),
     Subscript(SubscriptRegisters),
+    FieldAccess(usize),
 }
 
 enum NullTest {
@@ -434,6 +435,16 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     _ => unreachable!("subscript has two children"),
                 }
             }
+            hir::Expr::FieldAccess(_) => {
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::FieldAccess(self.program.alloc_register());
+                }
+                let ExprRegisters::FieldAccess(base) = context.registers else {
+                    unreachable!("field-access base register was allocated")
+                };
+                debug_assert_eq!(child_index, 0);
+                base
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -722,6 +733,25 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     array_reg: registers.base,
                     index_reg: registers.index,
                     dest: target,
+                });
+                Ok(target)
+            }
+            hir::Expr::FieldAccess(access) => {
+                let ExprRegisters::FieldAccess(base) = context.registers else {
+                    unreachable!("field-access base register was allocated")
+                };
+                debug_assert_eq!(children, [base]);
+                self.program.emit_insn(match access.kind {
+                    hir::FieldAccessKind::Struct { field_index } => Insn::StructField {
+                        src_reg: base,
+                        field_index,
+                        dest: target,
+                    },
+                    hir::FieldAccessKind::Union { tag_index } => Insn::UnionExtract {
+                        src_reg: base,
+                        expected_tag: tag_index,
+                        dest: target,
+                    },
                 });
                 Ok(target)
             }
@@ -1556,6 +1586,23 @@ mod tests {
             hir::CatalogSnapshot::from_id(1),
             None,
             crate::sync::Arc::new(function),
+        )
+    }
+
+    fn resolved_type(kind: crate::schema::TypeDefKind) -> hir::ResolvedType {
+        hir::CatalogObject::new(
+            hir::CatalogObjectId::new(2),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(crate::schema::TypeDef {
+                name: "container".to_string(),
+                is_builtin: false,
+                not_null: false,
+                is_domain: false,
+                sql: String::new(),
+                domain_checks: Vec::new(),
+                kind,
+            }),
         )
     }
 
@@ -2467,6 +2514,138 @@ mod tests {
                 .insns
                 .iter()
                 .filter(|(instruction, _)| matches!(instruction, Insn::MakeArray { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn field_access_uses_the_resolved_member_index() {
+        let cases = [
+            (
+                hir::FieldAccessKind::Struct { field_index: 7 },
+                resolved_type(crate::schema::TypeDefKind::Struct(
+                    crate::schema::StructDef { fields: Vec::new() },
+                )),
+            ),
+            (
+                hir::FieldAccessKind::Union { tag_index: 3 },
+                resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
+                    variants: Vec::new(),
+                    tag_names: crate::sync::Arc::from(Vec::<String>::new()),
+                })),
+            ),
+        ];
+
+        for (kind, container_type) in cases {
+            let expression = hir::Expr::FieldAccess(hir::FieldAccess {
+                base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                field_name: "already_resolved".to_string(),
+                kind,
+                container_type,
+                result_type: TypeFact::dynamic(),
+            });
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                (&program.insns[0].0, &program.insns[1].0, kind),
+                (
+                    Insn::Integer { dest: 1, .. },
+                    Insn::StructField {
+                        src_reg: 1,
+                        field_index: 7,
+                        dest: 8,
+                    },
+                    hir::FieldAccessKind::Struct { .. },
+                ) | (
+                    Insn::Integer { dest: 1, .. },
+                    Insn::UnionExtract {
+                        src_reg: 1,
+                        expected_tag: 3,
+                        dest: 8,
+                    },
+                    hir::FieldAccessKind::Union { .. },
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn nested_field_access_writes_each_result_into_its_parent_register() {
+        let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
+            crate::schema::StructDef { fields: Vec::new() },
+        ));
+        let union_type =
+            resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
+                variants: Vec::new(),
+                tag_names: crate::sync::Arc::from(Vec::<String>::new()),
+            }));
+        let expression = hir::Expr::FieldAccess(hir::FieldAccess {
+            base: Box::new(hir::Expr::FieldAccess(hir::FieldAccess {
+                base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                field_name: "variant".to_string(),
+                kind: hir::FieldAccessKind::Union { tag_index: 2 },
+                container_type: union_type,
+                result_type: TypeFact::dynamic(),
+            })),
+            field_name: "field".to_string(),
+            kind: hir::FieldAccessKind::Struct { field_index: 4 },
+            container_type: struct_type,
+            result_type: TypeFact::dynamic(),
+        });
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { dest: 2, .. }, _),
+                (
+                    Insn::UnionExtract {
+                        src_reg: 2,
+                        expected_tag: 2,
+                        dest: 1,
+                    },
+                    _,
+                ),
+                (
+                    Insn::StructField {
+                        src_reg: 1,
+                        field_index: 4,
+                        dest: 8,
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn nested_field_access_lowering_does_not_use_the_call_stack() {
+        let container_type = resolved_type(crate::schema::TypeDefKind::Struct(
+            crate::schema::StructDef { fields: Vec::new() },
+        ));
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::FieldAccess(hir::FieldAccess {
+                base: Box::new(expression),
+                field_name: "field".to_string(),
+                kind: hir::FieldAccessKind::Struct { field_index: 0 },
+                container_type: container_type.clone(),
+                result_type: TypeFact::dynamic(),
+            });
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::StructField { .. }))
                 .count(),
             10_000
         );
