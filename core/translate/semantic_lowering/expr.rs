@@ -139,6 +139,13 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
         }
         Func::Math(_) => Some(EmptyArgumentStart::UseTarget),
         Func::Scalar(
+            ScalarFunc::Date
+            | ScalarFunc::DateTime
+            | ScalarFunc::JulianDay
+            | ScalarFunc::UnixEpoch
+            | ScalarFunc::Time,
+        ) => Some(EmptyArgumentStart::ReserveOneRegister),
+        Func::Scalar(
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper
@@ -4397,6 +4404,7 @@ mod tests {
             (ScalarFunc::Unhex, 2),
             (ScalarFunc::Min, 2),
             (ScalarFunc::Max, 3),
+            (ScalarFunc::DateTime, 2),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
@@ -4425,6 +4433,35 @@ mod tests {
                     },
                 }) if *arg_count == argument_count
             ));
+        }
+    }
+
+    #[test]
+    fn empty_date_functions_reserve_the_legacy_start_register() {
+        for function in [
+            ScalarFunc::Date,
+            ScalarFunc::DateTime,
+            ScalarFunc::JulianDay,
+            ScalarFunc::UnixEpoch,
+            ScalarFunc::Time,
+        ] {
+            let expression = ordinary_scalar_call(Func::Scalar(function), Vec::new());
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(
+                    Insn::Function {
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx { arg_count: 0, .. },
+                        ..
+                    },
+                    _,
+                )]
+            ));
+            assert_eq!(program.alloc_register(), 2);
         }
     }
 
