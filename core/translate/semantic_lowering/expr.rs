@@ -50,12 +50,19 @@ struct InListRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct LikeRegisters {
+    start: usize,
+    result: usize,
+}
+
+#[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
     Binary(BinaryOperands),
     Between(BetweenRegisters),
     Case(CaseRegisters),
     InList(InListRegisters),
+    Like(LikeRegisters),
 }
 
 enum NullTest {
@@ -355,6 +362,44 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     }
                 }
             }
+            hir::Expr::Like {
+                negated,
+                operator,
+                argument_count,
+                ..
+            } => {
+                if *argument_count < 2 {
+                    return Err(LimboError::InternalError(
+                        "HIR LIKE-family expression has fewer than two arguments".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Like(LikeRegisters {
+                        start: self.program.alloc_registers(*argument_count),
+                        result: if *negated {
+                            self.program.alloc_register()
+                        } else {
+                            context.target
+                        },
+                    });
+                }
+                let ExprRegisters::Like(registers) = context.registers else {
+                    unreachable!("LIKE-family registers were allocated")
+                };
+                match (operator, child_index) {
+                    (turso_parser::ast::LikeOperator::Match, 0) => registers.start,
+                    (turso_parser::ast::LikeOperator::Match, 1) => {
+                        registers.start + argument_count - 1
+                    }
+                    (turso_parser::ast::LikeOperator::Match, _) => {
+                        unreachable!("MATCH has two expression children")
+                    }
+                    (_, 0) => registers.start + 1,
+                    (_, 1) => registers.start,
+                    (_, 2) => registers.start + 2,
+                    (_, _) => unreachable!("LIKE-family expression has at most three children"),
+                }
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -574,6 +619,47 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     dst_reg: target,
                     extra_amount: 0,
                 });
+                Ok(target)
+            }
+            hir::Expr::Like {
+                negated,
+                operator,
+                function,
+                argument_count,
+                rhs,
+                escape,
+                ..
+            } => {
+                let ExprRegisters::Like(registers) = context.registers else {
+                    unreachable!("LIKE-family registers were allocated")
+                };
+                let expected_children = 2 + usize::from(escape.is_some());
+                debug_assert_eq!(children.len(), expected_children);
+                let constant_mask = if matches!(
+                    operator,
+                    turso_parser::ast::LikeOperator::Like | turso_parser::ast::LikeOperator::Glob
+                ) && matches!(rhs.as_ref(), hir::Expr::Literal(_))
+                {
+                    self.program.mark_last_insn_constant();
+                    1
+                } else {
+                    0
+                };
+                self.program.emit_insn(Insn::Function {
+                    constant_mask,
+                    start_reg: registers.start,
+                    dest: registers.result,
+                    func: FuncCtx {
+                        func: function.value().clone(),
+                        arg_count: *argument_count,
+                    },
+                });
+                if *negated {
+                    self.program.emit_insn(Insn::Not {
+                        reg: registers.result,
+                        dest: target,
+                    });
+                }
                 Ok(target)
             }
             hir::Expr::Row(values) => {
@@ -1401,6 +1487,15 @@ mod tests {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
     }
 
+    fn resolved_function(function: Func) -> hir::ResolvedFunction {
+        hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            crate::sync::Arc::new(function),
+        )
+    }
+
     #[test]
     fn resolved_parameter_spelling_reaches_program_metadata() {
         let cases = [
@@ -2024,6 +2119,172 @@ mod tests {
                 .insns
                 .iter()
                 .filter(|(instruction, _)| matches!(instruction, Insn::Eq { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn like_uses_legacy_argument_order_and_resolved_function() {
+        let expression = hir::Expr::Like {
+            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            negated: false,
+            operator: turso_parser::ast::LikeOperator::Like,
+            function: resolved_function(Func::Scalar(ScalarFunc::Like)),
+            argument_count: 2,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            escape: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::String8 { value: lhs, dest: 2 }, _),
+                (Insn::String8 { value: rhs, dest: 1 }, _),
+                (
+                    Insn::Function {
+                        constant_mask: 1,
+                        start_reg: 1,
+                        dest: 8,
+                        func:
+                            FuncCtx {
+                                func: Func::Scalar(ScalarFunc::Like),
+                                arg_count: 2,
+                            },
+                    },
+                    _,
+                ),
+            ] if lhs == "value" && rhs == "pattern"
+        ));
+    }
+
+    #[test]
+    fn like_escape_and_negation_keep_existing_register_shape() {
+        let expression = hir::Expr::Like {
+            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            negated: true,
+            operator: turso_parser::ast::LikeOperator::Like,
+            function: resolved_function(Func::Scalar(ScalarFunc::Like)),
+            argument_count: 3,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            escape: Some(Box::new(hir::Expr::Literal(Literal::String(
+                "'!'".to_string(),
+            )))),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::String8 { dest: 2, .. }, _),
+                (Insn::String8 { dest: 1, .. }, _),
+                (Insn::String8 { dest: 3, .. }, _),
+                (
+                    Insn::Function {
+                        constant_mask: 1,
+                        start_reg: 1,
+                        dest: 4,
+                        func: FuncCtx { arg_count: 3, .. },
+                    },
+                    _,
+                ),
+                (Insn::Not { reg: 4, dest: 8 }, _),
+            ]
+        ));
+    }
+
+    #[test]
+    fn regexp_uses_the_function_resolved_by_semantic_analysis() {
+        let expression = hir::Expr::Like {
+            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            negated: false,
+            operator: turso_parser::ast::LikeOperator::Regexp,
+            function: resolved_function(Func::Scalar(ScalarFunc::Abs)),
+            argument_count: 2,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+            escape: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Function {
+                constant_mask: 0,
+                start_reg: 1,
+                dest: 8,
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::Abs),
+                    arg_count: 2,
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn match_places_row_columns_before_the_query() {
+        let expression = hir::Expr::Like {
+            lhs: Box::new(hir::Expr::Row(vec![
+                hir::Expr::Literal(Literal::String("'one'".to_string())),
+                hir::Expr::Literal(Literal::String("'two'".to_string())),
+            ])),
+            negated: false,
+            operator: turso_parser::ast::LikeOperator::Match,
+            function: resolved_function(Func::Scalar(ScalarFunc::Abs)),
+            argument_count: 3,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'query'".to_string()))),
+            escape: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::String8 { dest: 1, .. }, _),
+                (Insn::String8 { dest: 2, .. }, _),
+                (Insn::String8 { dest: 3, .. }, _),
+                (
+                    Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx { arg_count: 3, .. },
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn nested_like_lowering_does_not_use_the_call_stack() {
+        let function = resolved_function(Func::Scalar(ScalarFunc::Like));
+        let mut expression = hir::Expr::Literal(Literal::String("'value'".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::Like {
+                lhs: Box::new(expression),
+                negated: false,
+                operator: turso_parser::ast::LikeOperator::Like,
+                function: function.clone(),
+                argument_count: 2,
+                rhs: Box::new(hir::Expr::Literal(Literal::String("'pattern'".to_string()))),
+                escape: None,
+            };
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
                 .count(),
             10_000
         );
