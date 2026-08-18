@@ -116,6 +116,26 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
+### Non-lowering phase complete
+
+Validated HIR and HIR access planning now cover query roots, INSERT-owned
+queries, top-level UPDATE and DELETE, and ordered trigger commands.
+
+No legacy binding code is safely deletable before production cutover.
+`translate_inner` still enters the AST plan builders, and the current emitter
+still consumes parser expressions, `Plan`, and `TableReferences`.
+
+The next phase must replace that production handoff. Only then can we delete:
+
+- SELECT binding and rewriting in `select.rs`
+- DML binding and rewriting in `insert.rs`, `update.rs`, and `delete.rs`
+- `expr/binding.rs`
+- name-resolution state and methods from `TableReferences`
+- parser-expression fields retained solely by legacy plans
+
+This boundary must not be crossed by running HIR and legacy planning together,
+or by converting HIR expressions back into parser AST.
+
 Completed:
 
 - Trigger predicates and commands now have ordered HIR planner roots. SELECT
