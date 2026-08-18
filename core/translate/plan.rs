@@ -1702,7 +1702,7 @@ impl
         if self
             .expression_index_usages
             .iter()
-            .any(|usage| usage.normalized_expr.equivalent_for_index(&expression))
+            .any(|usage| usage.normalized_expr.equivalent(&expression))
         {
             return;
         }
@@ -1727,11 +1727,11 @@ impl
                         .columns
                         .iter()
                         .flatten()
-                        .any(|indexed| expression.equivalent_for_index(indexed))
+                        .any(|indexed| expression.equivalent(indexed))
                         || expressions
                             .predicate
                             .as_ref()
-                            .is_some_and(|predicate| expression.equivalent_for_index(predicate))
+                            .is_some_and(|predicate| expression.equivalent(predicate))
                 })
         })
     }

@@ -422,7 +422,7 @@ pub(crate) trait ExprVisitor {
     fn pre_order(
         &mut self,
         parent: &Expr,
-        context: &Self::Context,
+        context: &mut Self::Context,
         child_index: usize,
         child: &Expr,
     ) -> Result<ControlFlow<(), Self::Context>, Self::Error>;
@@ -447,7 +447,7 @@ impl<F: FnMut(&Expr)> ExprVisitor for WalkVisitor<'_, F> {
     fn pre_order(
         &mut self,
         _parent: &Expr,
-        _context: &(),
+        _context: &mut (),
         _child_index: usize,
         child: &Expr,
     ) -> Result<ControlFlow<(), ()>, Infallible> {
@@ -478,7 +478,7 @@ impl<T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor for FoldVisitor<'_, F, T> {
     fn pre_order(
         &mut self,
         _parent: &Expr,
-        _context: &(),
+        _context: &mut (),
         _child_index: usize,
         _child: &Expr,
     ) -> Result<ControlFlow<(), ()>, Infallible> {
@@ -635,12 +635,12 @@ impl Expr {
         }
     }
 
-    /// Compare resolved expression shapes for expression-index matching.
+    /// Compare resolved expression shapes.
     ///
-    /// Work stays on explicit stacks because index expressions can be deeply
-    /// nested. Commutative operators retain the existing planner rule that
+    /// Work stays on explicit stacks because expressions can be deeply
+    /// nested. Commutative operators retain the existing equivalence rule that
     /// permits their operands to appear in either order.
-    pub(crate) fn equivalent_for_index(&self, other: &Self) -> bool {
+    pub(crate) fn equivalent(&self, other: &Self) -> bool {
         let mut pending = vec![(self, other)];
         let mut alternatives = Vec::new();
 
@@ -650,8 +650,19 @@ impl Expr {
                     (Self::Literal(left), Self::Literal(right)) => {
                         check_literal_equivalency(left, right)
                     }
+                    (Self::Parameter(left), Self::Parameter(right)) => left.index == right.index,
                     (Self::Column(left), Self::Column(right)) => left == right,
+                    (Self::MergedColumn(left), Self::MergedColumn(right)) => {
+                        pending.push((&left.left, &right.left));
+                        left.right == right.right
+                            && left.value == right.value
+                            && left.type_fact == right.type_fact
+                            && left.affinity == right.affinity
+                            && left.has_affinity == right.has_affinity
+                            && left.collation == right.collation
+                    }
                     (Self::RowId(left), Self::RowId(right)) => left == right,
+                    (Self::Output(left), Self::Output(right)) => left == right,
                     (
                         Self::Unary {
                             operator: left_operator,
@@ -877,6 +888,60 @@ impl Expr {
                             && left.container_type == right.container_type
                             && left.result_type == right.result_type
                     }
+                    (
+                        Self::Subquery(SubqueryExpr::Scalar {
+                            query: left_query,
+                            output: left_output,
+                        }),
+                        Self::Subquery(SubqueryExpr::Scalar {
+                            query: right_query,
+                            output: right_output,
+                        }),
+                    ) => left_query == right_query && left_output == right_output,
+                    (
+                        Self::Subquery(SubqueryExpr::Row { query: left }),
+                        Self::Subquery(SubqueryExpr::Row { query: right }),
+                    )
+                    | (
+                        Self::Subquery(SubqueryExpr::Exists(left)),
+                        Self::Subquery(SubqueryExpr::Exists(right)),
+                    ) => left == right,
+                    (
+                        Self::Subquery(SubqueryExpr::In {
+                            lhs: left_lhs,
+                            query: left_query,
+                            negated: left_negated,
+                            comparison: left_comparison,
+                        }),
+                        Self::Subquery(SubqueryExpr::In {
+                            lhs: right_lhs,
+                            query: right_query,
+                            negated: right_negated,
+                            comparison: right_comparison,
+                        }),
+                    ) => {
+                        pending.push((left_lhs, right_lhs));
+                        left_query == right_query
+                            && left_negated == right_negated
+                            && left_comparison == right_comparison
+                    }
+                    (
+                        Self::Raise {
+                            action: left_action,
+                            message: left_message,
+                        },
+                        Self::Raise {
+                            action: right_action,
+                            message: right_message,
+                        },
+                    ) => {
+                        left_action == right_action
+                            && push_optional_pair(
+                                &mut pending,
+                                left_message.as_deref(),
+                                right_message.as_deref(),
+                            )
+                    }
                     _ => false,
                 };
 
@@ -932,7 +997,7 @@ impl Expr {
         loop {
             let frame = frames.last_mut().expect("root expression frame exists");
             if let Some((index, child)) = frame.next_child() {
-                match visitor.pre_order(frame.expression, &frame.context, index, child)? {
+                match visitor.pre_order(frame.expression, &mut frame.context, index, child)? {
                     ControlFlow::Continue(context) => {
                         frames.push(ExprFrame::new(child, context));
                     }

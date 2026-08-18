@@ -4,60 +4,109 @@ use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
 use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
 use crate::{LimboError, Numeric, Result, Value};
-use turso_parser::ast::{Literal, UnaryOperator};
+use turso_parser::ast::{Literal, Operator, UnaryOperator};
+
+enum BinaryOperands {
+    Unallocated,
+    Shared(usize),
+    Pair { lhs: usize, rhs: usize },
+}
+
+struct LoweringContext {
+    target: usize,
+    binary_operands: BinaryOperands,
+}
+
+impl LoweringContext {
+    const fn new(target: usize) -> Self {
+        Self {
+            target,
+            binary_operands: BinaryOperands::Unallocated,
+        }
+    }
+}
 
 struct ExprLowerer<'a> {
     program: &'a mut ProgramBuilder,
 }
 
 impl hir::ExprVisitor for ExprLowerer<'_> {
-    type Context = usize;
+    type Context = LoweringContext;
     type Output = usize;
     type Error = LimboError;
 
     fn pre_order(
         &mut self,
         parent: &hir::Expr,
-        context: &usize,
-        _child_index: usize,
+        context: &mut LoweringContext,
+        child_index: usize,
         child: &hir::Expr,
-    ) -> Result<ControlFlow<(), usize>> {
-        let hir::Expr::Unary { operator, .. } = parent else {
-            return Ok(ControlFlow::Break(()));
+    ) -> Result<ControlFlow<(), LoweringContext>> {
+        let target = match parent {
+            hir::Expr::Unary { operator, .. } => match operator {
+                UnaryOperator::Positive => context.target,
+                UnaryOperator::Negative
+                    if matches!(child, hir::Expr::Literal(Literal::Numeric(_))) =>
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+                UnaryOperator::BitwiseNot
+                    if matches!(
+                        child,
+                        hir::Expr::Literal(Literal::Numeric(_) | Literal::Null)
+                    ) =>
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+                UnaryOperator::Negative | UnaryOperator::BitwiseNot | UnaryOperator::Not => {
+                    self.program.alloc_register()
+                }
+            },
+            hir::Expr::Binary { lhs, rhs, .. } => {
+                if matches!(context.binary_operands, BinaryOperands::Unallocated) {
+                    context.binary_operands = if lhs.equivalent(rhs) {
+                        BinaryOperands::Shared(self.program.alloc_register())
+                    } else {
+                        let lhs = self.program.alloc_registers(2);
+                        BinaryOperands::Pair { lhs, rhs: lhs + 1 }
+                    };
+                }
+                match (&context.binary_operands, child_index) {
+                    (BinaryOperands::Shared(register), 0) => *register,
+                    (BinaryOperands::Shared(_), 1) => return Ok(ControlFlow::Break(())),
+                    (BinaryOperands::Pair { lhs, .. }, 0) => *lhs,
+                    (BinaryOperands::Pair { rhs, .. }, 1) => *rhs,
+                    (BinaryOperands::Unallocated, _) => {
+                        unreachable!("binary operand registers were allocated")
+                    }
+                    (_, _) => unreachable!("binary expression has two children"),
+                }
+            }
+            _ => return Ok(ControlFlow::Break(())),
         };
-
-        let context = match operator {
-            UnaryOperator::Positive => *context,
-            UnaryOperator::Negative if matches!(child, hir::Expr::Literal(Literal::Numeric(_))) => {
-                return Ok(ControlFlow::Break(()));
-            }
-            UnaryOperator::BitwiseNot
-                if matches!(
-                    child,
-                    hir::Expr::Literal(Literal::Numeric(_) | Literal::Null)
-                ) =>
-            {
-                return Ok(ControlFlow::Break(()));
-            }
-            UnaryOperator::Negative | UnaryOperator::BitwiseNot | UnaryOperator::Not => {
-                self.program.alloc_register()
-            }
-        };
-        Ok(ControlFlow::Continue(context))
+        Ok(ControlFlow::Continue(LoweringContext::new(target)))
     }
 
     fn post_order(
         &mut self,
         expression: &hir::Expr,
-        target: usize,
+        context: LoweringContext,
         children: &[usize],
     ) -> Result<usize> {
+        let target = context.target;
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
             }
+            hir::Expr::Binary {
+                operator,
+                array_concat: false,
+                custom: None,
+                comparison: None,
+                ..
+            } => self.emit_binary(*operator, context.binary_operands, target, children),
             _ => Err(LimboError::InternalError(
                 "HIR expression lowering is not implemented for this expression".to_string(),
             )),
@@ -66,6 +115,92 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn emit_binary(
+        &mut self,
+        operator: Operator,
+        operands: BinaryOperands,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
+        let (lhs, rhs) = match operands {
+            BinaryOperands::Shared(register) => {
+                debug_assert_eq!(children, [register]);
+                (register, register)
+            }
+            BinaryOperands::Pair { lhs, rhs } => {
+                debug_assert_eq!(children, [lhs, rhs]);
+                (lhs, rhs)
+            }
+            BinaryOperands::Unallocated => {
+                unreachable!("binary expression allocated operand registers")
+            }
+        };
+        let instruction = match operator {
+            Operator::Add => Insn::Add {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Subtract => Insn::Subtract {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Multiply => Insn::Multiply {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Divide => Insn::Divide {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Modulus => Insn::Remainder {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::And => Insn::And {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::Or => Insn::Or {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::BitwiseAnd => Insn::BitAnd {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::BitwiseOr => Insn::BitOr {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::LeftShift => Insn::ShiftLeft {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            Operator::RightShift => Insn::ShiftRight {
+                lhs,
+                rhs,
+                dest: target,
+            },
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR binary lowering is not implemented for {operator:?}"
+                )));
+            }
+        };
+        self.program.emit_insn(instruction);
+        Ok(target)
+    }
+
     fn emit_unary(
         &mut self,
         operator: UnaryOperator,
@@ -157,7 +292,7 @@ pub(crate) fn translate_expr(
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
-    expression.walk(target, &mut ExprLowerer { program })
+    expression.walk(LoweringContext::new(target), &mut ExprLowerer { program })
 }
 
 /// Emit a literal already selected by semantic analysis.
@@ -313,6 +448,246 @@ mod tests {
                 _
             )]
         ));
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExpectedBinaryInsn {
+        Add,
+        Subtract,
+        Multiply,
+        Divide,
+        Remainder,
+        And,
+        Or,
+        BitAnd,
+        BitOr,
+        ShiftLeft,
+        ShiftRight,
+    }
+
+    #[test]
+    fn ordinary_binary_lowering_keeps_existing_register_and_opcode_shape() {
+        let cases = [
+            (Operator::Add, ExpectedBinaryInsn::Add),
+            (Operator::Subtract, ExpectedBinaryInsn::Subtract),
+            (Operator::Multiply, ExpectedBinaryInsn::Multiply),
+            (Operator::Divide, ExpectedBinaryInsn::Divide),
+            (Operator::Modulus, ExpectedBinaryInsn::Remainder),
+            (Operator::And, ExpectedBinaryInsn::And),
+            (Operator::Or, ExpectedBinaryInsn::Or),
+            (Operator::BitwiseAnd, ExpectedBinaryInsn::BitAnd),
+            (Operator::BitwiseOr, ExpectedBinaryInsn::BitOr),
+            (Operator::LeftShift, ExpectedBinaryInsn::ShiftLeft),
+            (Operator::RightShift, ExpectedBinaryInsn::ShiftRight),
+        ];
+
+        for (operator, expected) in cases {
+            let expression = hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                operator,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..2],
+                [
+                    (Insn::Integer { value: 2, dest: 1 }, _),
+                    (Insn::Integer { value: 3, dest: 2 }, _),
+                ]
+            ));
+            let instruction = &program.insns[2].0;
+            match expected {
+                ExpectedBinaryInsn::Add => assert!(matches!(
+                    instruction,
+                    Insn::Add {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::Subtract => assert!(matches!(
+                    instruction,
+                    Insn::Subtract {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::Multiply => assert!(matches!(
+                    instruction,
+                    Insn::Multiply {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::Divide => assert!(matches!(
+                    instruction,
+                    Insn::Divide {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::Remainder => assert!(matches!(
+                    instruction,
+                    Insn::Remainder {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::And => assert!(matches!(
+                    instruction,
+                    Insn::And {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::Or => assert!(matches!(
+                    instruction,
+                    Insn::Or {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::BitAnd => assert!(matches!(
+                    instruction,
+                    Insn::BitAnd {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::BitOr => assert!(matches!(
+                    instruction,
+                    Insn::BitOr {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::ShiftLeft => assert!(matches!(
+                    instruction,
+                    Insn::ShiftLeft {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+                ExpectedBinaryInsn::ShiftRight => assert!(matches!(
+                    instruction,
+                    Insn::ShiftRight {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn equivalent_binary_operands_share_one_register() {
+        let expression = hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            operator: Operator::Add,
+            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 2, dest: 1 }, _),
+                (
+                    Insn::Add {
+                        lhs: 1,
+                        rhs: 1,
+                        dest: 8
+                    },
+                    _
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn nested_binary_operands_are_allocated_before_lowering_children() {
+        let expression = hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                operator: Operator::Add,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            }),
+            operator: Operator::Multiply,
+            rhs: Box::new(hir::Expr::Literal(Literal::Numeric("4".to_string()))),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 2, dest: 3 }, _),
+                (Insn::Integer { value: 3, dest: 4 }, _),
+                (
+                    Insn::Add {
+                        lhs: 3,
+                        rhs: 4,
+                        dest: 1
+                    },
+                    _
+                ),
+                (Insn::Integer { value: 4, dest: 2 }, _),
+                (
+                    Insn::Multiply {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    },
+                    _
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn binary_lowering_does_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for value in 2..=10_000 {
+            expression = hir::Expr::Binary {
+                lhs: Box::new(expression),
+                operator: Operator::Add,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric(value.to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            };
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 4).unwrap();
+        assert_eq!(program.insns.len(), 19_999);
+
+        std::mem::forget(expression);
     }
 
     #[test]

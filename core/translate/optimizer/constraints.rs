@@ -848,9 +848,10 @@ fn hir_partial_index_predicate_terms(
         |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
     let mut matched_terms = SmallVec::new();
     for index_conjunct in predicate.conjuncts() {
-        let (term_position, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && index_conjunct.equivalent_for_index(&term.expr)
-        })?;
+        let (term_position, _) = query_where_clause
+            .iter()
+            .enumerate()
+            .find(|(_, term)| can_use_query_term(term) && index_conjunct.equivalent(&term.expr))?;
         if !matched_terms.contains(&term_position) {
             matched_terms.push(term_position);
         }
@@ -1237,9 +1238,9 @@ pub(crate) fn hir_constraints_for_source(
                     };
                     let constrained_expr = hir_constrained_expr(constraint, where_clause)?;
                     expressions.columns.iter().position(|indexed_expr| {
-                        indexed_expr.as_ref().is_some_and(|indexed_expr| {
-                            constrained_expr.equivalent_for_index(indexed_expr)
-                        })
+                        indexed_expr
+                            .as_ref()
+                            .is_some_and(|indexed_expr| constrained_expr.equivalent(indexed_expr))
                     })
                 }
                 None => None,

@@ -60,7 +60,7 @@ impl ExprVisitor for ExprValidationVisitor<'_, '_> {
     fn pre_order(
         &mut self,
         _parent: &Expr,
-        _context: &(),
+        _context: &mut (),
         _child_index: usize,
         _child: &Expr,
     ) -> ValidationResult<ControlFlow<(), ()>> {

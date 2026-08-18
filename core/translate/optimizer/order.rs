@@ -851,7 +851,7 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
     }
 
     fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
-        target.equivalent_for_index(indexed)
+        target.equivalent(indexed)
     }
 }
 
