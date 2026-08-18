@@ -1,5 +1,6 @@
 use std::ops::ControlFlow;
 
+use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, ScalarFunc};
@@ -11,7 +12,7 @@ use crate::vdbe::{
     BranchOffset,
 };
 use crate::{LimboError, Numeric, Result, Value};
-use turso_parser::ast::{Literal, Operator, UnaryOperator};
+use turso_parser::ast::{Literal, Operator, ResolveType, UnaryOperator};
 
 #[derive(Clone, Copy)]
 enum BinaryOperands {
@@ -72,6 +73,7 @@ enum ExprRegisters {
     Array(usize),
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
+    RaiseMessage(usize),
 }
 
 enum NullTest {
@@ -445,6 +447,26 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 debug_assert_eq!(child_index, 0);
                 base
             }
+            hir::Expr::Raise {
+                action, message, ..
+            } => {
+                debug_assert_eq!(child_index, 0);
+                if *action == ResolveType::Ignore
+                    || matches!(
+                        message.as_deref(),
+                        Some(hir::Expr::Literal(Literal::String(_)))
+                    )
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::RaiseMessage(self.program.alloc_register());
+                }
+                let ExprRegisters::RaiseMessage(message) = context.registers else {
+                    unreachable!("RAISE message register was allocated")
+                };
+                message
+            }
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
@@ -753,6 +775,66 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         dest: target,
                     },
                 });
+                Ok(target)
+            }
+            hir::Expr::Raise { action, message } => {
+                let in_trigger = self.program.trigger.is_some();
+                match action {
+                    ResolveType::Ignore => {
+                        if !in_trigger {
+                            crate::bail_parse_error!(
+                                "RAISE() may only be used within a trigger-program"
+                            );
+                        }
+                        if message.is_some() {
+                            return Err(LimboError::InternalError(
+                                "RAISE(IGNORE) has a message".to_string(),
+                            ));
+                        }
+                        debug_assert!(children.is_empty());
+                        self.program.emit_insn(Insn::Halt {
+                            err_code: 0,
+                            description: String::new(),
+                            on_error: Some(ResolveType::Ignore),
+                            description_reg: None,
+                        });
+                    }
+                    action @ (ResolveType::Fail | ResolveType::Abort | ResolveType::Rollback) => {
+                        if !in_trigger && *action != ResolveType::Abort {
+                            crate::bail_parse_error!(
+                                "RAISE() may only be used within a trigger-program"
+                            );
+                        }
+                        let Some(message) = message else {
+                            crate::bail_parse_error!("RAISE requires an error message");
+                        };
+                        let (description, description_reg) = match message.as_ref() {
+                            hir::Expr::Literal(Literal::String(value)) => {
+                                debug_assert!(children.is_empty());
+                                (expr::sanitize_string(value), None)
+                            }
+                            _ => {
+                                let [message] = children else {
+                                    unreachable!("dynamic RAISE has one lowered message")
+                                };
+                                (String::new(), Some(*message))
+                            }
+                        };
+                        self.program.emit_insn(Insn::Halt {
+                            err_code: if in_trigger {
+                                SQLITE_CONSTRAINT_TRIGGER
+                            } else {
+                                SQLITE_ERROR
+                            },
+                            description,
+                            on_error: Some(*action),
+                            description_reg,
+                        });
+                    }
+                    ResolveType::Replace => {
+                        crate::bail_parse_error!("REPLACE is not valid for RAISE");
+                    }
+                }
                 Ok(target)
             }
             hir::Expr::Row(values) => {
@@ -1604,6 +1686,23 @@ mod tests {
                 kind,
             }),
         )
+    }
+
+    fn trigger_program() -> ProgramBuilder {
+        let mut program = program();
+        program.trigger = Some(crate::sync::Arc::new(crate::schema::Trigger::new(
+            "trigger".to_string(),
+            String::new(),
+            "items".to_string(),
+            None,
+            turso_parser::ast::TriggerEvent::Insert,
+            true,
+            None,
+            Vec::new(),
+            false,
+            None,
+        )));
+        program
     }
 
     #[test]
@@ -2646,6 +2745,131 @@ mod tests {
                 .insns
                 .iter()
                 .filter(|(instruction, _)| matches!(instruction, Insn::StructField { .. }))
+                .count(),
+            10_000
+        );
+
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn standalone_abort_embeds_a_literal_message() {
+        let expression = hir::Expr::Raise {
+            action: ResolveType::Abort,
+            message: Some(Box::new(hir::Expr::Literal(Literal::String(
+                "'stop'' now'".to_string(),
+            )))),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Halt {
+                    err_code: SQLITE_ERROR,
+                    description,
+                    on_error: Some(ResolveType::Abort),
+                    description_reg: None,
+                },
+                _,
+            )] if description == "stop' now"
+        ));
+    }
+
+    #[test]
+    fn dynamic_raise_message_uses_one_result_register() {
+        let expression = hir::Expr::Raise {
+            action: ResolveType::Abort,
+            message: Some(Box::new(hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                operator: Operator::Add,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            })),
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 2, dest: 2 }, _),
+                (Insn::Integer { value: 3, dest: 3 }, _),
+                (
+                    Insn::Add {
+                        lhs: 2,
+                        rhs: 3,
+                        dest: 1,
+                    },
+                    _,
+                ),
+                (
+                    Insn::Halt {
+                        err_code: SQLITE_ERROR,
+                        description_reg: Some(1),
+                        on_error: Some(ResolveType::Abort),
+                        ..
+                    },
+                    _,
+                ),
+            ]
+        ));
+    }
+
+    #[test]
+    fn trigger_raise_uses_trigger_error_codes_and_ignore_shape() {
+        let cases = [
+            (
+                hir::Expr::Raise {
+                    action: ResolveType::Ignore,
+                    message: None,
+                },
+                ResolveType::Ignore,
+                0,
+            ),
+            (
+                hir::Expr::Raise {
+                    action: ResolveType::Fail,
+                    message: Some(Box::new(hir::Expr::Literal(Literal::String(
+                        "'stop'".to_string(),
+                    )))),
+                },
+                ResolveType::Fail,
+                SQLITE_CONSTRAINT_TRIGGER,
+            ),
+        ];
+
+        for (expression, expected_action, expected_code) in cases {
+            let mut program = trigger_program();
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(Insn::Halt { err_code, on_error: Some(action), .. }, _)]
+                    if *err_code == expected_code && *action == expected_action
+            ));
+        }
+    }
+
+    #[test]
+    fn nested_raise_lowering_does_not_use_the_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::Raise {
+                action: ResolveType::Abort,
+                message: Some(Box::new(expression)),
+            };
+        }
+
+        let mut program = program();
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Halt { .. }))
                 .count(),
             10_000
         );
