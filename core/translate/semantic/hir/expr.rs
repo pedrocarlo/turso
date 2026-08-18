@@ -414,23 +414,36 @@ struct ExprFrame<'expr, C, T> {
     child_values: SmallVec<[T; 3]>,
 }
 
-pub(crate) trait ExprVisitor<C, T, E> {
+pub(crate) trait ExprVisitor {
+    type Context;
+    type Output;
+    type Error;
+
     fn pre_order(
         &mut self,
         parent: &Expr,
-        context: &C,
+        context: &Self::Context,
         child_index: usize,
         child: &Expr,
-    ) -> Result<ControlFlow<(), C>, E>;
+    ) -> Result<ControlFlow<(), Self::Context>, Self::Error>;
 
-    fn post_order(&mut self, expression: &Expr, context: C, children: &[T]) -> Result<T, E>;
+    fn post_order(
+        &mut self,
+        expression: &Expr,
+        context: Self::Context,
+        children: &[Self::Output],
+    ) -> Result<Self::Output, Self::Error>;
 }
 
 struct WalkVisitor<'a, F> {
     visit: &'a mut F,
 }
 
-impl<F: FnMut(&Expr)> ExprVisitor<(), (), Infallible> for WalkVisitor<'_, F> {
+impl<F: FnMut(&Expr)> ExprVisitor for WalkVisitor<'_, F> {
+    type Context = ();
+    type Output = ();
+    type Error = Infallible;
+
     fn pre_order(
         &mut self,
         _parent: &Expr,
@@ -452,11 +465,16 @@ impl<F: FnMut(&Expr)> ExprVisitor<(), (), Infallible> for WalkVisitor<'_, F> {
     }
 }
 
-struct FoldVisitor<'a, F> {
+struct FoldVisitor<'a, F, T> {
     fold: &'a mut F,
+    output: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<(), T, Infallible> for FoldVisitor<'_, F> {
+impl<T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor for FoldVisitor<'_, F, T> {
+    type Context = ();
+    type Output = T;
+    type Error = Infallible;
+
     fn pre_order(
         &mut self,
         _parent: &Expr,
@@ -877,9 +895,9 @@ impl Expr {
     /// Visit this expression and every expression it owns. References to
     /// outputs and subqueries remain references; their definitions are walked
     /// by the query that owns them.
-    pub(crate) fn walk(&self, visitor: &mut impl FnMut(&Expr)) {
+    pub(crate) fn for_each(&self, visitor: &mut impl FnMut(&Expr)) {
         visitor(self);
-        let result = self.visit((), &mut WalkVisitor { visit: visitor });
+        let result = self.walk((), &mut WalkVisitor { visit: visitor });
         if let Err(error) = result {
             match error {}
         }
@@ -889,7 +907,13 @@ impl Expr {
     /// Child values keep expression-child order, letting callers handle nodes
     /// whose result depends on more than one child.
     pub(crate) fn fold<T>(&self, folder: &mut impl FnMut(&Expr, &[T]) -> T) -> T {
-        match self.visit((), &mut FoldVisitor { fold: folder }) {
+        match self.walk(
+            (),
+            &mut FoldVisitor {
+                fold: folder,
+                output: std::marker::PhantomData,
+            },
+        ) {
             Ok(value) => value,
             Err(error) => match error {},
         }
@@ -899,11 +923,11 @@ impl Expr {
     /// after all selected children. The pre-order callback chooses the
     /// context for a child or skips that child. The post-order callback
     /// reduces completed child values into the current node's value.
-    pub(crate) fn visit<C, T, E>(
+    pub(crate) fn walk<V: ExprVisitor>(
         &self,
-        root_context: C,
-        visitor: &mut impl ExprVisitor<C, T, E>,
-    ) -> Result<T, E> {
+        root_context: V::Context,
+        visitor: &mut V,
+    ) -> Result<V::Output, V::Error> {
         let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
             let frame = frames.last_mut().expect("root expression frame exists");
@@ -1180,7 +1204,7 @@ mod tests {
         };
 
         let mut visited = Vec::new();
-        expression.walk(&mut |expression| {
+        expression.for_each(&mut |expression| {
             visited.push(match expression {
                 Expr::Binary { .. } => "binary",
                 Expr::Unary { .. } => "unary",

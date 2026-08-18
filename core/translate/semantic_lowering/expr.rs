@@ -10,7 +10,11 @@ struct ExprLowerer<'a> {
     program: &'a mut ProgramBuilder,
 }
 
-impl hir::ExprVisitor<usize, usize, LimboError> for ExprLowerer<'_> {
+impl hir::ExprVisitor for ExprLowerer<'_> {
+    type Context = usize;
+    type Output = usize;
+    type Error = LimboError;
+
     fn pre_order(
         &mut self,
         parent: &hir::Expr,
@@ -153,7 +157,7 @@ pub(crate) fn translate_expr(
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
-    expression.visit(target, &mut ExprLowerer { program })
+    expression.walk(target, &mut ExprLowerer { program })
 }
 
 /// Emit a literal already selected by semantic analysis.

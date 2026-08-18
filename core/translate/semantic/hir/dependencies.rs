@@ -61,7 +61,7 @@ impl HirDocument {
                 _ => {}
             },
             QueryPart::Expression(expression) => {
-                expression.walk(&mut |expression| {
+                expression.for_each(&mut |expression| {
                     let Expr::Subquery(subquery) = expression else {
                         return;
                     };
@@ -86,7 +86,7 @@ impl HirDocument {
     /// contribute their validated outer captures rather than their local
     /// sources.
     pub(crate) fn visit_expr_sources(&self, expression: &Expr, visit: &mut impl FnMut(SourceId)) {
-        expression.walk(&mut |expression| match expression {
+        expression.for_each(&mut |expression| match expression {
             Expr::Column(reference) => visit(reference.source),
             Expr::MergedColumn(column) => visit(column.right.source),
             Expr::RowId(source) => visit(*source),
@@ -491,7 +491,7 @@ fn collect_source_argument_column_reads<'source>(
 }
 
 fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector) {
-    expression.walk(&mut |expression| match expression {
+    expression.for_each(&mut |expression| match expression {
         Expr::Column(reference) => {
             reads.record(*reference);
         }

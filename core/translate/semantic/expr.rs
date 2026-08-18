@@ -3826,7 +3826,7 @@ fn nested_function_iter<'a>(
 
 fn nested_function_in_expr(expression: &hir::Expr) -> Option<NestedFunction> {
     let mut nested = None;
-    expression.walk(&mut |expression| {
+    expression.for_each(&mut |expression| {
         if nested.is_some() {
             return;
         }
