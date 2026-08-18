@@ -1,6 +1,6 @@
 //! Independent structural validation for completed HIR documents.
 
-use std::{cell::Cell, collections::HashSet, fmt, sync::Arc};
+use std::{cell::Cell, collections::HashSet, fmt, ops::ControlFlow, sync::Arc};
 
 use super::*;
 
@@ -46,6 +46,35 @@ struct HirValidator<'document> {
     visited_ctes: Vec<Cell<bool>>,
     /// 0 is unseen, 1 is on the current validation stack, and 2 is complete.
     schema_program_states: Vec<Cell<u8>>,
+}
+
+struct ExprValidationVisitor<'validator, 'document> {
+    validator: &'validator HirValidator<'document>,
+}
+
+impl ExprVisitor for ExprValidationVisitor<'_, '_> {
+    type Context = ();
+    type Output = ();
+    type Error = HirValidationError;
+
+    fn pre_order(
+        &mut self,
+        _parent: &Expr,
+        _context: &(),
+        _child_index: usize,
+        _child: &Expr,
+    ) -> ValidationResult<ControlFlow<(), ()>> {
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &Expr,
+        _context: (),
+        _children: &[()],
+    ) -> ValidationResult {
+        self.validator.validate_expr_node(expression)
+    }
 }
 
 impl<'document> HirValidator<'document> {
@@ -1542,24 +1571,27 @@ impl<'document> HirValidator<'document> {
         Ok(())
     }
 
-    fn visit_cast_programs(&self, programs: &BoundCastPrograms) -> ValidationResult {
+    fn visit_cast_program_references(&self, programs: &BoundCastPrograms) -> ValidationResult {
         for call in &programs.encode {
-            self.visit_schema_call(call)?;
+            self.visit_schema_program(call.program)?;
         }
         if let Some(domain) = &programs.domain {
             for check in &domain.checks {
-                self.visit_schema_call(&check.call)?;
+                self.visit_schema_program(check.call.program)?;
             }
         }
         Ok(())
     }
 
     fn visit_expr(&self, expression: &Expr) -> ValidationResult {
+        expression.walk((), &mut ExprValidationVisitor { validator: self })
+    }
+
+    fn validate_expr_node(&self, expression: &Expr) -> ValidationResult {
         match expression {
             Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
             Expr::Column(reference) => self.visit_column_ref(*reference),
             Expr::MergedColumn(column) => {
-                self.visit_expr(&column.left)?;
                 self.visit_column_ref(column.right)?;
                 self.visit_type_fact(&column.type_fact)?;
                 self.visit_optional_catalog_object(
@@ -1575,9 +1607,7 @@ impl<'document> HirValidator<'document> {
                 )
             }
             Expr::Output(output) => self.visit_output_reference(*output),
-            Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::NotNull(expr) => {
-                self.visit_expr(expr)
-            }
+            Expr::Unary { .. } | Expr::IsNull(_) | Expr::NotNull(_) => Ok(()),
             Expr::Binary {
                 lhs,
                 operator,
@@ -1586,8 +1616,6 @@ impl<'document> HirValidator<'document> {
                 custom,
                 comparison,
             } => {
-                self.visit_expr(lhs)?;
-                self.visit_expr(rhs)?;
                 self.require(
                     operator.is_comparison() == comparison.is_some(),
                     "binary expression has incorrect comparison metadata",
@@ -1627,7 +1655,7 @@ impl<'document> HirValidator<'document> {
                             "custom operator literal encoding refers to a non-literal operand",
                         )?;
                         if let Some(encoder) = &encoding.encoder {
-                            self.visit_schema_call(encoder)?;
+                            self.visit_schema_program(encoder.program)?;
                         }
                     }
                     self.visit_catalog_object(&custom.function, "custom operator function")?;
@@ -1642,9 +1670,6 @@ impl<'document> HirValidator<'document> {
                 end_comparison,
                 ..
             } => {
-                self.visit_expr(expr)?;
-                self.visit_expr(start)?;
-                self.visit_expr(end)?;
                 self.visit_expression_comparison(
                     start_comparison,
                     expr,
@@ -1661,46 +1686,35 @@ impl<'document> HirValidator<'document> {
             Expr::Case {
                 base,
                 when_then,
-                else_expr,
                 base_comparisons,
-            } => {
-                self.visit_optional_expr(base.as_deref())?;
-                for (when, then) in when_then {
-                    self.visit_expr(when)?;
-                    self.visit_expr(then)?;
-                }
-                self.visit_optional_expr(else_expr.as_deref())?;
-                match base.as_deref() {
-                    None => self.require(
-                        base_comparisons.is_empty(),
-                        "searched CASE contains base-comparison metadata",
-                    ),
-                    Some(base) => {
-                        self.require(
-                            base_comparisons.len() == when_then.len(),
-                            "simple CASE comparison count does not match its WHEN count",
+                ..
+            } => match base.as_deref() {
+                None => self.require(
+                    base_comparisons.is_empty(),
+                    "searched CASE contains base-comparison metadata",
+                ),
+                Some(base) => {
+                    self.require(
+                        base_comparisons.len() == when_then.len(),
+                        "simple CASE comparison count does not match its WHEN count",
+                    )?;
+                    for ((when, _), comparison) in when_then.iter().zip(base_comparisons) {
+                        self.visit_expression_comparison(
+                            comparison,
+                            base,
+                            when,
+                            "simple CASE comparison",
                         )?;
-                        for ((when, _), comparison) in when_then.iter().zip(base_comparisons) {
-                            self.visit_expression_comparison(
-                                comparison,
-                                base,
-                                when,
-                                "simple CASE comparison",
-                            )?;
-                        }
-                        Ok(())
                     }
+                    Ok(())
                 }
-            }
-            Expr::Cast { expr, target } => {
-                self.visit_expr(expr)?;
-                self.visit_exprs(&target.parameters)?;
+            },
+            Expr::Cast { target, .. } => {
                 self.visit_type_fact(&target.type_fact)?;
-                self.visit_cast_programs(&target.programs)
+                self.visit_cast_program_references(&target.programs)
             }
-            Expr::Collate { expr, collation } => {
-                self.visit_catalog_object(collation, "COLLATE expression")?;
-                self.visit_expr(expr)
+            Expr::Collate { collation, .. } => {
+                self.visit_catalog_object(collation, "COLLATE expression")
             }
             Expr::Function(function) => {
                 self.visit_catalog_object(&function.function, "function call")?;
@@ -1715,10 +1729,7 @@ impl<'document> HirValidator<'document> {
                         self.visit_sequence_function(function, operation)?;
                     }
                 }
-                self.visit_exprs(function.arguments.expressions())?;
-                self.visit_order_terms(function.arguments.order_terms())?;
-                self.visit_optional_expr(function.evaluation.filter())?;
-                Ok(())
+                self.validate_order_term_metadata(function.arguments.order_terms())
             }
             Expr::InList {
                 lhs,
@@ -1726,8 +1737,6 @@ impl<'document> HirValidator<'document> {
                 comparisons,
                 ..
             } => {
-                self.visit_expr(lhs)?;
-                self.visit_exprs(values)?;
                 self.require(
                     comparisons.len() == values.len(),
                     "IN-list comparison count does not match its value count",
@@ -1740,7 +1749,6 @@ impl<'document> HirValidator<'document> {
             Expr::Subquery(subquery) => self.visit_subquery(subquery),
             Expr::Like {
                 lhs,
-                rhs,
                 escape,
                 function,
                 operator,
@@ -1761,22 +1769,15 @@ impl<'document> HirValidator<'document> {
                     *argument_count == lhs_width + 1 + usize::from(escape.is_some()),
                     "LIKE-family argument count does not match its expressions",
                 )?;
-                self.visit_expr(lhs)?;
-                self.visit_expr(rhs)?;
-                self.visit_optional_expr(escape.as_deref())
+                Ok(())
             }
-            Expr::Row(values) | Expr::Array(values) => self.visit_exprs(values),
-            Expr::Subscript { base, index } => {
-                self.visit_expr(base)?;
-                self.visit_expr(index)
-            }
+            Expr::Row(_) | Expr::Array(_) | Expr::Subscript { .. } => Ok(()),
             Expr::FieldAccess(access) => {
                 self.visit_catalog_object(&access.container_type, "field-access type")?;
                 self.visit_type_fact(&access.result_type)?;
-                self.visit_expr(&access.base)?;
                 self.visit_field_access(access)
             }
-            Expr::Raise { message, .. } => self.visit_optional_expr(message.as_deref()),
+            Expr::Raise { .. } => Ok(()),
         }
     }
 
@@ -1889,7 +1890,6 @@ impl<'document> HirValidator<'document> {
                 comparison,
                 ..
             } => {
-                self.visit_expr(lhs)?;
                 self.visit_query(*query)?;
                 let lhs_width = self.expression_width(lhs)?;
                 let output_width = self.query(*query)?.output.len();
@@ -1973,6 +1973,12 @@ impl<'document> HirValidator<'document> {
     fn visit_order_terms(&self, terms: &[OrderTerm]) -> ValidationResult {
         for term in terms {
             self.visit_expr(&term.expr)?;
+        }
+        self.validate_order_term_metadata(terms)
+    }
+
+    fn validate_order_term_metadata(&self, terms: &[OrderTerm]) -> ValidationResult {
+        for term in terms {
             self.visit_type_fact(&term.type_fact)?;
             if let Some(collation) = &term.collation {
                 self.visit_catalog_object(collation, "ORDER BY collation")?;
@@ -2543,5 +2549,42 @@ impl<'document> HirValidator<'document> {
 
     fn invalid<T>(&self, message: impl Into<String>) -> ValidationResult<T> {
         Err(HirValidationError::new(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expression_validation_does_not_use_the_call_stack() {
+        let document = HirDocument {
+            snapshot: CatalogSnapshot::from_id(1),
+            databases: Vec::new(),
+            root: HirRoot::Query(QueryRoot {
+                query: QueryId::new(0),
+            }),
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let validator = HirValidator::new(&document);
+        let mut expression = Expr::Literal(turso_parser::ast::Literal::Null);
+        for _ in 0..10_000 {
+            expression = Expr::Unary {
+                operator: turso_parser::ast::UnaryOperator::Negative,
+                expr: Box::new(expression),
+            };
+        }
+
+        validator
+            .visit_expr(&expression)
+            .expect("deep expression validates iteratively");
+
+        // Dropping this synthetic tree recursively would test Rust's drop
+        // stack instead of the HIR walker.
+        std::mem::forget(expression);
     }
 }
