@@ -7007,6 +7007,66 @@ mod tests {
         )
         .expect("query-free INSERT plans from resolved HIR");
         assert!(plan.queries.is_empty());
+        assert!(matches!(
+            plan.root,
+            crate::translate::semantic_to_plan::HirRootPlan::Insert
+        ));
+    }
+
+    #[test]
+    fn delete_root_uses_hir_access_planning() {
+        use crate::translate::{
+            optimizer::SelectedBtreeOperation,
+            semantic_to_plan::{HirPlan, HirRootPlan, HirSourceAccess},
+        };
+
+        let schema = schema_with_items();
+        let document = analyze_sql_with_schema(&schema, "DELETE FROM items WHERE rowid = 1")
+            .expect("DELETE binds");
+        document.validate().expect("DELETE produces closed HIR");
+        let HirRoot::Delete(delete) = &document.root else {
+            panic!("DELETE produces DELETE root");
+        };
+        let target = delete.target;
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("DELETE plans from resolved HIR");
+        let HirRootPlan::Delete(access) = &plan.root else {
+            panic!("DELETE produces DELETE access plan");
+        };
+        let [target_loop] = access.loops.as_slice() else {
+            panic!("DELETE has one target loop");
+        };
+        assert_eq!(target_loop.source, target);
+        assert_eq!(target_loop.source_position, 0);
+        assert!(matches!(
+            &target_loop.access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
+                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+            }) if value == "1"
+        ));
+        assert_eq!(access.predicates.len(), 1);
+        assert!(access.predicates[0].consumed);
+
+        let document =
+            analyze_sql_with_schema(&schema, "DELETE FROM items").expect("unfiltered DELETE binds");
+        let plan = HirPlan::build(
+            Arc::new(document),
+            &schema,
+            &crate::translate::optimizer::CostModelParams::default(),
+        )
+        .expect("unfiltered DELETE plans from resolved HIR");
+        let HirRootPlan::Delete(access) = &plan.root else {
+            panic!("unfiltered DELETE produces DELETE access plan");
+        };
+        assert!(access.predicates.is_empty());
+        assert!(matches!(
+            &access.loops[0].access,
+            HirSourceAccess::BTree(SelectedBtreeOperation::Scan { index: None, .. })
+        ));
     }
 
     #[test]

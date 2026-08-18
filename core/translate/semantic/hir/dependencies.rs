@@ -31,11 +31,8 @@ impl ColumnUsageCollector {
         usage
     }
 
-    fn into_reads(self) -> Vec<ColumnRef> {
-        self.into_usage()
-            .into_iter()
-            .map(|usage| usage.reference)
-            .collect()
+    fn into_reads(self) -> impl Iterator<Item = ColumnRef> {
+        self.into_usage().into_iter().map(|usage| usage.reference)
     }
 }
 
@@ -371,11 +368,10 @@ impl Query {
     pub(crate) fn direct_column_reads<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
-    ) -> Vec<ColumnRef> {
+    ) -> impl Iterator<Item = ColumnRef> {
         self.direct_column_usage(source_by_id)
             .into_iter()
             .map(|usage| usage.reference)
-            .collect()
     }
 }
 
@@ -385,7 +381,7 @@ impl Update {
     pub(crate) fn direct_column_reads<'source>(
         &self,
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
-    ) -> Vec<ColumnRef> {
+    ) -> impl Iterator<Item = ColumnRef> {
         let mut reads = ColumnUsageCollector::default();
         if let Some(from) = &self.from {
             collect_from_column_reads(from, &mut reads, source_by_id);
@@ -415,9 +411,9 @@ impl Update {
 }
 
 impl Delete {
-    /// Return every table column read directly by the DELETE root. Nested
-    /// queries own their reads and are visited separately by the analyzer.
-    pub(crate) fn direct_column_reads(&self) -> Vec<ColumnRef> {
+    /// Count every table column read directly by the DELETE root. Nested
+    /// queries own their usage and are visited separately by later phases.
+    pub(crate) fn direct_column_usage(&self) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
         collect_optional_expr_column_reads(self.predicate.as_ref(), &mut reads);
         collect_order_column_reads(&self.order_by, &mut reads);
@@ -431,7 +427,15 @@ impl Delete {
             }
         }
 
-        reads.into_reads()
+        reads.into_usage()
+    }
+
+    /// Return every table column read directly by the DELETE root. Nested
+    /// queries own their reads and are visited separately by the analyzer.
+    pub(crate) fn direct_column_reads(&self) -> impl Iterator<Item = ColumnRef> {
+        self.direct_column_usage()
+            .into_iter()
+            .map(|usage| usage.reference)
     }
 }
 
@@ -759,7 +763,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            query.direct_column_reads(no_source),
+            query.direct_column_reads(no_source).collect::<Vec<_>>(),
             vec![ColumnRef { source, column: 0 }]
         );
     }

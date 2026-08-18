@@ -44,7 +44,19 @@ struct HirFromContext {
 /// definitions.
 pub(crate) struct HirPlan {
     pub(crate) document: Arc<HirDocument>,
+    pub(crate) root: HirRootPlan,
     pub(crate) queries: Vec<HirPlannedQuery>,
+}
+
+/// Planner facts owned by the semantic root. Variants without a source scan
+/// need no additional access data before lowering.
+pub(crate) enum HirRootPlan {
+    Query,
+    Insert,
+    Update,
+    Delete(HirAccessPlan),
+    Trigger,
+    SchemaExpressions,
 }
 
 /// Access plans and estimates for one query in the owned HIR document.
@@ -69,7 +81,21 @@ impl HirPlan {
             context.plan_query_tree(query.id, schema, params, &mut queries, &mut active)?;
         }
         queries.sort_unstable_by_key(|plan| plan.query.index());
-        Ok(Self { document, queries })
+        let query_estimate = |query| {
+            queries
+                .iter()
+                .find(|plan| plan.query == query)
+                .map(|plan| HirQueryEstimate {
+                    output_cardinality: plan.output_cardinality,
+                    cost: plan.cost,
+                })
+        };
+        let root = context.plan_root(schema, params, &query_estimate)?;
+        Ok(Self {
+            document,
+            root,
+            queries,
+        })
     }
 
     fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
@@ -94,11 +120,11 @@ pub(crate) struct HirQueryBlockPlan {
 }
 
 /// Access choices and estimates shared by query blocks and DML scans.
-struct HirAccessPlan {
-    loops: Vec<HirPlannedLoop>,
-    predicates: Vec<HirWhereTerm>,
-    output_cardinality: f64,
-    cost: Cost,
+pub(crate) struct HirAccessPlan {
+    pub(crate) loops: Vec<HirPlannedLoop>,
+    pub(crate) predicates: Vec<HirWhereTerm>,
+    pub(crate) output_cardinality: f64,
+    pub(crate) cost: Cost,
 }
 
 /// One selected source loop in physical join order, still using HIR
@@ -149,6 +175,66 @@ impl<'a> HirPlanContext<'a> {
         self.document
             .source(id)
             .expect("validated HIR contains referenced source")
+    }
+
+    fn plan_root(
+        &self,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirRootPlan> {
+        match &self.document.root {
+            hir::HirRoot::Query(_) => Ok(HirRootPlan::Query),
+            hir::HirRoot::Insert(_) => Ok(HirRootPlan::Insert),
+            hir::HirRoot::Update(_) => Ok(HirRootPlan::Update),
+            hir::HirRoot::Delete(delete) => self
+                .plan_delete(delete, schema, params, query_estimate)
+                .map(HirRootPlan::Delete),
+            hir::HirRoot::Trigger(_) => Ok(HirRootPlan::Trigger),
+            hir::HirRoot::SchemaExpressions(_) => Ok(HirRootPlan::SchemaExpressions),
+        }
+    }
+
+    fn plan_delete(
+        &self,
+        delete: &hir::Delete,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> Result<HirAccessPlan> {
+        let usage = delete.direct_column_usage();
+        let mut input = HirQueryBlockPlanInput {
+            sources: vec![self.plan_source(delete.target, None, &usage)?],
+            groups: Vec::new(),
+            predicates: Vec::new(),
+        };
+        if let Some(predicate) = &delete.predicate {
+            append_predicates(&mut input.predicates, predicate, None);
+        }
+        for term in &delete.order_by {
+            self.register_expression_index_usage(&mut input.sources, &term.expr)?;
+        }
+        if let Some(returning) = &delete.returning {
+            for output in &returning.outputs {
+                self.register_expression_index_usage(&mut input.sources, &output.expr)?;
+            }
+        }
+
+        let order_target = self.order_target(
+            &delete.order_by,
+            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+        );
+        self.plan_source_access(
+            input,
+            order_target.as_ref(),
+            1.0,
+            schema,
+            params,
+            query_estimate,
+        )?
+        .ok_or_else(|| {
+            LimboError::InternalError("DELETE target produced no access plan".to_string())
+        })
     }
 
     /// Plan query-backed dependencies before their owning query so source

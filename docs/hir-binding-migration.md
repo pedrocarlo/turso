@@ -118,6 +118,10 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 
 Completed:
 
+- Top-level DELETE now uses resolved HIR for target access selection. Its
+  predicate, index hint, column-use counts, and target `SourceId` flow directly
+  into the shared access planner without `TableReferences`, binding, rewriting,
+  or parser-expression conversion.
 - HIR planning now starts from the owned document rather than a caller-supplied
   query ID. Query, DML, and trigger roots plan every reachable query once, while
   documents without query work produce an empty query-plan list.
