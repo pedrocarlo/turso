@@ -101,6 +101,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                 self.emit_unary(*operator, expr, target, children)
             }
             hir::Expr::Binary {
+                operator: Operator::Concat,
+                array_concat,
+                custom: None,
+                comparison: None,
+                ..
+            } => self.emit_concat(context.binary_operands, target, children, *array_concat),
+            hir::Expr::Binary {
                 operator,
                 array_concat: false,
                 custom: None,
@@ -115,6 +122,43 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
 }
 
 impl ExprLowerer<'_> {
+    fn emit_concat(
+        &mut self,
+        operands: BinaryOperands,
+        target: usize,
+        children: &[usize],
+        array_concat: bool,
+    ) -> Result<usize> {
+        let (lhs, rhs) = match operands {
+            BinaryOperands::Shared(register) => {
+                debug_assert_eq!(children, [register]);
+                (register, register)
+            }
+            BinaryOperands::Pair { lhs, rhs } => {
+                debug_assert_eq!(children, [lhs, rhs]);
+                (lhs, rhs)
+            }
+            BinaryOperands::Unallocated => {
+                unreachable!("binary expression allocated operand registers")
+            }
+        };
+        let instruction = if array_concat {
+            Insn::ArrayConcat {
+                lhs,
+                rhs,
+                dest: target,
+            }
+        } else {
+            Insn::Concat {
+                lhs,
+                rhs,
+                dest: target,
+            }
+        };
+        self.program.emit_insn(instruction);
+        Ok(target)
+    }
+
     fn emit_binary(
         &mut self,
         operator: Operator,
@@ -592,6 +636,78 @@ mod tests {
                 )),
             }
         }
+    }
+
+    #[test]
+    fn concat_lowering_uses_resolved_array_semantics() {
+        for array_concat in [false, true] {
+            let expression = hir::Expr::Binary {
+                lhs: Box::new(hir::Expr::Literal(Literal::String("'left'".to_string()))),
+                operator: Operator::Concat,
+                rhs: Box::new(hir::Expr::Literal(Literal::String("'right'".to_string()))),
+                array_concat,
+                custom: None,
+                comparison: None,
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                &program.insns[..2],
+                [
+                    (Insn::String8 { value, dest: 1 }, _),
+                    (Insn::String8 { dest: 2, .. }, _),
+                ] if value == "left"
+            ));
+            if array_concat {
+                assert!(matches!(
+                    program.insns[2].0,
+                    Insn::ArrayConcat {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    program.insns[2].0,
+                    Insn::Concat {
+                        lhs: 1,
+                        rhs: 2,
+                        dest: 8
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn concat_can_share_equivalent_operand_registers() {
+        let expression = hir::Expr::Binary {
+            lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            operator: Operator::Concat,
+            rhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
+            array_concat: true,
+            custom: None,
+            comparison: None,
+        };
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::String8 { value, dest: 1 }, _),
+                (
+                    Insn::ArrayConcat {
+                        lhs: 1,
+                        rhs: 1,
+                        dest: 8
+                    },
+                    _
+                ),
+            ] if value == "value"
+        ));
     }
 
     #[test]
