@@ -1725,6 +1725,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 operator == ast::Operator::Is,
             ));
         }
+        if matches!(operator, ast::Operator::Is | ast::Operator::IsNot) {
+            if let Some(is_true) = truth_test_rhs(rhs_syntax) {
+                let collation = expression_operands_collation([&lhs, &rhs]);
+                return Ok(truth_test_expr(
+                    take_scalar_operand(lhs)?,
+                    is_true,
+                    operator == ast::Operator::IsNot,
+                    collation,
+                ));
+            }
+        }
         if lhs.components.len() != rhs.components.len()
             || lhs.components.len() > 1 && !supports_row_value_binary_comparison(operator)
         {
@@ -3500,6 +3511,37 @@ fn null_test_expr(inner: ResolvedScopeExpr, is_null: bool) -> ResolvedScopeExpr 
     )
 }
 
+/// Return TRUE/FALSE only when SQLite treats this syntax as a truth-test
+/// keyword. Parentheses and COLLATE do not block recognition; unary `+` does.
+fn truth_test_rhs(expression: &ast::Expr) -> Option<bool> {
+    match expression {
+        ast::Expr::Literal(ast::Literal::True) => Some(true),
+        ast::Expr::Literal(ast::Literal::False) => Some(false),
+        ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
+            truth_test_rhs(&expressions[0])
+        }
+        ast::Expr::Collate(inner, _) => truth_test_rhs(inner),
+        _ => None,
+    }
+}
+
+fn truth_test_expr(
+    inner: ResolvedScopeExpr,
+    is_true: bool,
+    negated: bool,
+    collation: ExprCollation,
+) -> ResolvedScopeExpr {
+    computed_expr(
+        hir::Expr::TruthTest {
+            expr: Box::new(inner.expr),
+            is_true,
+            negated,
+        },
+        hir::TypeFact::known(Type::Integer),
+        collation,
+    )
+}
+
 fn computed_expr(
     expr: hir::Expr,
     type_fact: hir::TypeFact,
@@ -4283,6 +4325,48 @@ mod tests {
             error.to_string(),
             "Parse error: no such column: missing_parameter"
         );
+    }
+
+    #[test]
+    fn is_true_and_false_become_explicit_hir_truth_tests() {
+        for (sql, expected_is_true, expected_negated) in [
+            ("SELECT 2 IS TRUE", true, false),
+            ("SELECT 2 IS FALSE", false, false),
+            ("SELECT 2 IS NOT TRUE", true, true),
+            ("SELECT 2 IS NOT FALSE", false, true),
+            ("SELECT 2 IS (TRUE)", true, false),
+        ] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("truth test binds");
+            assert!(matches!(
+                analyzed,
+                Expr::TruthTest {
+                    expr,
+                    is_true,
+                    negated,
+                } if matches!(*expr, Expr::Literal(ast::Literal::Numeric(ref value)) if value == "2")
+                    && is_true == expected_is_true
+                    && negated == expected_negated
+            ));
+        }
+
+        let unary_true = analyze_expression(
+            &expression("SELECT 2 IS +TRUE"),
+            &Scope::default(),
+            ExprPolicy::select(DoubleQuotedDml::Enabled),
+        )
+        .expect("unary plus blocks truth-test recognition");
+        assert!(matches!(
+            unary_true,
+            Expr::Binary {
+                operator: ast::Operator::Is,
+                ..
+            }
+        ));
     }
 
     #[test]

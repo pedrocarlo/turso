@@ -1607,7 +1607,9 @@ impl<'document> HirValidator<'document> {
                 )
             }
             Expr::Output(output) => self.visit_output_reference(*output),
-            Expr::Unary { .. } | Expr::IsNull(_) | Expr::NotNull(_) => Ok(()),
+            Expr::Unary { .. } | Expr::IsNull(_) | Expr::NotNull(_) | Expr::TruthTest { .. } => {
+                Ok(())
+            }
             Expr::Binary {
                 lhs,
                 operator,

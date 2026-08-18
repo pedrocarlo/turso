@@ -378,6 +378,11 @@ pub enum Expr {
     Function(FunctionCall),
     IsNull(Box<Expr>),
     NotNull(Box<Expr>),
+    TruthTest {
+        expr: Box<Expr>,
+        is_true: bool,
+        negated: bool,
+    },
     InList {
         lhs: Box<Expr>,
         negated: bool,
@@ -540,6 +545,7 @@ impl Expr {
             Self::Unary { expr, .. }
             | Self::IsNull(expr)
             | Self::NotNull(expr)
+            | Self::TruthTest { expr, .. }
             | Self::Collate { expr, .. } => (index == 0).then_some(expr.as_ref()),
             Self::Binary {
                 lhs, rhs, custom, ..
@@ -812,6 +818,21 @@ impl Expr {
                     | (Self::NotNull(left), Self::NotNull(right)) => {
                         pending.push((left, right));
                         true
+                    }
+                    (
+                        Self::TruthTest {
+                            expr: left,
+                            is_true: left_is_true,
+                            negated: left_negated,
+                        },
+                        Self::TruthTest {
+                            expr: right,
+                            is_true: right_is_true,
+                            negated: right_negated,
+                        },
+                    ) => {
+                        pending.push((left, right));
+                        left_is_true == right_is_true && left_negated == right_negated
                     }
                     (
                         Self::InList {

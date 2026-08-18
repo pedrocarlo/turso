@@ -596,7 +596,10 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::RowId(source) => {
             references.insert(*source);
         }
-        Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::NotNull(expr) => {
+        Expr::Unary { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::TruthTest { expr, .. } => {
             collect_expr_references(expr, references);
         }
         Expr::Binary {

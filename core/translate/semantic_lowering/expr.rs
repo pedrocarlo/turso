@@ -71,7 +71,9 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     self.program.alloc_register()
                 }
             },
-            hir::Expr::IsNull(_) | hir::Expr::NotNull(_) => self.program.alloc_register(),
+            hir::Expr::IsNull(_) | hir::Expr::NotNull(_) | hir::Expr::TruthTest { .. } => {
+                self.program.alloc_register()
+            }
             hir::Expr::Collate { .. } => context.target,
             hir::Expr::Cast { .. } => {
                 if child_index == 0 {
@@ -120,6 +122,20 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             }
             hir::Expr::IsNull(_) => self.emit_null_test(NullTest::IsNull, target, children),
             hir::Expr::NotNull(_) => self.emit_null_test(NullTest::NotNull, target, children),
+            hir::Expr::TruthTest {
+                is_true, negated, ..
+            } => {
+                let [value] = children else {
+                    unreachable!("truth test has one lowered child")
+                };
+                self.program.emit_insn(Insn::IsTrue {
+                    reg: *value,
+                    dest: target,
+                    null_value: *negated,
+                    invert: *negated == *is_true,
+                });
+                Ok(target)
+            }
             hir::Expr::Collate { .. } => {
                 let [value] = children else {
                     unreachable!("COLLATE has one lowered child")
@@ -813,6 +829,56 @@ mod tests {
             assert!(matches!(
                 program.insns[5].0,
                 Insn::Integer { value: 0, dest: 8 }
+            ));
+        }
+    }
+
+    #[test]
+    fn truth_test_lowering_keeps_existing_flags_for_nested_expressions() {
+        for (is_true, negated, expected_invert) in [
+            (true, false, false),
+            (false, false, true),
+            (true, true, true),
+            (false, true, false),
+        ] {
+            let expression = hir::Expr::TruthTest {
+                expr: Box::new(hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::Literal(Literal::Numeric("2".to_string()))),
+                    operator: Operator::Add,
+                    rhs: Box::new(hir::Expr::Literal(Literal::Numeric("3".to_string()))),
+                    array_concat: false,
+                    custom: None,
+                    comparison: None,
+                }),
+                is_true,
+                negated,
+            };
+            let mut program = program();
+
+            assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
+            assert!(matches!(
+                program.insns.as_slice(),
+                [
+                    (Insn::Integer { value: 2, dest: 2 }, _),
+                    (Insn::Integer { value: 3, dest: 3 }, _),
+                    (
+                        Insn::Add {
+                            lhs: 2,
+                            rhs: 3,
+                            dest: 1
+                        },
+                        _
+                    ),
+                    (
+                        Insn::IsTrue {
+                            reg: 1,
+                            dest: 8,
+                            null_value,
+                            invert,
+                        },
+                        _
+                    ),
+                ] if *null_value == negated && *invert == expected_invert
             ));
         }
     }
