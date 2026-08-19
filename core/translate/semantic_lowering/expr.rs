@@ -139,12 +139,17 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
         }
         Func::Math(_) => Some(EmptyArgumentStart::UseTarget),
         Func::Scalar(
-            ScalarFunc::Date
+            ScalarFunc::Changes
+            | ScalarFunc::TotalChanges
+            | ScalarFunc::Random
+            | ScalarFunc::Date
             | ScalarFunc::DateTime
             | ScalarFunc::JulianDay
             | ScalarFunc::UnixEpoch
             | ScalarFunc::Time,
         ) => Some(EmptyArgumentStart::ReserveOneRegister),
+        #[cfg(feature = "test_helper")]
+        Func::Scalar(ScalarFunc::TestNondetCounter) => Some(EmptyArgumentStart::ReserveOneRegister),
         Func::Scalar(
             ScalarFunc::Abs
             | ScalarFunc::Lower
@@ -4437,13 +4442,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_date_functions_reserve_the_legacy_start_register() {
+    fn empty_plain_functions_reserve_the_legacy_start_register() {
         for function in [
+            ScalarFunc::Changes,
+            ScalarFunc::TotalChanges,
+            ScalarFunc::Random,
             ScalarFunc::Date,
             ScalarFunc::DateTime,
             ScalarFunc::JulianDay,
             ScalarFunc::UnixEpoch,
             ScalarFunc::Time,
+            #[cfg(feature = "test_helper")]
+            ScalarFunc::TestNondetCounter,
         ] {
             let expression = ordinary_scalar_call(Func::Scalar(function), Vec::new());
             let mut program = program();
