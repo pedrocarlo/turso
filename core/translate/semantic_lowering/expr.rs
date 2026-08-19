@@ -250,7 +250,9 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::TableColumnsJsonArray
+            | ScalarFunc::BinRecordJsonObject,
         ) => Some(EmptyArgumentStart::UseNextRegister),
         #[cfg(all(feature = "fs", not(target_family = "wasm")))]
         Func::Scalar(ScalarFunc::LoadExtension) => Some(EmptyArgumentStart::UseNextRegister),
@@ -4985,11 +4987,13 @@ mod tests {
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
+            (ScalarFunc::TableColumnsJsonArray, 1),
+            (ScalarFunc::BinRecordJsonObject, 2),
         ] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
                 .collect();
-            let expression = ordinary_scalar_call(Func::Scalar(function), arguments);
+            let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
             let mut program = program();
 
             translate_expr(&mut program, &expression, 8).unwrap();
@@ -5005,10 +5009,10 @@ mod tests {
                     start_reg: 1,
                     dest: 8,
                     func: FuncCtx {
-                        func: Func::Scalar(_),
+                        func: Func::Scalar(emitted),
                         arg_count,
                     },
-                }) if *arg_count == argument_count
+                }) if *emitted == function && *arg_count == argument_count
             ));
         }
     }

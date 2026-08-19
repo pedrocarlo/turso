@@ -819,6 +819,16 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
             crate::bail_parse_error!("likely function must have exactly 1 argument")
         }
         Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input),
+        Func::Scalar(ScalarFunc::TableColumnsJsonArray) if count != 1 => {
+            crate::bail_parse_error!(
+                "table_columns_json_array() function must have exactly 1 argument"
+            )
+        }
+        Func::Scalar(ScalarFunc::BinRecordJsonObject) if count != 2 => {
+            crate::bail_parse_error!(
+                "bin_record_json_object() function must have exactly 2 arguments"
+            )
+        }
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4721,6 +4731,22 @@ mod tests {
                 "SELECT ifnull(1, 2, 3)",
                 "ifnull function requires exactly 2 arguments",
             ),
+            (
+                "SELECT table_columns_json_array()",
+                "table_columns_json_array() function must have exactly 1 argument",
+            ),
+            (
+                "SELECT table_columns_json_array(1, 2)",
+                "table_columns_json_array() function must have exactly 1 argument",
+            ),
+            (
+                "SELECT bin_record_json_object(1)",
+                "bin_record_json_object() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT bin_record_json_object(1, 2, 3)",
+                "bin_record_json_object() function must have exactly 2 arguments",
+            ),
         ] {
             let error = analyze_expression(
                 &expression(sql),
@@ -4738,6 +4764,8 @@ mod tests {
             "SELECT instr(1, 2)",
             "SELECT replace(1, 2, 3)",
             "SELECT ifnull(1, 2)",
+            "SELECT table_columns_json_array(1)",
+            "SELECT bin_record_json_object(1, 2)",
         ] {
             let analyzed = analyze_expression(
                 &expression(sql),
