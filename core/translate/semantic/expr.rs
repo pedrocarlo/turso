@@ -798,6 +798,11 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Random) if count != 0 => {
             crate::bail_parse_error!("{} function with arguments", function)
         }
+        Func::Scalar(
+            ScalarFunc::SqliteVersion | ScalarFunc::TursoVersion | ScalarFunc::SqliteSourceId,
+        ) if count != 0 => {
+            crate::bail_parse_error!("sqlite_version function with arguments")
+        }
         #[cfg(feature = "test_helper")]
         Func::Scalar(ScalarFunc::TestNondetCounter) if count != 0 => {
             crate::bail_parse_error!("{} function with arguments", function)
@@ -4786,6 +4791,9 @@ mod tests {
                 "total_changes function with more than 0 arguments",
             ),
             ("random", "random function with arguments"),
+            ("sqlite_version", "sqlite_version function with arguments"),
+            ("turso_version", "sqlite_version function with arguments"),
+            ("sqlite_source_id", "sqlite_version function with arguments"),
         ] {
             let error = analyze_expression(
                 &expression(&format!("SELECT {function}(1)")),
