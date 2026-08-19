@@ -178,6 +178,7 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::Unhex
             | ScalarFunc::Min
             | ScalarFunc::Max
+            | ScalarFunc::Concat
             | ScalarFunc::Char
             | ScalarFunc::Printf
             | ScalarFunc::GetByte
@@ -4409,6 +4410,8 @@ mod tests {
             (ScalarFunc::Unhex, 2),
             (ScalarFunc::Min, 2),
             (ScalarFunc::Max, 3),
+            (ScalarFunc::Concat, 1),
+            (ScalarFunc::Concat, 3),
             (ScalarFunc::DateTime, 2),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
