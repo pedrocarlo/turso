@@ -63,6 +63,12 @@ struct ConcatWsRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct IfNullRegisters {
+    value: usize,
+    copy_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
 struct SubscriptRegisters {
     base: usize,
     index: usize,
@@ -77,6 +83,7 @@ enum ExprRegisters {
     InList(InListRegisters),
     Like(LikeRegisters),
     ConcatWs(ConcatWsRegisters),
+    IfNull(IfNullRegisters),
     Array(usize),
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
@@ -590,6 +597,47 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::IfNull)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() != 2 {
+                    return Err(LimboError::InternalError(
+                        "ifnull has invalid HIR arguments".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::IfNull(IfNullRegisters {
+                        value: self.program.alloc_register(),
+                        copy_label: self.program.allocate_label(),
+                    });
+                }
+                let ExprRegisters::IfNull(registers) = context.registers else {
+                    unreachable!("ifnull registers were allocated")
+                };
+                match child_index {
+                    0 => registers.value,
+                    1 => {
+                        self.program.emit_insn(Insn::NotNull {
+                            reg: registers.value,
+                            target_pc: registers.copy_label,
+                        });
+                        registers.value
+                    }
+                    _ => unreachable!("ifnull has two arguments"),
+                }
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(call.function.value(), Func::Scalar(ScalarFunc::ConcatWs)) =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -1016,6 +1064,39 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::IfNull)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() != 2 || children.len() != 2 {
+                    return Err(LimboError::InternalError(
+                        "ifnull has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::IfNull(registers) = context.registers else {
+                    unreachable!("ifnull registers were allocated")
+                };
+                debug_assert_eq!(children, [registers.value, registers.value]);
+                self.program
+                    .preassign_label_to_next_insn(registers.copy_label);
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: registers.value,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -4565,6 +4646,37 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn ifnull_keeps_legacy_short_circuit_register_and_opcode_shape() {
+        let expression = ordinary_scalar_call(
+            Func::Scalar(ScalarFunc::IfNull),
+            vec![
+                hir::Expr::Literal(Literal::Numeric("1".to_string())),
+                hir::Expr::Literal(Literal::Numeric("2".to_string())),
+            ],
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { dest: 1, .. }, _),
+                (Insn::NotNull { reg: 1, .. }, _),
+                (Insn::Integer { dest: 1, .. }, _),
+                (
+                    Insn::Copy {
+                        src_reg: 1,
+                        dst_reg: 8,
+                        extra_amount: 0,
+                    },
+                    _
+                ),
+            ]
+        ));
+        assert_eq!(program.alloc_register(), 2);
     }
 
     #[test]
