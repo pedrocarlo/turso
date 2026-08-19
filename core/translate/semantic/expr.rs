@@ -782,7 +782,9 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::IfNull) if count != 2 => {
             crate::bail_parse_error!("{} function requires exactly 2 arguments", function)
         }
-        Func::Scalar(ScalarFunc::Iif) => require_at_least_arguments(function, count, 2),
+        Func::Scalar(ScalarFunc::Iif | ScalarFunc::Coalesce) => {
+            require_at_least_arguments(function, count, 2)
+        }
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4713,6 +4715,11 @@ mod tests {
         for (sql, expected) in [
             ("SELECT iif()", "iif function with no arguments"),
             ("SELECT iif(1)", "iif function with less than 2 arguments"),
+            ("SELECT coalesce()", "coalesce function with no arguments"),
+            (
+                "SELECT coalesce(1)",
+                "coalesce function with less than 2 arguments",
+            ),
         ] {
             let error = analyze_expression(
                 &expression(sql),
@@ -4723,7 +4730,12 @@ mod tests {
             assert_eq!(error.to_string(), format!("Parse error: {expected}"));
         }
 
-        for sql in ["SELECT iif(1, 2)", "SELECT iif(1, 2, 3)"] {
+        for sql in [
+            "SELECT iif(1, 2)",
+            "SELECT iif(1, 2, 3)",
+            "SELECT coalesce(1, 2)",
+            "SELECT coalesce(1, 2, 3)",
+        ] {
             let analyzed = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
