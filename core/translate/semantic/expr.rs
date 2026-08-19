@@ -832,6 +832,22 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
                 "bin_record_json_object() function must have exactly 2 arguments"
             )
         }
+        Func::Scalar(ScalarFunc::Attach) => {
+            crate::bail_parse_error!(
+                "ATTACH should be handled at statement level, not as expression"
+            )
+        }
+        Func::Scalar(ScalarFunc::Detach) => {
+            crate::bail_parse_error!(
+                "DETACH should be handled at statement level, not as expression"
+            )
+        }
+        Func::Scalar(ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet) => {
+            crate::bail_parse_error!("{} is an internal function used by ANALYZE", function)
+        }
+        Func::Scalar(ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit) => {
+            crate::bail_parse_error!("{} is an internal function used by CDC", function)
+        }
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4654,6 +4670,68 @@ mod tests {
             error.to_string(),
             "Parse error: misuse of aggregate function sum()"
         );
+    }
+
+    #[test]
+    fn statement_and_internal_functions_are_rejected_during_semantic_analysis() {
+        let input = FunctionInput::Expressions {
+            distinctness: None,
+            values: ExprChildren::new(),
+            order_by: Vec::new(),
+        };
+        for (function, expected) in [
+            (
+                ScalarFunc::Attach,
+                "ATTACH should be handled at statement level, not as expression",
+            ),
+            (
+                ScalarFunc::Detach,
+                "DETACH should be handled at statement level, not as expression",
+            ),
+            (
+                ScalarFunc::StatInit,
+                "stat_init is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::StatPush,
+                "stat_push is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::StatGet,
+                "stat_get is an internal function used by ANALYZE",
+            ),
+            (
+                ScalarFunc::ConnTxnId,
+                "conn_txn_id is an internal function used by CDC",
+            ),
+            (
+                ScalarFunc::IsAutocommit,
+                "is_autocommit is an internal function used by CDC",
+            ),
+        ] {
+            let error = validate_scalar_arguments(&Func::Scalar(function), &input)
+                .expect_err("statement-only or internal function is rejected");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for (sql, expected) in [
+            (
+                "SELECT conn_txn_id()",
+                "Parse error: conn_txn_id is an internal function used by CDC",
+            ),
+            (
+                "SELECT is_autocommit()",
+                "Parse error: is_autocommit is an internal function used by CDC",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("publicly resolvable internal function is rejected");
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
