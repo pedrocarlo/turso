@@ -180,6 +180,8 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
         Func::Scalar(ScalarFunc::TestNondetCounter) => Some(EmptyArgumentStart::ReserveOneRegister),
         Func::Scalar(
             ScalarFunc::Abs
+            | ScalarFunc::Like
+            | ScalarFunc::Glob
             | ScalarFunc::Lower
             | ScalarFunc::Upper
             | ScalarFunc::Length
@@ -4941,6 +4943,38 @@ mod tests {
                     },
                 }) if *arg_count == argument_count
             ));
+        }
+    }
+
+    #[test]
+    fn direct_like_functions_use_plain_legacy_argument_registers() {
+        for function in [ScalarFunc::Like, ScalarFunc::Glob] {
+            for argument_count in [2, 3] {
+                let arguments = (0..argument_count)
+                    .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                    .collect();
+                let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
+                let mut program = program();
+
+                translate_expr(&mut program, &expression, 8).unwrap();
+                assert!(program.insns[..argument_count].iter().enumerate().all(
+                    |(index, (instruction, _))| {
+                        matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+                    }
+                ));
+                assert!(matches!(
+                    program.insns.last().map(|(instruction, _)| instruction),
+                    Some(Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx {
+                            func: Func::Scalar(emitted),
+                            arg_count,
+                        },
+                    }) if *emitted == function && *arg_count == argument_count
+                ));
+            }
         }
     }
 
