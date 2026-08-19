@@ -909,6 +909,35 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::StructPack)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "struct_pack has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "struct_pack has argument ordering".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers =
+                        ExprRegisters::Function(self.program.alloc_registers(values.len()));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("struct_pack registers were allocated")
+                };
+                start + child_index
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && plain_function_lowering(call.function.value()).is_some() =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -1647,6 +1676,42 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     src_reg: registers.result,
                     dst_reg: target,
                     extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::StructPack)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "struct_pack has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "struct_pack has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let start = match context.registers {
+                    ExprRegisters::Function(start) => start,
+                    ExprRegisters::None if values.is_empty() => self.program.alloc_registers(0),
+                    _ => unreachable!("struct_pack registers were allocated"),
+                };
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == start + index));
+                self.program.emit_insn(Insn::MakeArray {
+                    start_reg: start,
+                    count: values.len(),
+                    dest: target,
                 });
                 Ok(target)
             }
@@ -5288,6 +5353,52 @@ mod tests {
                 }) if *emitted == function && *arg_count == argument_count
             ));
         }
+    }
+
+    #[test]
+    fn struct_pack_uses_legacy_make_array_register_shape() {
+        let mut empty_program = program();
+        let empty = ordinary_scalar_call(Func::Scalar(ScalarFunc::StructPack), Vec::new());
+
+        translate_expr(&mut empty_program, &empty, 8).unwrap();
+        assert!(matches!(
+            empty_program.insns.as_slice(),
+            [(
+                Insn::MakeArray {
+                    start_reg: 1,
+                    count: 0,
+                    dest: 8,
+                },
+                _,
+            )]
+        ));
+        assert_eq!(empty_program.alloc_register(), 1);
+
+        let expression = ordinary_scalar_call(
+            Func::Scalar(ScalarFunc::StructPack),
+            vec![
+                hir::Expr::Literal(Literal::Numeric("10".to_string())),
+                hir::Expr::Literal(Literal::Numeric("20".to_string())),
+            ],
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 10, dest: 1 }, _),
+                (Insn::Integer { value: 20, dest: 2 }, _),
+                (
+                    Insn::MakeArray {
+                        start_reg: 1,
+                        count: 2,
+                        dest: 8,
+                    },
+                    _,
+                ),
+            ]
+        ));
     }
 
     #[test]
