@@ -57,6 +57,12 @@ struct LikeRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct ConcatWsRegisters {
+    result: usize,
+    arguments: usize,
+}
+
+#[derive(Clone, Copy)]
 struct SubscriptRegisters {
     base: usize,
     index: usize,
@@ -70,6 +76,7 @@ enum ExprRegisters {
     Case(CaseRegisters),
     InList(InListRegisters),
     Like(LikeRegisters),
+    ConcatWs(ConcatWsRegisters),
     Array(usize),
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
@@ -583,6 +590,38 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::ConcatWs)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has argument ordering".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    let result = self.program.alloc_registers(values.len() + 1);
+                    context.registers = ExprRegisters::ConcatWs(ConcatWsRegisters {
+                        result,
+                        arguments: result + 1,
+                    });
+                }
+                let ExprRegisters::ConcatWs(registers) = context.registers else {
+                    unreachable!("concat_ws registers were allocated")
+                };
+                registers.arguments + child_index
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && plain_function_lowering(call.function.value()).is_some() =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -977,6 +1016,49 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::ConcatWs)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::ConcatWs(registers) = context.registers else {
+                    unreachable!("concat_ws registers were allocated")
+                };
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == registers.arguments + index));
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: registers.arguments,
+                    dest: registers.result,
+                    func: FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: values.len(),
+                    },
+                });
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: registers.result,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -4440,6 +4522,47 @@ mod tests {
                         arg_count,
                     },
                 }) if *arg_count == argument_count
+            ));
+        }
+    }
+
+    #[test]
+    fn concat_ws_keeps_legacy_result_and_argument_registers() {
+        for argument_count in [2, 3] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::ConcatWs), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(program.insns[..argument_count].iter().enumerate().all(
+                |(index, (instruction, _))| {
+                    matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 2)
+                }
+            ));
+            assert!(matches!(
+                program
+                    .insns
+                    .get(argument_count)
+                    .map(|(instruction, _)| instruction),
+                Some(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: 2,
+                    dest: 1,
+                    func: FuncCtx {
+                        func: Func::Scalar(ScalarFunc::ConcatWs),
+                        arg_count,
+                    },
+                }) if *arg_count == argument_count
+            ));
+            assert!(matches!(
+                program.insns.last().map(|(instruction, _)| instruction),
+                Some(Insn::Copy {
+                    src_reg: 1,
+                    dst_reg: 8,
+                    extra_amount: 0,
+                })
             ));
         }
     }
