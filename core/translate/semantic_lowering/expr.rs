@@ -76,6 +76,11 @@ struct IifRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct CoalesceRegisters {
+    end_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
 struct SubscriptRegisters {
     base: usize,
     index: usize,
@@ -92,6 +97,7 @@ enum ExprRegisters {
     ConcatWs(ConcatWsRegisters),
     IfNull(IfNullRegisters),
     Iif(IifRegisters),
+    Coalesce(CoalesceRegisters),
     Array(usize),
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
@@ -601,6 +607,42 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     unreachable!("RAISE message register was allocated")
                 };
                 message
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::Coalesce)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() < 2 {
+                    return Err(LimboError::InternalError(
+                        "coalesce has invalid HIR arguments".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Coalesce(CoalesceRegisters {
+                        end_label: self.program.allocate_label(),
+                    });
+                }
+                let ExprRegisters::Coalesce(registers) = context.registers else {
+                    unreachable!("coalesce registers were allocated")
+                };
+                if child_index > 0 {
+                    self.program.emit_insn(Insn::NotNull {
+                        reg: context.target,
+                        target_pc: registers.end_label,
+                    });
+                }
+                context.target
             }
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
@@ -1129,6 +1171,34 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::Coalesce)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() < 2 || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "coalesce has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::Coalesce(registers) = context.registers else {
+                    unreachable!("coalesce registers were allocated")
+                };
+                debug_assert!(children.iter().all(|child| *child == target));
+                self.program
+                    .preassign_label_to_next_insn(registers.end_label);
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -4824,6 +4894,28 @@ mod tests {
                 .join(" ");
             assert_eq!(shape, expected_shape);
             assert_eq!(program.alloc_register(), 2);
+        }
+    }
+
+    #[test]
+    fn coalesce_keeps_legacy_target_register_and_opcode_shape() {
+        for argument_count in [2, 3] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Coalesce), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert_eq!(program.insns.len(), argument_count * 2 - 1);
+            for (index, (instruction, _)) in program.insns.iter().enumerate() {
+                if index % 2 == 0 {
+                    assert!(matches!(instruction, Insn::Integer { dest: 8, .. }));
+                } else {
+                    assert!(matches!(instruction, Insn::NotNull { reg: 8, .. }));
+                }
+            }
+            assert_eq!(program.alloc_register(), 1);
         }
     }
 
