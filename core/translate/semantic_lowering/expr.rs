@@ -617,6 +617,53 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             }
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::CustomType(_)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "custom-type function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                let runtime_argument = match &call.operation {
+                    hir::FunctionOperation::CustomType(hir::CustomTypeOperation::UnionValue {
+                        ..
+                    }) if values.len() == 2 => 1,
+                    hir::FunctionOperation::CustomType(hir::CustomTypeOperation::UnionTag {
+                        ..
+                    }) if values.len() == 1 => 0,
+                    hir::FunctionOperation::CustomType(
+                        hir::CustomTypeOperation::UnionExtract { .. }
+                        | hir::CustomTypeOperation::StructExtract { .. },
+                    ) if values.len() == 2 => 0,
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "custom-type function has invalid HIR arguments".to_string(),
+                        ));
+                    }
+                };
+                if !order_by.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "custom-type function has argument ordering".to_string(),
+                    ));
+                }
+                if child_index != runtime_argument {
+                    return Ok(ControlFlow::Break(()));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Function(self.program.alloc_register());
+                }
+                let ExprRegisters::Function(argument) = context.registers else {
+                    unreachable!("custom-type function register was allocated")
+                };
+                argument
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
@@ -1331,6 +1378,54 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         func: call.function.value().clone(),
                         arg_count: values.len(),
                     },
+                });
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::CustomType(_)) =>
+            {
+                let [argument] = children else {
+                    return Err(LimboError::InternalError(
+                        "custom-type function has invalid lowered arguments".to_string(),
+                    ));
+                };
+                let ExprRegisters::Function(expected_argument) = context.registers else {
+                    unreachable!("custom-type function register was allocated")
+                };
+                debug_assert_eq!(*argument, expected_argument);
+                self.program.emit_insn(match &call.operation {
+                    hir::FunctionOperation::CustomType(hir::CustomTypeOperation::UnionValue {
+                        tag_index,
+                        ..
+                    }) => Insn::UnionPack {
+                        tag_index: *tag_index,
+                        value_reg: *argument,
+                        dest: target,
+                    },
+                    hir::FunctionOperation::CustomType(hir::CustomTypeOperation::UnionTag {
+                        tag_names,
+                        ..
+                    }) => Insn::UnionTag {
+                        src_reg: *argument,
+                        dest: target,
+                        tag_names: tag_names.clone(),
+                    },
+                    hir::FunctionOperation::CustomType(
+                        hir::CustomTypeOperation::UnionExtract { tag_index, .. },
+                    ) => Insn::UnionExtract {
+                        src_reg: *argument,
+                        expected_tag: *tag_index,
+                        dest: target,
+                    },
+                    hir::FunctionOperation::CustomType(
+                        hir::CustomTypeOperation::StructExtract { field_index, .. },
+                    ) => Insn::StructField {
+                        src_reg: *argument,
+                        field_index: *field_index,
+                        dest: target,
+                    },
+                    _ => unreachable!("custom-type operation was checked by match guard"),
                 });
                 Ok(target)
             }
@@ -2449,6 +2544,24 @@ mod tests {
         })
     }
 
+    fn custom_type_call(
+        function: ScalarFunc,
+        values: Vec<hir::Expr>,
+        operation: hir::CustomTypeOperation,
+    ) -> hir::Expr {
+        hir::Expr::Function(hir::FunctionCall {
+            function: resolved_function(Func::Scalar(function)),
+            evaluation: hir::FunctionEvaluation::Scalar,
+            arguments: hir::FunctionArguments::Expressions {
+                values,
+                distinctness: None,
+                order_by: Vec::new(),
+            },
+            result_type: TypeFact::dynamic(),
+            operation: hir::FunctionOperation::CustomType(operation),
+        })
+    }
+
     fn resolved_type(kind: crate::schema::TypeDefKind) -> hir::ResolvedType {
         hir::CatalogObject::new(
             hir::CatalogObjectId::new(2),
@@ -2464,6 +2577,123 @@ mod tests {
                 kind,
             }),
         )
+    }
+
+    #[test]
+    fn custom_type_calls_use_resolved_metadata_and_skip_name_arguments() {
+        #[derive(Debug)]
+        enum ExpectedInsn {
+            UnionPack,
+            UnionTag,
+            UnionExtract,
+            StructField,
+        }
+
+        let union_type =
+            resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
+                variants: Vec::new(),
+                tag_names: crate::sync::Arc::from(Vec::<String>::new()),
+            }));
+        let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
+            crate::schema::StructDef { fields: Vec::new() },
+        ));
+        let runtime_value = || hir::Expr::Literal(Literal::Numeric("7".to_string()));
+        let semantic_name = || hir::Expr::Literal(Literal::String("'ignored'".to_string()));
+        let cases = [
+            (
+                custom_type_call(
+                    ScalarFunc::UnionValueFunc,
+                    vec![semantic_name(), runtime_value()],
+                    hir::CustomTypeOperation::UnionValue {
+                        union_type: union_type.clone(),
+                        tag_index: 3,
+                    },
+                ),
+                ExpectedInsn::UnionPack,
+            ),
+            (
+                custom_type_call(
+                    ScalarFunc::UnionTagFunc,
+                    vec![runtime_value()],
+                    hir::CustomTypeOperation::UnionTag {
+                        union_type: union_type.clone(),
+                        tag_names: crate::sync::Arc::from([
+                            "email".to_string(),
+                            "chat".to_string(),
+                        ]),
+                    },
+                ),
+                ExpectedInsn::UnionTag,
+            ),
+            (
+                custom_type_call(
+                    ScalarFunc::UnionExtractFunc,
+                    vec![runtime_value(), semantic_name()],
+                    hir::CustomTypeOperation::UnionExtract {
+                        union_type,
+                        tag_index: 4,
+                    },
+                ),
+                ExpectedInsn::UnionExtract,
+            ),
+            (
+                custom_type_call(
+                    ScalarFunc::StructExtractFunc,
+                    vec![runtime_value(), semantic_name()],
+                    hir::CustomTypeOperation::StructExtract {
+                        struct_type,
+                        field_index: 5,
+                    },
+                ),
+                ExpectedInsn::StructField,
+            ),
+        ];
+
+        for (expression, expected_operation) in cases {
+            let mut program = program();
+            translate_expr(&mut program, &expression, 8).unwrap();
+
+            assert_eq!(program.insns.len(), 2);
+            assert!(matches!(
+                program.insns[0].0,
+                Insn::Integer { value: 7, dest: 1 }
+            ));
+            match (&program.insns[1].0, expected_operation) {
+                (
+                    Insn::UnionPack {
+                        tag_index: 3,
+                        value_reg: 1,
+                        dest: 8,
+                    },
+                    ExpectedInsn::UnionPack,
+                ) => {}
+                (
+                    Insn::UnionTag {
+                        src_reg: 1,
+                        dest: 8,
+                        tag_names,
+                    },
+                    ExpectedInsn::UnionTag,
+                ) if tag_names.as_ref() == ["email", "chat"] => {}
+                (
+                    Insn::UnionExtract {
+                        src_reg: 1,
+                        expected_tag: 4,
+                        dest: 8,
+                    },
+                    ExpectedInsn::UnionExtract,
+                )
+                | (
+                    Insn::StructField {
+                        src_reg: 1,
+                        field_index: 5,
+                        dest: 8,
+                    },
+                    ExpectedInsn::StructField,
+                ) => {}
+                unexpected => panic!("unexpected custom-type lowering: {unexpected:?}"),
+            }
+        }
     }
 
     fn trigger_program() -> ProgramBuilder {
