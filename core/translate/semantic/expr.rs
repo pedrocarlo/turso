@@ -776,6 +776,16 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
             | ScalarFunc::Round
             | ScalarFunc::Unhex,
         ) => require_at_most_arguments(function, count, 2),
+        Func::Scalar(ScalarFunc::Changes | ScalarFunc::TotalChanges) if count != 0 => {
+            crate::bail_parse_error!("{} function with more than 0 arguments", function)
+        }
+        Func::Scalar(ScalarFunc::Random) if count != 0 => {
+            crate::bail_parse_error!("{} function with arguments", function)
+        }
+        #[cfg(feature = "test_helper")]
+        Func::Scalar(ScalarFunc::TestNondetCounter) if count != 0 => {
+            crate::bail_parse_error!("{} function with arguments", function)
+        }
         #[cfg(all(feature = "fs", not(target_family = "wasm")))]
         Func::Scalar(ScalarFunc::LoadExtension) => require_exact_arguments(function, count, 1),
         #[cfg(feature = "json")]
@@ -4699,6 +4709,56 @@ mod tests {
                 .expect("valid one-or-two argument call binds");
                 assert!(matches!(analyzed, Expr::Function(_)));
             }
+        }
+    }
+
+    #[test]
+    fn nullary_argument_rules_are_checked_during_semantic_analysis() {
+        for (function, expected) in [
+            ("changes", "changes function with more than 0 arguments"),
+            (
+                "total_changes",
+                "total_changes function with more than 0 arguments",
+            ),
+            ("random", "random function with arguments"),
+        ] {
+            let error = analyze_expression(
+                &expression(&format!("SELECT {function}(1)")),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid nullary call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+
+            let analyzed = analyze_expression(
+                &expression(&format!("SELECT {function}()")),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid nullary call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+
+        #[cfg(feature = "test_helper")]
+        {
+            let error = analyze_expression(
+                &expression("SELECT test_nondet_counter(1)"),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("test counter rejects arguments during semantic analysis");
+            assert_eq!(
+                error.to_string(),
+                "Parse error: test_nondet_counter function with arguments"
+            );
+
+            let analyzed = analyze_expression(
+                &expression("SELECT test_nondet_counter()"),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("nullary test counter binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
         }
     }
 
