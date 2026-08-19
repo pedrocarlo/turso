@@ -613,6 +613,37 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
+                        Func::Scalar(ScalarFunc::Substr | ScalarFunc::Substring)
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || !matches!(values.len(), 2 | 3) {
+                    return Err(LimboError::InternalError(
+                        "substring has invalid HIR arguments".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers = ExprRegisters::Function(self.program.alloc_registers(3));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("substring registers were allocated")
+                };
+                start + child_index
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
                         Func::Scalar(ScalarFunc::LastInsertRowid)
                     ) =>
             {
@@ -1181,6 +1212,50 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::Substr | ScalarFunc::Substring)
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty()
+                    || !matches!(values.len(), 2 | 3)
+                    || children.len() != values.len()
+                {
+                    return Err(LimboError::InternalError(
+                        "substring has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("substring registers were allocated")
+                };
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == start + index));
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: start,
+                    dest: target,
+                    func: FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: values.len(),
+                    },
+                });
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -5075,6 +5150,39 @@ mod tests {
                 ] if *emitted == function
             ));
             assert_eq!(program.alloc_register(), 2);
+        }
+    }
+
+    #[test]
+    fn substring_functions_always_reserve_three_legacy_argument_registers() {
+        for function in [ScalarFunc::Substr, ScalarFunc::Substring] {
+            for argument_count in [2, 3] {
+                let arguments = (0..argument_count)
+                    .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                    .collect();
+                let expression = ordinary_scalar_call(Func::Scalar(function.clone()), arguments);
+                let mut program = program();
+
+                translate_expr(&mut program, &expression, 8).unwrap();
+                assert!(program.insns[..argument_count].iter().enumerate().all(
+                    |(index, (instruction, _))| {
+                        matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+                    }
+                ));
+                assert!(matches!(
+                    program.insns.last().map(|(instruction, _)| instruction),
+                    Some(Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx {
+                            func: Func::Scalar(emitted),
+                            arg_count,
+                        },
+                    }) if *emitted == function && *arg_count == argument_count
+                ));
+                assert_eq!(program.alloc_register(), 4);
+            }
         }
     }
 
