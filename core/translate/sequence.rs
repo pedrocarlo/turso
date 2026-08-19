@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use crate::bail_parse_error;
+use crate::function::FuncCtx;
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
@@ -433,6 +434,117 @@ pub fn emit_disk_read_nextval(
     });
 
     Ok(())
+}
+
+/// Emit the existing disk-backed `setval` bytecode after the caller has
+/// lowered its arguments into consecutive registers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_disk_setval(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    backing_table: Arc<BTreeTable>,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
+    seq_name: &str,
+    seq: &Sequence,
+    start_reg: usize,
+    argument_count: usize,
+    target_register: usize,
+    func_ctx: FuncCtx,
+) -> Result<()> {
+    // setval keeps its own cursor lifecycle: open the backing table,
+    // validate the user-supplied value via the Function handler,
+    // DELETE every existing row, then INSERT one at the requested
+    // value with the descriptor suffix.
+    let root_page = backing_table.root_page;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(root_page),
+        db: database_id,
+    });
+
+    // Function instruction performs argument validation and writes the
+    // user-visible result into target_register. The handler no longer
+    // mutates any in-memory atomic.
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg,
+        dest: target_register,
+        func: func_ctx,
+    });
+
+    let empty_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: empty_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: seq_name.to_string(),
+        // Sequence storage is internal bookkeeping, not a SQL row change.
+        is_part_of_update: true,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_label,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(empty_label);
+
+    let col_base = program.alloc_registers(7);
+    program.emit_insn(Insn::Copy {
+        src_reg: start_reg + 1,
+        dst_reg: col_base,
+        extra_amount: 0,
+    });
+    if argument_count > 2 {
+        program.emit_insn(Insn::Copy {
+            src_reg: start_reg + 2,
+            dst_reg: col_base + 1,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_insn(Insn::Integer {
+            dest: col_base + 1,
+            value: 1,
+        });
+    }
+    emit_sequence_descriptor_literals(program, seq, col_base + 2);
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(col_base),
+        count: 7,
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: start_reg + 1,
+        record_reg,
+        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        table_name: seq_name.to_string(),
+    });
+    program.emit_insn(Insn::SetSequenceCurrval {
+        seq_name_reg: start_reg,
+        value_reg: start_reg + 1,
+    });
+    program.emit_insn(Insn::Close { cursor_id });
+    // For AUTOINCREMENT-backing sequences, also mirror the new
+    // watermark into `sqlite_sequence` so the SQLite-compat row
+    // tracks `setval()` without waiting for a checkpoint. Matches
+    // the inline sync the nextval / advance_past paths emit; see
+    // `emit_autoincrement_sqlite_sequence_sync` for the rationale.
+    emit_autoincrement_sqlite_sequence_sync(
+        program,
+        database_id,
+        sqlite_sequence,
+        seq_name,
+        start_reg + 1,
+    )
 }
 
 /// Emit bytecode that ensures the sequence's disk watermark is at least
