@@ -616,6 +616,41 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
+                        Func::Scalar(ScalarFunc::Likely | ScalarFunc::Likelihood)
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                let expected = match call.function.value() {
+                    Func::Scalar(ScalarFunc::Likely) => 1,
+                    Func::Scalar(ScalarFunc::Likelihood) => 2,
+                    _ => unreachable!("planner likelihood function was checked by match guard"),
+                };
+                if !order_by.is_empty() || values.len() != expected {
+                    return Err(LimboError::InternalError(
+                        "planner likelihood function has invalid HIR arguments".to_string(),
+                    ));
+                }
+                if child_index == 0 {
+                    context.target
+                } else {
+                    debug_assert_eq!(child_index, 1);
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
                         Func::Scalar(ScalarFunc::Substr | ScalarFunc::Substring)
                     ) =>
             {
@@ -1214,6 +1249,36 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     ResolveType::Replace => {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
+                }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::Likely | ScalarFunc::Likelihood)
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                let expected = match call.function.value() {
+                    Func::Scalar(ScalarFunc::Likely) => 1,
+                    Func::Scalar(ScalarFunc::Likelihood) => 2,
+                    _ => unreachable!("planner likelihood function was checked by match guard"),
+                };
+                if !order_by.is_empty() || values.len() != expected || children != [target] {
+                    return Err(LimboError::InternalError(
+                        "planner likelihood function has invalid lowered arguments".to_string(),
+                    ));
                 }
                 Ok(target)
             }
@@ -4977,6 +5042,33 @@ mod tests {
                     }) if *emitted == function && *arg_count == argument_count
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn likelihood_hints_only_lower_the_value_expression() {
+        for (function, arguments) in [
+            (
+                ScalarFunc::Likely,
+                vec![hir::Expr::Literal(Literal::Numeric("7".to_string()))],
+            ),
+            (
+                ScalarFunc::Likelihood,
+                vec![
+                    hir::Expr::Literal(Literal::Numeric("7".to_string())),
+                    hir::Expr::Literal(Literal::Numeric("0.5".to_string())),
+                ],
+            ),
+        ] {
+            let expression = ordinary_scalar_call(Func::Scalar(function), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(Insn::Integer { value: 7, dest: 8 }, _)]
+            ));
+            assert_eq!(program.alloc_register(), 1);
         }
     }
 

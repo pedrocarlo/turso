@@ -750,6 +750,33 @@ fn require_at_least_arguments(function: &Func, count: usize, minimum: usize) -> 
     Ok(())
 }
 
+fn validate_likelihood_arguments(input: &FunctionInput) -> Result<()> {
+    if input.argument_count() != 2 {
+        crate::bail_parse_error!("likelihood() function must have exactly 2 arguments");
+    }
+    let hir::Expr::Literal(ast::Literal::Numeric(value)) = &input.facts()[1].expr else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    };
+    let Ok(probability) = value.parse::<f64>() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point constant"
+        );
+    };
+    if !(0.0..=1.0).contains(&probability) {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    }
+    if !value.contains('.') {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point number with decimal point"
+        );
+    }
+    Ok(())
+}
+
 fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
     let count = input.argument_count();
     match function {
@@ -788,6 +815,10 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Like | ScalarFunc::Glob) if count < 2 => {
             crate::bail_parse_error!("{} function with less than 2 arguments", function)
         }
+        Func::Scalar(ScalarFunc::Likely) if count != 1 => {
+            crate::bail_parse_error!("likely function must have exactly 1 argument")
+        }
+        Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input),
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4758,6 +4789,58 @@ mod tests {
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid minimum-arity call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn planner_likelihood_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            (
+                "SELECT likely()",
+                "likely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT likely(1, 2)",
+                "likely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT likelihood(1)",
+                "likelihood() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT likelihood(1, 0.5, 2)",
+                "likelihood() function must have exactly 2 arguments",
+            ),
+            (
+                "SELECT likelihood(1, 0)",
+                "second argument to likelihood() must be a floating point number with decimal point",
+            ),
+            (
+                "SELECT likelihood(1, 1.5)",
+                "second argument to likelihood() must be a constant between 0.0 and 1.0",
+            ),
+            (
+                "SELECT likelihood(1, '0.5')",
+                "second argument to likelihood() must be a constant between 0.0 and 1.0",
+            ),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid planner likelihood call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in ["SELECT likely(1)", "SELECT likelihood(1, 0.5)"] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid planner likelihood call binds");
             assert!(matches!(analyzed, Expr::Function(_)));
         }
     }
