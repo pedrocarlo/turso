@@ -162,6 +162,8 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
         Func::External(_) | Func::Dialect(_) | Func::Vector(_) => {
             Some(EmptyArgumentStart::UseTarget)
         }
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        Func::Fts(_) => Some(EmptyArgumentStart::UseNextRegister),
         Func::Math(function) if matches!(function.arity(), MathFuncArity::Nullary) => {
             Some(EmptyArgumentStart::UseZero)
         }
@@ -4904,6 +4906,43 @@ mod tests {
                         arg_count,
                     },
                 }) if *start_reg == expected_start && *arg_count == expected_count
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    #[test]
+    fn direct_fts_functions_use_consecutive_argument_registers() {
+        use crate::function::FtsFunc;
+
+        for (function, argument_count) in [
+            (FtsFunc::Score, 2),
+            (FtsFunc::Match, 3),
+            (FtsFunc::Highlight, 4),
+        ] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression = ordinary_scalar_call(Func::Fts(function.clone()), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(program.insns[..argument_count].iter().enumerate().all(
+                |(index, (instruction, _))| {
+                    matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+                }
+            ));
+            assert!(matches!(
+                program.insns.last().map(|(instruction, _)| instruction),
+                Some(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: 1,
+                    dest: 8,
+                    func: FuncCtx {
+                        func: Func::Fts(emitted),
+                        arg_count,
+                    },
+                }) if *emitted == function && *arg_count == argument_count
             ));
         }
     }
