@@ -174,7 +174,8 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::DateTime
             | ScalarFunc::JulianDay
             | ScalarFunc::UnixEpoch
-            | ScalarFunc::Time,
+            | ScalarFunc::Time
+            | ScalarFunc::StrfTime,
         ) => Some(EmptyArgumentStart::ReserveOneRegister),
         #[cfg(feature = "test_helper")]
         Func::Scalar(ScalarFunc::TestNondetCounter) => Some(EmptyArgumentStart::ReserveOneRegister),
@@ -4915,6 +4916,7 @@ mod tests {
             (ScalarFunc::Concat, 1),
             (ScalarFunc::Concat, 3),
             (ScalarFunc::DateTime, 2),
+            (ScalarFunc::StrfTime, 2),
             (ScalarFunc::StringReverse, 1),
             (ScalarFunc::Gcd, 2),
             (ScalarFunc::NumericEncode, 3),
@@ -5231,6 +5233,7 @@ mod tests {
             ScalarFunc::JulianDay,
             ScalarFunc::UnixEpoch,
             ScalarFunc::Time,
+            ScalarFunc::StrfTime,
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter,
         ] {
