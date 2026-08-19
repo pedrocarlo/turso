@@ -611,6 +611,16 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::LastInsertRowid)
+                    ) =>
+            {
+                return Ok(ControlFlow::Break(()));
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(call.function.value(), Func::Scalar(ScalarFunc::Coalesce)) =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -1171,6 +1181,41 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
+                        Func::Scalar(ScalarFunc::LastInsertRowid)
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || !children.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "last_insert_rowid has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let start_reg = self.program.alloc_register();
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg,
+                    dest: target,
+                    func: FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: values.len(),
+                    },
+                });
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -4916,6 +4961,36 @@ mod tests {
                 }
             }
             assert_eq!(program.alloc_register(), 1);
+        }
+    }
+
+    #[test]
+    fn last_insert_rowid_keeps_legacy_ignored_argument_behavior() {
+        for argument_count in [0, 2] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression =
+                ordinary_scalar_call(Func::Scalar(ScalarFunc::LastInsertRowid), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(
+                    Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx {
+                            func: Func::Scalar(ScalarFunc::LastInsertRowid),
+                            arg_count,
+                        },
+                    },
+                    _,
+                )] if *arg_count == argument_count
+            ));
+            assert_eq!(program.alloc_register(), 2);
         }
     }
 
