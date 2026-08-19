@@ -769,6 +769,9 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Replace) if count != 3 => {
             crate::bail_parse_error!("wrong number of arguments to function {}()", function)
         }
+        Func::Scalar(ScalarFunc::IfNull) if count != 2 => {
+            crate::bail_parse_error!("{} function requires exactly 2 arguments", function)
+        }
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4654,6 +4657,18 @@ mod tests {
                 "SELECT replace(1, 2)",
                 "wrong number of arguments to function replace()",
             ),
+            (
+                "SELECT ifnull()",
+                "ifnull function requires exactly 2 arguments",
+            ),
+            (
+                "SELECT ifnull(1)",
+                "ifnull function requires exactly 2 arguments",
+            ),
+            (
+                "SELECT ifnull(1, 2, 3)",
+                "ifnull function requires exactly 2 arguments",
+            ),
         ] {
             let error = analyze_expression(
                 &expression(sql),
@@ -4670,6 +4685,7 @@ mod tests {
             "SELECT nullif(1, 2)",
             "SELECT instr(1, 2)",
             "SELECT replace(1, 2, 3)",
+            "SELECT ifnull(1, 2)",
         ] {
             let analyzed = analyze_expression(
                 &expression(sql),
