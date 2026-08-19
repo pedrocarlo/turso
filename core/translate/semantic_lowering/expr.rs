@@ -198,6 +198,7 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
             | ScalarFunc::Sign
             | ScalarFunc::Soundex
             | ScalarFunc::ZeroBlob
+            | ScalarFunc::CurrVal
             | ScalarFunc::SequenceWatermark
             | ScalarFunc::TimeDiff
             | ScalarFunc::Hex
@@ -5398,6 +5399,37 @@ mod tests {
                     _,
                 ),
             ]
+        ));
+    }
+
+    #[test]
+    fn currval_uses_ordinary_function_lowering() {
+        let expression = ordinary_scalar_call(
+            Func::Scalar(ScalarFunc::CurrVal),
+            vec![hir::Expr::Literal(Literal::String(
+                "'main.seq'".to_string(),
+            ))],
+        );
+        let mut program = program();
+
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::String8 { value, dest: 1 }, _),
+                (
+                    Insn::Function {
+                        constant_mask: 0,
+                        start_reg: 1,
+                        dest: 8,
+                        func: FuncCtx {
+                            func: Func::Scalar(ScalarFunc::CurrVal),
+                            arg_count: 1,
+                        },
+                    },
+                    _,
+                ),
+            ] if value == "main.seq"
         ));
     }
 
