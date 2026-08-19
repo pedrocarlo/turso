@@ -1188,6 +1188,50 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
+                        Func::Scalar(
+                            ScalarFunc::SqliteVersion
+                                | ScalarFunc::TursoVersion
+                                | ScalarFunc::SqliteSourceId
+                        )
+                    ) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !values.is_empty() || !order_by.is_empty() || !children.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "version function has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let output = self.program.alloc_register();
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: output,
+                    dest: output,
+                    func: FuncCtx {
+                        func: call.function.value().clone(),
+                        arg_count: 0,
+                    },
+                });
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: output,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(
+                        call.function.value(),
                         Func::Scalar(ScalarFunc::LastInsertRowid)
                     ) =>
             {
@@ -4989,6 +5033,46 @@ mod tests {
                     },
                     _,
                 )] if *arg_count == argument_count
+            ));
+            assert_eq!(program.alloc_register(), 2);
+        }
+    }
+
+    #[test]
+    fn version_functions_keep_legacy_output_register_and_copy_shape() {
+        for function in [
+            ScalarFunc::SqliteVersion,
+            ScalarFunc::TursoVersion,
+            ScalarFunc::SqliteSourceId,
+        ] {
+            let expression = ordinary_scalar_call(Func::Scalar(function.clone()), Vec::new());
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            assert!(matches!(
+                program.insns.as_slice(),
+                [
+                    (
+                        Insn::Function {
+                            constant_mask: 0,
+                            start_reg: 1,
+                            dest: 1,
+                            func: FuncCtx {
+                                func: Func::Scalar(emitted),
+                                arg_count: 0,
+                            },
+                        },
+                        _,
+                    ),
+                    (
+                        Insn::Copy {
+                            src_reg: 1,
+                            dst_reg: 8,
+                            extra_amount: 0,
+                        },
+                        _,
+                    ),
+                ] if *emitted == function
             ));
             assert_eq!(program.alloc_register(), 2);
         }
