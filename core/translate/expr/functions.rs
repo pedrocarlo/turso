@@ -246,6 +246,12 @@ pub(super) fn translate_sequence_function(
     if backing_table.is_none() {
         crate::bail_parse_error!("sequence \"{}\" does not exist", seq_name_raw);
     }
+    let backing_table = backing_table.expect("sequence backing table was checked");
+    let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+        resolver,
+        database_id,
+        &normalized_name,
+    );
 
     // Fetch the immutable sequence descriptor — start/inc/min/max/cycle are
     // baked into the bytecode as literal Integers since they never change
@@ -273,8 +279,9 @@ pub(super) fn translate_sequence_function(
         // correct database id resolved here.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
-            resolver,
             database_id,
+            backing_table,
+            sqlite_sequence,
             &normalized_name,
             &seq_arc,
             target_register,
@@ -285,7 +292,6 @@ pub(super) fn translate_sequence_function(
         // validate the user-supplied value via the Function handler,
         // DELETE every existing row, then INSERT one at the requested
         // value with the descriptor suffix.
-        let backing_table = backing_table.unwrap();
         let root_page = backing_table.root_page;
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
         program.emit_insn(Insn::OpenWrite {
@@ -371,8 +377,8 @@ pub(super) fn translate_sequence_function(
         // `emit_autoincrement_sqlite_sequence_sync` for the rationale.
         crate::translate::sequence::emit_autoincrement_sqlite_sequence_sync(
             program,
-            resolver,
             database_id,
+            sqlite_sequence,
             &normalized_name,
             start_reg + 1,
         )?;

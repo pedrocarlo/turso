@@ -1340,10 +1340,21 @@ fn emit_cdc_change_id(
                 "missing implicit AUTOINCREMENT sequence for CDC table \"{cdc_table}\""
             ))
         })?;
-    crate::translate::sequence::emit_disk_read_nextval(
-        program,
+    let backing_table = crate::translate::sequence::resolve_sequence_backing_table(
         resolver,
         crate::MAIN_DB_ID,
+        &seq_name,
+    )?;
+    let sqlite_sequence = crate::translate::sequence::resolve_autoincrement_sqlite_sequence(
+        resolver,
+        crate::MAIN_DB_ID,
+        &seq_name,
+    );
+    crate::translate::sequence::emit_disk_read_nextval(
+        program,
+        crate::MAIN_DB_ID,
+        backing_table,
+        sqlite_sequence,
         &seq_name,
         &seq,
         dest_reg,

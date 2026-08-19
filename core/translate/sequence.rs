@@ -33,6 +33,38 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
     String::from(SEQ_BACKING_TABLE_PREFIX) + seq_name
 }
 
+/// Legacy catalog lookup kept outside sequence bytecode emission. Resolved HIR
+/// callers already own this table and bypass this helper.
+pub(crate) fn resolve_sequence_backing_table(
+    resolver: &Resolver,
+    database_id: usize,
+    seq_name: &str,
+) -> Result<Arc<BTreeTable>> {
+    let backing_table_name = sequence_backing_table_name(seq_name);
+    resolver
+        .with_schema(database_id, |schema| {
+            schema.get_btree_table(&backing_table_name)
+        })
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing backing table for sequence \"{seq_name}\""
+            ))
+        })
+}
+
+/// Legacy catalog lookup for the optional SQLite compatibility table. HIR
+/// sequence operations carry this object directly.
+pub(crate) fn resolve_autoincrement_sqlite_sequence(
+    resolver: &Resolver,
+    database_id: usize,
+    seq_name: &str,
+) -> Option<Arc<BTreeTable>> {
+    seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX)?;
+    resolver.with_schema(database_id, |schema| {
+        schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+    })
+}
+
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {
     let table_name = sequence_backing_table_name(seq_name);
     // INTEGER PRIMARY KEY makes `value` the rowid alias: nextval inserts are
@@ -175,8 +207,9 @@ pub fn emit_sequence_backing_table(
 /// reading them back from the row would be wasteful.
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     database_id: usize,
+    backing_table: Arc<BTreeTable>,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
@@ -185,14 +218,6 @@ pub fn emit_disk_read_nextval(
     // When `None` the helper allocates its own.
     seq_name_reg: Option<usize>,
 ) -> Result<()> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
-    let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
-        .ok_or_else(|| {
-            crate::LimboError::InternalError(format!(
-                "missing backing table for sequence \"{seq_name}\""
-            ))
-        })?;
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
 
@@ -355,8 +380,8 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_commit_inner_tx` absorbs the WW-conflicts.
     emit_autoincrement_sqlite_sequence_sync(
         program,
-        resolver,
         database_id,
+        sqlite_sequence,
         seq_name,
         target_register,
     )?;
@@ -417,20 +442,13 @@ pub fn emit_disk_read_nextval(
 /// watermark — mirrors `Sequence::advance_past` but on disk.
 pub fn emit_disk_advance_past(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     database_id: usize,
+    backing_table: Arc<BTreeTable>,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
     seq_name: &str,
     seq: &Sequence,
     value_reg: usize,
 ) -> Result<()> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
-    let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
-        .ok_or_else(|| {
-            crate::LimboError::InternalError(format!(
-                "missing backing table for sequence \"{seq_name}\""
-            ))
-        })?;
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
 
@@ -562,7 +580,13 @@ pub fn emit_disk_advance_past(
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
     // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
-    emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
+    emit_autoincrement_sqlite_sequence_sync(
+        program,
+        database_id,
+        sqlite_sequence,
+        seq_name,
+        value_reg,
+    )?;
 
     program.preassign_label_to_next_insn(done_seek_label);
     program.emit_insn(Insn::Close { cursor_id });
@@ -658,14 +682,12 @@ pub(crate) fn emit_backing_table_compaction(
 /// sync.
 pub(crate) fn emit_sqlite_sequence_sync(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     database_id: usize,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
     autoinc_table_name: &str,
     value_reg: usize,
 ) -> Result<bool> {
-    let Some(sseq_table) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
-    }) else {
+    let Some(sseq_table) = sqlite_sequence else {
         return Ok(false);
     };
     let sseq_root = sseq_table.root_page;
@@ -758,15 +780,15 @@ pub(crate) fn emit_sqlite_sequence_sync(
 /// uniform.
 pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     database_id: usize,
+    sqlite_sequence: Option<Arc<BTreeTable>>,
     seq_name: &str,
     value_reg: usize,
 ) -> Result<()> {
     let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    emit_sqlite_sequence_sync(program, database_id, sqlite_sequence, table_name, value_reg)?;
     Ok(())
 }
 
