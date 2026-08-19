@@ -740,6 +740,16 @@ fn require_at_most_arguments(function: &Func, count: usize, maximum: usize) -> R
     Ok(())
 }
 
+fn require_at_least_arguments(function: &Func, count: usize, minimum: usize) -> Result<()> {
+    if count == 0 {
+        crate::bail_parse_error!("{} function with no arguments", function);
+    }
+    if count < minimum {
+        crate::bail_parse_error!("{} function with less than {} arguments", function, minimum);
+    }
+    Ok(())
+}
+
 fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<()> {
     let count = input.argument_count();
     match function {
@@ -772,6 +782,7 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::IfNull) if count != 2 => {
             crate::bail_parse_error!("{} function requires exactly 2 arguments", function)
         }
+        Func::Scalar(ScalarFunc::Iif) => require_at_least_arguments(function, count, 2),
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4693,6 +4704,32 @@ mod tests {
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
             .expect("valid fixed-arity call binds");
+            assert!(matches!(analyzed, Expr::Function(_)));
+        }
+    }
+
+    #[test]
+    fn minimum_argument_rules_are_checked_during_semantic_analysis() {
+        for (sql, expected) in [
+            ("SELECT iif()", "iif function with no arguments"),
+            ("SELECT iif(1)", "iif function with less than 2 arguments"),
+        ] {
+            let error = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect_err("invalid minimum-arity call fails during semantic analysis");
+            assert_eq!(error.to_string(), format!("Parse error: {expected}"));
+        }
+
+        for sql in ["SELECT iif(1, 2)", "SELECT iif(1, 2, 3)"] {
+            let analyzed = analyze_expression(
+                &expression(sql),
+                &Scope::default(),
+                ExprPolicy::select(DoubleQuotedDml::Enabled),
+            )
+            .expect("valid minimum-arity call binds");
             assert!(matches!(analyzed, Expr::Function(_)));
         }
     }
