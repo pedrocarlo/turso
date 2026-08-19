@@ -69,6 +69,13 @@ struct IfNullRegisters {
 }
 
 #[derive(Clone, Copy)]
+struct IifRegisters {
+    condition: usize,
+    end_label: BranchOffset,
+    false_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
 struct SubscriptRegisters {
     base: usize,
     index: usize,
@@ -84,6 +91,7 @@ enum ExprRegisters {
     Like(LikeRegisters),
     ConcatWs(ConcatWsRegisters),
     IfNull(IfNullRegisters),
+    Iif(IifRegisters),
     Array(usize),
     Subscript(SubscriptRegisters),
     FieldAccess(usize),
@@ -597,6 +605,63 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::Iif)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() < 2 {
+                    return Err(LimboError::InternalError(
+                        "iif has invalid HIR arguments".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    let end_label = self.program.allocate_label();
+                    let condition = self.program.alloc_register();
+                    let false_label = self.program.allocate_label();
+                    context.registers = ExprRegisters::Iif(IifRegisters {
+                        condition,
+                        end_label,
+                        false_label,
+                    });
+                }
+                let target = context.target;
+                let ExprRegisters::Iif(registers) = &mut context.registers else {
+                    unreachable!("iif registers were allocated")
+                };
+                if child_index % 2 == 1 {
+                    self.program.emit_insn(Insn::IfNot {
+                        reg: registers.condition,
+                        target_pc: registers.false_label,
+                        jump_if_null: true,
+                    });
+                    target
+                } else if child_index == 0 {
+                    registers.condition
+                } else {
+                    self.program.emit_insn(Insn::Goto {
+                        target_pc: registers.end_label,
+                    });
+                    self.program
+                        .preassign_label_to_next_insn(registers.false_label);
+                    if child_index == values.len() - 1 {
+                        target
+                    } else {
+                        registers.false_label = self.program.allocate_label();
+                        registers.condition
+                    }
+                }
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(call.function.value(), Func::Scalar(ScalarFunc::IfNull)) =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -1064,6 +1129,44 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                         crate::bail_parse_error!("REPLACE is not valid for RAISE");
                     }
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && matches!(call.function.value(), Func::Scalar(ScalarFunc::Iif)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "ordinary scalar function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || values.len() < 2 || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "iif has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::Iif(registers) = context.registers else {
+                    unreachable!("iif registers were allocated")
+                };
+                if values.len() % 2 == 0 {
+                    self.program.emit_insn(Insn::Goto {
+                        target_pc: registers.end_label,
+                    });
+                    self.program
+                        .preassign_label_to_next_insn(registers.false_label);
+                    self.program.emit_insn(Insn::Null {
+                        dest: target,
+                        dest_end: None,
+                    });
+                }
+                self.program
+                    .preassign_label_to_next_insn(registers.end_label);
                 Ok(target)
             }
             hir::Expr::Function(call)
@@ -4677,6 +4780,51 @@ mod tests {
             ]
         ));
         assert_eq!(program.alloc_register(), 2);
+    }
+
+    #[test]
+    fn iif_keeps_legacy_branch_register_and_opcode_shapes() {
+        for (argument_count, expected_shape) in [
+            (2, "condition if-not value goto null"),
+            (
+                4,
+                "condition if-not value goto condition if-not value goto null",
+            ),
+            (
+                5,
+                "condition if-not value goto condition if-not value goto value",
+            ),
+        ] {
+            let arguments = (0..argument_count)
+                .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
+                .collect();
+            let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Iif), arguments);
+            let mut program = program();
+
+            translate_expr(&mut program, &expression, 8).unwrap();
+            let shape = program
+                .insns
+                .iter()
+                .map(|(instruction, _)| match instruction {
+                    Insn::Integer { dest: 1, .. } => "condition",
+                    Insn::Integer { dest: 8, .. } => "value",
+                    Insn::IfNot {
+                        reg: 1,
+                        jump_if_null: true,
+                        ..
+                    } => "if-not",
+                    Insn::Goto { .. } => "goto",
+                    Insn::Null {
+                        dest: 8,
+                        dest_end: None,
+                    } => "null",
+                    instruction => panic!("unexpected IIF instruction: {instruction:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(shape, expected_shape);
+            assert_eq!(program.alloc_register(), 2);
+        }
     }
 
     #[test]
