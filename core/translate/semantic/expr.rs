@@ -785,6 +785,9 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Iif | ScalarFunc::Coalesce) => {
             require_at_least_arguments(function, count, 2)
         }
+        Func::Scalar(ScalarFunc::Like | ScalarFunc::Glob) if count < 2 => {
+            crate::bail_parse_error!("{} function with less than 2 arguments", function)
+        }
         Func::Scalar(
             ScalarFunc::Trim
             | ScalarFunc::LTrim
@@ -4725,6 +4728,10 @@ mod tests {
                 "SELECT coalesce(1)",
                 "coalesce function with less than 2 arguments",
             ),
+            ("SELECT like()", "like function with less than 2 arguments"),
+            ("SELECT like(1)", "like function with less than 2 arguments"),
+            ("SELECT glob()", "glob function with less than 2 arguments"),
+            ("SELECT glob(1)", "glob function with less than 2 arguments"),
         ] {
             let error = analyze_expression(
                 &expression(sql),
@@ -4740,6 +4747,10 @@ mod tests {
             "SELECT iif(1, 2, 3)",
             "SELECT coalesce(1, 2)",
             "SELECT coalesce(1, 2, 3)",
+            "SELECT like(1, 2)",
+            "SELECT like(1, 2, 3)",
+            "SELECT glob(1, 2)",
+            "SELECT glob(1, 2, 3)",
         ] {
             let analyzed = analyze_expression(
                 &expression(sql),
