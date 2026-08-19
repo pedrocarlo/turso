@@ -618,7 +618,9 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
-                        Func::Scalar(ScalarFunc::Likely | ScalarFunc::Likelihood)
+                        Func::Scalar(
+                            ScalarFunc::Likely | ScalarFunc::Likelihood | ScalarFunc::Unlikely
+                        )
                     ) =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -632,13 +634,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     ));
                 };
                 let expected = match call.function.value() {
-                    Func::Scalar(ScalarFunc::Likely) => 1,
+                    Func::Scalar(ScalarFunc::Likely | ScalarFunc::Unlikely) => 1,
                     Func::Scalar(ScalarFunc::Likelihood) => 2,
-                    _ => unreachable!("planner likelihood function was checked by match guard"),
+                    _ => unreachable!("planner hint was checked by match guard"),
                 };
                 if !order_by.is_empty() || values.len() != expected {
                     return Err(LimboError::InternalError(
-                        "planner likelihood function has invalid HIR arguments".to_string(),
+                        "planner hint has invalid HIR arguments".to_string(),
                     ));
                 }
                 if child_index == 0 {
@@ -1259,7 +1261,9 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
-                        Func::Scalar(ScalarFunc::Likely | ScalarFunc::Likelihood)
+                        Func::Scalar(
+                            ScalarFunc::Likely | ScalarFunc::Likelihood | ScalarFunc::Unlikely
+                        )
                     ) =>
             {
                 let hir::FunctionArguments::Expressions {
@@ -1273,13 +1277,13 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     ));
                 };
                 let expected = match call.function.value() {
-                    Func::Scalar(ScalarFunc::Likely) => 1,
+                    Func::Scalar(ScalarFunc::Likely | ScalarFunc::Unlikely) => 1,
                     Func::Scalar(ScalarFunc::Likelihood) => 2,
-                    _ => unreachable!("planner likelihood function was checked by match guard"),
+                    _ => unreachable!("planner hint was checked by match guard"),
                 };
                 if !order_by.is_empty() || values.len() != expected || children != [target] {
                     return Err(LimboError::InternalError(
-                        "planner likelihood function has invalid lowered arguments".to_string(),
+                        "planner hint has invalid lowered arguments".to_string(),
                     ));
                 }
                 Ok(target)
@@ -5050,10 +5054,14 @@ mod tests {
     }
 
     #[test]
-    fn likelihood_hints_only_lower_the_value_expression() {
+    fn planner_hints_only_lower_the_value_expression() {
         for (function, arguments) in [
             (
                 ScalarFunc::Likely,
+                vec![hir::Expr::Literal(Literal::Numeric("7".to_string()))],
+            ),
+            (
+                ScalarFunc::Unlikely,
                 vec![hir::Expr::Literal(Literal::Numeric("7".to_string()))],
             ),
             (

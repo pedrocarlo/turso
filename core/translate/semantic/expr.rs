@@ -818,6 +818,9 @@ fn validate_scalar_arguments(function: &Func, input: &FunctionInput) -> Result<(
         Func::Scalar(ScalarFunc::Likely) if count != 1 => {
             crate::bail_parse_error!("likely function must have exactly 1 argument")
         }
+        Func::Scalar(ScalarFunc::Unlikely) if count != 1 => {
+            crate::bail_parse_error!("Unlikely function must have exactly 1 argument")
+        }
         Func::Scalar(ScalarFunc::Likelihood) => validate_likelihood_arguments(input),
         Func::Scalar(ScalarFunc::TableColumnsJsonArray) if count != 1 => {
             crate::bail_parse_error!(
@@ -4822,7 +4825,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_likelihood_rules_are_checked_during_semantic_analysis() {
+    fn planner_hint_rules_are_checked_during_semantic_analysis() {
         for (sql, expected) in [
             (
                 "SELECT likely()",
@@ -4831,6 +4834,14 @@ mod tests {
             (
                 "SELECT likely(1, 2)",
                 "likely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT unlikely()",
+                "Unlikely function must have exactly 1 argument",
+            ),
+            (
+                "SELECT unlikely(1, 2)",
+                "Unlikely function must have exactly 1 argument",
             ),
             (
                 "SELECT likelihood(1)",
@@ -4858,17 +4869,21 @@ mod tests {
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
-            .expect_err("invalid planner likelihood call fails during semantic analysis");
+            .expect_err("invalid planner hint fails during semantic analysis");
             assert_eq!(error.to_string(), format!("Parse error: {expected}"));
         }
 
-        for sql in ["SELECT likely(1)", "SELECT likelihood(1, 0.5)"] {
+        for sql in [
+            "SELECT likely(1)",
+            "SELECT unlikely(1)",
+            "SELECT likelihood(1, 0.5)",
+        ] {
             let analyzed = analyze_expression(
                 &expression(sql),
                 &Scope::default(),
                 ExprPolicy::select(DoubleQuotedDml::Enabled),
             )
-            .expect("valid planner likelihood call binds");
+            .expect("valid planner hint binds");
             assert!(matches!(analyzed, Expr::Function(_)));
         }
     }
