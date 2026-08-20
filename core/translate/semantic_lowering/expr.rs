@@ -1946,10 +1946,16 @@ impl ExprLowerer<'_, '_> {
                 "HIR source custom-type metadata is incomplete".to_string(),
             ));
         };
-        if !matches!(default, hir::ColumnReadExpression::Absent) || type_program.is_some() {
+        if type_program.is_some() {
             return Err(LimboError::InternalError(
-                "HIR default and custom-type column lowering is not implemented".to_string(),
+                "HIR custom-type column lowering is not implemented".to_string(),
             ));
+        }
+        if matches!(default, hir::ColumnReadExpression::NotRequired) {
+            return Err(LimboError::InternalError(format!(
+                "HIR default for column {}.{} was not planned",
+                reference.source, reference.column
+            )));
         }
 
         match generated {
@@ -3076,6 +3082,57 @@ mod tests {
                 ),
                 (Insn::Affinity { start_reg: 3, .. }, _),
             ]
+        ));
+    }
+
+    #[test]
+    fn ordinary_defaults_keep_the_column_instruction_default() {
+        let source_id = hir::SourceId::new(0);
+        let table = Arc::new(
+            BTreeTable::from_sql("CREATE TABLE items(value TEXT DEFAULT 7)", 2)
+                .expect("table parses"),
+        );
+        let resolved_table = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            Arc::new(Table::BTree(table.clone())),
+        );
+        let mut definition = source(
+            source_id,
+            hir::SourceKind::Table(resolved_table),
+            vec![source_column("value", Type::Text, Affinity::Text, false)],
+            true,
+        );
+        definition.default_expressions[0] = hir::ColumnReadExpression::Planned(hir::Expr::Literal(
+            Literal::Numeric("7".to_string()),
+        ));
+        let mut document = document(Vec::new());
+        document.sources.push(definition);
+        let mut program = program();
+        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+        program.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: table_cursor,
+                table_cursor: None,
+            },
+        );
+
+        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
+            .expect("column with an ordinary default lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Column {
+                    cursor_id,
+                    column: 0,
+                    dest: 3,
+                    default: Some(_),
+                },
+                _
+            )] if *cursor_id == table_cursor
         ));
     }
 
