@@ -7,7 +7,7 @@ use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc};
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
 use crate::vdbe::{
-    builder::ProgramBuilder,
+    builder::{CursorType, ProgramBuilder, SourceBinding},
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
@@ -84,6 +84,12 @@ struct CoalesceRegisters {
 struct SubscriptRegisters {
     base: usize,
     index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CursorColumn {
+    cursor: usize,
+    column: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1010,6 +1016,8 @@ impl hir::ExprVisitor for ExprLowerer<'_, '_> {
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
+            hir::Expr::Column(column) => self.emit_column(*column, target),
+            hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
             }
@@ -1888,6 +1896,176 @@ impl hir::ExprVisitor for ExprLowerer<'_, '_> {
 }
 
 impl ExprLowerer<'_, '_> {
+    fn emit_column(&mut self, reference: hir::ColumnRef, target: usize) -> Result<usize> {
+        let Some(source) = self.document.source(reference.source) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR column references missing source {}",
+                reference.source
+            )));
+        };
+        let Some(column) = source.columns.get(reference.column) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR column {}.{} is out of bounds",
+                reference.source, reference.column
+            )));
+        };
+        let Some(generated) = source.generated_expressions.get(reference.column) else {
+            return Err(LimboError::InternalError(
+                "HIR source generated-expression metadata is incomplete".to_string(),
+            ));
+        };
+        let Some(default) = source.default_expressions.get(reference.column) else {
+            return Err(LimboError::InternalError(
+                "HIR source default-expression metadata is incomplete".to_string(),
+            ));
+        };
+        let Some(type_program) = source.column_type_programs.get(reference.column) else {
+            return Err(LimboError::InternalError(
+                "HIR source custom-type metadata is incomplete".to_string(),
+            ));
+        };
+        if !matches!(generated, hir::ColumnReadExpression::Absent)
+            || !matches!(default, hir::ColumnReadExpression::Absent)
+            || type_program.is_some()
+        {
+            return Err(LimboError::InternalError(
+                "HIR generated, default, and custom-type column lowering is not implemented"
+                    .to_string(),
+            ));
+        }
+
+        let Some(binding) = self.program.source_binding(reference.source).copied() else {
+            return Err(LimboError::InternalError(format!(
+                "HIR source {} has no physical binding",
+                reference.source
+            )));
+        };
+
+        self.program.set_collation(
+            column
+                .collation
+                .as_ref()
+                .map(|collation| (collation.value().clone(), false)),
+        );
+        match binding {
+            SourceBinding::Registers { start } => {
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: start + reference.column,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+            }
+            SourceBinding::Virtual { cursor } => {
+                self.program.emit_insn(Insn::VColumn {
+                    cursor_id: cursor,
+                    column: reference.column,
+                    dest: target,
+                });
+            }
+            SourceBinding::BTree {
+                scan_cursor,
+                table_cursor,
+            } => {
+                if column.rowid_alias {
+                    self.emit_btree_rowid(scan_cursor, target)?;
+                } else {
+                    let read = match self.program.get_cursor_type(scan_cursor) {
+                        Some(CursorType::BTreeTable(_)) => CursorColumn {
+                            cursor: scan_cursor,
+                            column: reference.column,
+                        },
+                        Some(CursorType::BTreeIndex(index)) => {
+                            if let Some(column) =
+                                index.column_table_pos_to_index_pos(reference.column)
+                            {
+                                CursorColumn {
+                                    cursor: scan_cursor,
+                                    column,
+                                }
+                            } else {
+                                let Some(table_cursor) = table_cursor else {
+                                    return Err(LimboError::InternalError(format!(
+                                        "HIR source {} index does not contain column {} and has no table cursor",
+                                        reference.source, reference.column
+                                    )));
+                                };
+                                CursorColumn {
+                                    cursor: table_cursor,
+                                    column: reference.column,
+                                }
+                            }
+                        }
+                        Some(cursor) => {
+                            return Err(LimboError::InternalError(format!(
+                                "HIR B-tree source uses incompatible cursor {cursor:?}"
+                            )));
+                        }
+                        None => {
+                            return Err(LimboError::InternalError(
+                                "HIR B-tree source cursor does not exist".to_string(),
+                            ));
+                        }
+                    };
+                    self.program
+                        .emit_column_or_rowid(read.cursor, read.column, target);
+                }
+                if let Some(storage) = column.type_fact.storage {
+                    expr::maybe_apply_affinity(storage, target, self.program);
+                }
+            }
+        }
+        Ok(target)
+    }
+
+    fn emit_rowid(&mut self, source: hir::SourceId, target: usize) -> Result<usize> {
+        let Some(definition) = self.document.source(source) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR rowid references missing source {source}"
+            )));
+        };
+        if !definition.rowid_available {
+            return Err(LimboError::InternalError(format!(
+                "HIR source {source} has no rowid"
+            )));
+        }
+        let Some(binding) = self.program.source_binding(source).copied() else {
+            return Err(LimboError::InternalError(format!(
+                "HIR source {source} has no physical binding"
+            )));
+        };
+        let SourceBinding::BTree { scan_cursor, .. } = binding else {
+            return Err(LimboError::InternalError(format!(
+                "HIR rowid source {source} is not bound to a B-tree cursor"
+            )));
+        };
+        self.emit_btree_rowid(scan_cursor, target)?;
+        Ok(target)
+    }
+
+    fn emit_btree_rowid(&mut self, cursor: usize, target: usize) -> Result<()> {
+        match self.program.get_cursor_type(cursor) {
+            Some(CursorType::BTreeTable(_)) => self.program.emit_insn(Insn::RowId {
+                cursor_id: cursor,
+                dest: target,
+            }),
+            Some(CursorType::BTreeIndex(_)) => self.program.emit_insn(Insn::IdxRowId {
+                cursor_id: cursor,
+                dest: target,
+            }),
+            Some(cursor) => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR rowid uses incompatible cursor {cursor:?}"
+                )));
+            }
+            None => {
+                return Err(LimboError::InternalError(
+                    "HIR rowid cursor does not exist".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn finish_in_list_value(
         &mut self,
         registers: &InListRegisters,
@@ -2694,8 +2872,12 @@ mod tests {
 
     use super::*;
     use crate::parameters::ParameterSpelling;
+    use crate::schema::{BTreeTable, Index, IndexColumn, Table, Type};
+    use crate::sync::Arc;
     use crate::translate::semantic::hir::TypeFact;
-    use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+    use crate::vdbe::affinity::Affinity;
+    use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode, SourceBinding};
+    use turso_parser::ast::SortOrder;
 
     fn program() -> ProgramBuilder {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
@@ -2731,6 +2913,173 @@ mod tests {
             None,
             crate::sync::Arc::new(function),
         )
+    }
+
+    fn source_column(
+        name: &str,
+        storage: Type,
+        affinity: Affinity,
+        rowid_alias: bool,
+    ) -> hir::SourceColumn {
+        hir::SourceColumn {
+            name: name.to_string(),
+            type_fact: TypeFact::known(storage),
+            affinity,
+            has_affinity: true,
+            collation: None,
+            hidden: false,
+            rowid_alias,
+        }
+    }
+
+    fn source(
+        id: hir::SourceId,
+        kind: hir::SourceKind,
+        columns: Vec<hir::SourceColumn>,
+        rowid_available: bool,
+    ) -> hir::Source {
+        let width = columns.len();
+        hir::Source {
+            id,
+            owner: hir::SourceOwner::Root,
+            database: None,
+            name: "items".to_string(),
+            alias: None,
+            kind,
+            columns,
+            generated_expressions: vec![hir::ColumnReadExpression::Absent; width],
+            default_expressions: vec![hir::ColumnReadExpression::Absent; width],
+            column_type_programs: vec![None; width],
+            check_constraints: None,
+            rowid_available,
+            index_hint: hir::IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: hir::IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn columns_copy_from_bound_source_registers() {
+        let source_id = hir::SourceId::new(0);
+        let mut document = document(Vec::new());
+        document.sources.push(source(
+            source_id,
+            hir::SourceKind::SchemaExpression,
+            vec![source_column(
+                "value",
+                Type::Integer,
+                Affinity::Integer,
+                false,
+            )],
+            false,
+        ));
+        let mut program = program();
+        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+
+        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
+            .expect("bound register column lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Copy {
+                    src_reg: 7,
+                    dst_reg: 3,
+                    extra_amount: 0,
+                },
+                _
+            )]
+        ));
+    }
+
+    #[test]
+    fn btree_columns_and_rowids_use_the_scan_index() {
+        let source_id = hir::SourceId::new(0);
+        let table = Arc::new(
+            BTreeTable::from_sql(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, value REAL, note TEXT)",
+                2,
+            )
+            .expect("table parses"),
+        );
+        let resolved_table = hir::CatalogObject::new(
+            hir::CatalogObjectId::new(1),
+            hir::CatalogSnapshot::from_id(1),
+            None,
+            Arc::new(Table::BTree(table.clone())),
+        );
+        let mut document = document(Vec::new());
+        document.sources.push(source(
+            source_id,
+            hir::SourceKind::Table(resolved_table),
+            vec![
+                source_column("id", Type::Integer, Affinity::Integer, true),
+                source_column("value", Type::Real, Affinity::Real, false),
+                source_column("note", Type::Text, Affinity::Text, false),
+            ],
+            true,
+        ));
+
+        let index = Arc::new(Index {
+            name: "items_value".to_string(),
+            table_name: "items".to_string(),
+            root_page: 3,
+            columns: vec![IndexColumn {
+                name: "value".to_string(),
+                order: SortOrder::Asc,
+                nulls_order: None,
+                pos_in_table: 1,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: false,
+            ephemeral: false,
+            has_rowid: true,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let mut program = program();
+        let table_cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+        program.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: index_cursor,
+                table_cursor: Some(table_cursor),
+            },
+        );
+
+        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 1), 4)
+            .expect("indexed column lowers");
+        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 2), 6)
+            .expect("table fallback column lowers");
+        super::translate_expr(&mut program, &document, &hir::Expr::rowid(source_id), 5)
+            .expect("index rowid lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Column {
+                    cursor_id,
+                    column: 0,
+                    dest: 4,
+                    ..
+                }, _),
+                (Insn::RealAffinity { register: 4 }, _),
+                (Insn::Column {
+                    cursor_id: fallback_cursor,
+                    column: 2,
+                    dest: 6,
+                    ..
+                }, _),
+                (Insn::IdxRowId { cursor_id: rowid_cursor, dest: 5 }, _),
+            ] if *cursor_id == index_cursor
+                && *fallback_cursor == table_cursor
+                && *rowid_cursor == index_cursor
+        ));
     }
 
     fn ordinary_scalar_call(function: Func, values: Vec<hir::Expr>) -> hir::Expr {
