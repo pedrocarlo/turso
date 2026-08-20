@@ -58,6 +58,23 @@ pub enum CursorOwner {
     Source(SourceId),
 }
 
+/// Physical location used to read values from one resolved HIR source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceBinding {
+    BTree {
+        /// Cursor driving the current scan. This may be a table or index cursor.
+        scan_cursor: CursorID,
+        /// Table cursor used when the scan cursor cannot supply a column.
+        table_cursor: Option<CursorID>,
+    },
+    Virtual {
+        cursor: CursorID,
+    },
+    Registers {
+        start: usize,
+    },
+}
+
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of source identity and index.
 /// The index is only provided when the cursor is an index cursor.
@@ -302,6 +319,8 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Physical value locations for resolved HIR sources.
+    source_bindings: HashMap<SourceId, SourceBinding>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -768,6 +787,7 @@ impl ProgramBuilder {
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
+            source_bindings: HashMap::default(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -931,6 +951,14 @@ impl ProgramBuilder {
     /// Returns None if the subquery hasn't been emitted yet.
     pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
         self.subquery_result_regs.get(&internal_id).copied()
+    }
+
+    pub(crate) fn bind_source(&mut self, source: SourceId, binding: SourceBinding) {
+        self.source_bindings.insert(source, binding);
+    }
+
+    pub(crate) fn source_binding(&self, source: SourceId) -> Option<&SourceBinding> {
+        self.source_bindings.get(&source)
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -2408,5 +2436,36 @@ mod tests {
             program.resolve_cursor_id(&CursorKey::source(source)),
             source_cursor
         );
+    }
+
+    #[test]
+    fn hir_source_bindings_are_keyed_by_source_identity() {
+        let mut program = program();
+        let table_source = SourceId::new(0);
+        let register_source = SourceId::new(1);
+        let scan_cursor = program.alloc_cursor_id(CursorType::Sorter);
+        let table_cursor = program.alloc_cursor_id(CursorType::Sorter);
+
+        program.bind_source(
+            table_source,
+            SourceBinding::BTree {
+                scan_cursor,
+                table_cursor: Some(table_cursor),
+            },
+        );
+        program.bind_source(register_source, SourceBinding::Registers { start: 7 });
+
+        assert_eq!(
+            program.source_binding(table_source),
+            Some(&SourceBinding::BTree {
+                scan_cursor,
+                table_cursor: Some(table_cursor),
+            })
+        );
+        assert_eq!(
+            program.source_binding(register_source),
+            Some(&SourceBinding::Registers { start: 7 })
+        );
+        assert_eq!(program.source_binding(SourceId::new(2)), None);
     }
 }
