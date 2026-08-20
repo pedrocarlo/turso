@@ -2287,8 +2287,19 @@ impl<'document> HirValidator<'document> {
     fn visit_sequence_operation(&self, operation: &SequenceOperation) -> ValidationResult {
         self.visit_catalog_object(&operation.sequence, "sequence")?;
         self.visit_catalog_object(&operation.backing_table, "sequence backing table")?;
+        self.require(
+            matches!(
+                operation.backing_table.value(),
+                crate::schema::Table::BTree(_)
+            ),
+            "sequence backing table is not a B-tree table",
+        )?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
             self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
+            self.require(
+                matches!(sqlite_sequence.value(), crate::schema::Table::BTree(_)),
+                "sqlite_sequence is not a B-tree table",
+            )?;
         }
         let database = operation
             .sequence
@@ -2558,11 +2569,10 @@ impl<'document> HirValidator<'document> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn expression_validation_does_not_use_the_call_stack() {
-        let document = HirDocument {
+    fn empty_document(databases: Vec<DatabaseSnapshot>) -> HirDocument {
+        HirDocument {
             snapshot: CatalogSnapshot::from_id(1),
-            databases: Vec::new(),
+            databases,
             root: HirRoot::Query(QueryRoot {
                 query: QueryId::new(0),
             }),
@@ -2571,7 +2581,12 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
-        };
+        }
+    }
+
+    #[test]
+    fn expression_validation_does_not_use_the_call_stack() {
+        let document = empty_document(Vec::new());
         let validator = HirValidator::new(&document);
         let mut expression = Expr::Literal(turso_parser::ast::Literal::Null);
         for _ in 0..10_000 {
@@ -2588,5 +2603,78 @@ mod tests {
         // Dropping this synthetic tree recursively would test Rust's drop
         // stack instead of the HIR walker.
         std::mem::forget(expression);
+    }
+
+    #[test]
+    fn sequence_storage_validation_requires_btree_tables() {
+        let database = DatabaseId::new(2);
+        let document = empty_document(vec![DatabaseSnapshot {
+            database,
+            schema_version: 1,
+        }]);
+        let validator = HirValidator::new(&document);
+        let sequence = CatalogObject::new(
+            CatalogObjectId::new(1),
+            document.snapshot,
+            Some(database),
+            Arc::new(
+                crate::schema::Sequence::new("seq".to_string(), None, None, None, None, false)
+                    .unwrap(),
+            ),
+        );
+        let non_btree = |id, name: &str| {
+            CatalogObject::new(
+                CatalogObjectId::new(id),
+                document.snapshot,
+                Some(database),
+                Arc::new(crate::schema::Table::RecursiveCteInput(Arc::new(
+                    crate::schema::RecursiveCteInput {
+                        name: name.to_string(),
+                        columns: Vec::new(),
+                    },
+                ))),
+            )
+        };
+
+        let invalid_backing = SequenceOperation {
+            kind: SequenceOperationKind::NextValue,
+            user_name: "seq".to_string(),
+            normalized_name: "seq".to_string(),
+            sequence: sequence.clone(),
+            backing_table: non_btree(2, "__turso_internal_seq_seq"),
+            sqlite_sequence: None,
+        };
+        assert_eq!(
+            validator
+                .visit_sequence_operation(&invalid_backing)
+                .unwrap_err()
+                .message(),
+            "sequence backing table is not a B-tree table"
+        );
+
+        let backing_sql = crate::translate::sequence::sequence_backing_table_sql("seq");
+        let valid_backing = CatalogObject::new(
+            CatalogObjectId::new(3),
+            document.snapshot,
+            Some(database),
+            Arc::new(crate::schema::Table::BTree(Arc::new(
+                crate::schema::BTreeTable::from_sql(&backing_sql, 9).unwrap(),
+            ))),
+        );
+        let invalid_sqlite_sequence = SequenceOperation {
+            kind: SequenceOperationKind::NextValue,
+            user_name: "seq".to_string(),
+            normalized_name: "seq".to_string(),
+            sequence,
+            backing_table: valid_backing,
+            sqlite_sequence: Some(non_btree(4, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)),
+        };
+        assert_eq!(
+            validator
+                .visit_sequence_operation(&invalid_sqlite_sequence)
+                .unwrap_err()
+                .message(),
+            "sqlite_sequence is not a B-tree table"
+        );
     }
 }

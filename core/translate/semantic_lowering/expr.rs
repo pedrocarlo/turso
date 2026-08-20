@@ -269,11 +269,12 @@ fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
     }
 }
 
-struct ExprLowerer<'a> {
-    program: &'a mut ProgramBuilder,
+struct ExprLowerer<'program, 'document> {
+    program: &'program mut ProgramBuilder,
+    document: &'document hir::HirDocument,
 }
 
-impl hir::ExprVisitor for ExprLowerer<'_> {
+impl hir::ExprVisitor for ExprLowerer<'_, '_> {
     type Context = LoweringContext;
     type Output = usize;
     type Error = LimboError;
@@ -662,6 +663,34 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
                     unreachable!("custom-type function register was allocated")
                 };
                 argument
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Sequence(_)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "sequence function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() {
+                    return Err(LimboError::InternalError(
+                        "sequence function has argument ordering".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    context.registers =
+                        ExprRegisters::Function(self.program.alloc_registers(values.len()));
+                }
+                let ExprRegisters::Function(start) = context.registers else {
+                    unreachable!("sequence function registers were allocated")
+                };
+                start + child_index
             }
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
@@ -1461,6 +1490,87 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
             }
             hir::Expr::Function(call)
                 if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Sequence(_)) =>
+            {
+                let hir::FunctionArguments::Expressions {
+                    values,
+                    distinctness: None,
+                    order_by,
+                } = &call.arguments
+                else {
+                    return Err(LimboError::InternalError(
+                        "sequence function has invalid HIR arguments".to_string(),
+                    ));
+                };
+                if !order_by.is_empty() || children.len() != values.len() {
+                    return Err(LimboError::InternalError(
+                        "sequence function has invalid lowered arguments".to_string(),
+                    ));
+                }
+                let ExprRegisters::Function(start_reg) = context.registers else {
+                    unreachable!("sequence function registers were allocated")
+                };
+                debug_assert!(children
+                    .iter()
+                    .enumerate()
+                    .all(|(index, register)| *register == start_reg + index));
+
+                let hir::FunctionOperation::Sequence(operation) = &call.operation else {
+                    unreachable!("sequence operation was checked by match guard")
+                };
+                let database = operation.sequence.database().ok_or_else(|| {
+                    LimboError::InternalError("HIR sequence has no owning database".to_string())
+                })?;
+                let snapshot = self.document.database(database).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR database {} is absent from the catalog snapshot",
+                        database.index()
+                    ))
+                })?;
+                self.program
+                    .begin_write_on_database(database.index(), snapshot.schema_version)?;
+
+                let backing_table = operation.backing_table.value().require_btree()?;
+                let sqlite_sequence = operation
+                    .sqlite_sequence
+                    .as_ref()
+                    .map(|table| table.value().require_btree())
+                    .transpose()?;
+                match operation.kind {
+                    hir::SequenceOperationKind::NextValue => {
+                        crate::translate::sequence::emit_disk_read_nextval(
+                            self.program,
+                            database.index(),
+                            backing_table,
+                            sqlite_sequence,
+                            &operation.normalized_name,
+                            operation.sequence.value(),
+                            target,
+                            Some(start_reg),
+                        )?;
+                    }
+                    hir::SequenceOperationKind::SetValue => {
+                        crate::translate::sequence::emit_disk_setval(
+                            self.program,
+                            database.index(),
+                            backing_table,
+                            sqlite_sequence,
+                            &operation.normalized_name,
+                            operation.sequence.value(),
+                            start_reg,
+                            values.len(),
+                            target,
+                            FuncCtx {
+                                func: call.function.value().clone(),
+                                arg_count: values.len(),
+                            },
+                        )?;
+                    }
+                }
+                Ok(target)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     && matches!(call.operation, hir::FunctionOperation::Ordinary)
                     && matches!(
                         call.function.value(),
@@ -1777,7 +1887,7 @@ impl hir::ExprVisitor for ExprLowerer<'_> {
     }
 }
 
-impl ExprLowerer<'_> {
+impl ExprLowerer<'_, '_> {
     fn finish_in_list_value(
         &mut self,
         registers: &InListRegisters,
@@ -2545,10 +2655,14 @@ impl ExprLowerer<'_> {
 /// Lower a resolved expression into an existing target register.
 pub(crate) fn translate_expr(
     program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
-    expression.walk(LoweringContext::new(target), &mut ExprLowerer { program })
+    expression.walk(
+        LoweringContext::new(target),
+        &mut ExprLowerer { program, document },
+    )
 }
 
 /// Emit a literal already selected by semantic analysis.
@@ -2585,6 +2699,29 @@ mod tests {
 
     fn program() -> ProgramBuilder {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
+    }
+
+    fn document(databases: Vec<hir::DatabaseSnapshot>) -> hir::HirDocument {
+        hir::HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(1),
+            databases,
+            root: hir::HirRoot::Query(hir::QueryRoot {
+                query: hir::QueryId::new(0),
+            }),
+            queries: Vec::new(),
+            sources: Vec::new(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        }
+    }
+
+    fn translate_expr(
+        program: &mut ProgramBuilder,
+        expression: &hir::Expr,
+        target: usize,
+    ) -> Result<usize> {
+        super::translate_expr(program, &document(Vec::new()), expression, target)
     }
 
     fn resolved_function(function: Func) -> hir::ResolvedFunction {
@@ -2625,6 +2762,56 @@ mod tests {
             },
             result_type: TypeFact::dynamic(),
             operation: hir::FunctionOperation::CustomType(operation),
+        })
+    }
+
+    fn sequence_call(kind: hir::SequenceOperationKind, values: Vec<hir::Expr>) -> hir::Expr {
+        let database = hir::DatabaseId::new(2);
+        let normalized_name = "seq".to_string();
+        let backing_sql = crate::translate::sequence::sequence_backing_table_sql("seq");
+        let backing_table = crate::schema::BTreeTable::from_sql(&backing_sql, 9).unwrap();
+        let sequence = crate::schema::Sequence::new(
+            normalized_name.clone(),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(100),
+            false,
+        )
+        .unwrap();
+        let function = match kind {
+            hir::SequenceOperationKind::NextValue => ScalarFunc::NextVal,
+            hir::SequenceOperationKind::SetValue => ScalarFunc::SetVal,
+        };
+        hir::Expr::Function(hir::FunctionCall {
+            function: resolved_function(Func::Scalar(function)),
+            evaluation: hir::FunctionEvaluation::Scalar,
+            arguments: hir::FunctionArguments::Expressions {
+                values,
+                distinctness: None,
+                order_by: Vec::new(),
+            },
+            result_type: TypeFact::known(crate::schema::Type::Integer),
+            operation: hir::FunctionOperation::Sequence(hir::SequenceOperation {
+                kind,
+                user_name: "aux.seq".to_string(),
+                normalized_name,
+                sequence: hir::CatalogObject::new(
+                    hir::CatalogObjectId::new(2),
+                    hir::CatalogSnapshot::from_id(1),
+                    Some(database),
+                    crate::sync::Arc::new(sequence),
+                ),
+                backing_table: hir::CatalogObject::new(
+                    hir::CatalogObjectId::new(3),
+                    hir::CatalogSnapshot::from_id(1),
+                    Some(database),
+                    crate::sync::Arc::new(crate::schema::Table::BTree(crate::sync::Arc::new(
+                        backing_table,
+                    ))),
+                ),
+                sqlite_sequence: None,
+            }),
         })
     }
 
@@ -5431,6 +5618,60 @@ mod tests {
                 ),
             ] if value == "main.seq"
         ));
+    }
+
+    #[test]
+    fn sequence_calls_use_resolved_hir_objects_and_database_snapshot() {
+        let database = hir::DatabaseId::new(2);
+        let document = document(vec![hir::DatabaseSnapshot {
+            database,
+            schema_version: 37,
+        }]);
+
+        let nextval = sequence_call(
+            hir::SequenceOperationKind::NextValue,
+            vec![hir::Expr::Literal(Literal::String("'aux.seq'".to_string()))],
+        );
+        let mut nextval_program = program();
+        nextval_program.prologue();
+        super::translate_expr(&mut nextval_program, &document, &nextval, 8).unwrap();
+        nextval_program.epilogue(&crate::schema::Schema::new());
+        assert!(nextval_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SequenceComputeNext { db: 2, .. })));
+        assert!(nextval_program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Transaction {
+                db: 2,
+                schema_cookie: 37,
+                tx_mode: crate::translate::emitter::TransactionMode::Write,
+            }
+        )));
+
+        let setval = sequence_call(
+            hir::SequenceOperationKind::SetValue,
+            vec![
+                hir::Expr::Literal(Literal::String("'aux.seq'".to_string())),
+                hir::Expr::Literal(Literal::Numeric("12".to_string())),
+            ],
+        );
+        let mut setval_program = program();
+        super::translate_expr(&mut setval_program, &document, &setval, 8).unwrap();
+        assert!(setval_program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Function {
+                func: FuncCtx {
+                    func: Func::Scalar(ScalarFunc::SetVal),
+                    arg_count: 2,
+                },
+                ..
+            }
+        )));
+        assert!(setval_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SetSequenceCurrval { .. })));
     }
 
     #[test]
