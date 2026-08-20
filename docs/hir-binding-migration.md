@@ -79,7 +79,7 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Preparation can capture that catalog from the same schema inputs used to create the legacy resolver, but does not call the semantic entry point yet. Switching execution to HIR remains a later step; physical lowering is explicitly out of scope for now. |
+| Production entry point and whole-query lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Standalone HIR expression lowering is now being ported in narrow checkpoints, but preparation still enters the legacy plan and emitter path. |
 
 ### Cutover deletion map
 
@@ -138,6 +138,12 @@ or by converting HIR expressions back into parser AST.
 
 Completed:
 
+- Standalone HIR expression lowering now consumes frozen custom-column,
+  custom-CAST, and custom-binary-operator programs directly. Custom binary
+  calls preserve legacy operand swapping, literal encoding, result negation,
+  and target-copy behavior while calling the exact function resolved by
+  semantic analysis. No resolver, parser expression, or `TableReferences`
+  lookup enters these paths.
 - Trigger predicates and commands now have ordered HIR planner roots. SELECT
   commands retain their `QueryId`; UPDATE and DELETE commands reuse resolved
   target access planning without turning trigger OLD/NEW pseudo-sources into

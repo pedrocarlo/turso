@@ -23,6 +23,24 @@ enum BinaryOperands {
 }
 
 #[derive(Clone, Copy)]
+enum BinaryRegisters {
+    Ordinary(BinaryOperands),
+    Custom(CustomBinaryRegisters),
+}
+
+#[derive(Clone, Copy)]
+enum CustomBinaryRegisters {
+    Direct {
+        arguments: usize,
+    },
+    EncodeLiteral {
+        inputs: usize,
+        arguments: usize,
+        encoder_arguments_start: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
 struct BetweenRegisters {
     value: usize,
     start: usize,
@@ -126,6 +144,11 @@ enum CastChild<'expr> {
     },
 }
 
+enum BinaryChild<'expr> {
+    Operand(&'expr hir::Expr),
+    Encoder(SchemaCallChild<'expr>),
+}
+
 impl<'expr> ColumnChild<'expr> {
     const fn expression(&self) -> &'expr hir::Expr {
         match self {
@@ -148,6 +171,15 @@ impl<'expr> CastChild<'expr> {
         match self {
             Self::Value(expression) => expression,
             Self::Program { child, .. } => child.expression(),
+        }
+    }
+}
+
+impl<'expr> BinaryChild<'expr> {
+    const fn expression(&self) -> &'expr hir::Expr {
+        match self {
+            Self::Operand(expression) => expression,
+            Self::Encoder(child) => child.expression(),
         }
     }
 }
@@ -189,7 +221,7 @@ struct CastProgramRegisters {
 #[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
-    Binary(BinaryOperands),
+    Binary(BinaryRegisters),
     Between(BetweenRegisters),
     Case(CaseRegisters),
     InList(InListRegisters),
@@ -227,10 +259,17 @@ impl LoweringContext {
 }
 
 fn binary_registers(registers: ExprRegisters) -> BinaryOperands {
-    let ExprRegisters::Binary(operands) = registers else {
+    let ExprRegisters::Binary(BinaryRegisters::Ordinary(operands)) = registers else {
         unreachable!("binary operand registers were allocated")
     };
     operands
+}
+
+const fn custom_operand_position(operand: hir::BinaryOperand, swap_args: bool) -> usize {
+    match (operand, swap_args) {
+        (hir::BinaryOperand::Left, false) | (hir::BinaryOperand::Right, true) => 0,
+        (hir::BinaryOperand::Right, false) | (hir::BinaryOperand::Left, true) => 1,
+    }
 }
 
 fn comparison_flags(component: &hir::ComparisonComponent) -> CmpInsFlags {
@@ -497,6 +536,28 @@ impl<'expr> ExprLowerer<'_, 'expr> {
                 child,
             })
     }
+
+    fn binary_child(
+        &self,
+        lhs: &'expr hir::Expr,
+        rhs: &'expr hir::Expr,
+        custom: Option<&'expr hir::CustomBinaryOperator>,
+        mut index: usize,
+    ) -> Option<BinaryChild<'expr>> {
+        let (first, second) = match custom {
+            Some(custom) if custom.swap_args => (rhs, lhs),
+            _ => (lhs, rhs),
+        };
+        match index {
+            0 => return Some(BinaryChild::Operand(first)),
+            1 => return Some(BinaryChild::Operand(second)),
+            _ => index -= 2,
+        }
+
+        let encoder = custom?.literal_encoding.as_ref()?.encoder.as_ref()?;
+        self.schema_call_child(std::iter::once(encoder), index)
+            .map(BinaryChild::Encoder)
+    }
 }
 
 impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
@@ -511,6 +572,11 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                 .map(|child| child.expression()),
             hir::Expr::Cast { expr, target } => self
                 .cast_child(expr, target, index)
+                .map(|child| child.expression()),
+            hir::Expr::Binary {
+                lhs, rhs, custom, ..
+            } => self
+                .binary_child(lhs, rhs, custom.as_ref(), index)
                 .map(|child| child.expression()),
             _ => expression.child(index),
         }
@@ -681,32 +747,154 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
             hir::Expr::Binary {
                 lhs,
                 rhs,
+                custom,
                 comparison,
                 ..
             } => {
                 if matches!(context.registers, ExprRegisters::None) {
-                    let width = comparison
-                        .as_ref()
-                        .map_or(1, |comparison| comparison.components.len());
-                    let operands = if lhs.equivalent(rhs) {
-                        BinaryOperands::Shared(self.program.alloc_registers(width))
+                    let registers = if let Some(custom) = custom {
+                        BinaryRegisters::Custom(
+                            if let Some(encoder) = custom
+                                .literal_encoding
+                                .as_ref()
+                                .and_then(|encoding| encoding.encoder.as_ref())
+                            {
+                                CustomBinaryRegisters::EncodeLiteral {
+                                    inputs: self.program.alloc_registers(2),
+                                    arguments: self.program.alloc_registers(2),
+                                    encoder_arguments_start: self
+                                        .program
+                                        .alloc_registers(encoder.arguments.len()),
+                                }
+                            } else {
+                                CustomBinaryRegisters::Direct {
+                                    arguments: self.program.alloc_registers(2),
+                                }
+                            },
+                        )
                     } else {
-                        let lhs = self.program.alloc_registers(width * 2);
-                        BinaryOperands::Pair {
-                            lhs,
-                            rhs: lhs + width,
-                        }
+                        let width = comparison
+                            .as_ref()
+                            .map_or(1, |comparison| comparison.components.len());
+                        let operands = if lhs.equivalent(rhs) {
+                            BinaryOperands::Shared(self.program.alloc_registers(width))
+                        } else {
+                            let lhs = self.program.alloc_registers(width * 2);
+                            BinaryOperands::Pair {
+                                lhs,
+                                rhs: lhs + width,
+                            }
+                        };
+                        BinaryRegisters::Ordinary(operands)
                     };
-                    context.registers = ExprRegisters::Binary(operands);
+                    context.registers = ExprRegisters::Binary(registers);
                 }
                 match (context.registers, child_index) {
-                    (ExprRegisters::Binary(BinaryOperands::Shared(register)), 0) => register,
-                    (ExprRegisters::Binary(BinaryOperands::Shared(_)), 1) => {
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Ordinary(BinaryOperands::Shared(
+                            register,
+                        ))),
+                        0,
+                    ) => register,
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Ordinary(BinaryOperands::Shared(_))),
+                        1,
+                    ) => {
                         return Ok(ControlFlow::Break(()));
                     }
-                    (ExprRegisters::Binary(BinaryOperands::Pair { lhs, .. }), 0) => lhs,
-                    (ExprRegisters::Binary(BinaryOperands::Pair { rhs, .. }), 1) => rhs,
-                    (_, _) => unreachable!("binary expression has two children"),
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Ordinary(BinaryOperands::Pair {
+                            lhs,
+                            ..
+                        })),
+                        0,
+                    ) => lhs,
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Ordinary(BinaryOperands::Pair {
+                            rhs,
+                            ..
+                        })),
+                        1,
+                    ) => rhs,
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Custom(
+                            CustomBinaryRegisters::Direct { arguments },
+                        )),
+                        0 | 1,
+                    ) => arguments + child_index,
+                    (
+                        ExprRegisters::Binary(BinaryRegisters::Custom(
+                            CustomBinaryRegisters::EncodeLiteral {
+                                inputs,
+                                arguments,
+                                encoder_arguments_start,
+                            },
+                        )),
+                        _,
+                    ) => {
+                        let custom = custom
+                            .as_ref()
+                            .expect("custom binary registers require a custom operator");
+                        let encoding = custom
+                            .literal_encoding
+                            .as_ref()
+                            .expect("literal encoding registers require literal encoding");
+                        if child_index == 2 {
+                            let literal =
+                                custom_operand_position(encoding.operand, custom.swap_args);
+                            let column = 1 - literal;
+                            self.program.emit_insn(Insn::Copy {
+                                src_reg: inputs + column,
+                                dst_reg: arguments + column,
+                                extra_amount: 0,
+                            });
+                        }
+                        let Some(child) = self.binary_child(lhs, rhs, Some(custom), child_index)
+                        else {
+                            return Err(LimboError::InternalError(format!(
+                                "HIR custom binary operator has an invalid linked child {child_index}"
+                            )));
+                        };
+                        match child {
+                            BinaryChild::Operand(_) => inputs + child_index,
+                            BinaryChild::Encoder(SchemaCallChild::Argument {
+                                call,
+                                argument,
+                                argument_count,
+                                ..
+                            }) => {
+                                debug_assert_eq!(call, 0);
+                                debug_assert_eq!(
+                                    argument_count,
+                                    encoding.encoder.as_ref().unwrap().arguments.len()
+                                );
+                                encoder_arguments_start + argument
+                            }
+                            BinaryChild::Encoder(SchemaCallChild::Body {
+                                call,
+                                argument_count,
+                                input_source,
+                                ..
+                            }) => {
+                                debug_assert_eq!(call, 0);
+                                debug_assert_eq!(
+                                    argument_count,
+                                    encoding.encoder.as_ref().unwrap().arguments.len()
+                                );
+                                let literal =
+                                    custom_operand_position(encoding.operand, custom.swap_args);
+                                self.program.bind_source(
+                                    input_source,
+                                    SourceBinding::SchemaInputs {
+                                        value: inputs + literal,
+                                        arguments_start: encoder_arguments_start,
+                                    },
+                                );
+                                arguments + literal
+                            }
+                        }
+                    }
+                    (_, _) => unreachable!("binary expression has valid linked children"),
                 }
             }
             hir::Expr::Between {
@@ -1405,6 +1593,16 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                 target: cast_target,
                 ..
             } => self.emit_cast(cast_target, target, context.registers, children),
+            hir::Expr::Binary {
+                custom: Some(custom),
+                ..
+            } => {
+                let ExprRegisters::Binary(BinaryRegisters::Custom(registers)) = context.registers
+                else {
+                    unreachable!("custom binary registers were allocated")
+                };
+                self.emit_custom_binary(custom, registers, target, children)
+            }
             hir::Expr::Binary {
                 operator: Operator::Concat,
                 array_concat,
@@ -2970,6 +3168,66 @@ impl ExprLowerer<'_, '_> {
         Ok(target)
     }
 
+    fn emit_custom_binary(
+        &mut self,
+        custom: &hir::CustomBinaryOperator,
+        registers: CustomBinaryRegisters,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
+        let arguments = match registers {
+            CustomBinaryRegisters::Direct { arguments } => {
+                debug_assert_eq!(children, [arguments, arguments + 1]);
+                arguments
+            }
+            CustomBinaryRegisters::EncodeLiteral {
+                inputs,
+                arguments,
+                encoder_arguments_start: _,
+            } => {
+                let encoding = custom
+                    .literal_encoding
+                    .as_ref()
+                    .expect("literal encoding registers require literal encoding");
+                let encoder = encoding
+                    .encoder
+                    .as_ref()
+                    .expect("literal encoding registers require an encoder");
+                debug_assert_eq!(children[0], inputs);
+                debug_assert_eq!(children[1], inputs + 1);
+                debug_assert_eq!(children.len(), encoder.arguments.len() + 3);
+                let literal = custom_operand_position(encoding.operand, custom.swap_args);
+                debug_assert_eq!(children.last(), Some(&(arguments + literal)));
+                arguments
+            }
+        };
+
+        let result = self.program.alloc_register();
+        self.program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: arguments,
+            dest: result,
+            func: FuncCtx {
+                func: custom.function.value().clone(),
+                arg_count: 2,
+            },
+        });
+        if custom.negate {
+            self.program.emit_insn(Insn::Not {
+                reg: result,
+                dest: result,
+            });
+        }
+        if result != target {
+            self.program.emit_insn(Insn::Copy {
+                src_reg: result,
+                dst_reg: target,
+                extra_amount: 0,
+            });
+        }
+        Ok(target)
+    }
+
     fn emit_binary_comparison(
         &mut self,
         operator: Operator,
@@ -3668,6 +3926,54 @@ mod tests {
         &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
     }
 
+    fn custom_operator_schema() -> crate::schema::Schema {
+        let mut schema = crate::schema::Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE amount(value INTEGER, factor INTEGER) BASE INTEGER \
+                 ENCODE value * factor DECODE value / factor \
+                 OPERATOR '+' numeric_add OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+            )
+            .expect("custom operator type parses");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE custom_values(a amount(4), b amount(4)) STRICT",
+                    2,
+                )
+                .expect("custom operator table parses"),
+            ))
+            .expect("custom operator table name is unique");
+        schema
+    }
+
+    fn lower_btree_output(document: &hir::HirDocument, target: usize) -> ProgramBuilder {
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source_id = block.from.as_ref().expect("query has FROM").first;
+        let source = document.source(source_id).expect("source exists");
+        let hir::SourceKind::Table(table) = &source.kind else {
+            panic!("source is a table");
+        };
+        let Table::BTree(table) = table.value() else {
+            panic!("source is a B-tree table");
+        };
+        let mut program = program();
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        super::translate_expr(&mut program, document, &block.outputs[0].expr, target)
+            .expect("analyzed output lowers");
+        program
+    }
+
     fn translate_expr(
         program: &mut ProgramBuilder,
         expression: &hir::Expr,
@@ -3906,6 +4212,115 @@ mod tests {
                 _
             )] if *cursor_id == suppressed_cursor
         ));
+    }
+
+    #[test]
+    fn custom_binary_operator_uses_resolved_function_and_swap_order() {
+        let document = analyze_sql(custom_operator_schema(), "SELECT a > b FROM custom_values");
+        let program = lower_btree_output(&document, 20);
+
+        let columns = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Column { column, .. } => Some(*column),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(columns, [1, 0], "swapped operator evaluates b before a");
+
+        let (function_index, result) = program
+            .insns
+            .iter()
+            .enumerate()
+            .find_map(|(index, (instruction, _))| match instruction {
+                Insn::Function {
+                    dest,
+                    func:
+                        FuncCtx {
+                            func: Func::Scalar(ScalarFunc::NumericLt),
+                            arg_count: 2,
+                        },
+                    ..
+                } => Some((index, *dest)),
+                _ => None,
+            })
+            .expect("resolved less-than function is called");
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Not { .. })));
+        assert!(matches!(
+            program.insns[function_index + 1].0,
+            Insn::Copy {
+                src_reg,
+                dst_reg: 20,
+                extra_amount: 0,
+            } if src_reg == result
+        ));
+    }
+
+    #[test]
+    fn custom_binary_operator_encodes_literal_into_resolved_argument_slot() {
+        for (sql, literal_position, negate, literal_before_column) in [
+            ("SELECT a >= 7 FROM custom_values", 1, true, false),
+            ("SELECT 7 < a FROM custom_values", 0, false, true),
+        ] {
+            let document = analyze_sql(custom_operator_schema(), sql);
+            let program = lower_btree_output(&document, 20);
+            let column_index = program
+                .insns
+                .iter()
+                .position(|(instruction, _)| matches!(instruction, Insn::Column { column: 0, .. }))
+                .expect("custom column is read");
+            let literal_index = program
+                .insns
+                .iter()
+                .position(|(instruction, _)| matches!(instruction, Insn::Integer { value: 7, .. }))
+                .expect("literal is evaluated");
+            assert_eq!(literal_index < column_index, literal_before_column);
+
+            let (arguments, result) = program
+                .insns
+                .iter()
+                .find_map(|(instruction, _)| match instruction {
+                    Insn::Function {
+                        start_reg,
+                        dest,
+                        func:
+                            FuncCtx {
+                                func: Func::Scalar(ScalarFunc::NumericLt),
+                                arg_count: 2,
+                            },
+                        ..
+                    } => Some((*start_reg, *dest)),
+                    _ => None,
+                })
+                .expect("resolved less-than function is called");
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Multiply { dest, .. } if *dest == arguments + literal_position
+            )));
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Copy { dst_reg, .. } if *dst_reg == arguments + (1 - literal_position)
+            )));
+            assert_eq!(
+                program.insns.iter().any(|(instruction, _)| matches!(
+                    instruction,
+                    Insn::Not { reg, dest } if *reg == result && *dest == result
+                )),
+                negate
+            );
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Copy {
+                    src_reg,
+                    dst_reg: 20,
+                    extra_amount: 0,
+                } if *src_reg == result
+            )));
+        }
     }
 
     #[test]
