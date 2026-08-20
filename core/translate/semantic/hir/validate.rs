@@ -52,7 +52,7 @@ struct ExprValidationVisitor<'validator, 'document> {
     validator: &'validator HirValidator<'document>,
 }
 
-impl ExprVisitor for ExprValidationVisitor<'_, '_> {
+impl<'expr> ExprVisitor<'expr> for ExprValidationVisitor<'_, '_> {
     type Context = ();
     type Output = ();
     type Error = HirValidationError;

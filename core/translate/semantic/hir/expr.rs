@@ -419,22 +419,26 @@ struct ExprFrame<'expr, C, T> {
     child_values: SmallVec<[T; 3]>,
 }
 
-pub(crate) trait ExprVisitor {
+pub(crate) trait ExprVisitor<'expr> {
     type Context;
     type Output;
     type Error;
 
+    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
+        expression.child(index)
+    }
+
     fn pre_order(
         &mut self,
-        parent: &Expr,
+        parent: &'expr Expr,
         context: &mut Self::Context,
         child_index: usize,
-        child: &Expr,
+        child: &'expr Expr,
     ) -> Result<ControlFlow<(), Self::Context>, Self::Error>;
 
     fn post_order(
         &mut self,
-        expression: &Expr,
+        expression: &'expr Expr,
         context: Self::Context,
         children: &[Self::Output],
     ) -> Result<Self::Output, Self::Error>;
@@ -444,7 +448,7 @@ struct WalkVisitor<'a, F> {
     visit: &'a mut F,
 }
 
-impl<F: FnMut(&Expr)> ExprVisitor for WalkVisitor<'_, F> {
+impl<'expr, F: FnMut(&Expr)> ExprVisitor<'expr> for WalkVisitor<'_, F> {
     type Context = ();
     type Output = ();
     type Error = Infallible;
@@ -475,7 +479,7 @@ struct FoldVisitor<'a, F, T> {
     output: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor for FoldVisitor<'_, F, T> {
+impl<'expr, T, F: FnMut(&Expr, &[T]) -> T> ExprVisitor<'expr> for FoldVisitor<'_, F, T> {
     type Context = ();
     type Output = T;
     type Error = Infallible;
@@ -510,9 +514,12 @@ impl<'expr, C, T> ExprFrame<'expr, C, T> {
         }
     }
 
-    fn next_child(&mut self) -> Option<(usize, &'expr Expr)> {
+    fn next_child<V: ExprVisitor<'expr>>(
+        &mut self,
+        visitor: &mut V,
+    ) -> Option<(usize, &'expr Expr)> {
         let index = self.next_child;
-        let child = self.expression.child(index)?;
+        let child = visitor.child(self.expression, index)?;
         self.next_child += 1;
         Some((index, child))
     }
@@ -531,7 +538,7 @@ impl Expr {
         Self::Output(output)
     }
 
-    fn child(&self, mut index: usize) -> Option<&Self> {
+    pub(crate) fn child(&self, mut index: usize) -> Option<&Self> {
         match self {
             Self::Literal(_)
             | Self::Parameter(_)
@@ -1009,15 +1016,15 @@ impl Expr {
     /// after all selected children. The pre-order callback chooses the
     /// context for a child or skips that child. The post-order callback
     /// reduces completed child values into the current node's value.
-    pub(crate) fn walk<V: ExprVisitor>(
-        &self,
+    pub(crate) fn walk<'expr, V: ExprVisitor<'expr>>(
+        &'expr self,
         root_context: V::Context,
         visitor: &mut V,
     ) -> Result<V::Output, V::Error> {
         let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
             let frame = frames.last_mut().expect("root expression frame exists");
-            if let Some((index, child)) = frame.next_child() {
+            if let Some((index, child)) = frame.next_child(visitor) {
                 match visitor.pre_order(frame.expression, &mut frame.context, index, child)? {
                     ControlFlow::Continue(context) => {
                         frames.push(ExprFrame::new(child, context));

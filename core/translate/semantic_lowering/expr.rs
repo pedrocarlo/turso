@@ -280,10 +280,26 @@ struct ExprLowerer<'program, 'document> {
     document: &'document hir::HirDocument,
 }
 
-impl hir::ExprVisitor for ExprLowerer<'_, '_> {
+impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
     type Context = LoweringContext;
     type Output = usize;
     type Error = LimboError;
+
+    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        let hir::Expr::Column(reference) = expression else {
+            return expression.child(index);
+        };
+        let 0 = index else {
+            return None;
+        };
+        let source = self.document.source(reference.source)?;
+        let hir::ColumnReadExpression::Planned(generated) =
+            source.generated_expressions.get(reference.column)?
+        else {
+            return None;
+        };
+        Some(generated)
+    }
 
     fn pre_order(
         &mut self,
@@ -293,6 +309,7 @@ impl hir::ExprVisitor for ExprLowerer<'_, '_> {
         child: &hir::Expr,
     ) -> Result<ControlFlow<(), LoweringContext>> {
         let target = match parent {
+            hir::Expr::Column(_) => context.target,
             hir::Expr::Unary { operator, .. } => match operator {
                 UnaryOperator::Positive => context.target,
                 UnaryOperator::Negative
@@ -1016,7 +1033,7 @@ impl hir::ExprVisitor for ExprLowerer<'_, '_> {
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
-            hir::Expr::Column(column) => self.emit_column(*column, target),
+            hir::Expr::Column(column) => self.emit_column(*column, target, children),
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
@@ -1896,7 +1913,12 @@ impl hir::ExprVisitor for ExprLowerer<'_, '_> {
 }
 
 impl ExprLowerer<'_, '_> {
-    fn emit_column(&mut self, reference: hir::ColumnRef, target: usize) -> Result<usize> {
+    fn emit_column(
+        &mut self,
+        reference: hir::ColumnRef,
+        target: usize,
+        children: &[usize],
+    ) -> Result<usize> {
         let Some(source) = self.document.source(reference.source) else {
             return Err(LimboError::InternalError(format!(
                 "HIR column references missing source {}",
@@ -1924,14 +1946,40 @@ impl ExprLowerer<'_, '_> {
                 "HIR source custom-type metadata is incomplete".to_string(),
             ));
         };
-        if !matches!(generated, hir::ColumnReadExpression::Absent)
-            || !matches!(default, hir::ColumnReadExpression::Absent)
-            || type_program.is_some()
-        {
+        if !matches!(default, hir::ColumnReadExpression::Absent) || type_program.is_some() {
             return Err(LimboError::InternalError(
-                "HIR generated, default, and custom-type column lowering is not implemented"
-                    .to_string(),
+                "HIR default and custom-type column lowering is not implemented".to_string(),
             ));
+        }
+
+        match generated {
+            hir::ColumnReadExpression::Planned(_) => {
+                let [result] = children else {
+                    return Err(LimboError::InternalError(
+                        "HIR generated column did not lower exactly one expression".to_string(),
+                    ));
+                };
+                debug_assert_eq!(*result, target);
+                if column.has_affinity {
+                    self.program.emit_column_affinity(target, column.affinity);
+                }
+                self.program.set_collation(
+                    column
+                        .collation
+                        .as_ref()
+                        .map(|collation| (collation.value().clone(), false)),
+                );
+                return Ok(target);
+            }
+            hir::ColumnReadExpression::Absent => {
+                debug_assert!(children.is_empty());
+            }
+            hir::ColumnReadExpression::NotRequired => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR generated column {}.{} was not planned",
+                    reference.source, reference.column
+                )));
+            }
         }
 
         let Some(binding) = self.program.source_binding(reference.source).copied() else {
@@ -1941,12 +1989,6 @@ impl ExprLowerer<'_, '_> {
             )));
         };
 
-        self.program.set_collation(
-            column
-                .collation
-                .as_ref()
-                .map(|collation| (collation.value().clone(), false)),
-        );
         match binding {
             SourceBinding::Registers { start } => {
                 self.program.emit_insn(Insn::Copy {
@@ -2014,6 +2056,12 @@ impl ExprLowerer<'_, '_> {
                 }
             }
         }
+        self.program.set_collation(
+            column
+                .collation
+                .as_ref()
+                .map(|collation| (collation.value().clone(), false)),
+        );
         Ok(target)
     }
 
@@ -2979,6 +3027,91 @@ mod tests {
 
         super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
             .expect("bound register column lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Copy {
+                    src_reg: 7,
+                    dst_reg: 3,
+                    extra_amount: 0,
+                },
+                _
+            )]
+        ));
+    }
+
+    #[test]
+    fn generated_columns_use_linked_expression_and_declared_affinity() {
+        let source_id = hir::SourceId::new(0);
+        let mut definition = source(
+            source_id,
+            hir::SourceKind::SchemaExpression,
+            vec![
+                source_column("value", Type::Integer, Affinity::Integer, false),
+                source_column("generated", Type::Real, Affinity::Real, false),
+            ],
+            false,
+        );
+        definition.generated_expressions[1] =
+            hir::ColumnReadExpression::Planned(hir::Expr::column(source_id, 0));
+        let mut document = document(Vec::new());
+        document.sources.push(definition);
+        let mut program = program();
+        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+
+        super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 1), 3)
+            .expect("generated column lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (
+                    Insn::Copy {
+                        src_reg: 7,
+                        dst_reg: 3,
+                        extra_amount: 0,
+                    },
+                    _
+                ),
+                (Insn::Affinity { start_reg: 3, .. }, _),
+            ]
+        ));
+    }
+
+    #[test]
+    fn linked_generated_columns_do_not_use_the_call_stack() {
+        const WIDTH: usize = 20_000;
+
+        let source_id = hir::SourceId::new(0);
+        let mut columns = Vec::with_capacity(WIDTH);
+        for index in 0..WIDTH {
+            let mut column = source_column(
+                &format!("column_{index}"),
+                Type::Integer,
+                Affinity::Integer,
+                false,
+            );
+            column.has_affinity = false;
+            columns.push(column);
+        }
+        let mut definition = source(source_id, hir::SourceKind::SchemaExpression, columns, false);
+        for index in 1..WIDTH {
+            definition.generated_expressions[index] =
+                hir::ColumnReadExpression::Planned(hir::Expr::column(source_id, index - 1));
+        }
+        let mut document = document(Vec::new());
+        document.sources.push(definition);
+        let mut program = program();
+        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+
+        super::translate_expr(
+            &mut program,
+            &document,
+            &hir::Expr::column(source_id, WIDTH - 1),
+            3,
+        )
+        .expect("deep generated chain lowers iteratively");
 
         assert!(matches!(
             program.insns.as_slice(),
