@@ -73,6 +73,11 @@ pub(crate) enum SourceBinding {
     Registers {
         start: usize,
     },
+    /// Runtime value plus separately allocated arguments for a schema program.
+    SchemaInputs {
+        value: usize,
+        arguments_start: usize,
+    },
 }
 
 /// A key that uniquely identifies a cursor.

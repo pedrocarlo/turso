@@ -92,6 +92,39 @@ struct CursorColumn {
     column: usize,
 }
 
+enum ColumnChild<'expr> {
+    Generated(&'expr hir::Expr),
+    DecodeArgument {
+        call: usize,
+        argument: usize,
+        argument_count: usize,
+        expression: &'expr hir::Expr,
+    },
+    DecodeBody {
+        call: usize,
+        argument_count: usize,
+        input_source: hir::SourceId,
+        expression: &'expr hir::Expr,
+    },
+}
+
+impl<'expr> ColumnChild<'expr> {
+    const fn expression(&self) -> &'expr hir::Expr {
+        match self {
+            Self::Generated(expression)
+            | Self::DecodeArgument { expression, .. }
+            | Self::DecodeBody { expression, .. } => expression,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColumnDecodeRegisters {
+    skip: BranchOffset,
+    call: Option<usize>,
+    arguments_start: usize,
+}
+
 #[derive(Clone, Copy)]
 enum ExprRegisters {
     None,
@@ -109,6 +142,7 @@ enum ExprRegisters {
     FieldAccess(usize),
     RaiseMessage(usize),
     Function(usize),
+    ColumnDecode(ColumnDecodeRegisters),
 }
 
 enum NullTest {
@@ -280,6 +314,55 @@ struct ExprLowerer<'program, 'document> {
     document: &'document hir::HirDocument,
 }
 
+impl<'expr> ExprLowerer<'_, 'expr> {
+    fn column_child(
+        &self,
+        reference: hir::ColumnRef,
+        mut index: usize,
+    ) -> Option<ColumnChild<'expr>> {
+        let source = self.document.source(reference.source)?;
+        let generated = source.generated_expressions.get(reference.column)?;
+        if let hir::ColumnReadExpression::Planned(expression) = generated {
+            if index == 0 {
+                return Some(ColumnChild::Generated(expression));
+            }
+            index -= 1;
+        }
+
+        let column = source.columns.get(reference.column)?;
+        if column.type_fact.array_dimensions > 0 || self.program.flags.suppress_custom_type_decode()
+        {
+            return None;
+        }
+        let programs = source
+            .column_type_programs
+            .get(reference.column)?
+            .as_ref()?;
+        for (call_index, call) in programs.decode.iter().enumerate() {
+            if let Some(expression) = call.arguments.get(index) {
+                return Some(ColumnChild::DecodeArgument {
+                    call: call_index,
+                    argument: index,
+                    argument_count: call.arguments.len(),
+                    expression,
+                });
+            }
+            index -= call.arguments.len();
+            if index == 0 {
+                let program = self.document.schema_program(call.program)?;
+                return Some(ColumnChild::DecodeBody {
+                    call: call_index,
+                    argument_count: call.arguments.len(),
+                    input_source: program.input_source,
+                    expression: &program.body,
+                });
+            }
+            index -= 1;
+        }
+        None
+    }
+}
+
 impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
     type Context = LoweringContext;
     type Output = usize;
@@ -289,16 +372,8 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
         let hir::Expr::Column(reference) = expression else {
             return expression.child(index);
         };
-        let 0 = index else {
-            return None;
-        };
-        let source = self.document.source(reference.source)?;
-        let hir::ColumnReadExpression::Planned(generated) =
-            source.generated_expressions.get(reference.column)?
-        else {
-            return None;
-        };
-        Some(generated)
+        self.column_child(*reference, index)
+            .map(|child| child.expression())
     }
 
     fn pre_order(
@@ -309,7 +384,62 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
         child: &hir::Expr,
     ) -> Result<ControlFlow<(), LoweringContext>> {
         let target = match parent {
-            hir::Expr::Column(_) => context.target,
+            hir::Expr::Column(reference) => {
+                let Some(column_child) = self.column_child(*reference, child_index) else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR column {}.{} has an invalid linked child {child_index}",
+                        reference.source, reference.column
+                    )));
+                };
+                match column_child {
+                    ColumnChild::Generated(_) => context.target,
+                    ColumnChild::DecodeArgument {
+                        call,
+                        argument,
+                        argument_count,
+                        ..
+                    } => {
+                        if matches!(context.registers, ExprRegisters::None) {
+                            self.begin_column_decode(*reference, context)?;
+                        }
+                        let ExprRegisters::ColumnDecode(registers) = &mut context.registers else {
+                            unreachable!("column decode registers were allocated")
+                        };
+                        if registers.call != Some(call) {
+                            registers.call = Some(call);
+                            registers.arguments_start =
+                                self.program.alloc_registers(argument_count);
+                        }
+                        registers.arguments_start + argument
+                    }
+                    ColumnChild::DecodeBody {
+                        call,
+                        argument_count,
+                        input_source,
+                        ..
+                    } => {
+                        if matches!(context.registers, ExprRegisters::None) {
+                            self.begin_column_decode(*reference, context)?;
+                        }
+                        let ExprRegisters::ColumnDecode(registers) = &mut context.registers else {
+                            unreachable!("column decode registers were allocated")
+                        };
+                        if registers.call != Some(call) {
+                            registers.call = Some(call);
+                            registers.arguments_start =
+                                self.program.alloc_registers(argument_count);
+                        }
+                        self.program.bind_source(
+                            input_source,
+                            SourceBinding::SchemaInputs {
+                                value: context.target,
+                                arguments_start: registers.arguments_start,
+                            },
+                        );
+                        context.target
+                    }
+                }
+            }
             hir::Expr::Unary { operator, .. } => match operator {
                 UnaryOperator::Positive => context.target,
                 UnaryOperator::Negative
@@ -1033,7 +1163,9 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
-            hir::Expr::Column(column) => self.emit_column(*column, target, children),
+            hir::Expr::Column(column) => {
+                self.emit_column(*column, target, context.registers, children)
+            }
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
@@ -1917,6 +2049,7 @@ impl ExprLowerer<'_, '_> {
         &mut self,
         reference: hir::ColumnRef,
         target: usize,
+        registers: ExprRegisters,
         children: &[usize],
     ) -> Result<usize> {
         let Some(source) = self.document.source(reference.source) else {
@@ -1946,40 +2079,55 @@ impl ExprLowerer<'_, '_> {
                 "HIR source custom-type metadata is incomplete".to_string(),
             ));
         };
-        if type_program.is_some() {
-            return Err(LimboError::InternalError(
-                "HIR custom-type column lowering is not implemented".to_string(),
-            ));
-        }
         if matches!(default, hir::ColumnReadExpression::NotRequired) {
             return Err(LimboError::InternalError(format!(
                 "HIR default for column {}.{} was not planned",
                 reference.source, reference.column
             )));
         }
+        if matches!(default, hir::ColumnReadExpression::Planned(_))
+            && type_program
+                .as_ref()
+                .is_some_and(|programs| !programs.encode.is_empty())
+        {
+            return Err(LimboError::InternalError(
+                "HIR custom-type default encoding is not implemented".to_string(),
+            ));
+        }
+
+        let decode_children = if column.type_fact.array_dimensions > 0
+            || self.program.flags.suppress_custom_type_decode()
+        {
+            0
+        } else {
+            type_program.as_ref().map_or(0, |programs| {
+                programs
+                    .decode
+                    .iter()
+                    .map(|call| call.arguments.len() + 1)
+                    .sum()
+            })
+        };
+        let generated_children =
+            usize::from(matches!(generated, hir::ColumnReadExpression::Planned(_)));
+        if children.len() != generated_children + decode_children {
+            return Err(LimboError::InternalError(format!(
+                "HIR column {}.{} lowered {} linked children, expected {}",
+                reference.source,
+                reference.column,
+                children.len(),
+                generated_children + decode_children
+            )));
+        }
 
         match generated {
             hir::ColumnReadExpression::Planned(_) => {
-                let [result] = children else {
-                    return Err(LimboError::InternalError(
-                        "HIR generated column did not lower exactly one expression".to_string(),
-                    ));
-                };
-                debug_assert_eq!(*result, target);
-                if column.has_affinity {
+                debug_assert_eq!(children[0], target);
+                if decode_children == 0 && column.has_affinity {
                     self.program.emit_column_affinity(target, column.affinity);
                 }
-                self.program.set_collation(
-                    column
-                        .collation
-                        .as_ref()
-                        .map(|collation| (collation.value().clone(), false)),
-                );
-                return Ok(target);
             }
-            hir::ColumnReadExpression::Absent => {
-                debug_assert!(children.is_empty());
-            }
+            hir::ColumnReadExpression::Absent => {}
             hir::ColumnReadExpression::NotRequired => {
                 return Err(LimboError::InternalError(format!(
                     "HIR generated column {}.{} was not planned",
@@ -1988,6 +2136,105 @@ impl ExprLowerer<'_, '_> {
             }
         }
 
+        if let ExprRegisters::ColumnDecode(registers) = registers {
+            self.program.preassign_label_to_next_insn(registers.skip);
+            self.set_column_collation(column);
+            return Ok(target);
+        }
+        if matches!(generated, hir::ColumnReadExpression::Planned(_)) {
+            self.set_column_collation(column);
+            return Ok(target);
+        }
+
+        self.emit_stored_column(reference, column, target, type_program.is_none())?;
+        self.set_column_collation(column);
+        Ok(target)
+    }
+
+    fn begin_column_decode(
+        &mut self,
+        reference: hir::ColumnRef,
+        context: &mut LoweringContext,
+    ) -> Result<()> {
+        let source = self.document.source(reference.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR column references missing source {}",
+                reference.source
+            ))
+        })?;
+        let column = source.columns.get(reference.column).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR column {}.{} is out of bounds",
+                reference.source, reference.column
+            ))
+        })?;
+        let generated = source
+            .generated_expressions
+            .get(reference.column)
+            .ok_or_else(|| {
+                LimboError::InternalError(
+                    "HIR source generated-expression metadata is incomplete".to_string(),
+                )
+            })?;
+        let default = source
+            .default_expressions
+            .get(reference.column)
+            .ok_or_else(|| {
+                LimboError::InternalError(
+                    "HIR source default-expression metadata is incomplete".to_string(),
+                )
+            })?;
+        let programs = source
+            .column_type_programs
+            .get(reference.column)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                LimboError::InternalError(
+                    "HIR source custom-type metadata is incomplete".to_string(),
+                )
+            })?;
+        if matches!(default, hir::ColumnReadExpression::Planned(_)) && !programs.encode.is_empty() {
+            return Err(LimboError::InternalError(
+                "HIR custom-type default encoding is not implemented".to_string(),
+            ));
+        }
+        match generated {
+            hir::ColumnReadExpression::Planned(_) => {
+                if column.has_affinity {
+                    self.program
+                        .emit_column_affinity(context.target, column.affinity);
+                }
+            }
+            hir::ColumnReadExpression::Absent => {
+                self.emit_stored_column(reference, column, context.target, false)?;
+            }
+            hir::ColumnReadExpression::NotRequired => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR generated column {}.{} was not planned",
+                    reference.source, reference.column
+                )));
+            }
+        }
+        let skip = self.program.allocate_label();
+        self.program.emit_insn(Insn::IsNull {
+            reg: context.target,
+            target_pc: skip,
+        });
+        context.registers = ExprRegisters::ColumnDecode(ColumnDecodeRegisters {
+            skip,
+            call: None,
+            arguments_start: 0,
+        });
+        Ok(())
+    }
+
+    fn emit_stored_column(
+        &mut self,
+        reference: hir::ColumnRef,
+        column: &hir::SourceColumn,
+        target: usize,
+        apply_storage_affinity: bool,
+    ) -> Result<()> {
         let Some(binding) = self.program.source_binding(reference.source).copied() else {
             return Err(LimboError::InternalError(format!(
                 "HIR source {} has no physical binding",
@@ -1999,6 +2246,21 @@ impl ExprLowerer<'_, '_> {
             SourceBinding::Registers { start } => {
                 self.program.emit_insn(Insn::Copy {
                     src_reg: start + reference.column,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+            }
+            SourceBinding::SchemaInputs {
+                value,
+                arguments_start,
+            } => {
+                let src_reg = if reference.column == 0 {
+                    value
+                } else {
+                    arguments_start + reference.column - 1
+                };
+                self.program.emit_insn(Insn::Copy {
+                    src_reg,
                     dst_reg: target,
                     extra_amount: 0,
                 });
@@ -2057,18 +2319,24 @@ impl ExprLowerer<'_, '_> {
                     self.program
                         .emit_column_or_rowid(read.cursor, read.column, target);
                 }
-                if let Some(storage) = column.type_fact.storage {
+                if apply_storage_affinity {
+                    let Some(storage) = column.type_fact.storage else {
+                        return Ok(());
+                    };
                     expr::maybe_apply_affinity(storage, target, self.program);
                 }
             }
         }
+        Ok(())
+    }
+
+    fn set_column_collation(&mut self, column: &hir::SourceColumn) {
         self.program.set_collation(
             column
                 .collation
                 .as_ref()
                 .map(|collation| (collation.value().clone(), false)),
         );
-        Ok(target)
     }
 
     fn emit_rowid(&mut self, source: hir::SourceId, target: usize) -> Result<usize> {
@@ -2925,13 +3193,20 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+    use crate::dialect::SqliteDialect;
     use crate::parameters::ParameterSpelling;
     use crate::schema::{BTreeTable, Index, IndexColumn, Table, Type};
     use crate::sync::Arc;
-    use crate::translate::semantic::hir::TypeFact;
+    use crate::translate::semantic::{
+        catalog::{SemanticCatalog, SemanticCatalogDatabase},
+        context::DoubleQuotedDml,
+        hir::TypeFact,
+        SemanticOptions, SemanticRootInput,
+    };
     use crate::vdbe::affinity::Affinity;
     use crate::vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode, SourceBinding};
-    use turso_parser::ast::SortOrder;
+    use crate::{SymbolTable, MAIN_DB_ID};
+    use turso_parser::{ast::SortOrder, parser::Parser};
 
     fn program() -> ProgramBuilder {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
@@ -3082,6 +3357,120 @@ mod tests {
                 ),
                 (Insn::Affinity { start_reg: 3, .. }, _),
             ]
+        ));
+    }
+
+    #[test]
+    fn custom_columns_run_validated_decode_programs() {
+        let mut schema = crate::schema::Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE scaled(value INTEGER, factor INTEGER) BASE INTEGER \
+                 ENCODE value * factor DECODE value / factor",
+            )
+            .expect("custom type parses");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE typed_values(value scaled(4)) STRICT", 2)
+                    .expect("custom table parses"),
+            ))
+            .expect("table name is unique");
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("custom affinity resolves");
+        let catalog = SemanticCatalog {
+            databases: vec![SemanticCatalogDatabase {
+                id: hir::DatabaseId::new(MAIN_DB_ID),
+                name: "main".to_string(),
+                schema: Arc::new(schema),
+            }],
+            unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+        };
+        let statement = match Parser::new(b"SELECT value FROM typed_values")
+            .next_cmd()
+            .expect("SELECT parses")
+            .expect("SELECT exists")
+        {
+            turso_parser::ast::Cmd::Stmt(statement) => statement,
+            _ => panic!("SQL contains a statement"),
+        };
+        let document = crate::translate::semantic::analyze_root(
+            &catalog,
+            &SymbolTable::new(),
+            SemanticOptions {
+                dialect: Arc::new(SqliteDialect),
+                custom_types_enabled: true,
+                dqs_dml: DoubleQuotedDml::Enabled,
+            },
+            SemanticRootInput::Statement(&statement),
+        )
+        .expect("custom column analyzes");
+        document.validate().expect("custom column HIR validates");
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let source_id = block.from.as_ref().expect("query has FROM").first;
+        let source = document.source(source_id).expect("source exists");
+        let hir::SourceKind::Table(table) = &source.kind else {
+            panic!("source is a table");
+        };
+        let Table::BTree(table) = table.value() else {
+            panic!("source is a B-tree table");
+        };
+        let expression = &block.outputs[0].expr;
+        let mut decoded = program();
+        let cursor = decoded.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        decoded.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+
+        super::translate_expr(&mut decoded, &document, expression, 3)
+            .expect("custom column lowers");
+
+        assert!(matches!(
+            decoded.insns.first(),
+            Some((Insn::Column { cursor_id, dest: 3, .. }, _)) if *cursor_id == cursor
+        ));
+        assert!(decoded
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IsNull { reg: 3, .. })));
+        assert!(decoded
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 4, .. })));
+        assert!(decoded
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Divide { dest: 3, .. })));
+
+        let mut suppressed = program();
+        suppressed.flags.set_suppress_custom_type_decode(true);
+        let suppressed_cursor = suppressed.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        suppressed.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: suppressed_cursor,
+                table_cursor: None,
+            },
+        );
+        super::translate_expr(&mut suppressed, &document, expression, 3)
+            .expect("encoded custom column lowers without decode");
+        assert!(matches!(
+            suppressed.insns.as_slice(),
+            [(
+                Insn::Column {
+                    cursor_id,
+                    dest: 3,
+                    ..
+                },
+                _
+            )] if *cursor_id == suppressed_cursor
         ));
     }
 
