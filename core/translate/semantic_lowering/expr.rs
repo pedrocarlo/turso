@@ -1,6 +1,8 @@
 use std::ops::ControlFlow;
 
-use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
+use crate::error::{
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR,
+};
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc};
@@ -95,15 +97,20 @@ struct CursorColumn {
 enum ColumnChild<'expr> {
     Generated(&'expr hir::Expr),
     Default(&'expr hir::Expr),
-    ProgramArgument {
+    Program {
         phase: ColumnProgram,
+        child: SchemaCallChild<'expr>,
+    },
+}
+
+enum SchemaCallChild<'expr> {
+    Argument {
         call: usize,
         argument: usize,
         argument_count: usize,
         expression: &'expr hir::Expr,
     },
-    ProgramBody {
-        phase: ColumnProgram,
+    Body {
         call: usize,
         argument_count: usize,
         input_source: hir::SourceId,
@@ -111,13 +118,36 @@ enum ColumnChild<'expr> {
     },
 }
 
+enum CastChild<'expr> {
+    Value(&'expr hir::Expr),
+    Program {
+        phase: CastProgram,
+        child: SchemaCallChild<'expr>,
+    },
+}
+
 impl<'expr> ColumnChild<'expr> {
     const fn expression(&self) -> &'expr hir::Expr {
         match self {
-            Self::Generated(expression)
-            | Self::Default(expression)
-            | Self::ProgramArgument { expression, .. }
-            | Self::ProgramBody { expression, .. } => expression,
+            Self::Generated(expression) | Self::Default(expression) => expression,
+            Self::Program { child, .. } => child.expression(),
+        }
+    }
+}
+
+impl<'expr> SchemaCallChild<'expr> {
+    const fn expression(&self) -> &'expr hir::Expr {
+        match self {
+            Self::Argument { expression, .. } | Self::Body { expression, .. } => expression,
+        }
+    }
+}
+
+impl<'expr> CastChild<'expr> {
+    const fn expression(&self) -> &'expr hir::Expr {
+        match self {
+            Self::Value(expression) => expression,
+            Self::Program { child, .. } => child.expression(),
         }
     }
 }
@@ -134,6 +164,26 @@ struct ColumnProgramRegisters {
     arguments_start: usize,
     stored_value: Option<BranchOffset>,
     decode_done: Option<BranchOffset>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastProgram {
+    Encode,
+    DomainCheck,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDomainCheck {
+    check: usize,
+    result: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CastProgramRegisters {
+    call: Option<(CastProgram, usize)>,
+    arguments_start: usize,
+    domain_not_null_emitted: bool,
+    pending_domain_check: Option<PendingDomainCheck>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,6 +204,7 @@ enum ExprRegisters {
     RaiseMessage(usize),
     Function(usize),
     ColumnPrograms(ColumnProgramRegisters),
+    CastPrograms(CastProgramRegisters),
 }
 
 enum NullTest {
@@ -326,16 +377,14 @@ struct ExprLowerer<'program, 'document> {
 }
 
 impl<'expr> ExprLowerer<'_, 'expr> {
-    fn column_program_child(
+    fn schema_call_child(
         &self,
-        phase: ColumnProgram,
-        calls: &'expr [hir::BoundSchemaCall],
+        calls: impl IntoIterator<Item = &'expr hir::BoundSchemaCall>,
         mut index: usize,
-    ) -> Option<ColumnChild<'expr>> {
-        for (call_index, call) in calls.iter().enumerate() {
+    ) -> Option<SchemaCallChild<'expr>> {
+        for (call_index, call) in calls.into_iter().enumerate() {
             if let Some(expression) = call.arguments.get(index) {
-                return Some(ColumnChild::ProgramArgument {
-                    phase,
+                return Some(SchemaCallChild::Argument {
                     call: call_index,
                     argument: index,
                     argument_count: call.arguments.len(),
@@ -345,8 +394,7 @@ impl<'expr> ExprLowerer<'_, 'expr> {
             index -= call.arguments.len();
             if index == 0 {
                 let program = self.document.schema_program(call.program)?;
-                return Some(ColumnChild::ProgramBody {
-                    phase,
+                return Some(SchemaCallChild::Body {
                     call: call_index,
                     argument_count: call.arguments.len(),
                     input_source: program.input_source,
@@ -392,21 +440,62 @@ impl<'expr> ExprLowerer<'_, 'expr> {
                         .map(|call| call.arguments.len() + 1)
                         .sum();
                     if index < encode_children {
-                        return self.column_program_child(
-                            ColumnProgram::Encode,
-                            &programs.encode,
-                            index,
-                        );
+                        return self
+                            .schema_call_child(&programs.encode, index)
+                            .map(|child| ColumnChild::Program {
+                                phase: ColumnProgram::Encode,
+                                child,
+                            });
                     }
                     index -= encode_children;
                 }
             }
 
             if column.type_fact.array_dimensions == 0 {
-                return self.column_program_child(ColumnProgram::Decode, &programs.decode, index);
+                return self
+                    .schema_call_child(&programs.decode, index)
+                    .map(|child| ColumnChild::Program {
+                        phase: ColumnProgram::Decode,
+                        child,
+                    });
             }
         }
         None
+    }
+
+    fn cast_child(
+        &self,
+        expression: &'expr hir::Expr,
+        target: &'expr hir::TypeName,
+        mut index: usize,
+    ) -> Option<CastChild<'expr>> {
+        if index == 0 {
+            return Some(CastChild::Value(expression));
+        }
+        index -= 1;
+
+        let encode_children: usize = target
+            .programs
+            .encode
+            .iter()
+            .map(|call| call.arguments.len() + 1)
+            .sum();
+        if index < encode_children {
+            return self
+                .schema_call_child(&target.programs.encode, index)
+                .map(|child| CastChild::Program {
+                    phase: CastProgram::Encode,
+                    child,
+                });
+        }
+        index -= encode_children;
+
+        let checks = target.programs.domain.as_ref()?.checks.as_slice();
+        self.schema_call_child(checks.iter().map(|check| &check.call), index)
+            .map(|child| CastChild::Program {
+                phase: CastProgram::DomainCheck,
+                child,
+            })
     }
 }
 
@@ -416,11 +505,15 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
     type Error = LimboError;
 
     fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        let hir::Expr::Column(reference) = expression else {
-            return expression.child(index);
-        };
-        self.column_child(*reference, index)
-            .map(|child| child.expression())
+        match expression {
+            hir::Expr::Column(reference) => self
+                .column_child(*reference, index)
+                .map(|child| child.expression()),
+            hir::Expr::Cast { expr, target } => self
+                .cast_child(expr, target, index)
+                .map(|child| child.expression()),
+            _ => expression.child(index),
+        }
     }
 
     fn pre_order(
@@ -444,55 +537,55 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                         self.begin_encoded_default(*reference, context)?;
                         context.target
                     }
-                    ColumnChild::ProgramArgument {
-                        phase,
-                        call,
-                        argument,
-                        argument_count,
-                        ..
-                    } => {
-                        if phase == ColumnProgram::Decode {
-                            self.begin_column_decode(*reference, context)?;
+                    ColumnChild::Program { phase, child } => match child {
+                        SchemaCallChild::Argument {
+                            call,
+                            argument,
+                            argument_count,
+                            ..
+                        } => {
+                            if phase == ColumnProgram::Decode {
+                                self.begin_column_decode(*reference, context)?;
+                            }
+                            let ExprRegisters::ColumnPrograms(registers) = &mut context.registers
+                            else {
+                                unreachable!("column program registers were allocated")
+                            };
+                            if registers.call != Some((phase, call)) {
+                                registers.call = Some((phase, call));
+                                registers.arguments_start =
+                                    self.program.alloc_registers(argument_count);
+                            }
+                            registers.arguments_start + argument
                         }
-                        let ExprRegisters::ColumnPrograms(registers) = &mut context.registers
-                        else {
-                            unreachable!("column program registers were allocated")
-                        };
-                        if registers.call != Some((phase, call)) {
-                            registers.call = Some((phase, call));
-                            registers.arguments_start =
-                                self.program.alloc_registers(argument_count);
-                        }
-                        registers.arguments_start + argument
-                    }
-                    ColumnChild::ProgramBody {
-                        phase,
-                        call,
-                        argument_count,
-                        input_source,
-                        ..
-                    } => {
-                        if phase == ColumnProgram::Decode {
-                            self.begin_column_decode(*reference, context)?;
-                        }
-                        let ExprRegisters::ColumnPrograms(registers) = &mut context.registers
-                        else {
-                            unreachable!("column program registers were allocated")
-                        };
-                        if registers.call != Some((phase, call)) {
-                            registers.call = Some((phase, call));
-                            registers.arguments_start =
-                                self.program.alloc_registers(argument_count);
-                        }
-                        self.program.bind_source(
+                        SchemaCallChild::Body {
+                            call,
+                            argument_count,
                             input_source,
-                            SourceBinding::SchemaInputs {
-                                value: context.target,
-                                arguments_start: registers.arguments_start,
-                            },
-                        );
-                        context.target
-                    }
+                            ..
+                        } => {
+                            if phase == ColumnProgram::Decode {
+                                self.begin_column_decode(*reference, context)?;
+                            }
+                            let ExprRegisters::ColumnPrograms(registers) = &mut context.registers
+                            else {
+                                unreachable!("column program registers were allocated")
+                            };
+                            if registers.call != Some((phase, call)) {
+                                registers.call = Some((phase, call));
+                                registers.arguments_start =
+                                    self.program.alloc_registers(argument_count);
+                            }
+                            self.program.bind_source(
+                                input_source,
+                                SourceBinding::SchemaInputs {
+                                    value: context.target,
+                                    arguments_start: registers.arguments_start,
+                                },
+                            );
+                            context.target
+                        }
+                    },
                 }
             }
             hir::Expr::Unary { operator, .. } => match operator {
@@ -518,11 +611,71 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                 self.program.alloc_register()
             }
             hir::Expr::Collate { .. } => context.target,
-            hir::Expr::Cast { .. } => {
-                if child_index == 0 {
-                    context.target
-                } else {
-                    return Ok(ControlFlow::Break(()));
+            hir::Expr::Cast {
+                expr,
+                target: cast_target,
+            } => {
+                let Some(cast_child) = self.cast_child(expr, cast_target, child_index) else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR CAST has an invalid linked child {child_index}"
+                    )));
+                };
+                match cast_child {
+                    CastChild::Value(_) => context.target,
+                    CastChild::Program { phase, child } => match child {
+                        SchemaCallChild::Argument {
+                            call,
+                            argument,
+                            argument_count,
+                            ..
+                        } => {
+                            let arguments_start = self.begin_cast_call(
+                                cast_target,
+                                context,
+                                phase,
+                                call,
+                                argument_count,
+                            )?;
+                            arguments_start + argument
+                        }
+                        SchemaCallChild::Body {
+                            call,
+                            argument_count,
+                            input_source,
+                            ..
+                        } => {
+                            let arguments_start = self.begin_cast_call(
+                                cast_target,
+                                context,
+                                phase,
+                                call,
+                                argument_count,
+                            )?;
+                            self.program.bind_source(
+                                input_source,
+                                SourceBinding::SchemaInputs {
+                                    value: context.target,
+                                    arguments_start,
+                                },
+                            );
+                            match phase {
+                                CastProgram::Encode => context.target,
+                                CastProgram::DomainCheck => {
+                                    let result = self.program.alloc_register();
+                                    let ExprRegisters::CastPrograms(registers) =
+                                        &mut context.registers
+                                    else {
+                                        unreachable!("CAST program registers were allocated")
+                                    };
+                                    registers.pending_domain_check = Some(PendingDomainCheck {
+                                        check: call,
+                                        result,
+                                    });
+                                    result
+                                }
+                            }
+                        }
+                    },
                 }
             }
             hir::Expr::Binary {
@@ -1251,20 +1404,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
             hir::Expr::Cast {
                 target: cast_target,
                 ..
-            } if cast_target.programs.apply_builtin_affinity
-                && cast_target.programs.encode.is_empty()
-                && cast_target.programs.domain.is_none() =>
-            {
-                let [value] = children else {
-                    unreachable!("built-in CAST has one lowered child")
-                };
-                debug_assert_eq!(*value, target);
-                self.program.emit_insn(Insn::Cast {
-                    reg: target,
-                    affinity: cast_target.affinity,
-                });
-                Ok(target)
-            }
+            } => self.emit_cast(cast_target, target, context.registers, children),
             hir::Expr::Binary {
                 operator: Operator::Concat,
                 array_concat,
@@ -2100,6 +2240,160 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
 }
 
 impl ExprLowerer<'_, '_> {
+    fn begin_cast_call(
+        &mut self,
+        target: &hir::TypeName,
+        context: &mut LoweringContext,
+        phase: CastProgram,
+        call: usize,
+        argument_count: usize,
+    ) -> Result<usize> {
+        let mut registers = match context.registers {
+            ExprRegisters::None => CastProgramRegisters {
+                call: None,
+                arguments_start: 0,
+                domain_not_null_emitted: false,
+                pending_domain_check: None,
+            },
+            ExprRegisters::CastPrograms(registers) => registers,
+            _ => unreachable!("CAST program registers were allocated"),
+        };
+        if phase == CastProgram::DomainCheck
+            && registers.call != Some((CastProgram::DomainCheck, call))
+        {
+            self.finish_pending_domain_check(target, &mut registers)?;
+            self.emit_domain_not_null(target, context.target, &mut registers)?;
+        }
+        if registers.call != Some((phase, call)) {
+            registers.call = Some((phase, call));
+            registers.arguments_start = self.program.alloc_registers(argument_count);
+        }
+        let arguments_start = registers.arguments_start;
+        context.registers = ExprRegisters::CastPrograms(registers);
+        Ok(arguments_start)
+    }
+
+    fn emit_domain_not_null(
+        &mut self,
+        target: &hir::TypeName,
+        value: usize,
+        registers: &mut CastProgramRegisters,
+    ) -> Result<()> {
+        if registers.domain_not_null_emitted {
+            return Ok(());
+        }
+        let domain = target.programs.domain.as_ref().ok_or_else(|| {
+            LimboError::InternalError("HIR domain CHECK has no domain metadata".to_string())
+        })?;
+        if let Some(description) = &domain.not_null_description {
+            self.program.emit_insn(Insn::HaltIfNull {
+                target_reg: value,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: description.clone(),
+            });
+        }
+        registers.domain_not_null_emitted = true;
+        Ok(())
+    }
+
+    fn finish_pending_domain_check(
+        &mut self,
+        target: &hir::TypeName,
+        registers: &mut CastProgramRegisters,
+    ) -> Result<()> {
+        let Some(pending) = registers.pending_domain_check.take() else {
+            return Ok(());
+        };
+        let check = target
+            .programs
+            .domain
+            .as_ref()
+            .and_then(|domain| domain.checks.get(pending.check))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR domain CHECK {} has no metadata",
+                    pending.check
+                ))
+            })?;
+        let passed = self.program.allocate_label();
+        self.program.emit_insn(Insn::IsNull {
+            reg: pending.result,
+            target_pc: passed,
+        });
+        self.program.emit_insn(Insn::If {
+            reg: pending.result,
+            target_pc: passed,
+            jump_if_null: false,
+        });
+        self.program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: check.failure_description.clone(),
+            on_error: None,
+            description_reg: None,
+        });
+        self.program.preassign_label_to_next_insn(passed);
+        Ok(())
+    }
+
+    fn emit_cast(
+        &mut self,
+        target: &hir::TypeName,
+        value: usize,
+        registers: ExprRegisters,
+        children: &[usize],
+    ) -> Result<usize> {
+        let encode_children: usize = target
+            .programs
+            .encode
+            .iter()
+            .map(|call| call.arguments.len() + 1)
+            .sum();
+        let domain_children: usize = target.programs.domain.as_ref().map_or(0, |domain| {
+            domain
+                .checks
+                .iter()
+                .map(|check| check.call.arguments.len() + 1)
+                .sum()
+        });
+        let expected_children = 1 + encode_children + domain_children;
+        if children.len() != expected_children {
+            return Err(LimboError::InternalError(format!(
+                "HIR CAST lowered {} linked children, expected {expected_children}",
+                children.len()
+            )));
+        }
+        debug_assert_eq!(children[0], value);
+
+        if target.programs.apply_builtin_affinity {
+            if encode_children != 0 || target.programs.domain.is_some() {
+                return Err(LimboError::InternalError(
+                    "HIR built-in CAST contains custom programs".to_string(),
+                ));
+            }
+            self.program.emit_insn(Insn::Cast {
+                reg: value,
+                affinity: target.affinity,
+            });
+            return Ok(value);
+        }
+
+        let mut registers = match registers {
+            ExprRegisters::None => CastProgramRegisters {
+                call: None,
+                arguments_start: 0,
+                domain_not_null_emitted: false,
+                pending_domain_check: None,
+            },
+            ExprRegisters::CastPrograms(registers) => registers,
+            _ => unreachable!("CAST program registers were allocated"),
+        };
+        if target.programs.domain.is_some() {
+            self.emit_domain_not_null(target, value, &mut registers)?;
+            self.finish_pending_domain_check(target, &mut registers)?;
+        }
+        Ok(value)
+    }
+
     fn emit_column(
         &mut self,
         reference: hir::ColumnRef,
@@ -3332,6 +3626,48 @@ mod tests {
         }
     }
 
+    fn analyze_sql(mut schema: crate::schema::Schema, sql: &str) -> hir::HirDocument {
+        schema
+            .resolve_all_custom_type_affinities()
+            .expect("custom affinities resolve");
+        let catalog = SemanticCatalog {
+            databases: vec![SemanticCatalogDatabase {
+                id: hir::DatabaseId::new(MAIN_DB_ID),
+                name: "main".to_string(),
+                schema: Arc::new(schema),
+            }],
+            unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+        };
+        let statement = match Parser::new(sql.as_bytes())
+            .next_cmd()
+            .expect("SQL parses")
+            .expect("SQL contains a command")
+        {
+            turso_parser::ast::Cmd::Stmt(statement) => statement,
+            _ => panic!("SQL contains a statement"),
+        };
+        let document = crate::translate::semantic::analyze_root(
+            &catalog,
+            &SymbolTable::new(),
+            SemanticOptions {
+                dialect: Arc::new(SqliteDialect),
+                custom_types_enabled: true,
+                dqs_dml: DoubleQuotedDml::Enabled,
+            },
+            SemanticRootInput::Statement(&statement),
+        )
+        .expect("SQL analyzes");
+        document.validate().expect("HIR validates");
+        document
+    }
+
+    fn root_output(document: &hir::HirDocument) -> &hir::Expr {
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
+    }
+
     fn translate_expr(
         program: &mut ProgramBuilder,
         expression: &hir::Expr,
@@ -3483,37 +3819,7 @@ mod tests {
                 .expect("custom table parses"),
             ))
             .expect("table name is unique");
-        schema
-            .resolve_all_custom_type_affinities()
-            .expect("custom affinity resolves");
-        let catalog = SemanticCatalog {
-            databases: vec![SemanticCatalogDatabase {
-                id: hir::DatabaseId::new(MAIN_DB_ID),
-                name: "main".to_string(),
-                schema: Arc::new(schema),
-            }],
-            unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
-        };
-        let statement = match Parser::new(b"SELECT value FROM typed_values")
-            .next_cmd()
-            .expect("SELECT parses")
-            .expect("SELECT exists")
-        {
-            turso_parser::ast::Cmd::Stmt(statement) => statement,
-            _ => panic!("SQL contains a statement"),
-        };
-        let document = crate::translate::semantic::analyze_root(
-            &catalog,
-            &SymbolTable::new(),
-            SemanticOptions {
-                dialect: Arc::new(SqliteDialect),
-                custom_types_enabled: true,
-                dqs_dml: DoubleQuotedDml::Enabled,
-            },
-            SemanticRootInput::Statement(&statement),
-        )
-        .expect("custom column analyzes");
-        document.validate().expect("custom column HIR validates");
+        let document = analyze_sql(schema, "SELECT value FROM typed_values");
         let hir::HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
         };
@@ -4337,6 +4643,125 @@ mod tests {
                 ] if *emitted_affinity == affinity
             ));
         }
+    }
+
+    #[test]
+    fn custom_cast_passes_resolved_type_parameters_to_the_encoder() {
+        let mut schema = crate::schema::Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE scaled(value INTEGER, factor INTEGER) BASE INTEGER \
+                 ENCODE value * factor DECODE value / factor",
+            )
+            .expect("custom type parses");
+        let document = analyze_sql(schema, "SELECT CAST(2 AS scaled(4))");
+        let expression = root_output(&document);
+        let mut program = program();
+
+        super::translate_expr(&mut program, &document, expression, 8)
+            .expect("parameterized custom CAST lowers");
+
+        let parameter = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Integer { value: 4, .. }))
+            .expect("resolved type parameter is evaluated");
+        let encode = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| matches!(instruction, Insn::Multiply { dest: 8, .. }))
+            .expect("custom encoder is emitted");
+        assert!(parameter < encode);
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Cast { .. })));
+    }
+
+    #[test]
+    fn custom_domain_cast_runs_validated_encode_and_constraint_programs() {
+        let mut schema = crate::schema::Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE shifted(value INTEGER) BASE INTEGER \
+                 ENCODE value + 1 DECODE value - 1",
+            )
+            .expect("custom type parses");
+        schema
+            .add_type_from_sql(
+                "CREATE DOMAIN positive_shifted AS shifted \
+                 CONSTRAINT positive CHECK (value > 0) \
+                 CONSTRAINT small CHECK (value < 10)",
+            )
+            .expect("parent domain parses");
+        schema
+            .add_type_from_sql("CREATE DOMAIN required_positive AS positive_shifted NOT NULL")
+            .expect("child domain parses");
+        let document = analyze_sql(schema, "SELECT CAST(2 AS required_positive)");
+        let expression = root_output(&document);
+        let mut program = program();
+
+        super::translate_expr(&mut program, &document, expression, 8)
+            .expect("custom domain CAST lowers");
+
+        let instruction = |predicate: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(instruction, _)| predicate(instruction))
+                .expect("expected instruction was emitted")
+        };
+        let value =
+            instruction(|instruction| matches!(instruction, Insn::Integer { value: 2, dest: 8 }));
+        let encode = instruction(|instruction| matches!(instruction, Insn::Add { dest: 8, .. }));
+        let not_null = instruction(|instruction| {
+            matches!(
+                instruction,
+                Insn::HaltIfNull {
+                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    description,
+                    ..
+                } if description == "domain required_positive does not allow null values"
+            )
+        });
+        let check = instruction(|instruction| matches!(instruction, Insn::Gt { .. }));
+        let check_null = instruction(|instruction| matches!(instruction, Insn::IsNull { .. }));
+        let check_truth = instruction(|instruction| matches!(instruction, Insn::If { .. }));
+        let first_failure = instruction(|instruction| {
+            matches!(
+                instruction,
+                Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_CHECK,
+                    description,
+                    ..
+                } if description
+                    == "value for domain positive_shifted violates check constraint \"positive\""
+            )
+        });
+        let second_check = instruction(|instruction| matches!(instruction, Insn::Lt { .. }));
+        let second_failure = instruction(|instruction| {
+            matches!(
+                instruction,
+                Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_CHECK,
+                    description,
+                    ..
+                } if description
+                    == "value for domain positive_shifted violates check constraint \"small\""
+            )
+        });
+        assert!(value < encode);
+        assert!(encode < not_null);
+        assert!(not_null < check);
+        assert!(check < check_null);
+        assert!(check_null < check_truth);
+        assert!(check_truth < first_failure);
+        assert!(first_failure < second_check);
+        assert!(second_check < second_failure);
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::Cast { .. })));
     }
 
     #[test]
