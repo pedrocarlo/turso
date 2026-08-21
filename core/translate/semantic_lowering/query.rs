@@ -407,7 +407,7 @@ pub(crate) fn emit_planned_query_body(
     if block.from.is_none() {
         return emit_query_body(program, document, query_id, destination);
     }
-    emit_single_btree_scan(
+    emit_single_btree_loop(
         program,
         document,
         query.limit.as_ref(),
@@ -417,7 +417,7 @@ pub(crate) fn emit_planned_query_body(
     )
 }
 
-fn emit_single_btree_scan(
+fn emit_single_btree_loop(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     query_limit: Option<&hir::Limit>,
@@ -427,7 +427,7 @@ fn emit_single_btree_scan(
 ) -> Result<()> {
     if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} is not a supported full scan",
+            "HIR query block {:?} is not a supported B-tree loop",
             block.id
         )));
     }
@@ -438,7 +438,7 @@ fn emit_single_btree_scan(
     } = &block.body
     else {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} has unsupported full-scan clauses",
+            "HIR query block {:?} has unsupported B-tree loop clauses",
             block.id
         )));
     };
@@ -449,42 +449,52 @@ fn emit_single_btree_scan(
         )));
     };
     let HirSourceAccess::BTree {
-        operation: HirBtreeOperation::Scan { iter_dir, index },
+        operation,
         table_lookup,
     } = &planned_loop.access
     else {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} does not use a full table scan",
+            "HIR query block {:?} does not use a B-tree loop",
             block.id
         )));
     };
+    let index = match operation {
+        HirBtreeOperation::Scan { index, .. } => index.as_ref(),
+        HirBtreeOperation::RowidEq { .. } => None,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} does not use a supported B-tree loop",
+                block.id
+            )));
+        }
+    };
     let source = document.source(planned_loop.source).ok_or_else(|| {
         LimboError::InternalError(format!(
-            "HIR full scan references missing source {}",
+            "HIR B-tree loop references missing source {}",
             planned_loop.source
         ))
     })?;
     let hir::SourceKind::Table(table) = &source.kind else {
         return Err(LimboError::InternalError(format!(
-            "HIR full scan source {} is not a table",
+            "HIR B-tree loop source {} is not a table",
             source.id
         )));
     };
     let Table::BTree(table) = table.value() else {
         return Err(LimboError::InternalError(format!(
-            "HIR full scan source {} is not a B-tree table",
+            "HIR B-tree loop source {} is not a B-tree table",
             source.id
         )));
     };
     let database = source.database.ok_or_else(|| {
         LimboError::InternalError(format!(
-            "HIR full scan source {} has no database",
+            "HIR B-tree loop source {} has no database",
             source.id
         ))
     })?;
     let database_snapshot = document.database(database).ok_or_else(|| {
         LimboError::InternalError(format!(
-            "HIR full scan source {} references missing database {database:?}",
+            "HIR B-tree loop source {} references missing database {database:?}",
             source.id
         ))
     })?;
@@ -524,9 +534,7 @@ fn emit_single_btree_scan(
     );
     program.emit_insn(Insn::OpenRead {
         cursor_id: cursor,
-        root_page: index
-            .as_ref()
-            .map_or(table.root_page, |index| index.root_page),
+        root_page: index.map_or(table.root_page, |index| index.root_page),
         db: database.index(),
     });
     if let Some(table_cursor) = table_cursor {
@@ -536,17 +544,31 @@ fn emit_single_btree_scan(
             db: database.index(),
         });
     }
-    match iter_dir {
-        IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
-            cursor_id: cursor,
-            pc_if_empty: done,
-        }),
-        IterationDirection::Backwards => program.emit_insn(Insn::Last {
-            cursor_id: cursor,
-            pc_if_empty: done,
-        }),
+    match operation {
+        HirBtreeOperation::Scan { iter_dir, .. } => {
+            match iter_dir {
+                IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
+                    cursor_id: cursor,
+                    pc_if_empty: done,
+                }),
+                IterationDirection::Backwards => program.emit_insn(Insn::Last {
+                    cursor_id: cursor,
+                    pc_if_empty: done,
+                }),
+            }
+            program.preassign_label_to_next_insn(loop_start);
+        }
+        HirBtreeOperation::RowidEq { cmp_expr } => {
+            let key = program.alloc_register();
+            super::expr::translate_expr(program, document, cmp_expr, key)?;
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: cursor,
+                src_reg: key,
+                target_pc: next,
+            });
+        }
+        _ => unreachable!("supported B-tree operation checked above"),
     }
-    program.preassign_label_to_next_insn(loop_start);
     if let Some(table_cursor) = table_cursor {
         program.emit_insn(Insn::DeferredSeek {
             index_cursor_id: cursor,
@@ -593,17 +615,19 @@ fn emit_single_btree_scan(
         done,
     );
     program.preassign_label_to_next_insn(next);
-    match iter_dir {
-        IterationDirection::Forwards => program.emit_insn(Insn::Next {
-            cursor_id: cursor,
-            pc_if_next: loop_start,
-            fullscan: true,
-        }),
-        IterationDirection::Backwards => program.emit_insn(Insn::Prev {
-            cursor_id: cursor,
-            pc_if_prev: loop_start,
-            fullscan: true,
-        }),
+    if let HirBtreeOperation::Scan { iter_dir, .. } = operation {
+        match iter_dir {
+            IterationDirection::Forwards => program.emit_insn(Insn::Next {
+                cursor_id: cursor,
+                pc_if_next: loop_start,
+                fullscan: true,
+            }),
+            IterationDirection::Backwards => program.emit_insn(Insn::Prev {
+                cursor_id: cursor,
+                pc_if_prev: loop_start,
+                fullscan: true,
+            }),
+        }
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
@@ -950,6 +974,17 @@ mod tests {
                 on_conflict: None,
             }))
             .expect("fixed index name is unique");
+        schema
+    }
+
+    fn rowid_items_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)", 2)
+                    .expect("fixed table schema parses"),
+            ))
+            .expect("fixed table name is unique");
         schema
     }
 
@@ -1800,5 +1835,57 @@ mod tests {
                 table_lookup: BtreeTableLookup::ScanOnly,
             }
         ));
+    }
+
+    #[test]
+    fn planned_rowid_equality_emits_one_point_lookup() {
+        for sql in [
+            "SELECT value FROM items WHERE rowid = 2",
+            "SELECT value FROM items WHERE id = 2",
+        ] {
+            let plan = analyze_plan(rowid_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let planned_loop = &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0];
+            assert!(matches!(
+                &planned_loop.access,
+                HirSourceAccess::BTree {
+                    operation: HirBtreeOperation::RowidEq { .. },
+                    table_lookup: BtreeTableLookup::ScanOnly,
+                }
+            ));
+            let mut program = program();
+
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("planned rowid equality emits");
+
+            let SourceBinding::BTree {
+                scan_cursor,
+                table_cursor: None,
+            } = program
+                .source_binding(planned_loop.source)
+                .copied()
+                .expect("source has a physical binding")
+            else {
+                panic!("rowid equality binds one table cursor");
+            };
+            assert!(matches!(
+                program.get_cursor_type(scan_cursor),
+                Some(CursorType::BTreeTable(table)) if table.name == "items"
+            ));
+            assert!(program.insns.iter().any(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::SeekRowid { cursor_id, .. } if *cursor_id == scan_cursor
+                )
+            }));
+            assert!(!program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. })));
+        }
     }
 }

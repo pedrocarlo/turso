@@ -745,6 +745,12 @@ and use `DeferredSeek`. HIR constraint planning now enforces its already-resolve
 `INDEXED BY` and `NOT INDEXED` choices just as the legacy planner does. Seeks,
 joins, and other source kinds remain later checkpoints.
 
+Single-table rowid equality plans now lower through the same HIR B-tree loop.
+The resolved comparison expression is evaluated by HIR expression lowering,
+`SeekRowid` performs the one-row lookup, and no scan advance is emitted. This
+also covers an `INTEGER PRIMARY KEY` rowid alias. Range seeks, joins, and other
+source kinds remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
