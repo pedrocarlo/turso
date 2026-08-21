@@ -88,7 +88,6 @@ impl HirDocument {
     pub(crate) fn visit_expr_sources(&self, expression: &Expr, visit: &mut impl FnMut(SourceId)) {
         expression.for_each(&mut |expression| match expression {
             Expr::Column(reference) => visit(reference.source),
-            Expr::MergedColumn(column) => visit(column.right.source),
             Expr::RowId(source) => visit(*source),
             Expr::Output(id) => {
                 let output = self
@@ -495,9 +494,6 @@ fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector
         Expr::Column(reference) => {
             reads.record(*reference);
         }
-        Expr::MergedColumn(column) => {
-            reads.record(column.right);
-        }
         _ => {}
     });
 }
@@ -589,10 +585,14 @@ fn collect_expr_references(expression: &Expr, references: &mut HashSet<SourceId>
         Expr::Column(reference) => {
             references.insert(reference.source);
         }
-        Expr::MergedColumn(column) => {
-            collect_expr_references(&column.left, references);
-            references.insert(column.right.source);
-        }
+        Expr::MergedColumn(column) => match column.value {
+            MergedColumnValue::Left => collect_expr_references(&column.left, references),
+            MergedColumnValue::Right => collect_expr_references(&column.right, references),
+            MergedColumnValue::Coalesce => {
+                collect_expr_references(&column.left, references);
+                collect_expr_references(&column.right, references);
+            }
+        },
         Expr::RowId(source) => {
             references.insert(*source);
         }

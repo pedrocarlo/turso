@@ -522,7 +522,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             for expression in generated.iter().chain(default.iter()) {
                 expression.for_each(&mut |expression| match expression {
                     Expr::Column(dependency) => pending.push(*dependency),
-                    Expr::MergedColumn(column) => pending.push(column.right),
                     _ => {}
                 });
             }

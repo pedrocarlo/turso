@@ -654,6 +654,26 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     },
                 }
             }
+            hir::Expr::MergedColumn(column) => match column.value {
+                hir::MergedColumnValue::Left | hir::MergedColumnValue::Right => context.target,
+                hir::MergedColumnValue::Coalesce => {
+                    if matches!(context.registers, ExprRegisters::None) {
+                        context.registers = ExprRegisters::Coalesce(CoalesceRegisters {
+                            end_label: self.program.allocate_label(),
+                        });
+                    }
+                    let ExprRegisters::Coalesce(registers) = context.registers else {
+                        unreachable!("merged-column registers were allocated")
+                    };
+                    if child_index == 1 {
+                        self.program.emit_insn(Insn::NotNull {
+                            reg: context.target,
+                            target_pc: registers.end_label,
+                        });
+                    }
+                    context.target
+                }
+            },
             hir::Expr::Unary { operator, .. } => match operator {
                 UnaryOperator::Positive => context.target,
                 UnaryOperator::Negative
@@ -1561,6 +1581,22 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
             hir::Expr::Column(column) => {
                 self.emit_column(*column, target, context.registers, children)
+            }
+            hir::Expr::MergedColumn(column) => {
+                match column.value {
+                    hir::MergedColumnValue::Left | hir::MergedColumnValue::Right => {
+                        debug_assert_eq!(children, [target]);
+                    }
+                    hir::MergedColumnValue::Coalesce => {
+                        debug_assert_eq!(children, [target, target]);
+                        let ExprRegisters::Coalesce(registers) = context.registers else {
+                            unreachable!("merged-column registers were allocated")
+                        };
+                        self.program
+                            .preassign_label_to_next_insn(registers.end_label);
+                    }
+                }
+                Ok(target)
             }
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
             hir::Expr::Unary { operator, expr } => {
@@ -3947,6 +3983,21 @@ mod tests {
         schema
     }
 
+    fn join_schema() -> crate::schema::Schema {
+        let mut schema = crate::schema::Schema::new();
+        for (sql, root_page) in [
+            ("CREATE TABLE left_values(id INTEGER)", 2),
+            ("CREATE TABLE right_values(id INTEGER)", 3),
+        ] {
+            schema
+                .add_btree_table(Arc::new(
+                    BTreeTable::from_sql(sql, root_page).expect("join table parses"),
+                ))
+                .expect("join table name is unique");
+        }
+        schema
+    }
+
     fn lower_btree_output(document: &hir::HirDocument, target: usize) -> ProgramBuilder {
         let hir::HirRoot::Query(root) = &document.root else {
             panic!("SELECT produces a query root");
@@ -3972,6 +4023,41 @@ mod tests {
         super::translate_expr(&mut program, document, &block.outputs[0].expr, target)
             .expect("analyzed output lowers");
         program
+    }
+
+    fn lower_join_output(
+        document: &hir::HirDocument,
+        target: usize,
+    ) -> (ProgramBuilder, Vec<usize>) {
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let block = &document.query(root.query).expect("query exists").blocks[0];
+        let from = block.from.as_ref().expect("query has FROM");
+        let mut program = program();
+        let mut cursors = Vec::new();
+        for source_id in std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right))
+        {
+            let source = document.source(source_id).expect("source exists");
+            let hir::SourceKind::Table(table) = &source.kind else {
+                panic!("source is a table");
+            };
+            let Table::BTree(table) = table.value() else {
+                panic!("source is a B-tree table");
+            };
+            let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+            program.bind_source(
+                source_id,
+                SourceBinding::BTree {
+                    scan_cursor: cursor,
+                    table_cursor: None,
+                },
+            );
+            cursors.push(cursor);
+        }
+        super::translate_expr(&mut program, document, &block.outputs[0].expr, target)
+            .expect("analyzed join output lowers");
+        (program, cursors)
     }
 
     fn translate_expr(
@@ -4321,6 +4407,93 @@ mod tests {
                 } if *src_reg == result
             )));
         }
+    }
+
+    #[test]
+    fn merged_join_columns_lower_only_the_resolved_runtime_values() {
+        for (join, expected_columns, coalesces) in [
+            ("LEFT JOIN", vec![0], false),
+            ("RIGHT JOIN", vec![1], false),
+            ("FULL JOIN", vec![0, 1], true),
+        ] {
+            let document = analyze_sql(
+                join_schema(),
+                &format!("SELECT id FROM left_values {join} right_values USING(id)"),
+            );
+            let (program, cursors) = lower_join_output(&document, 20);
+            let reads = program
+                .insns
+                .iter()
+                .filter_map(|(instruction, _)| match instruction {
+                    Insn::Column {
+                        cursor_id,
+                        column: 0,
+                        dest: 20,
+                        ..
+                    } => Some(*cursor_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let expected = expected_columns
+                .into_iter()
+                .map(|position| cursors[position])
+                .collect::<Vec<_>>();
+            assert_eq!(reads, expected);
+
+            let null_guards = program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::NotNull { reg: 20, .. }))
+                .count();
+            assert_eq!(null_guards, usize::from(coalesces));
+            if coalesces {
+                let first = program
+                    .insns
+                    .iter()
+                    .position(|(instruction, _)| {
+                        matches!(instruction, Insn::Column { cursor_id, .. } if *cursor_id == cursors[0])
+                    })
+                    .expect("left merged value is read");
+                let guard = program
+                    .insns
+                    .iter()
+                    .position(|(instruction, _)| matches!(instruction, Insn::NotNull { .. }))
+                    .expect("full join merge short-circuits");
+                let second = program
+                    .insns
+                    .iter()
+                    .position(|(instruction, _)| {
+                        matches!(instruction, Insn::Column { cursor_id, .. } if *cursor_id == cursors[1])
+                    })
+                    .expect("right merged value is read");
+                assert!(first < guard && guard < second);
+            }
+        }
+    }
+
+    #[test]
+    fn merged_join_column_validation_requires_a_right_source_column() {
+        let mut document = analyze_sql(
+            join_schema(),
+            "SELECT id FROM left_values FULL JOIN right_values USING(id)",
+        );
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let query = root.query;
+        let hir::Expr::MergedColumn(merged) =
+            &mut document.queries[query.index()].blocks[0].outputs[0].expr
+        else {
+            panic!("USING output is a merged column");
+        };
+        merged.right = Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string())));
+
+        let error = document
+            .validate()
+            .expect_err("merged right side must retain its source identity");
+        assert!(error
+            .to_string()
+            .contains("merged-column right side is not a source column"));
     }
 
     #[test]

@@ -4521,10 +4521,10 @@ mod tests {
 
         let merged = hir::Expr::MergedColumn(hir::MergedColumn {
             left: Box::new(hir::Expr::column(first, 0)),
-            right: hir::ColumnRef {
+            right: Box::new(hir::Expr::Column(hir::ColumnRef {
                 source: joined,
                 column: 0,
-            },
+            })),
             value: hir::MergedColumnValue::Coalesce,
             type_fact: hir::TypeFact::dynamic(),
             affinity: Affinity::Blob,

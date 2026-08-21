@@ -57,6 +57,15 @@ impl<'expr> ExprVisitor<'expr> for ExprValidationVisitor<'_, '_> {
     type Output = ();
     type Error = HirValidationError;
 
+    fn child(&mut self, expression: &'expr Expr, index: usize) -> Option<&'expr Expr> {
+        if let Expr::MergedColumn(column) = expression {
+            return [column.left.as_ref(), column.right.as_ref()]
+                .get(index)
+                .copied();
+        }
+        expression.child(index)
+    }
+
     fn pre_order(
         &mut self,
         _parent: &Expr,
@@ -1592,7 +1601,10 @@ impl<'document> HirValidator<'document> {
             Expr::Literal(_) | Expr::Parameter(_) => Ok(()),
             Expr::Column(reference) => self.visit_column_ref(*reference),
             Expr::MergedColumn(column) => {
-                self.visit_column_ref(column.right)?;
+                let Expr::Column(right) = column.right.as_ref() else {
+                    return self.invalid("merged-column right side is not a source column");
+                };
+                self.visit_column_ref(*right)?;
                 self.visit_type_fact(&column.type_fact)?;
                 self.visit_optional_catalog_object(
                     column.collation.as_ref(),

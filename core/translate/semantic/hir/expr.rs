@@ -39,7 +39,7 @@ pub struct MergedColumn {
     /// The visible value produced by the joins to the left. This may itself
     /// be a merged column when USING/NATURAL joins are chained.
     pub left: Box<Expr>,
-    pub right: ColumnRef,
+    pub right: Box<Expr>,
     pub value: MergedColumnValue,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
@@ -548,7 +548,13 @@ impl Expr {
             | Self::Subquery(
                 SubqueryExpr::Scalar { .. } | SubqueryExpr::Row { .. } | SubqueryExpr::Exists(_),
             ) => None,
-            Self::MergedColumn(column) => (index == 0).then_some(column.left.as_ref()),
+            Self::MergedColumn(column) => match column.value {
+                MergedColumnValue::Left => (index == 0).then_some(column.left.as_ref()),
+                MergedColumnValue::Right => (index == 0).then_some(column.right.as_ref()),
+                MergedColumnValue::Coalesce => [column.left.as_ref(), column.right.as_ref()]
+                    .get(index)
+                    .copied(),
+            },
             Self::Unary { expr, .. }
             | Self::IsNull(expr)
             | Self::NotNull(expr)
@@ -667,8 +673,8 @@ impl Expr {
                     (Self::Column(left), Self::Column(right)) => left == right,
                     (Self::MergedColumn(left), Self::MergedColumn(right)) => {
                         pending.push((&left.left, &right.left));
-                        left.right == right.right
-                            && left.value == right.value
+                        pending.push((&left.right, &right.right));
+                        left.value == right.value
                             && left.type_fact == right.type_fact
                             && left.affinity == right.affinity
                             && left.has_affinity == right.has_affinity

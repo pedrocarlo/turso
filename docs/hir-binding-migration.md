@@ -144,6 +144,11 @@ Completed:
   and target-copy behavior while calling the exact function resolved by
   semantic analysis. No resolver, parser expression, or `TableReferences`
   lookup enters these paths.
+- Merged USING/NATURAL columns now own resolved expressions for both sides.
+  LEFT and RIGHT joins lower only the selected value; FULL joins short-circuit
+  the same target register across both values. Validation still checks both
+  owned expressions and requires the right side to retain a source-column
+  identity.
 - Trigger predicates and commands now have ordered HIR planner roots. SELECT
   commands retain their `QueryId`; UPDATE and DELETE commands reuse resolved
   target access planning without turning trigger OLD/NEW pseudo-sources into
