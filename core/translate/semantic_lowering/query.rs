@@ -8,7 +8,8 @@ use crate::{
     translate::{
         eqp::EqpDetail,
         plan::QueryDestination,
-        semantic::hir::{HirDocument, QueryId, SubqueryExpr},
+        result_row::emit_columns_to_destination,
+        semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SubqueryBinding},
@@ -256,6 +257,157 @@ pub(crate) fn emit_prepared_subquery(
     })
 }
 
+/// Emit constant SELECT and VALUES query bodies into an existing destination.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn emit_query_body(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    query_id: QueryId,
+    destination: &QueryDestination,
+) -> Result<()> {
+    let query = document.query(query_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR lowering references missing query {query_id}"))
+    })?;
+    if query.blocks.len() != 1
+        || !query.compounds.is_empty()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+    {
+        return Err(LimboError::InternalError(format!(
+            "HIR query {query_id} is not a constant query body"
+        )));
+    }
+    let block = &query.blocks[0];
+    if block.from.is_some()
+        || block.aggregate_count != 0
+        || block.window_function_count != 0
+        || !block.windows.is_empty()
+    {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} is not a constant query body",
+            block.id
+        )));
+    }
+
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            distinctness: None,
+            filter: None,
+            grouping: None,
+        } => {
+            let start = constant_output_registers(program, destination, &block.outputs)?;
+            emit_constant_row(
+                program,
+                document,
+                destination,
+                &block.outputs,
+                block.outputs.iter().map(|output| &output.expr),
+                start,
+            )
+        }
+        hir::QueryBlockBody::Values { rows } => {
+            let start = constant_output_registers(program, destination, &block.outputs)?;
+            let stop_after_first = destination_stops_after_first_row(destination);
+            for row in rows {
+                emit_constant_row(
+                    program,
+                    document,
+                    destination,
+                    &block.outputs,
+                    row.iter(),
+                    start,
+                )?;
+                if stop_after_first {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(LimboError::InternalError(format!(
+            "HIR query block {:?} has unsupported constant-query clauses",
+            block.id
+        ))),
+    }
+}
+
+fn constant_output_registers(
+    program: &mut ProgramBuilder,
+    destination: &QueryDestination,
+    outputs: &[hir::Output],
+) -> Result<usize> {
+    if outputs.is_empty() {
+        return Err(LimboError::InternalError(
+            "HIR constant query has no outputs".to_string(),
+        ));
+    }
+    Ok(
+        if matches!(destination, QueryDestination::ExistsSubqueryResult { .. }) {
+            0
+        } else {
+            program.alloc_registers(outputs.len())
+        },
+    )
+}
+
+fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
+    matches!(
+        destination,
+        QueryDestination::ExistsSubqueryResult { .. }
+            | QueryDestination::RowValueSubqueryResult { .. }
+    )
+}
+
+fn emit_constant_row<'expr>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    destination: &QueryDestination,
+    outputs: &[hir::Output],
+    expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
+    start: usize,
+) -> Result<()> {
+    if expressions.len() != outputs.len() {
+        return Err(LimboError::InternalError(format!(
+            "HIR constant row width {} does not match output width {}",
+            expressions.len(),
+            outputs.len()
+        )));
+    }
+    if matches!(destination, QueryDestination::ExistsSubqueryResult { .. }) {
+        for expression in expressions {
+            super::expr::register_parameters(program, expression);
+        }
+    } else {
+        for (position, expression) in expressions.enumerate() {
+            super::expr::translate_expr_no_constant_opt(
+                program,
+                document,
+                expression,
+                start + position,
+            )?;
+            program.bind_output(outputs[position].id, start + position);
+        }
+        emit_array_results(program, outputs, start);
+    }
+    emit_columns_to_destination(program, destination, start, outputs.len())?;
+    Ok(())
+}
+
+fn emit_array_results(program: &mut ProgramBuilder, outputs: &[hir::Output], start: usize) {
+    for (position, output) in outputs.iter().enumerate() {
+        if !output.type_fact.is_array() {
+            continue;
+        }
+        let register = start + position;
+        let skip = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: register,
+            target_pc: skip,
+        });
+        program.emit_insn(Insn::ArrayDecode { reg: register });
+        program.preassign_label_to_next_insn(skip);
+    }
+}
+
 fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> DestinationBinding {
     let start = program.alloc_registers(width);
     DestinationBinding {
@@ -336,6 +488,13 @@ mod tests {
             panic!("SELECT produces a query root");
         };
         &document.queries[root.query.index()].blocks[0].outputs[0].expr
+    }
+
+    fn root_query(document: &HirDocument) -> QueryId {
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        root.query
     }
 
     fn root_subquery(document: &HirDocument) -> &SubqueryExpr {
@@ -602,5 +761,180 @@ mod tests {
                 )
             ));
         }
+    }
+
+    #[test]
+    fn constant_select_binds_outputs_and_emits_one_result_row() {
+        let document = analyze_sql(Schema::new(), "SELECT 1, 2");
+        let query_id = root_query(&document);
+        let query = document.query(query_id).expect("root query exists");
+        let outputs = &query.blocks[0].outputs;
+        let mut program = program();
+
+        emit_query_body(
+            &mut program,
+            &document,
+            query_id,
+            &QueryDestination::ResultRows,
+        )
+        .expect("constant SELECT emits");
+
+        let start = match program.insns.as_slice() {
+            [(
+                Insn::Integer {
+                    value: 1,
+                    dest: first,
+                },
+                _,
+            ), (
+                Insn::Integer {
+                    value: 2,
+                    dest: second,
+                },
+                _,
+            ), (
+                Insn::ResultRow {
+                    start_reg,
+                    count: 2,
+                },
+                _,
+            )] if *second == *first + 1 && *start_reg == *first => *first,
+            _ => panic!("constant SELECT keeps consecutive output registers"),
+        };
+        for (position, output) in outputs.iter().enumerate() {
+            assert_eq!(
+                program
+                    .output_binding(output.id)
+                    .expect("output register is bound")
+                    .register,
+                start + position
+            );
+        }
+    }
+
+    #[test]
+    fn values_emits_every_row_without_hoisting_constants() {
+        let document = analyze_sql(Schema::new(), "VALUES (1, 2), (3, 4)");
+        let mut program = program();
+
+        emit_query_body(
+            &mut program,
+            &document,
+            root_query(&document),
+            &QueryDestination::ResultRows,
+        )
+        .expect("VALUES emits");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::ResultRow { count: 2, .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter_map(|(insn, _)| match insn {
+                    Insn::Integer { value, .. } => Some(*value),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn scalar_and_in_subqueries_emit_the_legacy_number_of_rows() {
+        let scalar = analyze_sql(Schema::new(), "SELECT (VALUES (1), (2))");
+        let mut scalar_program = program();
+        let scalar_prepared =
+            prepare_subquery(&mut scalar_program, &scalar, root_subquery(&scalar))
+                .expect("scalar destination prepares");
+        emit_prepared_subquery(
+            &mut scalar_program,
+            &scalar_prepared,
+            |program, query, destination| emit_query_body(program, &scalar, query, destination),
+        )
+        .expect("scalar query emits");
+        assert!(scalar_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 1, .. })));
+        assert!(!scalar_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 2, .. })));
+        assert_eq!(
+            scalar_program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Copy { .. }))
+                .count(),
+            1
+        );
+
+        let membership = analyze_sql(Schema::new(), "SELECT 2 IN (VALUES (1), (2))");
+        let mut membership_program = program();
+        let membership_prepared = prepare_subquery(
+            &mut membership_program,
+            &membership,
+            root_subquery(&membership),
+        )
+        .expect("IN destination prepares");
+        emit_prepared_subquery(
+            &mut membership_program,
+            &membership_prepared,
+            |program, query, destination| emit_query_body(program, &membership, query, destination),
+        )
+        .expect("IN query emits");
+        assert_eq!(
+            membership_program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::IdxInsert { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn exists_skips_output_evaluation_and_arrays_are_decoded() {
+        let exists = analyze_sql(Schema::new(), "SELECT EXISTS (SELECT random())");
+        let mut exists_program = program();
+        let prepared = prepare_subquery(&mut exists_program, &exists, root_subquery(&exists))
+            .expect("EXISTS destination prepares");
+        emit_prepared_subquery(
+            &mut exists_program,
+            &prepared,
+            |program, query, destination| emit_query_body(program, &exists, query, destination),
+        )
+        .expect("EXISTS query emits");
+        assert!(!exists_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Function { .. })));
+        let QueryDestination::ExistsSubqueryResult { result_reg } = prepared.destination else {
+            panic!("EXISTS uses its result destination");
+        };
+        assert!(exists_program.insns.iter().any(|(insn, _)| {
+            matches!(insn, Insn::Integer { value: 1, dest } if *dest == result_reg)
+        }));
+
+        let array = analyze_sql(Schema::new(), "SELECT ARRAY[1, 2]");
+        let mut array_program = program();
+        emit_query_body(
+            &mut array_program,
+            &array,
+            root_query(&array),
+            &QueryDestination::ResultRows,
+        )
+        .expect("array SELECT emits");
+        assert!(array_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. })));
     }
 }

@@ -4189,6 +4189,28 @@ pub(crate) fn translate_expr(
     )
 }
 
+/// Lower an expression while keeping its instructions at the current use.
+pub(crate) fn translate_expr_no_constant_opt(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<usize> {
+    let first_new_span = program.constant_spans_next_idx();
+    let result = translate_expr(program, document, expression, target)?;
+    program.constant_spans_invalidate_after(first_new_span);
+    Ok(result)
+}
+
+/// Register parameter slots in an expression that runtime lowering may skip.
+pub(crate) fn register_parameters(program: &mut ProgramBuilder, expression: &hir::Expr) {
+    expression.for_each(&mut |expression| {
+        if let hir::Expr::Parameter(parameter) = expression {
+            program.register_parameter(parameter.index, &parameter.spelling);
+        }
+    });
+}
+
 /// Emit a literal already selected by semantic analysis.
 pub(crate) fn emit_literal(
     program: &mut ProgramBuilder,

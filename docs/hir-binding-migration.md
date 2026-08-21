@@ -724,6 +724,14 @@ subroutine, and query `IN` opens its prepared ephemeral index. Scalar/list EQP
 nodes and correlated re-execution retain the legacy opcode behavior. The shell
 accepts a HIR query-body emitter and does not depend on AST plans or a resolver.
 
+Constant SELECT and VALUES query bodies now lower directly from HIR into the
+existing query destinations. They bind resolved outputs to consecutive
+registers, preserve VALUES row order, stop scalar and EXISTS destinations after
+the first row, populate IN indexes for every row, skip unnecessary EXISTS
+output evaluation, and apply the existing array result decode step. FROM,
+filters, grouping, compounds, ordering, and limits remain later query-body
+checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
