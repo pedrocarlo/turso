@@ -4341,6 +4341,41 @@ pub(crate) fn translate_expr_no_constant_opt(
     Ok(result)
 }
 
+/// Apply bound schema calls to a value already stored in `target`.
+pub(crate) fn translate_schema_calls_in_place(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    calls: &[hir::BoundSchemaCall],
+    target: usize,
+) -> Result<()> {
+    for call in calls {
+        let schema_program = document.schema_program(call.program).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR schema call references missing program {}",
+                call.program
+            ))
+        })?;
+        let arguments_start = program.alloc_registers(call.arguments.len());
+        for (position, argument) in call.arguments.iter().enumerate() {
+            translate_expr_no_constant_opt(
+                program,
+                document,
+                argument,
+                arguments_start + position,
+            )?;
+        }
+        program.bind_source(
+            schema_program.input_source,
+            SourceBinding::SchemaInputs {
+                value: target,
+                arguments_start,
+            },
+        );
+        translate_expr_no_constant_opt(program, document, &schema_program.body, target)?;
+    }
+    Ok(())
+}
+
 /// Register parameter slots in an expression that runtime lowering may skip.
 pub(crate) fn register_parameters(program: &mut ProgramBuilder, expression: &hir::Expr) {
     expression.for_each(&mut |expression| {

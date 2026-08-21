@@ -751,6 +751,13 @@ The resolved comparison expression is evaluated by HIR expression lowering,
 also covers an `INTEGER PRIMARY KEY` rowid alias. Range seeks, joins, and other
 source kinds remain later checkpoints.
 
+Single-table range and equality-prefix seeks now share one generic seek emitter
+between legacy AST and HIR lowering. The HIR adapter evaluates resolved key
+expressions and uses frozen column type programs, while the common emitter keeps
+the existing affinity, NULL matching, forward/backward bound, covering-index,
+table lookup, and `DeferredSeek` behavior. Automatic-index seeks, `IN` seeks,
+and joins remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

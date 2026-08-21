@@ -67,7 +67,7 @@ use in_seek::open_in_seek_source_cursor;
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;
-use seek::SeekEmitter;
+pub(crate) use seek::{SeekEmitter, SeekExpressionLowering};
 
 #[derive(Debug)]
 pub struct LeftJoinMetadata {

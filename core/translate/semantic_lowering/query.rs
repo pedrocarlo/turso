@@ -8,6 +8,7 @@ use crate::{
     translate::{
         eqp::EqpDetail,
         expr::ConditionMetadata,
+        main_loop::{SeekEmitter, SeekExpressionLowering},
         optimizer::HirBtreeOperation,
         plan::{IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
@@ -16,6 +17,7 @@ use crate::{
     },
     util::parse_numeric_literal,
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
         insn::Insn,
         BranchOffset,
@@ -40,6 +42,98 @@ struct DestinationBinding {
 struct QueryLimitRegisters {
     limit: usize,
     offset: Option<usize>,
+}
+
+struct HirSeekExpressionLowering<'a> {
+    document: &'a HirDocument,
+    source: &'a hir::Source,
+}
+
+impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
+    fn emit_expression(
+        &mut self,
+        program: &mut ProgramBuilder,
+        expression: &hir::Expr,
+        target: usize,
+    ) -> Result<()> {
+        super::expr::translate_expr_no_constant_opt(program, self.document, expression, target)?;
+        Ok(())
+    }
+
+    fn is_nonnull(&self, expression: &hir::Expr) -> bool {
+        matches!(
+            expression,
+            hir::Expr::Literal(
+                Literal::Numeric(_)
+                    | Literal::String(_)
+                    | Literal::Blob(_)
+                    | Literal::True
+                    | Literal::False
+            )
+        )
+    }
+
+    fn is_null_matching(
+        &self,
+        operator: turso_parser::ast::Operator,
+        expression: &hir::Expr,
+    ) -> bool {
+        operator == turso_parser::ast::Operator::Is && !self.is_nonnull(expression)
+    }
+
+    fn affinity(&self, affinity: Affinity, _expression: &hir::Expr) -> Affinity {
+        // HIR constraint planning already removes affinity work that cannot
+        // change the resolved key expression.
+        affinity
+    }
+
+    fn encode_index_keys(
+        &mut self,
+        program: &mut ProgramBuilder,
+        index: &Arc<Index>,
+        start_reg: usize,
+        num_keys: usize,
+        index_column_offset: usize,
+    ) -> Result<()> {
+        for position in 0..num_keys {
+            let Some(index_column) = index.columns.get(index_column_offset + position) else {
+                break;
+            };
+            let Some(programs) = self
+                .source
+                .column_type_programs
+                .get(index_column.pos_in_table)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if programs.encode.is_empty() {
+                continue;
+            }
+            let register = start_reg + position;
+            let encoded = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: register,
+                target_pc: encoded,
+            });
+            super::expr::translate_schema_calls_in_place(
+                program,
+                self.document,
+                &programs.encode,
+                register,
+            )?;
+            program.preassign_label_to_next_insn(encoded);
+        }
+        Ok(())
+    }
+
+    fn rowid_affinity(&self) -> Affinity {
+        self.source
+            .columns
+            .iter()
+            .find(|column| column.rowid_alias)
+            .map_or(Affinity::Numeric, |column| column.affinity)
+    }
 }
 
 /// Allocate the legacy query destination from facts already frozen in HIR.
@@ -459,7 +553,9 @@ fn emit_single_btree_loop(
         )));
     };
     let index = match operation {
-        HirBtreeOperation::Scan { index, .. } => index.as_ref(),
+        HirBtreeOperation::Scan { index, .. } | HirBtreeOperation::Seek { index, .. } => {
+            index.as_ref()
+        }
         HirBtreeOperation::RowidEq { .. } => None,
         _ => {
             return Err(LimboError::InternalError(format!(
@@ -567,6 +663,27 @@ fn emit_single_btree_loop(
                 target_pc: next,
             });
         }
+        HirBtreeOperation::Seek { seek_def, .. } => {
+            if index.is_some_and(|index| index.ephemeral) {
+                return Err(LimboError::InternalError(
+                    "HIR automatic-index seek lowering is not implemented".to_string(),
+                ));
+            }
+            let key_registers = seek_def
+                .size(&seek_def.start)
+                .max(seek_def.size(&seek_def.end));
+            let start_register = program.alloc_registers(key_registers);
+            SeekEmitter::with_lowering(
+                program,
+                seek_def,
+                HirSeekExpressionLowering { document, source },
+                cursor,
+                start_register,
+                done,
+                index,
+            )
+            .emit(loop_start, false)?;
+        }
         _ => unreachable!("supported B-tree operation checked above"),
     }
     if let Some(table_cursor) = table_cursor {
@@ -615,17 +732,22 @@ fn emit_single_btree_loop(
         done,
     );
     program.preassign_label_to_next_insn(next);
-    if let HirBtreeOperation::Scan { iter_dir, .. } = operation {
+    let iter_dir = match operation {
+        HirBtreeOperation::Scan { iter_dir, .. } => Some(*iter_dir),
+        HirBtreeOperation::Seek { seek_def, .. } => Some(seek_def.iter_dir),
+        _ => None,
+    };
+    if let Some(iter_dir) = iter_dir {
         match iter_dir {
             IterationDirection::Forwards => program.emit_insn(Insn::Next {
                 cursor_id: cursor,
                 pc_if_next: loop_start,
-                fullscan: true,
+                fullscan: matches!(operation, HirBtreeOperation::Scan { .. }),
             }),
             IterationDirection::Backwards => program.emit_insn(Insn::Prev {
                 cursor_id: cursor,
                 pc_if_prev: loop_start,
-                fullscan: true,
+                fullscan: matches!(operation, HirBtreeOperation::Scan { .. }),
             }),
         }
     }
@@ -1887,5 +2009,194 @@ mod tests {
                 .iter()
                 .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. })));
         }
+    }
+
+    #[test]
+    fn planned_hir_ranges_use_the_shared_seek_emitter() {
+        for (sql, table_required) in [
+            (
+                "SELECT value FROM items INDEXED BY items_value WHERE value >= 2 AND value < 5",
+                false,
+            ),
+            (
+                "SELECT extra FROM items INDEXED BY items_value WHERE value >= 2 AND value < 5",
+                true,
+            ),
+        ] {
+            let plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let planned_loop = &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0];
+            let HirSourceAccess::BTree {
+                operation:
+                    HirBtreeOperation::Seek {
+                        index: Some(index), ..
+                    },
+                table_lookup,
+            } = &planned_loop.access
+            else {
+                panic!("indexed range selects an index seek: {sql}");
+            };
+            assert_eq!(index.name, "items_value");
+            assert_eq!(
+                *table_lookup,
+                if table_required {
+                    BtreeTableLookup::TableRequired
+                } else {
+                    BtreeTableLookup::ScanOnly
+                }
+            );
+            let mut program = program();
+
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("planned index range emits");
+
+            assert!(program.insns.iter().any(|(insn, _)| matches!(
+                insn,
+                Insn::SeekGE { is_index: true, .. }
+                    | Insn::SeekGT { is_index: true, .. }
+                    | Insn::SeekLE { is_index: true, .. }
+                    | Insn::SeekLT { is_index: true, .. }
+            )));
+            assert!(program.insns.iter().any(|(insn, _)| matches!(
+                insn,
+                Insn::IdxGE { .. } | Insn::IdxGT { .. } | Insn::IdxLE { .. } | Insn::IdxLT { .. }
+            )));
+            assert!(program.insns.iter().any(|(insn, _)| matches!(
+                insn,
+                Insn::Next {
+                    fullscan: false,
+                    ..
+                } | Insn::Prev {
+                    fullscan: false,
+                    ..
+                }
+            )));
+            assert_eq!(
+                program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })),
+                table_required
+            );
+        }
+
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT value FROM items WHERE rowid >= 2 AND rowid < 5",
+        );
+        let query = root_query(&plan.document);
+        let planned_loop = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0];
+        assert!(matches!(
+            &planned_loop.access,
+            HirSourceAccess::BTree {
+                operation: HirBtreeOperation::Seek { index: None, .. },
+                table_lookup: BtreeTableLookup::ScanOnly,
+            }
+        ));
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("planned rowid range emits");
+
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::SeekGE {
+                is_index: false,
+                ..
+            } | Insn::SeekGT {
+                is_index: false,
+                ..
+            } | Insn::SeekLE {
+                is_index: false,
+                ..
+            } | Insn::SeekLT {
+                is_index: false,
+                ..
+            }
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::RowId { .. })));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Ge { .. } | Insn::Gt { .. } | Insn::Le { .. } | Insn::Lt { .. }
+        )));
+    }
+
+    #[test]
+    fn shared_hir_seek_emitter_keeps_backward_bounds() {
+        use crate::{
+            translate::plan::{SeekDef, SeekKey, SeekKeyComponent},
+            types::SeekOp,
+        };
+
+        let document = analyze_sql(rowid_items_schema(), "SELECT value FROM items");
+        let source = &document.sources[0];
+        let seek_def = SeekDef {
+            prefix: Vec::new(),
+            start: SeekKey {
+                last_component: SeekKeyComponent::Expr(Expr::Literal(Literal::Numeric(
+                    "5".to_string(),
+                ))),
+                op: SeekOp::LE { eq_only: false },
+                affinity: Affinity::Integer,
+            },
+            end: SeekKey {
+                last_component: SeekKeyComponent::Expr(Expr::Literal(Literal::Numeric(
+                    "2".to_string(),
+                ))),
+                op: SeekOp::LE { eq_only: false },
+                affinity: Affinity::Integer,
+            },
+            iter_dir: IterationDirection::Backwards,
+        };
+        let mut program = program();
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(match &source.kind {
+            hir::SourceKind::Table(table) => match table.value() {
+                Table::BTree(table) => table.clone(),
+                _ => panic!("test source is a B-tree table"),
+            },
+            _ => panic!("test source is a table"),
+        }));
+        let start_register = program.alloc_register();
+        let loop_start = program.allocate_label();
+        let done = program.allocate_label();
+
+        SeekEmitter::with_lowering(
+            &mut program,
+            &seek_def,
+            HirSeekExpressionLowering {
+                document: &document,
+                source,
+            },
+            cursor,
+            start_register,
+            done,
+            None,
+        )
+        .emit(loop_start, false)
+        .expect("backward HIR seek emits");
+
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::SeekLE {
+                is_index: false,
+                cursor_id,
+                ..
+            } if *cursor_id == cursor
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Le { .. })));
     }
 }
