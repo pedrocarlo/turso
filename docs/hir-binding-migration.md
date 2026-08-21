@@ -735,6 +735,13 @@ AND/OR short-circuiting. LIMIT and OFFSET use the existing counter opcode flow,
 including integer checks, early LIMIT-zero exit, offset skipping, and result-row
 decrement.
 
+Planned single-table B-tree scans now lower directly from HIR. Lowering opens
+the resolved catalog table, binds its `SourceId` to the scan cursor, evaluates
+the plan's unconsumed predicates, emits resolved outputs, and preserves forward
+or backward full-scan, LIMIT, OFFSET, scalar, EXISTS, and result destination
+control flow. Index scans, seeks, joins, and other source kinds remain later
+checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

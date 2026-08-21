@@ -3,18 +3,20 @@
 use turso_parser::ast::{Literal, SortOrder};
 
 use crate::{
-    schema::{Index, IndexColumn},
+    schema::{Index, IndexColumn, Table},
     sync::Arc,
     translate::{
         eqp::EqpDetail,
         expr::ConditionMetadata,
-        plan::QueryDestination,
+        optimizer::HirBtreeOperation,
+        plan::{IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
+        semantic_to_plan::{HirPlan, HirQueryBlockPlan, HirSourceAccess},
     },
     util::parse_numeric_literal,
     vdbe::{
-        builder::{CursorType, ProgramBuilder, SubqueryBinding},
+        builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
         insn::Insn,
         BranchOffset,
     },
@@ -302,7 +304,7 @@ pub(crate) fn emit_query_body(
             filter,
             grouping: None,
         } => {
-            let start = non_from_output_registers(program, destination, &block.outputs)?;
+            let start = query_output_registers(program, destination, &block.outputs)?;
             if let Some(filter) = filter {
                 let emit_row = program.allocate_label();
                 super::expr::translate_condition_expr(
@@ -319,7 +321,7 @@ pub(crate) fn emit_query_body(
                 program.preassign_label_to_next_insn(emit_row);
             }
             emit_before_row(program, limit, done);
-            emit_non_from_row(
+            emit_query_row(
                 program,
                 document,
                 destination,
@@ -336,12 +338,12 @@ pub(crate) fn emit_query_body(
             Ok(())
         }
         hir::QueryBlockBody::Values { rows } => {
-            let start = non_from_output_registers(program, destination, &block.outputs)?;
+            let start = query_output_registers(program, destination, &block.outputs)?;
             let stop_after_first = destination_stops_after_first_row(destination);
             for row in rows {
                 let next_row = program.allocate_label();
                 emit_before_row(program, limit, next_row);
-                emit_non_from_row(
+                emit_query_row(
                     program,
                     document,
                     destination,
@@ -366,6 +368,210 @@ pub(crate) fn emit_query_body(
     };
     program.preassign_label_to_next_insn(done);
     result
+}
+
+/// Emit one planned HIR query whose source loop is a full B-tree scan.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn emit_planned_query_body(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query_id: QueryId,
+    destination: &QueryDestination,
+) -> Result<()> {
+    let document = &plan.document;
+    let query = document.query(query_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR lowering references missing query {query_id}"))
+    })?;
+    let planned_query = plan.planned_query(query_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR lowering references unplanned query {query_id}"
+        ))
+    })?;
+    if query.blocks.len() != 1
+        || planned_query.blocks.len() != 1
+        || !query.compounds.is_empty()
+        || !query.order_by.is_empty()
+    {
+        return Err(LimboError::InternalError(format!(
+            "HIR query {query_id} is not a supported single-block query body"
+        )));
+    }
+    let block = &query.blocks[0];
+    let block_plan = &planned_query.blocks[0];
+    if block_plan.block != block.id {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} has mismatched access plan {:?}",
+            block.id, block_plan.block
+        )));
+    }
+    if block.from.is_none() {
+        return emit_query_body(program, document, query_id, destination);
+    }
+    emit_single_btree_scan(
+        program,
+        document,
+        query.limit.as_ref(),
+        block,
+        block_plan,
+        destination,
+    )
+}
+
+fn emit_single_btree_scan(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    query_limit: Option<&hir::Limit>,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    destination: &QueryDestination,
+) -> Result<()> {
+    if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} is not a supported full scan",
+            block.id
+        )));
+    }
+    let hir::QueryBlockBody::Select {
+        distinctness: None,
+        grouping: None,
+        ..
+    } = &block.body
+    else {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} has unsupported full-scan clauses",
+            block.id
+        )));
+    };
+    let [planned_loop] = block_plan.loops.as_slice() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} does not have one source loop",
+            block.id
+        )));
+    };
+    let HirSourceAccess::BTree(HirBtreeOperation::Scan {
+        iter_dir,
+        index: None,
+    }) = &planned_loop.access
+    else {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} does not use a full table scan",
+            block.id
+        )));
+    };
+    let source = document.source(planned_loop.source).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR full scan references missing source {}",
+            planned_loop.source
+        ))
+    })?;
+    let hir::SourceKind::Table(table) = &source.kind else {
+        return Err(LimboError::InternalError(format!(
+            "HIR full scan source {} is not a table",
+            source.id
+        )));
+    };
+    let Table::BTree(table) = table.value() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR full scan source {} is not a B-tree table",
+            source.id
+        )));
+    };
+    let database = source.database.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR full scan source {} has no database",
+            source.id
+        ))
+    })?;
+    let database_snapshot = document.database(database).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR full scan source {} references missing database {database:?}",
+            source.id
+        ))
+    })?;
+
+    let done = program.allocate_label();
+    let next = program.allocate_label();
+    let loop_start = program.allocate_label();
+    let limit = initialize_limit(program, document, query_limit, done)?;
+    program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    program.bind_source(
+        source.id,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: cursor,
+        root_page: table.root_page,
+        db: database.index(),
+    });
+    match iter_dir {
+        IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: done,
+        }),
+        IterationDirection::Backwards => program.emit_insn(Insn::Last {
+            cursor_id: cursor,
+            pc_if_empty: done,
+        }),
+    }
+    program.preassign_label_to_next_insn(loop_start);
+
+    for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
+        if predicate.from_outer_join.is_some() {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} full scan contains an outer-join predicate",
+                block.id
+            )));
+        }
+        let passed = program.allocate_label();
+        super::expr::translate_condition_expr(
+            program,
+            document,
+            &predicate.expr,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: next,
+                jump_target_when_null: next,
+            },
+        )?;
+        program.preassign_label_to_next_insn(passed);
+    }
+
+    emit_before_row(program, limit, next);
+    let start = query_output_registers(program, destination, &block.outputs)?;
+    emit_query_row(
+        program,
+        document,
+        destination,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+    )?;
+    emit_after_row(
+        program,
+        limit,
+        destination_stops_after_first_row(destination),
+        done,
+    );
+    program.preassign_label_to_next_insn(next);
+    match iter_dir {
+        IterationDirection::Forwards => program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: loop_start,
+            fullscan: true,
+        }),
+        IterationDirection::Backwards => program.emit_insn(Insn::Prev {
+            cursor_id: cursor,
+            pc_if_prev: loop_start,
+            fullscan: true,
+        }),
+    }
+    program.preassign_label_to_next_insn(done);
+    Ok(())
 }
 
 fn initialize_limit(
@@ -510,14 +716,14 @@ fn emit_after_row(
     }
 }
 
-fn non_from_output_registers(
+fn query_output_registers(
     program: &mut ProgramBuilder,
     destination: &QueryDestination,
     outputs: &[hir::Output],
 ) -> Result<usize> {
     if outputs.is_empty() {
         return Err(LimboError::InternalError(
-            "HIR non-FROM query has no outputs".to_string(),
+            "HIR query has no outputs".to_string(),
         ));
     }
     Ok(
@@ -537,7 +743,7 @@ fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
     )
 }
 
-fn emit_non_from_row<'expr>(
+fn emit_query_row<'expr>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     destination: &QueryDestination,
@@ -547,7 +753,7 @@ fn emit_non_from_row<'expr>(
 ) -> Result<()> {
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
-            "HIR non-FROM row width {} does not match output width {}",
+            "HIR row width {} does not match output width {}",
             expressions.len(),
             outputs.len()
         )));
@@ -608,11 +814,15 @@ mod tests {
     use crate::{
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
-        translate::semantic::{
-            catalog::{SemanticCatalog, SemanticCatalogDatabase},
-            context::DoubleQuotedDml,
-            hir::{self, Expr, HirRoot},
-            SemanticOptions, SemanticRootInput,
+        translate::{
+            optimizer::CostModelParams,
+            semantic::{
+                catalog::{SemanticCatalog, SemanticCatalogDatabase},
+                context::DoubleQuotedDml,
+                hir::{self, Expr, HirRoot},
+                SemanticOptions, SemanticRootInput,
+            },
+            semantic_to_plan::HirPlan,
         },
         vdbe::builder::{ProgramBuilderOpts, QueryMode},
         SymbolTable, MAIN_DB_ID,
@@ -627,15 +837,16 @@ mod tests {
         ProgramBuilder::new(mode, None, ProgramBuilderOpts::new(0, 4, 0))
     }
 
-    fn analyze_sql(mut schema: Schema, sql: &str) -> HirDocument {
+    fn analyze_sql_with_schema(mut schema: Schema, sql: &str) -> (HirDocument, Arc<Schema>) {
         schema
             .resolve_all_custom_type_affinities()
             .expect("custom affinities resolve");
+        let schema = Arc::new(schema);
         let catalog = SemanticCatalog {
             databases: vec![SemanticCatalogDatabase {
                 id: hir::DatabaseId::new(MAIN_DB_ID),
                 name: "main".to_string(),
-                schema: Arc::new(schema),
+                schema: schema.clone(),
             }],
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
         };
@@ -646,7 +857,7 @@ mod tests {
         let turso_parser::ast::Cmd::Stmt(statement) = command else {
             panic!("SQL contains a statement command");
         };
-        crate::translate::semantic::analyze_root(
+        let document = crate::translate::semantic::analyze_root(
             &catalog,
             &SymbolTable::new(),
             SemanticOptions {
@@ -660,7 +871,18 @@ mod tests {
             document.validate().expect("HIR validates");
             document
         })
-        .expect("SQL analyzes")
+        .expect("SQL analyzes");
+        (document, schema)
+    }
+
+    fn analyze_sql(schema: Schema, sql: &str) -> HirDocument {
+        analyze_sql_with_schema(schema, sql).0
+    }
+
+    fn analyze_plan(schema: Schema, sql: &str) -> HirPlan {
+        let (document, schema) = analyze_sql_with_schema(schema, sql);
+        HirPlan::build(Arc::new(document), &schema, &CostModelParams::default())
+            .expect("HIR query plans")
     }
 
     fn root_expression(document: &HirDocument) -> &Expr {
@@ -1292,5 +1514,91 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn planned_full_scan_binds_its_source_and_emits_residual_filter() {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE items(value INTEGER)", 2)
+                    .expect("fixed table schema parses"),
+            ))
+            .expect("fixed table name is unique");
+        let plan = analyze_plan(
+            schema,
+            "SELECT value FROM items WHERE value LIMIT 2 OFFSET 1",
+        );
+        let query = root_query(&plan.document);
+        let source = plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0]
+            .source;
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("planned full scan emits");
+
+        let SourceBinding::BTree {
+            scan_cursor,
+            table_cursor: None,
+        } = program
+            .source_binding(source)
+            .copied()
+            .expect("source has a physical binding")
+        else {
+            panic!("full table scan binds one B-tree cursor");
+        };
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let open = position(&|insn| {
+            matches!(
+                insn,
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page: 2,
+                    db: MAIN_DB_ID,
+                } if *cursor_id == scan_cursor
+            )
+        });
+        let rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == scan_cursor),
+        );
+        let filter = position(&|insn| {
+            matches!(
+                insn,
+                Insn::IfNot {
+                    jump_if_null: true,
+                    ..
+                }
+            )
+        });
+        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 1, .. }));
+        let next = position(&|insn| {
+            matches!(
+                insn,
+                Insn::Next {
+                    cursor_id,
+                    fullscan: true,
+                    ..
+                } if *cursor_id == scan_cursor
+            )
+        });
+        assert!(open < rewind && rewind < filter && filter < result && result < next);
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
     }
 }

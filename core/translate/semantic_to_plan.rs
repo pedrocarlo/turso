@@ -114,7 +114,7 @@ impl HirPlan {
         })
     }
 
-    fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
+    pub(crate) fn planned_query(&self, query: QueryId) -> Option<&HirPlannedQuery> {
         self.queries.iter().find(|plan| plan.query == query)
     }
 }
