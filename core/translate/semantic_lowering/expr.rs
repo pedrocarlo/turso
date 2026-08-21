@@ -4189,6 +4189,145 @@ pub(crate) fn translate_expr(
     )
 }
 
+#[derive(Clone, Copy)]
+enum ConditionContext {
+    Predicate(expr::ConditionMetadata),
+    RightOperand {
+        metadata: expr::ConditionMetadata,
+        next_operand: BranchOffset,
+    },
+}
+
+impl ConditionContext {
+    fn metadata(self) -> expr::ConditionMetadata {
+        match self {
+            Self::Predicate(metadata) | Self::RightOperand { metadata, .. } => metadata,
+        }
+    }
+}
+
+struct ConditionLowerer<'program, 'document> {
+    program: &'program mut ProgramBuilder,
+    document: &'document hir::HirDocument,
+}
+
+impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
+    type Context = ConditionContext;
+    type Output = ();
+    type Error = LimboError;
+
+    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        let hir::Expr::Binary {
+            lhs,
+            operator: Operator::And | Operator::Or,
+            rhs,
+            custom: None,
+            ..
+        } = expression
+        else {
+            return None;
+        };
+        [lhs.as_ref(), rhs.as_ref()].get(index).copied()
+    }
+
+    fn pre_order(
+        &mut self,
+        parent: &hir::Expr,
+        context: &mut ConditionContext,
+        child_index: usize,
+        _child: &hir::Expr,
+    ) -> Result<ControlFlow<(), ConditionContext>> {
+        let hir::Expr::Binary { operator, .. } = parent else {
+            unreachable!("condition visitor only exposes binary AND/OR children")
+        };
+        match (operator, child_index) {
+            (Operator::And, 0) => {
+                let next_operand = self.program.allocate_label();
+                let metadata = context.metadata();
+                *context = ConditionContext::RightOperand {
+                    metadata,
+                    next_operand,
+                };
+                Ok(ControlFlow::Continue(ConditionContext::Predicate(
+                    expr::ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: next_operand,
+                        ..metadata
+                    },
+                )))
+            }
+            (Operator::Or, 0) => {
+                let next_operand = self.program.allocate_label();
+                let metadata = context.metadata();
+                *context = ConditionContext::RightOperand {
+                    metadata,
+                    next_operand,
+                };
+                Ok(ControlFlow::Continue(ConditionContext::Predicate(
+                    expr::ConditionMetadata {
+                        jump_if_condition_is_true: true,
+                        jump_target_when_false: next_operand,
+                        jump_target_when_null: next_operand,
+                        ..metadata
+                    },
+                )))
+            }
+            (Operator::And | Operator::Or, 1) => {
+                let ConditionContext::RightOperand {
+                    metadata,
+                    next_operand,
+                } = *context
+                else {
+                    return Err(LimboError::InternalError(
+                        "HIR condition is missing its right-operand state".to_string(),
+                    ));
+                };
+                *context = ConditionContext::Predicate(metadata);
+                self.program.preassign_label_to_next_insn(next_operand);
+                Ok(ControlFlow::Continue(ConditionContext::Predicate(metadata)))
+            }
+            _ => Err(LimboError::InternalError(format!(
+                "HIR condition visitor received invalid child {child_index} for {operator:?}"
+            ))),
+        }
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &hir::Expr,
+        context: ConditionContext,
+        _children: &[()],
+    ) -> Result<()> {
+        if matches!(
+            expression,
+            hir::Expr::Binary {
+                operator: Operator::And | Operator::Or,
+                custom: None,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        let register = self.program.alloc_register();
+        translate_expr(self.program, self.document, expression, register)?;
+        expr::emit_cond_jump(self.program, context.metadata(), register);
+        Ok(())
+    }
+}
+
+/// Lower a resolved predicate while preserving AND/OR short-circuiting.
+pub(crate) fn translate_condition_expr(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    metadata: expr::ConditionMetadata,
+) -> Result<()> {
+    expression.walk(
+        ConditionContext::Predicate(metadata),
+        &mut ConditionLowerer { program, document },
+    )
+}
+
 /// Lower an expression while keeping its instructions at the current use.
 pub(crate) fn translate_expr_no_constant_opt(
     program: &mut ProgramBuilder,
@@ -4313,6 +4452,20 @@ mod tests {
             panic!("SELECT produces a query root");
         };
         &document.query(root.query).expect("query exists").blocks[0].outputs[0].expr
+    }
+
+    fn root_filter(document: &hir::HirDocument) -> &hir::Expr {
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let hir::QueryBlockBody::Select {
+            filter: Some(filter),
+            ..
+        } = &document.query(root.query).expect("query exists").blocks[0].body
+        else {
+            panic!("SELECT has a filter");
+        };
+        filter
     }
 
     fn custom_operator_schema() -> crate::schema::Schema {
@@ -8967,6 +9120,90 @@ mod tests {
             [(Insn::Integer { value: 1, dest: 4 }, _)]
         ));
 
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn condition_lowering_short_circuits_and_and_or() {
+        #[derive(Clone, Copy)]
+        enum JumpKind {
+            If,
+            IfNot,
+        }
+        for (sql, expected_jump) in [
+            ("SELECT 1 WHERE 0 AND random()", JumpKind::IfNot),
+            ("SELECT 1 WHERE 1 OR random()", JumpKind::If),
+        ] {
+            let document = analyze_sql(crate::schema::Schema::new(), sql);
+            let mut program = program();
+            let when_true = program.allocate_label();
+            let when_false = program.allocate_label();
+            super::translate_condition_expr(
+                &mut program,
+                &document,
+                root_filter(&document),
+                expr::ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: when_true,
+                    jump_target_when_false: when_false,
+                    jump_target_when_null: when_false,
+                },
+            )
+            .expect("condition lowers");
+
+            let jump = program
+                .insns
+                .iter()
+                .position(|(instruction, _)| match expected_jump {
+                    JumpKind::If => matches!(instruction, Insn::If { .. }),
+                    JumpKind::IfNot => matches!(instruction, Insn::IfNot { .. }),
+                })
+                .expect("left operand emits its short-circuit jump");
+            let function = program
+                .insns
+                .iter()
+                .position(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
+                .expect("right operand is emitted");
+            assert!(jump < function, "left jump must guard right operand");
+        }
+    }
+
+    #[test]
+    fn condition_lowering_does_not_use_call_stack() {
+        let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
+        for _ in 0..10_000 {
+            expression = hir::Expr::Binary {
+                lhs: Box::new(expression),
+                operator: Operator::And,
+                rhs: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
+                array_concat: false,
+                custom: None,
+                comparison: None,
+            };
+        }
+        let mut program = program();
+        let when_true = program.allocate_label();
+        let when_false = program.allocate_label();
+        super::translate_condition_expr(
+            &mut program,
+            &document(Vec::new()),
+            &expression,
+            expr::ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: when_true,
+                jump_target_when_false: when_false,
+                jump_target_when_null: when_false,
+            },
+        )
+        .expect("deep condition lowers");
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::IfNot { .. }))
+                .count(),
+            10_001
+        );
         std::mem::forget(expression);
     }
 }

@@ -729,8 +729,11 @@ existing query destinations. They bind resolved outputs to consecutive
 registers, preserve VALUES row order, stop scalar and EXISTS destinations after
 the first row, populate IN indexes for every row, skip unnecessary EXISTS
 output evaluation, and apply the existing array result decode step. FROM,
-filters, grouping, compounds, ordering, and limits remain later query-body
-checkpoints.
+grouping, compounds, and ordering remain later query-body checkpoints.
+No-FROM WHERE predicates use the shared iterative expression visitor to retain
+AND/OR short-circuiting. LIMIT and OFFSET use the existing counter opcode flow,
+including integer checks, early LIMIT-zero exit, offset skipping, and result-row
+decrement.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

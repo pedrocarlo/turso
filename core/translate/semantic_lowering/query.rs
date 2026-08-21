@@ -1,21 +1,24 @@
 //! Runtime destination preparation for resolved HIR queries.
 
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{Literal, SortOrder};
 
 use crate::{
     schema::{Index, IndexColumn},
     sync::Arc,
     translate::{
         eqp::EqpDetail,
+        expr::ConditionMetadata,
         plan::QueryDestination,
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
     },
+    util::parse_numeric_literal,
     vdbe::{
         builder::{CursorType, ProgramBuilder, SubqueryBinding},
         insn::Insn,
+        BranchOffset,
     },
-    LimboError, Result,
+    LimboError, Numeric, Result, Value,
 };
 
 /// Physical destination and execution facts for one expression subquery.
@@ -29,6 +32,12 @@ pub(crate) struct PreparedSubquery {
 struct DestinationBinding {
     destination: QueryDestination,
     binding: SubqueryBinding,
+}
+
+#[derive(Clone, Copy)]
+struct QueryLimitRegisters {
+    limit: usize,
+    offset: Option<usize>,
 }
 
 /// Allocate the legacy query destination from facts already frozen in HIR.
@@ -257,7 +266,7 @@ pub(crate) fn emit_prepared_subquery(
     })
 }
 
-/// Emit constant SELECT and VALUES query bodies into an existing destination.
+/// Emit SELECT and VALUES bodies that do not read a row source.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn emit_query_body(
     program: &mut ProgramBuilder,
@@ -268,13 +277,9 @@ pub(crate) fn emit_query_body(
     let query = document.query(query_id).ok_or_else(|| {
         LimboError::InternalError(format!("HIR lowering references missing query {query_id}"))
     })?;
-    if query.blocks.len() != 1
-        || !query.compounds.is_empty()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-    {
+    if query.blocks.len() != 1 || !query.compounds.is_empty() || !query.order_by.is_empty() {
         return Err(LimboError::InternalError(format!(
-            "HIR query {query_id} is not a constant query body"
+            "HIR query {query_id} is not a supported non-FROM query body"
         )));
     }
     let block = &query.blocks[0];
@@ -284,32 +289,59 @@ pub(crate) fn emit_query_body(
         || !block.windows.is_empty()
     {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} is not a constant query body",
+            "HIR query block {:?} is not a supported non-FROM query body",
             block.id
         )));
     }
 
-    match &block.body {
+    let done = program.allocate_label();
+    let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
+    let result = match &block.body {
         hir::QueryBlockBody::Select {
             distinctness: None,
-            filter: None,
+            filter,
             grouping: None,
         } => {
-            let start = constant_output_registers(program, destination, &block.outputs)?;
-            emit_constant_row(
+            let start = non_from_output_registers(program, destination, &block.outputs)?;
+            if let Some(filter) = filter {
+                let emit_row = program.allocate_label();
+                super::expr::translate_condition_expr(
+                    program,
+                    document,
+                    filter,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true: emit_row,
+                        jump_target_when_false: done,
+                        jump_target_when_null: done,
+                    },
+                )?;
+                program.preassign_label_to_next_insn(emit_row);
+            }
+            emit_before_row(program, limit, done);
+            emit_non_from_row(
                 program,
                 document,
                 destination,
                 &block.outputs,
                 block.outputs.iter().map(|output| &output.expr),
                 start,
-            )
+            )?;
+            emit_after_row(
+                program,
+                limit,
+                destination_stops_after_first_row(destination),
+                done,
+            );
+            Ok(())
         }
         hir::QueryBlockBody::Values { rows } => {
-            let start = constant_output_registers(program, destination, &block.outputs)?;
+            let start = non_from_output_registers(program, destination, &block.outputs)?;
             let stop_after_first = destination_stops_after_first_row(destination);
             for row in rows {
-                emit_constant_row(
+                let next_row = program.allocate_label();
+                emit_before_row(program, limit, next_row);
+                emit_non_from_row(
                     program,
                     document,
                     destination,
@@ -317,27 +349,175 @@ pub(crate) fn emit_query_body(
                     row.iter(),
                     start,
                 )?;
-                if stop_after_first {
+                let needs_runtime_stop =
+                    stop_after_first && limit.and_then(|limit| limit.offset).is_some();
+                emit_after_row(program, limit, needs_runtime_stop, done);
+                program.preassign_label_to_next_insn(next_row);
+                if stop_after_first && !needs_runtime_stop {
                     break;
                 }
             }
             Ok(())
         }
         _ => Err(LimboError::InternalError(format!(
-            "HIR query block {:?} has unsupported constant-query clauses",
+            "HIR query block {:?} has unsupported non-FROM clauses",
             block.id
         ))),
+    };
+    program.preassign_label_to_next_insn(done);
+    result
+}
+
+fn initialize_limit(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    limit: Option<&hir::Limit>,
+    done: BranchOffset,
+) -> Result<Option<QueryLimitRegisters>> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let limit_register = program.alloc_register();
+    emit_limit_value(program, document, &limit.limit, limit_register)?;
+
+    let offset = if let Some(offset) = &limit.offset {
+        let offset_register = program.alloc_register();
+        emit_offset_value(program, document, offset, offset_register)?;
+        program.emit_insn(Insn::MustBeInt {
+            reg: offset_register,
+            target_pc: None,
+        });
+        let combined_register = program.alloc_register();
+        program.emit_insn(Insn::OffsetLimit {
+            limit_reg: limit_register,
+            offset_reg: offset_register,
+            combined_reg: combined_register,
+        });
+        Some(offset_register)
+    } else {
+        None
+    };
+    program.emit_insn(Insn::IfNot {
+        reg: limit_register,
+        target_pc: done,
+        jump_if_null: false,
+    });
+    Ok(Some(QueryLimitRegisters {
+        limit: limit_register,
+        offset,
+    }))
+}
+
+fn emit_limit_value(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<()> {
+    match expression {
+        hir::Expr::Literal(Literal::Numeric(value)) => match parse_numeric_literal(value)? {
+            Value::Numeric(Numeric::Integer(value)) => {
+                program.emit_insn(Insn::Integer {
+                    value,
+                    dest: target,
+                });
+            }
+            Value::Numeric(Numeric::Float(value)) => {
+                program.emit_insn(Insn::Real {
+                    value: value.into(),
+                    dest: target,
+                });
+                program.emit_insn(Insn::MustBeInt {
+                    reg: target,
+                    target_pc: None,
+                });
+            }
+            _ => unreachable!("numeric parser returns a numeric value"),
+        },
+        _ => {
+            super::expr::translate_expr(program, document, expression, target)?;
+            program.emit_insn(Insn::MustBeInt {
+                reg: target,
+                target_pc: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn emit_offset_value(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    expression: &hir::Expr,
+    target: usize,
+) -> Result<()> {
+    match expression {
+        hir::Expr::Literal(Literal::Numeric(value)) => match parse_numeric_literal(value)? {
+            Value::Numeric(Numeric::Integer(value)) => {
+                program.emit_insn(Insn::Integer {
+                    value,
+                    dest: target,
+                });
+            }
+            Value::Numeric(Numeric::Float(value)) => {
+                program.emit_insn(Insn::Real {
+                    value: value.into(),
+                    dest: target,
+                });
+                program.emit_insn(Insn::MustBeInt {
+                    reg: target,
+                    target_pc: None,
+                });
+            }
+            _ => unreachable!("numeric parser returns a numeric value"),
+        },
+        _ => {
+            super::expr::translate_expr(program, document, expression, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_before_row(
+    program: &mut ProgramBuilder,
+    limit: Option<QueryLimitRegisters>,
+    skip_row: BranchOffset,
+) {
+    let Some(offset) = limit.and_then(|limit| limit.offset) else {
+        return;
+    };
+    program.emit_insn(Insn::IfPos {
+        reg: offset,
+        target_pc: skip_row,
+        decrement_by: 1,
+    });
+}
+
+fn emit_after_row(
+    program: &mut ProgramBuilder,
+    limit: Option<QueryLimitRegisters>,
+    stop_after_first: bool,
+    done: BranchOffset,
+) {
+    if let Some(limit) = limit {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit.limit,
+            target_pc: done,
+        });
+    }
+    if stop_after_first {
+        program.emit_insn(Insn::Goto { target_pc: done });
     }
 }
 
-fn constant_output_registers(
+fn non_from_output_registers(
     program: &mut ProgramBuilder,
     destination: &QueryDestination,
     outputs: &[hir::Output],
 ) -> Result<usize> {
     if outputs.is_empty() {
         return Err(LimboError::InternalError(
-            "HIR constant query has no outputs".to_string(),
+            "HIR non-FROM query has no outputs".to_string(),
         ));
     }
     Ok(
@@ -357,7 +537,7 @@ fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
     )
 }
 
-fn emit_constant_row<'expr>(
+fn emit_non_from_row<'expr>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     destination: &QueryDestination,
@@ -367,7 +547,7 @@ fn emit_constant_row<'expr>(
 ) -> Result<()> {
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
-            "HIR constant row width {} does not match output width {}",
+            "HIR non-FROM row width {} does not match output width {}",
             expressions.len(),
             outputs.len()
         )));
@@ -936,5 +1116,181 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. })));
+    }
+
+    #[test]
+    fn no_from_filter_branches_around_result_emission() {
+        let document = analyze_sql(Schema::new(), "SELECT 7 WHERE 0");
+        let mut program = program();
+        emit_query_body(
+            &mut program,
+            &document,
+            root_query(&document),
+            &QueryDestination::ResultRows,
+        )
+        .expect("filtered SELECT emits");
+
+        let filter_jump = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::IfNot {
+                        jump_if_null: true,
+                        ..
+                    }
+                )
+            })
+            .expect("filter emits a false-or-null jump");
+        let output = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Integer { value: 7, .. }))
+            .expect("result expression is emitted");
+        let result = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::ResultRow { .. }))
+            .expect("result destination is emitted");
+        assert!(filter_jump < output && output < result);
+    }
+
+    #[test]
+    fn no_from_limit_and_offset_keep_row_counter_opcodes() {
+        let document = analyze_sql(Schema::new(), "SELECT 1 LIMIT 1 OFFSET 1");
+        let mut program = program();
+        emit_query_body(
+            &mut program,
+            &document,
+            root_query(&document),
+            &QueryDestination::ResultRows,
+        )
+        .expect("limited SELECT emits");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(
+                    insn,
+                    Insn::IfNot {
+                        jump_if_null: false,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        let offset_limit = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
+            .expect("offset and limit are combined");
+        let limit_exit = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::IfNot {
+                        jump_if_null: false,
+                        ..
+                    }
+                )
+            })
+            .expect("limit exits before rows when its counter is false");
+        assert!(offset_limit < limit_exit);
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::ResultRow { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scalar_select_offset_skips_its_only_candidate_row() {
+        let document = analyze_sql(Schema::new(), "SELECT (SELECT 1 LIMIT 1 OFFSET 1)");
+        let mut program = program();
+        let prepared = prepare_subquery(&mut program, &document, root_subquery(&document))
+            .expect("scalar destination prepares");
+        emit_prepared_subquery(&mut program, &prepared, |program, query, destination| {
+            emit_query_body(program, &document, query, destination)
+        })
+        .expect("offset scalar query emits");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Copy { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Goto { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn floating_limit_and_offset_keep_integer_checks() {
+        let document = analyze_sql(Schema::new(), "SELECT 1 LIMIT 1.0 OFFSET 0.0");
+        let mut program = program();
+        emit_query_body(
+            &mut program,
+            &document,
+            root_query(&document),
+            &QueryDestination::ResultRows,
+        )
+        .expect("floating counters emit");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::MustBeInt { .. }))
+                .count(),
+            3
+        );
     }
 }

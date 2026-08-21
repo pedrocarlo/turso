@@ -101,6 +101,7 @@ pub(crate) use emission::{
     emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
     seed_returning_row_image_in_cache,
 };
+pub(crate) use metadata::emit_cond_jump;
 pub use metadata::ConditionMetadata;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
