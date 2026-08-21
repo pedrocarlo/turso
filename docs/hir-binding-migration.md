@@ -712,6 +712,12 @@ comparison affinity and collation. Its true, false, and NULL branches retain
 the legacy opcode flow, including checking each row-value operand for NULL
 before evaluating the next operand.
 
+HIR subquery destination preparation now allocates the existing row-value,
+EXISTS, and ephemeral-index destinations directly from the resolved query and
+comparison metadata. Destination allocation installs the matching `QueryId`
+binding in `ProgramBuilder`, and correlation comes from the query's frozen
+capture set. Query-body emission remains the next lowering boundary.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
