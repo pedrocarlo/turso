@@ -1599,6 +1599,21 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                 Ok(target)
             }
             hir::Expr::RowId(source) => self.emit_rowid(*source, target),
+            hir::Expr::Output(output) => {
+                let binding = self.program.output_binding(*output).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR output {output:?} has no runtime binding"
+                    ))
+                })?;
+                if binding.register != target {
+                    self.program.emit_insn(Insn::Copy {
+                        src_reg: binding.register,
+                        dst_reg: target,
+                        extra_amount: 0,
+                    });
+                }
+                Ok(target)
+            }
             hir::Expr::Unary { operator, expr } => {
                 self.emit_unary(*operator, expr, target, children)
             }
@@ -4119,6 +4134,54 @@ mod tests {
             index_coverage: hir::IndexCoverage::Selective,
             index_method_patterns: Vec::new(),
         }
+    }
+
+    #[test]
+    fn output_references_read_the_bound_result_register() {
+        let document = analyze_sql(
+            crate::schema::Schema::new(),
+            "SELECT random() AS value ORDER BY value",
+        );
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let expression = &query.order_by[0].expr;
+        let hir::Expr::Output(output) = expression else {
+            panic!("ORDER BY alias becomes an output reference");
+        };
+
+        let mut lowered = program();
+        lowered.bind_output(*output, 7);
+        super::translate_expr(&mut lowered, &document, expression, 9).expect("bound output lowers");
+
+        assert!(matches!(
+            lowered.insns.as_slice(),
+            [(
+                Insn::Copy {
+                    src_reg: 7,
+                    dst_reg: 9,
+                    extra_amount: 0,
+                },
+                _
+            )]
+        ));
+
+        let mut same_register = program();
+        same_register.bind_output(*output, 7);
+        super::translate_expr(&mut same_register, &document, expression, 7)
+            .expect("output already in its target lowers");
+        assert!(same_register.insns.is_empty());
+    }
+
+    #[test]
+    fn unbound_output_reference_is_rejected() {
+        let block = hir::QueryBlockId::new(hir::QueryId::new(0), 0);
+        let expression = hir::Expr::output(hir::OutputId::query(block, 0));
+        let error = translate_expr(&mut program(), &expression, 7)
+            .expect_err("output needs a runtime binding");
+
+        assert!(error.to_string().contains("has no runtime binding"));
     }
 
     #[test]

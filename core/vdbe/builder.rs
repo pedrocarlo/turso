@@ -13,7 +13,7 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
-        semantic::hir::SourceId,
+        semantic::hir::{OutputId, SourceId},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -78,6 +78,12 @@ pub(crate) enum SourceBinding {
         value: usize,
         arguments_start: usize,
     },
+}
+
+/// Physical location of one resolved HIR output value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputBinding {
+    pub(crate) register: usize,
 }
 
 /// A key that uniquely identifies a cursor.
@@ -326,6 +332,8 @@ pub struct ProgramBuilder {
     cursor_overrides: HashMap<usize, CursorID>,
     /// Physical value locations for resolved HIR sources.
     source_bindings: HashMap<SourceId, SourceBinding>,
+    /// Registers containing already-evaluated resolved HIR outputs.
+    output_bindings: HashMap<OutputId, OutputBinding>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -793,6 +801,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             source_bindings: HashMap::default(),
+            output_bindings: HashMap::default(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -964,6 +973,15 @@ impl ProgramBuilder {
 
     pub(crate) fn source_binding(&self, source: SourceId) -> Option<&SourceBinding> {
         self.source_bindings.get(&source)
+    }
+
+    pub(crate) fn bind_output(&mut self, output: OutputId, register: usize) {
+        self.output_bindings
+            .insert(output, OutputBinding { register });
+    }
+
+    pub(crate) fn output_binding(&self, output: OutputId) -> Option<OutputBinding> {
+        self.output_bindings.get(&output).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -2472,5 +2490,23 @@ mod tests {
             Some(&SourceBinding::Registers { start: 7 })
         );
         assert_eq!(program.source_binding(SourceId::new(2)), None);
+    }
+
+    #[test]
+    fn hir_output_bindings_are_keyed_by_output_identity() {
+        let mut program = program();
+        let block = crate::translate::semantic::hir::QueryBlockId::new(
+            crate::translate::semantic::hir::QueryId::new(0),
+            0,
+        );
+        let output = OutputId::query(block, 0);
+
+        program.bind_output(output, 7);
+
+        assert_eq!(
+            program.output_binding(output),
+            Some(OutputBinding { register: 7 })
+        );
+        assert_eq!(program.output_binding(OutputId::query(block, 1)), None);
     }
 }

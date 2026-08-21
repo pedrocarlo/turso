@@ -138,6 +138,10 @@ or by converting HIR expressions back into parser AST.
 
 Completed:
 
+- HIR output references now read an already-evaluated register bound by
+  `OutputId` in `ProgramBuilder`. Expression lowering never follows the output
+  expression or evaluates volatile output expressions again; whole-query
+  lowering will establish and clear these bindings around each query block.
 - Standalone HIR expression lowering now consumes frozen custom-column,
   custom-CAST, and custom-binary-operator programs directly. Custom binary
   calls preserve legacy operand swapping, literal encoding, result negation,
