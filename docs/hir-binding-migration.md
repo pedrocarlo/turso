@@ -736,11 +736,14 @@ including integer checks, early LIMIT-zero exit, offset skipping, and result-row
 decrement.
 
 Planned single-table B-tree scans now lower directly from HIR. Lowering opens
-the resolved catalog table, binds its `SourceId` to the scan cursor, evaluates
-the plan's unconsumed predicates, emits resolved outputs, and preserves forward
-or backward full-scan, LIMIT, OFFSET, scalar, EXISTS, and result destination
-control flow. Index scans, seeks, joins, and other source kinds remain later
-checkpoints.
+the resolved catalog table or index, binds its `SourceId` to the scan cursor,
+evaluates the plan's unconsumed predicates, emits resolved outputs, and
+preserves forward or backward full-scan, LIMIT, OFFSET, scalar, EXISTS, and
+result destination control flow. The plan freezes whether an index is covering:
+covering scans open only the index, while non-covering scans also open the table
+and use `DeferredSeek`. HIR constraint planning now enforces its already-resolved
+`INDEXED BY` and `NOT INDEXED` choices just as the legacy planner does. Seeks,
+joins, and other source kinds remain later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

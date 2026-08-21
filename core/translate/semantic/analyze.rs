@@ -7094,9 +7094,12 @@ mod tests {
         assert_ne!(target_loop.source, new_source);
         assert!(matches!(
             &target_loop.access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
-                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-            }) if value == "1"
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::RowidEq {
+                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+                },
+                ..
+            } if value == "1"
         ));
 
         let schema = schema_with_join_tables();
@@ -7168,9 +7171,12 @@ mod tests {
         assert_eq!(target_loop.source_position, 0);
         assert!(matches!(
             &target_loop.access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::RowidEq {
-                cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
-            }) if value == "1"
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::RowidEq {
+                    cmp_expr: hir::Expr::Literal(ast::Literal::Numeric(value))
+                },
+                ..
+            } if value == "1"
         ));
         assert_eq!(access.predicates.len(), 1);
         assert!(access.predicates[0].consumed);
@@ -7189,7 +7195,10 @@ mod tests {
         assert!(access.predicates.is_empty());
         assert!(matches!(
             &access.loops[0].access,
-            HirSourceAccess::BTree(SelectedBtreeOperation::Scan { index: None, .. })
+            HirSourceAccess::BTree {
+                operation: SelectedBtreeOperation::Scan { index: None, .. },
+                ..
+            }
         ));
     }
 

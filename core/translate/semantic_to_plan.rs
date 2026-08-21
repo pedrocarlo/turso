@@ -19,7 +19,7 @@ use super::{
     semantic::hir::{self, ColumnUsage, HirDocument, QueryBlockId, QueryId, SourceId},
 };
 use crate::{
-    schema::{Schema, Table},
+    schema::{Index, Schema, Table},
     sync::Arc,
     LimboError, Result,
 };
@@ -151,9 +151,19 @@ pub(crate) struct HirPlannedLoop {
     pub(crate) access: HirSourceAccess,
 }
 
+/// Whether an index scan can supply every referenced value itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BtreeTableLookup {
+    ScanOnly,
+    TableRequired,
+}
+
 /// Selected access for one resolved HIR source.
 pub(crate) enum HirSourceAccess {
-    BTree(HirBtreeOperation),
+    BTree {
+        operation: HirBtreeOperation,
+        table_lookup: BtreeTableLookup,
+    },
     Virtual(HirVirtualTableOperation),
     Derived {
         query: QueryId,
@@ -950,14 +960,26 @@ impl<'a> HirPlanContext<'a> {
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
             let access = match &input.sources[source_position] {
                 HirPlanSource::BTree(source) => match &source.table {
-                    Table::BTree(_) => HirSourceAccess::BTree(apply_hir_selected_btree_access(
-                        source,
-                        &constraints[source_position],
-                        &mut input.predicates,
-                        &mut access_methods[access_method_position],
-                        &prior_sources,
-                        source_position,
-                    )?),
+                    Table::BTree(_) => {
+                        let operation = apply_hir_selected_btree_access(
+                            source,
+                            &constraints[source_position],
+                            &mut input.predicates,
+                            &mut access_methods[access_method_position],
+                            &prior_sources,
+                            source_position,
+                        )?;
+                        let definition = self.definition(source.internal_id);
+                        let table_lookup = selected_btree_index(&operation)
+                            .filter(|index| !source.index_is_covering(definition, index))
+                            .map_or(BtreeTableLookup::ScanOnly, |_| {
+                                BtreeTableLookup::TableRequired
+                            });
+                        HirSourceAccess::BTree {
+                            operation,
+                            table_lookup,
+                        }
+                    }
                     Table::Virtual(_) => {
                         HirSourceAccess::Virtual(apply_hir_selected_virtual_access(
                             &constraints[source_position],
@@ -1125,6 +1147,15 @@ impl<'a> HirPlanContext<'a> {
         }
         planned.register_expression_index_usage(expression.clone(), columns_mask);
         Ok(())
+    }
+}
+
+fn selected_btree_index(operation: &HirBtreeOperation) -> Option<&Index> {
+    match operation {
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_deref(),
+        HirBtreeOperation::RowidEq { .. } => None,
     }
 }
 
@@ -2256,10 +2287,14 @@ mod tests {
         assert_eq!(left_loop.source_position, 0);
         assert_eq!(right_loop.source, right);
         assert_eq!(right_loop.source_position, 1);
-        let HirSourceAccess::BTree(HirBtreeOperation::Seek {
-            index: Some(index),
-            seek_def,
-        }) = &right_loop.access
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index),
+                    seek_def,
+                },
+            ..
+        } = &right_loop.access
         else {
             panic!("right source uses its selected automatic-index seek");
         };
@@ -2808,7 +2843,7 @@ mod tests {
         assert_eq!(mixed_root.blocks[0].loops.len(), 2);
         assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
             source_loop.source == table_source_id
-                && matches!(source_loop.access, HirSourceAccess::BTree(_))
+                && matches!(source_loop.access, HirSourceAccess::BTree { .. })
         }));
         assert!(mixed_root.blocks[0].loops.iter().any(|source_loop| {
             source_loop.source == source_id

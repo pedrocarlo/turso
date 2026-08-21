@@ -12,7 +12,7 @@ use crate::{
         plan::{IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
-        semantic_to_plan::{HirPlan, HirQueryBlockPlan, HirSourceAccess},
+        semantic_to_plan::{BtreeTableLookup, HirPlan, HirQueryBlockPlan, HirSourceAccess},
     },
     util::parse_numeric_literal,
     vdbe::{
@@ -448,10 +448,10 @@ fn emit_single_btree_scan(
             block.id
         )));
     };
-    let HirSourceAccess::BTree(HirBtreeOperation::Scan {
-        iter_dir,
-        index: None,
-    }) = &planned_loop.access
+    let HirSourceAccess::BTree {
+        operation: HirBtreeOperation::Scan { iter_dir, index },
+        table_lookup,
+    } = &planned_loop.access
     else {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} does not use a full table scan",
@@ -494,19 +494,48 @@ fn emit_single_btree_scan(
     let loop_start = program.allocate_label();
     let limit = initialize_limit(program, document, query_limit, done)?;
     program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
-    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let (cursor, table_cursor) = if let Some(index) = index {
+        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        let table_cursor = match table_lookup {
+            BtreeTableLookup::ScanOnly => None,
+            BtreeTableLookup::TableRequired => {
+                Some(program.alloc_cursor_id(CursorType::BTreeTable(table.clone())))
+            }
+        };
+        (index_cursor, table_cursor)
+    } else {
+        if *table_lookup != BtreeTableLookup::ScanOnly {
+            return Err(LimboError::InternalError(format!(
+                "HIR table scan source {} unexpectedly requires a second table cursor",
+                source.id
+            )));
+        }
+        (
+            program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
+            None,
+        )
+    };
     program.bind_source(
         source.id,
         SourceBinding::BTree {
             scan_cursor: cursor,
-            table_cursor: None,
+            table_cursor,
         },
     );
     program.emit_insn(Insn::OpenRead {
         cursor_id: cursor,
-        root_page: table.root_page,
+        root_page: index
+            .as_ref()
+            .map_or(table.root_page, |index| index.root_page),
         db: database.index(),
     });
+    if let Some(table_cursor) = table_cursor {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: table_cursor,
+            root_page: table.root_page,
+            db: database.index(),
+        });
+    }
     match iter_dir {
         IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
             cursor_id: cursor,
@@ -518,6 +547,12 @@ fn emit_single_btree_scan(
         }),
     }
     program.preassign_label_to_next_insn(loop_start);
+    if let Some(table_cursor) = table_cursor {
+        program.emit_insn(Insn::DeferredSeek {
+            index_cursor_id: cursor,
+            table_cursor_id: table_cursor,
+        });
+    }
 
     for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
         if predicate.from_outer_join.is_some() {
@@ -883,6 +918,39 @@ mod tests {
         let (document, schema) = analyze_sql_with_schema(schema, sql);
         HirPlan::build(Arc::new(document), &schema, &CostModelParams::default())
             .expect("HIR query plans")
+    }
+
+    fn indexed_items_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE items(value INTEGER, extra TEXT)", 2)
+                    .expect("fixed table schema parses"),
+            ))
+            .expect("fixed table name is unique");
+        schema
+            .add_index(Arc::new(Index {
+                name: "items_value".to_string(),
+                table_name: "items".to_string(),
+                root_page: 3,
+                columns: vec![IndexColumn {
+                    name: "value".to_string(),
+                    order: SortOrder::Asc,
+                    nulls_order: None,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                has_rowid: true,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            }))
+            .expect("fixed index name is unique");
+        schema
     }
 
     fn root_expression(document: &HirDocument) -> &Expr {
@@ -1600,5 +1668,137 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
+    }
+
+    #[test]
+    fn planned_index_scan_opens_table_only_for_uncovered_columns() {
+        for (sql, table_required) in [
+            ("SELECT value FROM items INDEXED BY items_value", false),
+            ("SELECT extra FROM items INDEXED BY items_value", true),
+        ] {
+            let plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let planned_loop = &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0];
+            let HirSourceAccess::BTree {
+                operation:
+                    HirBtreeOperation::Scan {
+                        index: Some(index), ..
+                    },
+                table_lookup,
+            } = &planned_loop.access
+            else {
+                let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
+                    panic!("INDEXED BY selects B-tree access for {sql}");
+                };
+                panic!("INDEXED BY selects an index scan for {sql}: {operation:?}");
+            };
+            assert_eq!(index.name, "items_value");
+            assert_eq!(
+                *table_lookup,
+                if table_required {
+                    BtreeTableLookup::TableRequired
+                } else {
+                    BtreeTableLookup::ScanOnly
+                }
+            );
+            let source = planned_loop.source;
+            let mut program = program();
+
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("planned index scan emits");
+
+            let SourceBinding::BTree {
+                scan_cursor,
+                table_cursor,
+            } = program
+                .source_binding(source)
+                .copied()
+                .expect("source has a physical binding")
+            else {
+                panic!("index scan binds B-tree cursors");
+            };
+            assert!(matches!(
+                program.get_cursor_type(scan_cursor),
+                Some(CursorType::BTreeIndex(index)) if index.name == "items_value"
+            ));
+            assert_eq!(table_cursor.is_some(), table_required);
+            assert!(program.insns.iter().any(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::OpenRead {
+                        cursor_id,
+                        root_page: 3,
+                        db: MAIN_DB_ID,
+                    } if *cursor_id == scan_cursor
+                )
+            }));
+
+            match table_cursor {
+                Some(table_cursor) => {
+                    assert!(program.insns.iter().any(|(insn, _)| {
+                        matches!(
+                            insn,
+                            Insn::DeferredSeek {
+                                index_cursor_id,
+                                table_cursor_id,
+                            } if *index_cursor_id == scan_cursor
+                                && *table_cursor_id == table_cursor
+                        )
+                    }));
+                    assert!(program.insns.iter().any(|(insn, _)| {
+                        matches!(
+                            insn,
+                            Insn::Column {
+                                cursor_id,
+                                column: 1,
+                                ..
+                            } if *cursor_id == table_cursor
+                        )
+                    }));
+                }
+                None => {
+                    assert!(!program
+                        .insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })));
+                    assert!(program.insns.iter().any(|(insn, _)| {
+                        matches!(
+                            insn,
+                            Insn::Column {
+                                cursor_id,
+                                column: 0,
+                                ..
+                            } if *cursor_id == scan_cursor
+                        )
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn not_indexed_keeps_the_hir_plan_on_the_table() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT value FROM items NOT INDEXED",
+        );
+        let query = root_query(&plan.document);
+        let planned_loop = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0];
+
+        assert!(matches!(
+            &planned_loop.access,
+            HirSourceAccess::BTree {
+                operation: HirBtreeOperation::Scan { index: None, .. },
+                table_lookup: BtreeTableLookup::ScanOnly,
+            }
+        ));
     }
 }
