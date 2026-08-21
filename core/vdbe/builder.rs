@@ -91,6 +91,7 @@ pub(crate) struct OutputBinding {
 pub(crate) enum SubqueryBinding {
     RowValue { start: usize, count: usize },
     Exists { register: usize },
+    InIndex { cursor: CursorID },
 }
 
 /// A key that uniquely identifies a cursor.
@@ -2583,6 +2584,8 @@ mod tests {
 
         program.bind_subquery(row_query, SubqueryBinding::RowValue { start: 7, count: 2 });
         program.bind_subquery(exists_query, SubqueryBinding::Exists { register: 9 });
+        let in_query = QueryId::new(2);
+        program.bind_subquery(in_query, SubqueryBinding::InIndex { cursor: 11 });
 
         assert_eq!(
             program.subquery_binding(row_query),
@@ -2592,6 +2595,10 @@ mod tests {
             program.subquery_binding(exists_query),
             Some(SubqueryBinding::Exists { register: 9 })
         );
-        assert_eq!(program.subquery_binding(QueryId::new(2)), None);
+        assert_eq!(
+            program.subquery_binding(in_query),
+            Some(SubqueryBinding::InIndex { cursor: 11 })
+        );
+        assert_eq!(program.subquery_binding(QueryId::new(3)), None);
     }
 }

@@ -11,7 +11,7 @@ use crate::util::parse_numeric_literal;
 use crate::vdbe::{
     builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
     insn::{CmpInsFlags, Insn},
-    BranchOffset,
+    BranchOffset, CursorID,
 };
 use crate::{LimboError, Numeric, Result, Value};
 use turso_parser::ast::{Literal, Operator, ResolveType, UnaryOperator};
@@ -68,6 +68,13 @@ struct InListRegisters {
     match_label: BranchOffset,
     false_label: BranchOffset,
     null_label: BranchOffset,
+}
+
+#[derive(Clone, Copy)]
+struct InSubqueryRegisters {
+    lhs: usize,
+    width: usize,
+    null_rewind_label: BranchOffset,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +232,7 @@ enum ExprRegisters {
     Between(BetweenRegisters),
     Case(CaseRegisters),
     InList(InListRegisters),
+    InSubquery(InSubqueryRegisters),
     Like(LikeRegisters),
     ConcatWs(ConcatWsRegisters),
     IfNull(IfNullRegisters),
@@ -578,6 +586,10 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
             } => self
                 .binary_child(lhs, rhs, custom.as_ref(), index)
                 .map(|child| child.expression()),
+            hir::Expr::Subquery(hir::SubqueryExpr::In { lhs, .. }) => match lhs.as_ref() {
+                hir::Expr::Row(values) => values.get(index),
+                expression => (index == 0).then_some(expression),
+            },
             _ => expression.child(index),
         }
     }
@@ -1104,6 +1116,41 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                         registers.rhs
                     }
                 }
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::In { comparison, .. }) => {
+                let width = comparison.components.len();
+                if width == 0 {
+                    return Err(LimboError::InternalError(
+                        "HIR IN-subquery comparison has no components".to_string(),
+                    ));
+                }
+                if matches!(context.registers, ExprRegisters::None) {
+                    self.program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: context.target,
+                    });
+                    context.registers = ExprRegisters::InSubquery(InSubqueryRegisters {
+                        lhs: self.program.alloc_registers(width),
+                        width,
+                        null_rewind_label: self.program.allocate_label(),
+                    });
+                }
+                let ExprRegisters::InSubquery(registers) = context.registers else {
+                    unreachable!("IN-subquery registers were allocated")
+                };
+                if child_index >= registers.width {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR IN-subquery operand {child_index} exceeds comparison width {}",
+                        registers.width
+                    )));
+                }
+                if child_index > 0 {
+                    self.emit_in_subquery_null_check(
+                        registers.lhs + child_index - 1,
+                        registers.null_rewind_label,
+                    );
+                }
+                registers.lhs + child_index
             }
             hir::Expr::Like {
                 negated,
@@ -1692,6 +1739,31 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     extra_amount: 0,
                 });
                 Ok(target)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::In {
+                query,
+                negated,
+                comparison,
+                ..
+            }) => {
+                let ExprRegisters::InSubquery(registers) = context.registers else {
+                    unreachable!("IN-subquery registers were allocated")
+                };
+                if children.len() != registers.width {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR IN-subquery has {} lowered operands for comparison width {}",
+                        children.len(),
+                        registers.width
+                    )));
+                }
+                let Some(SubqueryBinding::InIndex { cursor }) =
+                    self.program.subquery_binding(*query)
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR IN subquery {query:?} has no index runtime binding"
+                    )));
+                };
+                self.emit_in_subquery(registers, cursor, *negated, comparison, target)
             }
             hir::Expr::Function(hir::FunctionCall {
                 evaluation: hir::FunctionEvaluation::Aggregate { id, .. },
@@ -3200,6 +3272,139 @@ impl ExprLowerer<'_, '_> {
         Ok(())
     }
 
+    fn emit_in_subquery_null_check(&mut self, register: usize, null_rewind_label: BranchOffset) {
+        // NullRow can make a NOT NULL column read as NULL, so this check cannot
+        // be removed based on the column's declared nullability.
+        self.program.emit_insn(Insn::IsNull {
+            reg: register,
+            target_pc: null_rewind_label,
+        });
+    }
+
+    fn emit_in_subquery(
+        &mut self,
+        registers: InSubqueryRegisters,
+        cursor: CursorID,
+        negated: bool,
+        comparison: &hir::ComparisonSemantics,
+        target: usize,
+    ) -> Result<usize> {
+        if comparison.components.len() != registers.width {
+            return Err(LimboError::InternalError(
+                "HIR IN-subquery comparison width changed while lowering".to_string(),
+            ));
+        }
+        self.emit_in_subquery_null_check(
+            registers.lhs + registers.width - 1,
+            registers.null_rewind_label,
+        );
+
+        if comparison
+            .components
+            .iter()
+            .any(|component| component.affinity != crate::vdbe::affinity::Affinity::Blob)
+        {
+            let count = std::num::NonZeroUsize::new(registers.width)
+                .expect("IN-subquery comparison width was checked");
+            self.program.emit_insn(Insn::Affinity {
+                start_reg: registers.lhs,
+                count,
+                affinities: comparison
+                    .components
+                    .iter()
+                    .map(|component| component.affinity.aff_mask())
+                    .collect(),
+            });
+        }
+
+        let skip_label = self.program.allocate_label();
+        let include_label = self.program.allocate_label();
+        let null_result_label = self.program.allocate_label();
+        let null_loop_label = self.program.allocate_label();
+        let null_next_label = self.program.allocate_label();
+        let no_null_label = if negated { include_label } else { skip_label };
+
+        if negated {
+            self.program.emit_insn(Insn::Found {
+                cursor_id: cursor,
+                target_pc: skip_label,
+                record_reg: registers.lhs,
+                num_regs: registers.width,
+            });
+        } else {
+            self.program.emit_insn(Insn::NotFound {
+                cursor_id: cursor,
+                target_pc: registers.null_rewind_label,
+                record_reg: registers.lhs,
+                num_regs: registers.width,
+            });
+            self.program.emit_insn(Insn::Goto {
+                target_pc: include_label,
+            });
+        }
+
+        self.program
+            .preassign_label_to_next_insn(registers.null_rewind_label);
+        self.program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: no_null_label,
+        });
+        self.program.preassign_label_to_next_insn(null_loop_label);
+        let column = self.program.alloc_register();
+        for (index, component) in comparison.components.iter().enumerate() {
+            self.program.emit_insn(Insn::Column {
+                cursor_id: cursor,
+                column: index,
+                dest: column,
+                default: None,
+            });
+            self.program.emit_insn(Insn::Ne {
+                lhs: registers.lhs + index,
+                rhs: column,
+                target_pc: null_next_label,
+                flags: comparison_flags(component),
+                collation: comparison_collation(component),
+            });
+        }
+        self.program.emit_insn(Insn::Goto {
+            target_pc: null_result_label,
+        });
+        self.program.preassign_label_to_next_insn(null_next_label);
+        self.program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: null_loop_label,
+            fullscan: false,
+        });
+        self.program.emit_insn(Insn::Goto {
+            target_pc: no_null_label,
+        });
+
+        let done_label = self.program.allocate_label();
+        self.program.preassign_label_to_next_insn(include_label);
+        self.program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: target,
+        });
+        self.program.emit_insn(Insn::Goto {
+            target_pc: done_label,
+        });
+        self.program.preassign_label_to_next_insn(skip_label);
+        self.program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: target,
+        });
+        self.program.emit_insn(Insn::Goto {
+            target_pc: done_label,
+        });
+        self.program.preassign_label_to_next_insn(null_result_label);
+        self.program.emit_insn(Insn::Null {
+            dest: target,
+            dest_end: None,
+        });
+        self.program.preassign_label_to_next_insn(done_label);
+        Ok(target)
+    }
+
     fn finish_case_arm(&mut self, registers: &mut CaseRegisters) {
         self.program.emit_insn(Insn::Goto {
             target_pc: registers.return_label,
@@ -4504,6 +4709,125 @@ mod tests {
         let error = super::translate_expr(&mut wrong_width, &row, rhs, 1)
             .expect_err("row subquery runtime width must match HIR");
         assert!(error.to_string().contains("does not match output width"));
+    }
+
+    #[test]
+    fn in_subquery_uses_the_bound_index_and_legacy_null_scan() {
+        let document = analyze_sql(
+            crate::schema::Schema::new(),
+            "SELECT (1, 2) IN (SELECT 3, 4)",
+        );
+        let expression = root_output(&document);
+        let hir::Expr::Subquery(hir::SubqueryExpr::In {
+            query,
+            negated: false,
+            comparison,
+            ..
+        }) = expression
+        else {
+            panic!("output is an IN subquery");
+        };
+        assert_eq!(comparison.components.len(), 2);
+
+        let mut program = program();
+        let target = program.alloc_register();
+        let cursor = 11;
+        program.bind_subquery(*query, SubqueryBinding::InIndex { cursor });
+        super::translate_expr(&mut program, &document, expression, target)
+            .expect("bound IN subquery lowers");
+
+        // Keep the legacy row evaluation order: after each component is
+        // evaluated, branch before evaluating the next component if it is NULL.
+        assert!(matches!(
+            program.insns.as_slice(),
+            [
+                (Insn::Integer { value: 0, dest }, _),
+                (Insn::Integer { value: 1, dest: first }, _),
+                (Insn::IsNull { reg, .. }, _),
+                (Insn::Integer { value: 2, dest: second }, _),
+                (Insn::IsNull { reg: last, .. }, _),
+                ..
+            ] if *dest == target && *reg == *first && *last == *second
+        ));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::NotFound {
+                cursor_id,
+                num_regs: 2,
+                ..
+            } if *cursor_id == cursor
+        )));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Rewind { cursor_id, .. } if *cursor_id == cursor
+        )));
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == cursor))
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::Ne { .. }))
+                .count(),
+            2
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Null { dest, .. } if *dest == target)));
+    }
+
+    #[test]
+    fn not_in_subquery_uses_found_for_the_negated_probe() {
+        let document = analyze_sql(crate::schema::Schema::new(), "SELECT 1 NOT IN (SELECT 2)");
+        let expression = root_output(&document);
+        let hir::Expr::Subquery(hir::SubqueryExpr::In {
+            query,
+            negated: true,
+            ..
+        }) = expression
+        else {
+            panic!("output is a NOT IN subquery");
+        };
+
+        let mut program = program();
+        program.bind_subquery(*query, SubqueryBinding::InIndex { cursor: 12 });
+        super::translate_expr(&mut program, &document, expression, 7)
+            .expect("bound NOT IN subquery lowers");
+
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Found {
+                cursor_id: 12,
+                num_regs: 1,
+                ..
+            }
+        )));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::NotFound { .. })));
+    }
+
+    #[test]
+    fn in_subquery_requires_an_index_binding() {
+        let document = analyze_sql(crate::schema::Schema::new(), "SELECT 1 IN (SELECT 2)");
+        let expression = root_output(&document);
+        let hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. }) = expression else {
+            panic!("output is an IN subquery");
+        };
+        let mut program = program();
+        program.bind_subquery(*query, SubqueryBinding::RowValue { start: 1, count: 1 });
+
+        let error = super::translate_expr(&mut program, &document, expression, 7)
+            .expect_err("IN subquery needs an index cursor");
+        assert!(error.to_string().contains("no index runtime binding"));
     }
 
     #[test]

@@ -706,6 +706,12 @@ expressions, row and row-subquery operands in comparisons and `BETWEEN`, list
 and query `IN`, and `MATCH`. `union_value` is resolved only in
 destination-aware DML expressions.
 
+Standalone HIR lowering now also covers query `IN` probes. `QueryId` maps to
+the ephemeral index cursor owned by query lowering; the probe uses the frozen
+comparison affinity and collation. Its true, false, and NULL branches retain
+the legacy opcode flow, including checking each row-value operand for NULL
+before evaluating the next operand.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
