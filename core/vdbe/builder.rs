@@ -13,7 +13,7 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
-        semantic::hir::{OutputId, SourceId},
+        semantic::hir::{AggregateId, OutputId, SourceId, WindowFunctionId},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -334,6 +334,10 @@ pub struct ProgramBuilder {
     source_bindings: HashMap<SourceId, SourceBinding>,
     /// Registers containing already-evaluated resolved HIR outputs.
     output_bindings: HashMap<OutputId, OutputBinding>,
+    /// Registers containing finalized aggregate results.
+    aggregate_result_registers: HashMap<AggregateId, usize>,
+    /// Registers containing results for the current window row.
+    window_result_registers: HashMap<WindowFunctionId, usize>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -802,6 +806,8 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::default(),
             source_bindings: HashMap::default(),
             output_bindings: HashMap::default(),
+            aggregate_result_registers: HashMap::default(),
+            window_result_registers: HashMap::default(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -982,6 +988,22 @@ impl ProgramBuilder {
 
     pub(crate) fn output_binding(&self, output: OutputId) -> Option<OutputBinding> {
         self.output_bindings.get(&output).copied()
+    }
+
+    pub(crate) fn bind_aggregate_result(&mut self, aggregate: AggregateId, register: usize) {
+        self.aggregate_result_registers.insert(aggregate, register);
+    }
+
+    pub(crate) fn aggregate_result_register(&self, aggregate: AggregateId) -> Option<usize> {
+        self.aggregate_result_registers.get(&aggregate).copied()
+    }
+
+    pub(crate) fn bind_window_result(&mut self, window: WindowFunctionId, register: usize) {
+        self.window_result_registers.insert(window, register);
+    }
+
+    pub(crate) fn window_result_register(&self, window: WindowFunctionId) -> Option<usize> {
+        self.window_result_registers.get(&window).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -2508,5 +2530,30 @@ mod tests {
             Some(OutputBinding { register: 7 })
         );
         assert_eq!(program.output_binding(OutputId::query(block, 1)), None);
+    }
+
+    #[test]
+    fn hir_function_results_are_keyed_by_semantic_identity() {
+        let mut program = program();
+        let block = crate::translate::semantic::hir::QueryBlockId::new(
+            crate::translate::semantic::hir::QueryId::new(0),
+            0,
+        );
+        let aggregate = AggregateId::new(block, 0);
+        let window = WindowFunctionId::new(block, 0);
+
+        program.bind_aggregate_result(aggregate, 7);
+        program.bind_window_result(window, 9);
+
+        assert_eq!(program.aggregate_result_register(aggregate), Some(7));
+        assert_eq!(
+            program.aggregate_result_register(AggregateId::new(block, 1)),
+            None
+        );
+        assert_eq!(program.window_result_register(window), Some(9));
+        assert_eq!(
+            program.window_result_register(WindowFunctionId::new(block, 1)),
+            None
+        );
     }
 }

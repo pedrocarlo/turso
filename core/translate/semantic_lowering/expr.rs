@@ -589,6 +589,19 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
         child_index: usize,
         child: &hir::Expr,
     ) -> Result<ControlFlow<(), LoweringContext>> {
+        // Query lowering evaluates aggregate/window inputs while stepping the
+        // function. Reading its result must not evaluate those inputs again.
+        if matches!(
+            parent,
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Aggregate { .. }
+                    | hir::FunctionEvaluation::Window { .. },
+                ..
+            })
+        ) {
+            return Ok(ControlFlow::Break(()));
+        }
+
         let target = match parent {
             hir::Expr::Column(reference) => {
                 let Some(column_child) = self.column_child(*reference, child_index) else {
@@ -1612,6 +1625,38 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                         extra_amount: 0,
                     });
                 }
+                Ok(target)
+            }
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Aggregate { id, .. },
+                ..
+            }) => {
+                let register = self.program.aggregate_result_register(*id).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR aggregate {id:?} has no runtime result register"
+                    ))
+                })?;
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Window { id, .. },
+                ..
+            }) => {
+                let register = self.program.window_result_register(*id).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR window function {id:?} has no runtime result register"
+                    ))
+                })?;
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
                 Ok(target)
             }
             hir::Expr::Unary { operator, expr } => {
@@ -4182,6 +4227,103 @@ mod tests {
             .expect_err("output needs a runtime binding");
 
         assert!(error.to_string().contains("has no runtime binding"));
+    }
+
+    #[test]
+    fn aggregate_results_use_the_register_bound_by_aggregate_identity() {
+        let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random())");
+        let expression = root_output(&document);
+        let hir::Expr::Function(hir::FunctionCall {
+            evaluation: hir::FunctionEvaluation::Aggregate { id, .. },
+            ..
+        }) = expression
+        else {
+            panic!("sum becomes an aggregate function");
+        };
+
+        let mut program = program();
+        program.bind_aggregate_result(*id, 7);
+        super::translate_expr(&mut program, &document, expression, 7)
+            .expect("bound aggregate lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Copy {
+                    src_reg: 7,
+                    dst_reg: 7,
+                    extra_amount: 0,
+                },
+                _
+            )]
+        ));
+    }
+
+    #[test]
+    fn window_results_use_the_register_bound_by_window_identity() {
+        let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random()) OVER ()");
+        let expression = root_output(&document);
+        let hir::Expr::Function(hir::FunctionCall {
+            evaluation: hir::FunctionEvaluation::Window { id, .. },
+            ..
+        }) = expression
+        else {
+            panic!("sum OVER becomes a window function");
+        };
+
+        let mut program = program();
+        program.bind_window_result(*id, 7);
+        super::translate_expr(&mut program, &document, expression, 9)
+            .expect("bound window function lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(
+                Insn::Copy {
+                    src_reg: 7,
+                    dst_reg: 9,
+                    extra_amount: 0,
+                },
+                _
+            )]
+        ));
+    }
+
+    #[test]
+    fn function_result_lowering_requires_a_runtime_binding() {
+        for sql in ["SELECT count(*)", "SELECT row_number() OVER ()"] {
+            let document = analyze_sql(crate::schema::Schema::new(), sql);
+            let error = super::translate_expr(&mut program(), &document, root_output(&document), 7)
+                .expect_err("query function needs a result register");
+            assert!(error.to_string().contains("has no runtime result register"));
+        }
+    }
+
+    #[test]
+    fn query_function_validation_rejects_out_of_range_result_identities() {
+        for sql in ["SELECT count(*)", "SELECT row_number() OVER ()"] {
+            let mut document = analyze_sql(crate::schema::Schema::new(), sql);
+            let hir::HirRoot::Query(root) = &document.root else {
+                panic!("SELECT produces a query root");
+            };
+            let block = &mut document.queries[root.query.index()].blocks[0];
+            let aggregate_count = block.aggregate_count;
+            let window_function_count = block.window_function_count;
+            let hir::Expr::Function(call) = &mut block.outputs[0].expr else {
+                panic!("output is a query function");
+            };
+            match &mut call.evaluation {
+                hir::FunctionEvaluation::Aggregate { id, .. } => {
+                    id.index = aggregate_count;
+                }
+                hir::FunctionEvaluation::Window { id, .. } => {
+                    id.index = window_function_count;
+                }
+                hir::FunctionEvaluation::Scalar => panic!("query function is not scalar"),
+            }
+
+            assert!(document.validate().is_err());
+        }
     }
 
     #[test]

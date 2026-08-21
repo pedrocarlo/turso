@@ -142,6 +142,10 @@ Completed:
   `OutputId` in `ProgramBuilder`. Expression lowering never follows the output
   expression or evaluates volatile output expressions again; whole-query
   lowering will establish and clear these bindings around each query block.
+- Aggregate and window result reads now use their stable HIR identities to
+  find the result registers owned by `ProgramBuilder`. This replaces the
+  legacy structural expression cache while preserving its unconditional copy
+  and avoiding a second evaluation of arguments or filters.
 - Standalone HIR expression lowering now consumes frozen custom-column,
   custom-CAST, and custom-binary-operator programs directly. Custom binary
   calls preserve legacy operand swapping, literal encoding, result negation,
