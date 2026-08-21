@@ -13,7 +13,7 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
-        semantic::hir::{AggregateId, OutputId, SourceId, WindowFunctionId},
+        semantic::hir::{AggregateId, OutputId, QueryId, SourceId, WindowFunctionId},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -84,6 +84,13 @@ pub(crate) enum SourceBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OutputBinding {
     pub(crate) register: usize,
+}
+
+/// Physical result produced by one non-FROM HIR subquery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubqueryBinding {
+    RowValue { start: usize, count: usize },
+    Exists { register: usize },
 }
 
 /// A key that uniquely identifies a cursor.
@@ -338,6 +345,8 @@ pub struct ProgramBuilder {
     aggregate_result_registers: HashMap<AggregateId, usize>,
     /// Registers containing results for the current window row.
     window_result_registers: HashMap<WindowFunctionId, usize>,
+    /// Runtime results for resolved non-FROM subqueries.
+    subquery_bindings: HashMap<QueryId, SubqueryBinding>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -808,6 +817,7 @@ impl ProgramBuilder {
             output_bindings: HashMap::default(),
             aggregate_result_registers: HashMap::default(),
             window_result_registers: HashMap::default(),
+            subquery_bindings: HashMap::default(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -1004,6 +1014,14 @@ impl ProgramBuilder {
 
     pub(crate) fn window_result_register(&self, window: WindowFunctionId) -> Option<usize> {
         self.window_result_registers.get(&window).copied()
+    }
+
+    pub(crate) fn bind_subquery(&mut self, query: QueryId, binding: SubqueryBinding) {
+        self.subquery_bindings.insert(query, binding);
+    }
+
+    pub(crate) fn subquery_binding(&self, query: QueryId) -> Option<SubqueryBinding> {
+        self.subquery_bindings.get(&query).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
@@ -2555,5 +2573,25 @@ mod tests {
             program.window_result_register(WindowFunctionId::new(block, 1)),
             None
         );
+    }
+
+    #[test]
+    fn hir_subquery_bindings_are_keyed_by_query_identity() {
+        let mut program = program();
+        let row_query = QueryId::new(0);
+        let exists_query = QueryId::new(1);
+
+        program.bind_subquery(row_query, SubqueryBinding::RowValue { start: 7, count: 2 });
+        program.bind_subquery(exists_query, SubqueryBinding::Exists { register: 9 });
+
+        assert_eq!(
+            program.subquery_binding(row_query),
+            Some(SubqueryBinding::RowValue { start: 7, count: 2 })
+        );
+        assert_eq!(
+            program.subquery_binding(exists_query),
+            Some(SubqueryBinding::Exists { register: 9 })
+        );
+        assert_eq!(program.subquery_binding(QueryId::new(2)), None);
     }
 }

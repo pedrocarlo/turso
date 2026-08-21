@@ -68,6 +68,7 @@ use custom_types::*;
 use emission::*;
 #[allow(unused_imports)]
 use functions::*;
+pub(crate) use metadata::assert_register_range_allocated as assert_vector_register_range_allocated;
 #[allow(unused_imports)]
 use metadata::*;
 #[allow(unused_imports)]

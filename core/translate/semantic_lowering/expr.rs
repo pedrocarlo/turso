@@ -9,7 +9,7 @@ use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc};
 use crate::translate::{expr, semantic::hir};
 use crate::util::parse_numeric_literal;
 use crate::vdbe::{
-    builder::{CursorType, ProgramBuilder, SourceBinding},
+    builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
@@ -1625,6 +1625,72 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                         extra_amount: 0,
                     });
                 }
+                Ok(target)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }) => {
+                let Some(SubqueryBinding::RowValue { start, count }) =
+                    self.program.subquery_binding(*query)
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR scalar subquery {query:?} has no row-value runtime binding"
+                    )));
+                };
+                if *output >= count {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR scalar subquery {query:?} output {output} exceeds runtime width {count}"
+                    )));
+                }
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: start + *output,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
+                Ok(target)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) => {
+                let Some(SubqueryBinding::RowValue { start, count }) =
+                    self.program.subquery_binding(*query)
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR row subquery {query:?} has no row-value runtime binding"
+                    )));
+                };
+                let expected = self
+                    .document
+                    .query(*query)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "HIR row subquery references missing query {query:?}"
+                        ))
+                    })?
+                    .output
+                    .len();
+                if count != expected {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR row subquery {query:?} runtime width {count} does not match output width {expected}"
+                    )));
+                }
+                expr::assert_vector_register_range_allocated(self.program, target, count)?;
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: start,
+                    dst_reg: target,
+                    extra_amount: count - 1,
+                });
+                Ok(target)
+            }
+            hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => {
+                let Some(SubqueryBinding::Exists { register }) =
+                    self.program.subquery_binding(*query)
+                else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR EXISTS subquery {query:?} has no EXISTS runtime binding"
+                    )));
+                };
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: register,
+                    dst_reg: target,
+                    extra_amount: 0,
+                });
                 Ok(target)
             }
             hir::Expr::Function(hir::FunctionCall {
@@ -4324,6 +4390,145 @@ mod tests {
 
             assert!(document.validate().is_err());
         }
+    }
+
+    #[test]
+    fn scalar_and_exists_subqueries_copy_their_bound_results() {
+        for (sql, exists) in [
+            ("SELECT (SELECT random())", false),
+            ("SELECT EXISTS (SELECT random())", true),
+        ] {
+            let document = analyze_sql(crate::schema::Schema::new(), sql);
+            let expression = root_output(&document);
+            let query = match expression {
+                hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output: 0 }) => {
+                    assert!(!exists);
+                    *query
+                }
+                hir::Expr::Subquery(hir::SubqueryExpr::Exists(query)) => {
+                    assert!(exists);
+                    *query
+                }
+                _ => panic!("output is the expected subquery kind"),
+            };
+            let mut program = program();
+            let result = program.alloc_register();
+            let target = program.alloc_register();
+            program.bind_subquery(
+                query,
+                if exists {
+                    SubqueryBinding::Exists { register: result }
+                } else {
+                    SubqueryBinding::RowValue {
+                        start: result,
+                        count: 1,
+                    }
+                },
+            );
+
+            super::translate_expr(&mut program, &document, expression, target)
+                .expect("bound subquery result lowers");
+
+            assert!(matches!(
+                program.insns.as_slice(),
+                [(Insn::Copy {
+                    src_reg,
+                    dst_reg,
+                    extra_amount: 0,
+                }, _)] if *src_reg == result && *dst_reg == target
+            ));
+        }
+    }
+
+    #[test]
+    fn row_subquery_copies_its_bound_register_range() {
+        let document = analyze_sql(
+            crate::schema::Schema::new(),
+            "SELECT (1, 2) = (SELECT random(), random())",
+        );
+        let hir::Expr::Binary { rhs, .. } = root_output(&document) else {
+            panic!("output is a row comparison");
+        };
+        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = rhs.as_ref() else {
+            panic!("comparison RHS is a row subquery");
+        };
+        let mut program = program();
+        let result = program.alloc_registers(2);
+        let target = program.alloc_registers(2);
+        program.bind_subquery(
+            *query,
+            SubqueryBinding::RowValue {
+                start: result,
+                count: 2,
+            },
+        );
+
+        super::translate_expr(&mut program, &document, rhs, target)
+            .expect("bound row subquery lowers");
+
+        assert!(matches!(
+            program.insns.as_slice(),
+            [(Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 1,
+            }, _)] if *src_reg == result && *dst_reg == target
+        ));
+    }
+
+    #[test]
+    fn subquery_result_binding_must_match_the_hir_shape() {
+        let scalar = analyze_sql(crate::schema::Schema::new(), "SELECT (SELECT 1)");
+        let hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) = root_output(&scalar)
+        else {
+            panic!("output is a scalar subquery");
+        };
+        let mut wrong_kind = program();
+        wrong_kind.bind_subquery(*query, SubqueryBinding::Exists { register: 1 });
+        let error = super::translate_expr(&mut wrong_kind, &scalar, root_output(&scalar), 1)
+            .expect_err("scalar subquery needs row-value storage");
+        assert!(error.to_string().contains("no row-value runtime binding"));
+
+        let row = analyze_sql(
+            crate::schema::Schema::new(),
+            "SELECT (1, 2) = (SELECT 3, 4)",
+        );
+        let hir::Expr::Binary { rhs, .. } = root_output(&row) else {
+            panic!("output is a row comparison");
+        };
+        let hir::Expr::Subquery(hir::SubqueryExpr::Row { query }) = rhs.as_ref() else {
+            panic!("comparison RHS is a row subquery");
+        };
+        let mut wrong_width = program();
+        wrong_width.bind_subquery(*query, SubqueryBinding::RowValue { start: 1, count: 1 });
+        let error = super::translate_expr(&mut wrong_width, &row, rhs, 1)
+            .expect_err("row subquery runtime width must match HIR");
+        assert!(error.to_string().contains("does not match output width"));
+    }
+
+    #[test]
+    fn scalar_subquery_validation_rejects_an_out_of_range_output() {
+        let mut document = analyze_sql(crate::schema::Schema::new(), "SELECT (SELECT 1)");
+        let hir::HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces a query root");
+        };
+        let root_query = root.query;
+        let hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, .. }) =
+            &document.queries[root_query.index()].blocks[0].outputs[0].expr
+        else {
+            panic!("output is a scalar subquery");
+        };
+        let output = document.queries[query.index()].output.len();
+        let hir::Expr::Subquery(hir::SubqueryExpr::Scalar {
+            output: invalid_output,
+            ..
+        }) = &mut document.queries[root_query.index()].blocks[0].outputs[0].expr
+        else {
+            unreachable!("scalar subquery shape was checked");
+        };
+        *invalid_output = output;
+
+        assert!(document.validate().is_err());
     }
 
     #[test]

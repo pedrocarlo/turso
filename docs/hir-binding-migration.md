@@ -146,6 +146,10 @@ Completed:
   find the result registers owned by `ProgramBuilder`. This replaces the
   legacy structural expression cache while preserving its unconditional copy
   and avoiding a second evaluation of arguments or filters.
+- Scalar, row-value, and EXISTS subqueries now read runtime results through a
+  `QueryId`-keyed binding in `ProgramBuilder`. Row widths are checked against
+  the validated HIR query output, and row copies reuse the legacy target-range
+  invariant instead of converting the subquery back into parser AST.
 - Standalone HIR expression lowering now consumes frozen custom-column,
   custom-CAST, and custom-binary-operator programs directly. Custom binary
   calls preserve legacy operand swapping, literal encoding, result negation,

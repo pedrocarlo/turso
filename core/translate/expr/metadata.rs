@@ -123,7 +123,7 @@ pub(super) fn emit_cond_jump(
     }
 }
 
-pub(super) fn assert_register_range_allocated(
+pub(crate) fn assert_register_range_allocated(
     program: &mut ProgramBuilder,
     start_register: usize,
     count: usize,
