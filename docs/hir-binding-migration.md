@@ -718,6 +718,12 @@ comparison metadata. Destination allocation installs the matching `QueryId`
 binding in `ProgramBuilder`, and correlation comes from the query's frozen
 capture set. Query-body emission remains the next lowering boundary.
 
+Prepared HIR subqueries now use the existing execution shell: uncorrelated
+queries receive `Once`, scalar and EXISTS results are initialized inside a
+subroutine, and query `IN` opens its prepared ephemeral index. Scalar/list EQP
+nodes and correlated re-execution retain the legacy opcode behavior. The shell
+accepts a HIR query-body emitter and does not depend on AST plans or a resolver.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
