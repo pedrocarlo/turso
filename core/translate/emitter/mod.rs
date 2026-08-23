@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{InSeekLoop, LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -1044,16 +1044,8 @@ pub struct TranslateCtx<'a> {
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
-    pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    pub meta_in_seeks: Vec<Option<InSeekLoop>>,
     pub unsafe_testing: bool,
-}
-
-/// Metadata for the two-level loop emitted by `Search::InSeek`.
-#[derive(Debug)]
-pub struct InSeekMetadata {
-    pub ephemeral_cursor_id: CursorID,
-    pub outer_loop_start: BranchOffset,
-    pub next_val_label: BranchOffset,
 }
 
 impl<'a> TranslateCtx<'a> {

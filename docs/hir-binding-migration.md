@@ -758,6 +758,14 @@ the existing affinity, NULL matching, forward/backward bound, covering-index,
 table lookup, and `DeferredSeek` behavior. Automatic-index seeks, `IN` seeks,
 and joins remain later checkpoints.
 
+Single-table `IN` seeks now lower from HIR through the same two-level loop as
+legacy plans. Literal values use resolved HIR expression lowering while the
+shared materializer keeps the unique ephemeral index, affinity, and duplicate
+handling. Query sources reuse their prepared `QueryId` index binding. Rowid
+lookups still use `SeekRowid`; index lookups still use `SeekGE`/`IdxGT`, scan
+duplicate keys, and defer table lookup only when the selected index is not
+covering. Joins and automatic indexes remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

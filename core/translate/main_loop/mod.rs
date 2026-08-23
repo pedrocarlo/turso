@@ -3,8 +3,8 @@ use turso_parser::ast::{Expr, SortOrder, TableInternalId};
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
-        InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
-        TranslateCtx, UpdateRowSource,
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
+        UpdateRowSource,
     },
     expr::{
         expr_references_subquery_id, translate_condition_expr, translate_expr,
@@ -64,6 +64,9 @@ pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;
 use close::{emit_autoindex, AutoIndexResult};
 use in_seek::open_in_seek_source_cursor;
+pub(crate) use in_seek::{
+    emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
+};
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;

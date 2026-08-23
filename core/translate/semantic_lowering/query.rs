@@ -8,8 +8,11 @@ use crate::{
     translate::{
         eqp::EqpDetail,
         expr::ConditionMetadata,
-        main_loop::{SeekEmitter, SeekExpressionLowering},
-        optimizer::HirBtreeOperation,
+        main_loop::{
+            emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, SeekEmitter,
+            SeekExpressionLowering,
+        },
+        optimizer::{HirBtreeOperation, HirInSeekSource},
         plan::{IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
@@ -42,6 +45,34 @@ struct DestinationBinding {
 struct QueryLimitRegisters {
     limit: usize,
     offset: Option<usize>,
+}
+
+fn open_hir_in_seek_source_cursor(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    index: Option<&Arc<Index>>,
+    source: &HirInSeekSource,
+) -> Result<usize> {
+    match source {
+        HirInSeekSource::Values { values, affinity } => open_in_seek_values_cursor(
+            program,
+            index,
+            values,
+            *affinity,
+            |program, expression, target| {
+                super::expr::translate_expr_no_constant_opt(program, document, expression, target)
+                    .map(|_| ())
+            },
+        ),
+        HirInSeekSource::Query { query } => {
+            let Some(SubqueryBinding::InIndex { cursor }) = program.subquery_binding(*query) else {
+                return Err(LimboError::InternalError(format!(
+                    "HIR IN seek query {query} has no index runtime binding"
+                )));
+            };
+            Ok(cursor)
+        }
+    }
 }
 
 struct HirSeekExpressionLowering<'a> {
@@ -553,16 +584,10 @@ fn emit_single_btree_loop(
         )));
     };
     let index = match operation {
-        HirBtreeOperation::Scan { index, .. } | HirBtreeOperation::Seek { index, .. } => {
-            index.as_ref()
-        }
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
         HirBtreeOperation::RowidEq { .. } => None,
-        _ => {
-            return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} does not use a supported B-tree loop",
-                block.id
-            )));
-        }
     };
     let source = document.source(planned_loop.source).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -640,6 +665,7 @@ fn emit_single_btree_loop(
             db: database.index(),
         });
     }
+    let mut in_seek = None;
     match operation {
         HirBtreeOperation::Scan { iter_dir, .. } => {
             match iter_dir {
@@ -684,13 +710,26 @@ fn emit_single_btree_loop(
             )
             .emit(loop_start, false)?;
         }
-        _ => unreachable!("supported B-tree operation checked above"),
+        HirBtreeOperation::InSeek { source, .. } => {
+            let source_cursor = open_hir_in_seek_source_cursor(program, document, index, source)?;
+            in_seek = Some(emit_in_seek_start(
+                program,
+                source_cursor,
+                cursor,
+                table_cursor,
+                index.is_some(),
+                loop_start,
+                done,
+            ));
+        }
     }
-    if let Some(table_cursor) = table_cursor {
-        program.emit_insn(Insn::DeferredSeek {
-            index_cursor_id: cursor,
-            table_cursor_id: table_cursor,
-        });
+    if !matches!(operation, HirBtreeOperation::InSeek { .. }) {
+        if let Some(table_cursor) = table_cursor {
+            program.emit_insn(Insn::DeferredSeek {
+                index_cursor_id: cursor,
+                table_cursor_id: table_cursor,
+            });
+        }
     }
 
     for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
@@ -750,6 +789,16 @@ fn emit_single_btree_loop(
                 fullscan: matches!(operation, HirBtreeOperation::Scan { .. }),
             }),
         }
+    } else if matches!(operation, HirBtreeOperation::InSeek { .. }) {
+        emit_in_seek_advance(
+            program,
+            in_seek
+                .as_ref()
+                .expect("HIR IN seek start must produce loop state"),
+            cursor,
+            index.is_some(),
+            loop_start,
+        );
     }
     program.preassign_label_to_next_insn(done);
     Ok(())
@@ -1135,6 +1184,20 @@ mod tests {
             }
             _ => panic!("root expression contains the expected subquery"),
         }
+    }
+
+    fn root_filter_subquery(document: &HirDocument) -> &SubqueryExpr {
+        let query = document
+            .query(root_query(document))
+            .expect("root query exists");
+        let hir::QueryBlockBody::Select {
+            filter: Some(Expr::Subquery(subquery)),
+            ..
+        } = &query.blocks[0].body
+        else {
+            panic!("root filter is a subquery expression");
+        };
+        subquery
     }
 
     #[test]
@@ -2079,8 +2142,9 @@ mod tests {
                 program
                     .insns
                     .iter()
-                    .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })),
-                table_required
+                    .filter(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. }))
+                    .count(),
+                usize::from(table_required)
             );
         }
 
@@ -2129,6 +2193,232 @@ mod tests {
         assert!(program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::Ge { .. } | Insn::Gt { .. } | Insn::Le { .. } | Insn::Lt { .. }
+        )));
+    }
+
+    #[test]
+    fn planned_hir_in_lists_use_the_shared_two_level_loop() {
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT value FROM items WHERE rowid IN (1, 2, 2)",
+        );
+        let query = root_query(&plan.document);
+        assert!(matches!(
+            &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0]
+                .access,
+            HirSourceAccess::BTree {
+                operation: HirBtreeOperation::InSeek {
+                    index: None,
+                    source: HirInSeekSource::Values { values, .. },
+                },
+                ..
+            } if values.len() == 3
+        ));
+        let mut rowid_program = program();
+
+        emit_planned_query_body(
+            &mut rowid_program,
+            &plan,
+            query,
+            &QueryDestination::ResultRows,
+        )
+        .expect("planned rowid IN seek emits");
+
+        assert_eq!(
+            rowid_program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::IdxInsert { .. }))
+                .count(),
+            3
+        );
+        assert!(rowid_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SeekRowid { .. })));
+        assert!(!rowid_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
+
+        for (sql, table_required) in [
+            (
+                "SELECT value FROM items INDEXED BY items_value WHERE value IN (1, 2, 2)",
+                false,
+            ),
+            (
+                "SELECT extra FROM items INDEXED BY items_value WHERE value IN (1, 2, 2)",
+                true,
+            ),
+        ] {
+            let mut plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let values = match &plan
+                .document
+                .query(query)
+                .expect("root query exists")
+                .blocks[0]
+                .body
+            {
+                hir::QueryBlockBody::Select {
+                    filter: Some(Expr::InList { values, .. }),
+                    ..
+                } => values.clone(),
+                _ => panic!("indexed test has an IN-list filter"),
+            };
+            let planned_query = plan
+                .queries
+                .iter_mut()
+                .find(|planned| planned.query == query)
+                .expect("root query is planned");
+            let HirSourceAccess::BTree { operation, .. } =
+                &mut planned_query.blocks[0].loops[0].access
+            else {
+                panic!("indexed IN uses a B-tree plan");
+            };
+            let HirBtreeOperation::Scan {
+                index: Some(index), ..
+            } = operation
+            else {
+                panic!("cost model starts from the requested index");
+            };
+            *operation = HirBtreeOperation::InSeek {
+                index: Some(index.clone()),
+                source: HirInSeekSource::Values {
+                    values,
+                    affinity: Affinity::Integer,
+                },
+            };
+            let planned_loop = &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0];
+            let HirSourceAccess::BTree {
+                operation,
+                table_lookup,
+            } = &planned_loop.access
+            else {
+                panic!("indexed IN uses a B-tree plan");
+            };
+            assert!(
+                matches!(
+                    operation,
+                    HirBtreeOperation::InSeek {
+                        index: Some(index),
+                        source: HirInSeekSource::Values { .. },
+                    } if index.name == "items_value"
+                ),
+                "unexpected indexed IN operation for {sql}: {operation:?}"
+            );
+            assert_eq!(
+                *table_lookup,
+                if table_required {
+                    BtreeTableLookup::TableRequired
+                } else {
+                    BtreeTableLookup::ScanOnly
+                }
+            );
+            let mut program = program();
+
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("planned indexed IN seek emits");
+
+            assert!(program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SeekGE { is_index: true, .. })));
+            assert!(program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
+            assert_eq!(
+                program
+                    .insns
+                    .iter()
+                    .filter(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. }))
+                    .count(),
+                usize::from(table_required)
+            );
+            assert_eq!(
+                program
+                    .insns
+                    .iter()
+                    .filter(|(insn, _)| matches!(
+                        insn,
+                        Insn::Next {
+                            fullscan: false,
+                            ..
+                        }
+                    ))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn planned_hir_in_subquery_reuses_its_prepared_index() {
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT value FROM items WHERE rowid IN (VALUES (1), (2))",
+        );
+        let query = root_query(&plan.document);
+        let subquery = root_filter_subquery(&plan.document);
+        let SubqueryExpr::In {
+            query: source_query,
+            ..
+        } = subquery
+        else {
+            panic!("root filter is an IN subquery");
+        };
+        assert!(matches!(
+            &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .loops[0]
+                .access,
+            HirSourceAccess::BTree {
+                operation: HirBtreeOperation::InSeek {
+                    source: HirInSeekSource::Query { query },
+                    ..
+                },
+                ..
+            } if query == source_query
+        ));
+        let mut program = program();
+        let prepared = prepare_subquery(&mut program, &plan.document, subquery)
+            .expect("IN subquery destination prepares");
+        let Some(SubqueryBinding::InIndex {
+            cursor: source_cursor,
+        }) = program.subquery_binding(*source_query)
+        else {
+            panic!("IN subquery has an index binding");
+        };
+        emit_prepared_subquery(&mut program, &prepared, |program, query, destination| {
+            emit_planned_query_body(program, &plan, query, destination)
+        })
+        .expect("IN subquery emits");
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("planned query IN seek emits");
+
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Rewind { cursor_id, .. } if *cursor_id == source_cursor
+        )));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Column {
+                cursor_id,
+                column: 0,
+                ..
+            } if *cursor_id == source_cursor
         )));
     }
 
