@@ -808,8 +808,16 @@ HIR adapter binds each resolved recursive-input `SourceId` directly to the
 dequeued registers. UNION ALL, UNION seen-row filtering, queue ordering and
 collation, NULL ordering, LIMIT, and OFFSET keep the existing runtime behavior.
 No parser expression, resolver scope, or synthetic table reference is rebuilt.
-Compound seed queries and correlated recursive bodies remain with the compound
-and correlated-query checkpoints.
+Compound seed queries now use compound HIR lowering. Correlated recursive
+bodies remain with the correlated-query checkpoint.
+
+Compound SELECT lowering now consumes prepared HIR blocks directly. UNION ALL
+shares one LIMIT/OFFSET state across its arms. UNION, EXCEPT, and INTERSECT use
+the existing ephemeral-index opcode flow with resolved output collations.
+Compound ORDER BY uses resolved output identities, HIR type facts, collations,
+sort direction, and NULL ordering; LIMIT/OFFSET is applied after sorting. This
+also permits compound recursive CTE seed queries without rebuilding AST nodes.
+Ordinary single-block ORDER BY and DISTINCT remain later checkpoints.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR

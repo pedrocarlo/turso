@@ -3,23 +3,28 @@
 use turso_parser::ast::{CompoundOperator, Literal, SortOrder};
 
 use crate::{
-    schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Table, Type},
+    LimboError, Numeric, Result, Value, emit_explain,
+    schema::{
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, PseudoCursorType,
+        Table, Type,
+    },
     sync::Arc,
     translate::{
-        eqp::EqpDetail,
+        eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod},
         expr::ConditionMetadata,
         main_loop::{
-            emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
             AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
+            emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource, HirVirtualTableOperation},
+        order_by::{custom_type_comparator_from_type_fact, sorter_insert},
         plan::{
             self, EphemeralRowidMode, HirCteMaterialization, HirSeekDef, IterationDirection,
             QueryDestination,
         },
         recursive_cte::{
-            emit_recursive_runtime, RecursivePhase, RecursiveRuntimeLimit, RecursiveRuntimeOrder,
-            RecursiveRuntimeSpec,
+            RecursivePhase, RecursiveRuntimeLimit, RecursiveRuntimeOrder, RecursiveRuntimeSpec,
+            emit_recursive_runtime,
         },
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
@@ -29,14 +34,13 @@ use crate::{
     },
     util::parse_numeric_literal,
     vdbe::{
+        BranchOffset, CursorID,
         affinity::Affinity,
         builder::{
             CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding, SubqueryBinding,
         },
-        insn::Insn,
-        BranchOffset, CursorID,
+        insn::{Insn, SorterOpenData},
     },
-    LimboError, Numeric, Result, Value,
 };
 
 /// Physical destination and execution facts for one expression subquery.
@@ -434,7 +438,20 @@ pub(crate) fn emit_query_body(
 
     let done = program.allocate_label();
     let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
-    let result = match &block.body {
+    let result = emit_query_block_without_from(program, document, block, destination, limit, done);
+    program.preassign_label_to_next_insn(done);
+    result
+}
+
+fn emit_query_block_without_from(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
+) -> Result<()> {
+    match &block.body {
         hir::QueryBlockBody::Select {
             distinctness: None,
             filter,
@@ -501,9 +518,7 @@ pub(crate) fn emit_query_body(
             "HIR query block {:?} has unsupported non-FROM clauses",
             block.id
         ))),
-    };
-    program.preassign_label_to_next_insn(done);
-    result
+    }
 }
 
 /// Emit one planned HIR query whose source loop is a full B-tree scan.
@@ -523,17 +538,54 @@ pub(crate) fn emit_planned_query_body(
             "HIR lowering references unplanned query {query_id}"
         ))
     })?;
-    if query.blocks.len() != 1
-        || planned_query.blocks.len() != 1
-        || !query.compounds.is_empty()
-        || !query.order_by.is_empty()
+    if query.blocks.len() != planned_query.blocks.len()
+        || query.compounds.len() + 1 != query.blocks.len()
     {
         return Err(LimboError::InternalError(format!(
-            "HIR query {query_id} is not a supported single-block query body"
+            "HIR query {query_id} has inconsistent compound access plans"
         )));
     }
-    let block = &query.blocks[0];
-    let block_plan = &planned_query.blocks[0];
+    if query.compounds.is_empty() && !query.order_by.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "HIR query {query_id} is not a supported ordered single-block query"
+        )));
+    }
+
+    if !query.compounds.is_empty() {
+        return emit_hir_compound_query(program, plan, query, destination);
+    }
+
+    let done = program.allocate_label();
+    let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
+    emit_planned_query_block(program, plan, query, 0, destination, limit, done)?;
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+fn emit_planned_query_block(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    block_index: usize,
+    destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
+) -> Result<()> {
+    let block = query.blocks.get(block_index).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR query {} references missing block {block_index}",
+            query.id
+        ))
+    })?;
+    let planned_query = plan.planned_query(query.id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR lowering references unplanned query {}",
+            query.id
+        ))
+    })?;
+    let block_plan = planned_query.blocks.get(block_index).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR query block {:?} has no access plan", block.id))
+    })?;
     if block_plan.block != block.id {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} has mismatched access plan {:?}",
@@ -541,16 +593,597 @@ pub(crate) fn emit_planned_query_body(
         )));
     }
     if block.from.is_none() {
-        return emit_query_body(program, document, query_id, destination);
+        if block.aggregate_count != 0
+            || block.window_function_count != 0
+            || !block.windows.is_empty()
+        {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} is not a supported non-FROM query body",
+                block.id
+            )));
+        }
+        return emit_query_block_without_from(
+            program,
+            &plan.document,
+            block,
+            destination,
+            limit,
+            done,
+        );
     }
-    emit_btree_loops(
+    emit_btree_loops(program, plan, block, block_plan, destination, limit, done)
+}
+
+fn emit_hir_compound_query(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    destination: &QueryDestination,
+) -> Result<()> {
+    emit_explain!(program, true, EqpDetail::Compound);
+    let result = if query.order_by.is_empty() {
+        let done = program.allocate_label();
+        let limit = initialize_limit(program, &plan.document, query.limit.as_ref(), done)?;
+        emit_hir_compound_prefix(
+            program,
+            plan,
+            query,
+            query.blocks.len() - 1,
+            destination,
+            limit,
+            done,
+        )?;
+        program.preassign_label_to_next_insn(done);
+        Ok(())
+    } else {
+        let (collection_cursor, collection_index) = open_hir_compound_index(
+            program,
+            query,
+            0,
+            query.blocks.len() - 1,
+            "compound_collection",
+            true,
+        )?;
+        let collection_destination = QueryDestination::EphemeralIndex {
+            cursor_id: collection_cursor,
+            index: collection_index.clone(),
+            affinity_str: None,
+            is_delete: false,
+        };
+        let collection_done = program.allocate_label();
+        emit_hir_compound_prefix(
+            program,
+            plan,
+            query,
+            query.blocks.len() - 1,
+            &collection_destination,
+            None,
+            collection_done,
+        )?;
+        program.preassign_label_to_next_insn(collection_done);
+        emit_hir_compound_order_by(
+            program,
+            &plan.document,
+            query,
+            collection_cursor,
+            destination,
+        )
+    };
+    program.pop_current_parent_explain();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_compound_prefix(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    last_block: usize,
+    destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
+) -> Result<()> {
+    if last_block == 0 {
+        emit_explain!(
+            program,
+            true,
+            EqpDetail::CompoundArm {
+                op: EqpCompoundOp::LeftMost,
+                temp_btree: false,
+            }
+        );
+        let result = emit_planned_query_block(program, plan, query, 0, destination, limit, done);
+        program.pop_current_parent_explain();
+        return result;
+    }
+
+    let operator = query.compounds[last_block - 1].operator;
+    match operator {
+        CompoundOperator::UnionAll => {
+            emit_hir_compound_prefix(
+                program,
+                plan,
+                query,
+                last_block - 1,
+                destination,
+                limit,
+                done,
+            )?;
+            emit_hir_compound_arm_explain(program, operator, false, |program| {
+                emit_planned_query_block(program, plan, query, last_block, destination, limit, done)
+            })
+        }
+        CompoundOperator::Union | CompoundOperator::Except => {
+            let (cursor, index) = open_hir_compound_index(
+                program,
+                query,
+                last_block - 1,
+                last_block,
+                "compound_dedupe",
+                false,
+            )?;
+            let insert_destination = QueryDestination::EphemeralIndex {
+                cursor_id: cursor,
+                index: index.clone(),
+                affinity_str: None,
+                is_delete: false,
+            };
+            emit_hir_compound_prefix(
+                program,
+                plan,
+                query,
+                last_block - 1,
+                &insert_destination,
+                None,
+                done,
+            )?;
+            let arm_destination = QueryDestination::EphemeralIndex {
+                cursor_id: cursor,
+                index: index.clone(),
+                affinity_str: None,
+                is_delete: operator == CompoundOperator::Except,
+            };
+            emit_hir_compound_arm_explain(program, operator, true, |program| {
+                emit_planned_query_block(
+                    program,
+                    plan,
+                    query,
+                    last_block,
+                    &arm_destination,
+                    None,
+                    done,
+                )
+            })?;
+            emit_hir_deduplicated_rows(program, cursor, &index, limit, destination, done)
+        }
+        CompoundOperator::Intersect => {
+            let (left_cursor, left_index) = open_hir_compound_index(
+                program,
+                query,
+                last_block - 1,
+                last_block,
+                "compound_intersect_left",
+                false,
+            )?;
+            let left_destination = QueryDestination::EphemeralIndex {
+                cursor_id: left_cursor,
+                index: left_index.clone(),
+                affinity_str: None,
+                is_delete: false,
+            };
+            emit_hir_compound_prefix(
+                program,
+                plan,
+                query,
+                last_block - 1,
+                &left_destination,
+                None,
+                done,
+            )?;
+
+            let (right_cursor, right_index) = open_hir_compound_index(
+                program,
+                query,
+                last_block - 1,
+                last_block,
+                "compound_intersect_right",
+                false,
+            )?;
+            let right_destination = QueryDestination::EphemeralIndex {
+                cursor_id: right_cursor,
+                index: right_index,
+                affinity_str: None,
+                is_delete: false,
+            };
+            emit_hir_compound_arm_explain(program, operator, true, |program| {
+                emit_planned_query_block(
+                    program,
+                    plan,
+                    query,
+                    last_block,
+                    &right_destination,
+                    None,
+                    done,
+                )
+            })?;
+            emit_hir_intersect_rows(
+                program,
+                left_cursor,
+                &left_index,
+                right_cursor,
+                limit,
+                destination,
+                done,
+            )
+        }
+    }
+}
+
+fn emit_hir_compound_arm_explain(
+    program: &mut ProgramBuilder,
+    operator: CompoundOperator,
+    temp_btree: bool,
+    emit: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let op = match operator {
+        CompoundOperator::Union => EqpCompoundOp::Union,
+        CompoundOperator::UnionAll => EqpCompoundOp::UnionAll,
+        CompoundOperator::Except => EqpCompoundOp::Except,
+        CompoundOperator::Intersect => EqpCompoundOp::Intersect,
+    };
+    emit_explain!(program, true, EqpDetail::CompoundArm { op, temp_btree });
+    let result = emit(program);
+    program.pop_current_parent_explain();
+    result
+}
+
+fn open_hir_compound_index(
+    program: &mut ProgramBuilder,
+    query: &hir::Query,
+    left_block: usize,
+    right_block: usize,
+    name: &str,
+    has_rowid: bool,
+) -> Result<(CursorID, Arc<Index>)> {
+    let left = query.blocks.get(left_block).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR compound query has no block {left_block}"))
+    })?;
+    let right = query.blocks.get(right_block).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR compound query has no block {right_block}"))
+    })?;
+    if left.outputs.len() != right.outputs.len() || left.outputs.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "HIR compound blocks {:?} and {:?} have inconsistent widths",
+            left.id, right.id
+        )));
+    }
+    let mut columns = Vec::with_capacity(left.outputs.len());
+    for (position, (left, right)) in left.outputs.iter().zip(&right.outputs).enumerate() {
+        columns.push(IndexColumn {
+            name: left.name.clone(),
+            order: SortOrder::Asc,
+            nulls_order: None,
+            pos_in_table: position,
+            collation: left
+                .collation
+                .as_ref()
+                .or(right.collation.as_ref())
+                .map(|collation| *collation.value()),
+            default: None,
+            expr: None,
+        });
+    }
+    let index = Arc::new(Index {
+        name: name.to_string(),
+        table_name: String::new(),
+        root_page: 0,
+        columns,
+        unique: false,
+        ephemeral: true,
+        has_rowid,
+        where_clause: None,
+        index_method: None,
+        on_conflict: None,
+    });
+    let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: false,
+    });
+    Ok((cursor, index))
+}
+
+fn emit_hir_deduplicated_rows(
+    program: &mut ProgramBuilder,
+    cursor: CursorID,
+    index: &Index,
+    limit: Option<QueryLimitRegisters>,
+    destination: &QueryDestination,
+    done: BranchOffset,
+) -> Result<()> {
+    let close = program.allocate_label();
+    let next = program.allocate_label();
+    let loop_start = program.allocate_label();
+    let columns = program.alloc_registers(index.columns.len());
+    program.emit_insn(Insn::Rewind {
+        cursor_id: cursor,
+        pc_if_empty: close,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    emit_before_row(program, limit, next);
+    for column in 0..index.columns.len() {
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column,
+            dest: columns + column,
+            default: None,
+        });
+    }
+    emit_columns_to_destination(program, destination, columns, index.columns.len())?;
+    emit_after_row(
         program,
-        plan,
-        query.limit.as_ref(),
-        block,
-        block_plan,
-        destination,
-    )
+        limit,
+        destination_stops_after_first_row(destination),
+        done,
+    );
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        pc_if_next: loop_start,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(close);
+    program.emit_insn(Insn::Close { cursor_id: cursor });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_intersect_rows(
+    program: &mut ProgramBuilder,
+    left_cursor: CursorID,
+    index: &Index,
+    right_cursor: CursorID,
+    limit: Option<QueryLimitRegisters>,
+    destination: &QueryDestination,
+    done: BranchOffset,
+) -> Result<()> {
+    let close = program.allocate_label();
+    let next = program.allocate_label();
+    let loop_start = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: left_cursor,
+        pc_if_empty: close,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    let record = program.alloc_register();
+    program.emit_insn(Insn::RowData {
+        cursor_id: left_cursor,
+        dest: record,
+    });
+    program.emit_insn(Insn::NotFound {
+        cursor_id: right_cursor,
+        target_pc: next,
+        record_reg: record,
+        num_regs: 0,
+    });
+    emit_before_row(program, limit, next);
+    let columns = program.alloc_registers(index.columns.len());
+    for column in 0..index.columns.len() {
+        program.emit_insn(Insn::Column {
+            cursor_id: left_cursor,
+            column,
+            dest: columns + column,
+            default: None,
+        });
+    }
+    emit_columns_to_destination(program, destination, columns, index.columns.len())?;
+    emit_after_row(
+        program,
+        limit,
+        destination_stops_after_first_row(destination),
+        done,
+    );
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::Next {
+        cursor_id: left_cursor,
+        pc_if_next: loop_start,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(close);
+    program.emit_insn(Insn::Close {
+        cursor_id: right_cursor,
+    });
+    program.emit_insn(Insn::Close {
+        cursor_id: left_cursor,
+    });
+    Ok(())
+}
+
+fn emit_hir_compound_order_by(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    query: &hir::Query,
+    collection_cursor: CursorID,
+    destination: &QueryDestination,
+) -> Result<()> {
+    let output_count = query.blocks[0].outputs.len();
+    let mut order_positions = Vec::with_capacity(query.order_by.len());
+    let mut order_collations_nulls = Vec::with_capacity(query.order_by.len() + 1);
+    let mut comparators = Vec::with_capacity(query.order_by.len() + 1);
+    for term in &query.order_by {
+        let position = hir_compound_order_position(query, &term.expr)?;
+        order_positions.push(position);
+        order_collations_nulls.push((
+            term.order,
+            term.collation.as_ref().map(|collation| *collation.value()),
+            term.nulls,
+        ));
+        comparators.push(custom_type_comparator_from_type_fact(&term.type_fact));
+    }
+    order_collations_nulls.push((SortOrder::Asc, None, None));
+    comparators.push(None);
+
+    let sequence_slot = order_positions.len();
+    let data_start = sequence_slot + 1;
+    let mut data_columns = 0;
+    let mut remappings = Vec::with_capacity(output_count);
+    for output in 0..output_count {
+        if let Some(sort_key) = order_positions
+            .iter()
+            .position(|position| *position == output)
+        {
+            remappings.push((sort_key, true));
+        } else {
+            remappings.push((data_start + data_columns, false));
+            data_columns += 1;
+        }
+    }
+    let sorter_column_count = data_start + data_columns;
+    let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(SorterOpenData {
+            cursor_id: sort_cursor,
+            columns: order_collations_nulls.len(),
+            order_collations_nulls,
+            comparators,
+        }),
+    });
+
+    let collection_done = program.allocate_label();
+    let collection_loop = program.allocate_label();
+    let read_registers = program.alloc_registers(output_count + 1);
+    let sequence_register = read_registers + output_count;
+    program.emit_insn(Insn::Rewind {
+        cursor_id: collection_cursor,
+        pc_if_empty: collection_done,
+    });
+    program.preassign_label_to_next_insn(collection_loop);
+    for output in 0..output_count {
+        program.emit_insn(Insn::Column {
+            cursor_id: collection_cursor,
+            column: output,
+            dest: read_registers + output,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::Column {
+        cursor_id: collection_cursor,
+        column: output_count,
+        dest: sequence_register,
+        default: None,
+    });
+
+    let sorter_registers = program.alloc_registers(sorter_column_count);
+    for (sort_key, output) in order_positions.iter().enumerate() {
+        program.emit_insn(Insn::Copy {
+            src_reg: read_registers + output,
+            dst_reg: sorter_registers + sort_key,
+            extra_amount: 0,
+        });
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: sequence_register,
+        dst_reg: sorter_registers + sequence_slot,
+        extra_amount: 0,
+    });
+    let mut data_column = data_start;
+    for (output, (_, deduplicated)) in remappings.iter().enumerate() {
+        if !deduplicated {
+            program.emit_insn(Insn::Copy {
+                src_reg: read_registers + output,
+                dst_reg: sorter_registers + data_column,
+                extra_amount: 0,
+            });
+            data_column += 1;
+        }
+    }
+    let sorter_record = program.alloc_register();
+    sorter_insert(
+        program,
+        sorter_registers,
+        sorter_column_count,
+        sort_cursor,
+        sorter_record,
+    );
+    program.emit_insn(Insn::Next {
+        cursor_id: collection_cursor,
+        pc_if_next: collection_loop,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(collection_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: collection_cursor,
+    });
+
+    emit_explain!(
+        program,
+        false,
+        EqpDetail::OrderBy {
+            method: EqpSortMethod::Sorter,
+        }
+    );
+    let sort_loop = program.allocate_label();
+    let sort_next = program.allocate_label();
+    let sort_done = program.allocate_label();
+    let limit = initialize_limit(program, document, query.limit.as_ref(), sort_done)?;
+    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: sorter_column_count,
+    }));
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo_cursor,
+        content_reg: sorter_record,
+        num_fields: sorter_column_count,
+    });
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sort_cursor,
+        pc_if_empty: sort_done,
+    });
+    program.preassign_label_to_next_insn(sort_loop);
+    emit_before_row(program, limit, sort_next);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: sort_cursor,
+        dest_reg: sorter_record,
+        pseudo_cursor,
+    });
+    let result_registers = program.alloc_registers(output_count);
+    for (output, (sorter_column, _)) in remappings.iter().enumerate() {
+        program.emit_column_or_rowid(pseudo_cursor, *sorter_column, result_registers + output);
+    }
+    emit_columns_to_destination(program, destination, result_registers, output_count)?;
+    emit_after_row(
+        program,
+        limit,
+        destination_stops_after_first_row(destination),
+        sort_done,
+    );
+    program.preassign_label_to_next_insn(sort_next);
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sort_cursor,
+        pc_if_next: sort_loop,
+    });
+    program.preassign_label_to_next_insn(sort_done);
+    Ok(())
+}
+
+fn hir_compound_order_position(query: &hir::Query, expression: &hir::Expr) -> Result<usize> {
+    let mut expression = expression;
+    while let hir::Expr::Collate { expr, .. } = expression {
+        expression = expr;
+    }
+    let hir::Expr::Output(output) = expression else {
+        return Err(LimboError::InternalError(format!(
+            "HIR compound ORDER BY expression is not an output reference: {expression:?}"
+        )));
+    };
+    query.blocks[0]
+        .outputs
+        .iter()
+        .position(|candidate| candidate.id == *output)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR compound ORDER BY references missing output {output:?}"
+            ))
+        })
 }
 
 enum HirLoopAdvance {
@@ -661,10 +1294,11 @@ enum HirPredicateKind {
 fn emit_btree_loops(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
-    query_limit: Option<&hir::Limit>,
     block: &hir::QueryBlock,
     block_plan: &HirQueryBlockPlan,
     destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
 ) -> Result<()> {
     let document = &plan.document;
     if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
@@ -709,8 +1343,7 @@ fn emit_btree_loops(
         )));
     }
 
-    let done = program.allocate_label();
-    let limit = initialize_limit(program, document, query_limit, done)?;
+    let block_done = program.allocate_label();
     let prepared_loops = block_plan
         .loops
         .iter()
@@ -724,7 +1357,7 @@ fn emit_btree_loops(
         document,
         block_plan,
         None,
-        done,
+        block_done,
         HirPredicateKind::Where,
         &left_joins,
     )?;
@@ -792,7 +1425,7 @@ fn emit_btree_loops(
     for hir_loop in loops.iter().rev() {
         close_hir_btree_loop(program, hir_loop, &left_joins);
     }
-    program.preassign_label_to_next_insn(done);
+    program.preassign_label_to_next_insn(block_done);
     Ok(())
 }
 
@@ -880,15 +1513,17 @@ fn prepare_hir_left_joins(
                     })
                     .collect::<Vec<_>>()
             } else {
-                vec![block_plan
-                    .loops
-                    .iter()
-                    .position(|planned_loop| planned_loop.source == *owner)
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "HIR LEFT JOIN owner {owner} has no physical loop"
-                        ))
-                    })?]
+                vec![
+                    block_plan
+                        .loops
+                        .iter()
+                        .position(|planned_loop| planned_loop.source == *owner)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "HIR LEFT JOIN owner {owner} has no physical loop"
+                            ))
+                        })?,
+                ]
             };
             let Some((&first_loop, &last_loop)) = loop_indices.first().zip(loop_indices.last())
             else {
@@ -1022,7 +1657,7 @@ fn prepare_hir_virtual_loop<'a>(
             return Err(LimboError::InternalError(format!(
                 "HIR virtual-table loop source {} is not a table",
                 source.id
-            )))
+            )));
         }
     };
     let Table::Virtual(table) = table.value() else {
@@ -1190,7 +1825,7 @@ fn emit_hir_recursive_cte(
             return Err(LimboError::InternalError(format!(
                 "recursive CTE {} does not use UNION or UNION ALL",
                 cte.id
-            )))
+            )));
         }
     };
     if recursive.arms.iter().any(|arm| {
@@ -2247,20 +2882,20 @@ fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> Destinat
 mod tests {
     use super::*;
     use crate::{
+        MAIN_DB_ID, SymbolTable,
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
         translate::{
             optimizer::CostModelParams,
             semantic::{
+                SemanticOptions, SemanticRootInput,
                 catalog::{SemanticCatalog, SemanticCatalogDatabase},
                 context::DoubleQuotedDml,
                 hir::{self, Expr, HirRoot},
-                SemanticOptions, SemanticRootInput,
             },
             semantic_to_plan::HirPlan,
         },
         vdbe::builder::{ProgramBuilderOpts, QueryMode},
-        SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
 
@@ -2507,6 +3142,166 @@ mod tests {
     }
 
     #[test]
+    fn planned_compound_operators_use_hir_blocks_and_existing_index_operations() {
+        for (sql, expected) in [
+            ("SELECT 1 UNION SELECT 1", "union"),
+            ("SELECT 1 EXCEPT SELECT 2", "except"),
+            ("SELECT 1 INTERSECT SELECT 1", "intersect"),
+        ] {
+            let plan = analyze_plan(Schema::new(), sql);
+            let query = root_query(&plan.document);
+            let mut program = program();
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("compound HIR query emits");
+            program.resolve_labels().expect("compound labels resolve");
+
+            assert!(program.insns.iter().any(|(insn, _)| matches!(
+                insn,
+                Insn::OpenEphemeral {
+                    is_table: false,
+                    ..
+                }
+            )));
+            match expected {
+                "union" => assert!(
+                    program
+                        .insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::IdxInsert { .. }))
+                ),
+                "except" => assert!(
+                    program
+                        .insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
+                ),
+                "intersect" => assert!(
+                    program
+                        .insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::NotFound { .. }))
+                ),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn planned_union_all_shares_limit_and_offset_across_arms() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "SELECT 1 UNION ALL SELECT 2 LIMIT 1 OFFSET 1",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("UNION ALL HIR query emits");
+        program.resolve_labels().expect("compound labels resolve");
+
+        assert!(
+            !program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. }))
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::ResultRow { .. }))
+                .count(),
+            2
+        );
+        let limit_registers = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::DecrJumpZero { reg, .. } => Some(*reg),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(limit_registers.len(), 2);
+        assert!(
+            limit_registers
+                .iter()
+                .all(|register| *register == limit_registers[0])
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn planned_compound_order_by_sorts_before_shared_limit_and_offset() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "SELECT 2 AS value UNION ALL SELECT 1 ORDER BY value DESC LIMIT 1 OFFSET 1",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("ordered compound HIR query emits");
+        program.resolve_labels().expect("compound labels resolve");
+
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SorterOpen { .. }))
+        );
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn planned_recursive_cte_accepts_compound_seed_query() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "WITH RECURSIVE seq(x) AS (\
+                 SELECT 1 UNION ALL SELECT 10 \
+                 UNION ALL SELECT x + 1 FROM seq WHERE x < 3\
+             ) SELECT x FROM seq",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("recursive CTE with compound seed emits from HIR");
+        program
+            .resolve_labels()
+            .expect("recursive compound labels resolve");
+
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
+        );
+        assert!(
+            !program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. }))
+        );
+    }
+
+    #[test]
     fn scalar_row_and_exists_destinations_install_matching_bindings() {
         for sql in [
             "SELECT (SELECT 1)",
@@ -2612,11 +3407,13 @@ mod tests {
             .expect("correlated subquery destination prepares");
 
         assert!(prepared.correlated);
-        assert!(!document
-            .query(prepared.query)
-            .expect("subquery exists")
-            .captures
-            .is_empty());
+        assert!(
+            !document
+                .query(prepared.query)
+                .expect("subquery exists")
+                .captures
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2722,10 +3519,12 @@ mod tests {
             .expect("correlated wrapper emits");
 
         assert!(prepared.correlated);
-        assert!(!program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Once { .. })));
+        assert!(
+            !program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Once { .. }))
+        );
     }
 
     #[test]
@@ -2776,25 +3575,29 @@ mod tests {
         .expect("constant SELECT emits");
 
         let start = match program.insns.as_slice() {
-            [(
-                Insn::Integer {
-                    value: 1,
-                    dest: first,
-                },
-                _,
-            ), (
-                Insn::Integer {
-                    value: 2,
-                    dest: second,
-                },
-                _,
-            ), (
-                Insn::ResultRow {
-                    start_reg,
-                    count: 2,
-                },
-                _,
-            )] if *second == *first + 1 && *start_reg == *first => *first,
+            [
+                (
+                    Insn::Integer {
+                        value: 1,
+                        dest: first,
+                    },
+                    _,
+                ),
+                (
+                    Insn::Integer {
+                        value: 2,
+                        dest: second,
+                    },
+                    _,
+                ),
+                (
+                    Insn::ResultRow {
+                        start_reg,
+                        count: 2,
+                    },
+                    _,
+                ),
+            ] if *second == *first + 1 && *start_reg == *first => *first,
             _ => panic!("constant SELECT keeps consecutive output registers"),
         };
         for (position, output) in outputs.iter().enumerate() {
@@ -2855,14 +3658,18 @@ mod tests {
             |program, query, destination| emit_query_body(program, &scalar, query, destination),
         )
         .expect("scalar query emits");
-        assert!(scalar_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 1, .. })));
-        assert!(!scalar_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 2, .. })));
+        assert!(
+            scalar_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Integer { value: 1, .. }))
+        );
+        assert!(
+            !scalar_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Integer { value: 2, .. }))
+        );
         assert_eq!(
             scalar_program
                 .insns
@@ -2908,10 +3715,12 @@ mod tests {
             |program, query, destination| emit_query_body(program, &exists, query, destination),
         )
         .expect("EXISTS query emits");
-        assert!(!exists_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Function { .. })));
+        assert!(
+            !exists_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Function { .. }))
+        );
         let QueryDestination::ExistsSubqueryResult { result_reg } = prepared.destination else {
             panic!("EXISTS uses its result destination");
         };
@@ -2928,10 +3737,12 @@ mod tests {
             &QueryDestination::ResultRows,
         )
         .expect("array SELECT emits");
-        assert!(array_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. })));
+        assert!(
+            array_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. }))
+        );
     }
 
     #[test]
@@ -3186,14 +3997,18 @@ mod tests {
             )
         });
         assert!(open < rewind && rewind < filter && filter < result && result < next);
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+        );
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
+        );
     }
 
     #[test]
@@ -3453,10 +4268,12 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. })));
+        assert!(
+            !program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. }))
+        );
     }
 
     #[test]
@@ -3507,18 +4324,24 @@ mod tests {
                 .count(),
             1
         );
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Goto { .. })));
-        assert!(!program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
+        );
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Goto { .. }))
+        );
+        assert!(
+            !program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. }))
+        );
     }
 
     #[test]
@@ -3552,10 +4375,12 @@ mod tests {
                 .count(),
             2
         );
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Found { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Found { .. }))
+        );
     }
 
     #[test]
@@ -3591,18 +4416,24 @@ mod tests {
             panic!("recursive queue uses an ephemeral index");
         };
         assert_eq!(queue.columns[0].order, SortOrder::Desc);
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
+        );
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+        );
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
+        );
     }
 
     #[cfg(feature = "json")]
@@ -3638,10 +4469,12 @@ mod tests {
             program.get_cursor_type(cursor),
             Some(CursorType::VirtualTable(_))
         ));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::VOpen { cursor_id } if *cursor_id == cursor)));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::VOpen { cursor_id } if *cursor_id == cursor))
+        );
         assert!(program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::VFilter {
@@ -4494,10 +5327,12 @@ mod tests {
                     }));
                 }
                 None => {
-                    assert!(!program
-                        .insns
-                        .iter()
-                        .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })));
+                    assert!(
+                        !program
+                            .insns
+                            .iter()
+                            .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. }))
+                    );
                     assert!(program.insns.iter().any(|(insn, _)| {
                         matches!(
                             insn,
@@ -4580,10 +5415,12 @@ mod tests {
                     Insn::SeekRowid { cursor_id, .. } if *cursor_id == scan_cursor
                 )
             }));
-            assert!(!program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. })));
+            assert!(
+                !program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. }))
+            );
         }
     }
 
@@ -4699,10 +5536,12 @@ mod tests {
                 ..
             }
         )));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::RowId { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::RowId { .. }))
+        );
         assert!(program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::Ge { .. } | Insn::Gt { .. } | Insn::Le { .. } | Insn::Lt { .. }
@@ -4749,14 +5588,18 @@ mod tests {
                 .count(),
             3
         );
-        assert!(rowid_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::SeekRowid { .. })));
-        assert!(!rowid_program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
+        assert!(
+            rowid_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SeekRowid { .. }))
+        );
+        assert!(
+            !rowid_program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. }))
+        );
 
         for (sql, table_required) in [
             (
@@ -4841,14 +5684,18 @@ mod tests {
             emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
                 .expect("planned indexed IN seek emits");
 
-            assert!(program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::SeekGE { is_index: true, .. })));
-            assert!(program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
+            assert!(
+                program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::SeekGE { is_index: true, .. }))
+            );
+            assert!(
+                program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. }))
+            );
             assert_eq!(
                 program
                     .insns
@@ -4997,9 +5844,11 @@ mod tests {
                 ..
             } if *cursor_id == cursor
         )));
-        assert!(program
-            .insns
-            .iter()
-            .any(|(insn, _)| matches!(insn, Insn::Le { .. })));
+        assert!(
+            program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Le { .. }))
+        );
     }
 }
