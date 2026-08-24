@@ -1,9 +1,10 @@
 //! Runtime destination preparation for resolved HIR queries.
 
-use turso_parser::ast::{CompoundOperator, Literal, SortOrder};
+use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
 
+use crate::translate::collate::CollationSeq;
 use crate::{
-    LimboError, Numeric, Result, Value, emit_explain,
+    emit_explain,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, PseudoCursorType,
         Table, Type,
@@ -13,8 +14,8 @@ use crate::{
         eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod},
         expr::ConditionMetadata,
         main_loop::{
-            AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
             emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
+            AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource, HirVirtualTableOperation},
         order_by::{custom_type_comparator_from_type_fact, sorter_insert},
@@ -23,8 +24,8 @@ use crate::{
             QueryDestination,
         },
         recursive_cte::{
-            RecursivePhase, RecursiveRuntimeLimit, RecursiveRuntimeOrder, RecursiveRuntimeSpec,
-            emit_recursive_runtime,
+            emit_recursive_runtime, RecursivePhase, RecursiveRuntimeLimit, RecursiveRuntimeOrder,
+            RecursiveRuntimeSpec,
         },
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
@@ -34,13 +35,14 @@ use crate::{
     },
     util::parse_numeric_literal,
     vdbe::{
-        BranchOffset, CursorID,
         affinity::Affinity,
         builder::{
             CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding, SubqueryBinding,
         },
-        insn::{Insn, SorterOpenData},
+        insn::{HashDistinctData, Insn, SorterOpenData},
+        BranchOffset, CursorID,
     },
+    LimboError, Numeric, Result, Value,
 };
 
 /// Physical destination and execution facts for one expression subquery.
@@ -60,6 +62,54 @@ struct DestinationBinding {
 struct QueryLimitRegisters {
     limit: usize,
     offset: Option<usize>,
+}
+
+struct HirDistinctOutput {
+    hash_table: usize,
+    collations: Vec<CollationSeq>,
+}
+
+#[derive(Clone, Copy)]
+enum HirSortKeySource {
+    Output(usize),
+    EncodedOutput(usize),
+    Expression,
+}
+
+struct HirSorterOutput<'a> {
+    cursor: CursorID,
+    record: usize,
+    row: usize,
+    column_count: usize,
+    order_by: &'a [hir::OrderTerm],
+    key_sources: Vec<HirSortKeySource>,
+    output_columns: Vec<usize>,
+}
+
+enum HirRowTarget<'a> {
+    Direct {
+        destination: &'a QueryDestination,
+        limit: Option<QueryLimitRegisters>,
+        done: BranchOffset,
+    },
+    Sorter(&'a HirSorterOutput<'a>),
+}
+
+struct HirRowOutput<'a> {
+    target: HirRowTarget<'a>,
+    distinct: Option<&'a HirDistinctOutput>,
+}
+
+impl HirRowOutput<'_> {
+    fn needs_values(&self) -> bool {
+        self.distinct.is_some()
+            || match self.target {
+                HirRowTarget::Direct { destination, .. } => {
+                    !matches!(destination, QueryDestination::ExistsSubqueryResult { .. })
+                }
+                HirRowTarget::Sorter(_) => true,
+            }
+    }
 }
 
 fn open_hir_in_seek_source_cursor(
@@ -419,7 +469,7 @@ pub(crate) fn emit_query_body(
     let query = document.query(query_id).ok_or_else(|| {
         LimboError::InternalError(format!("HIR lowering references missing query {query_id}"))
     })?;
-    if query.blocks.len() != 1 || !query.compounds.is_empty() || !query.order_by.is_empty() {
+    if query.blocks.len() != 1 || !query.compounds.is_empty() {
         return Err(LimboError::InternalError(format!(
             "HIR query {query_id} is not a supported non-FROM query body"
         )));
@@ -437,27 +487,48 @@ pub(crate) fn emit_query_body(
     }
 
     let done = program.allocate_label();
+    let distinct = initialize_hir_distinct(program, block)?;
+    let sorter = (!query.order_by.is_empty())
+        .then(|| initialize_hir_sorter(program, query, block))
+        .transpose()?;
     let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
-    let result = emit_query_block_without_from(program, document, block, destination, limit, done);
+    let output = if let Some(sorter) = sorter.as_ref() {
+        HirRowOutput {
+            target: HirRowTarget::Sorter(sorter),
+            distinct: distinct.as_ref(),
+        }
+    } else {
+        HirRowOutput {
+            target: HirRowTarget::Direct {
+                destination,
+                limit,
+                done,
+            },
+            distinct: distinct.as_ref(),
+        }
+    };
+    emit_query_block_without_from(program, document, block, &output, done)?;
+    if let Some(sorter) = sorter.as_ref() {
+        emit_hir_sorted_rows(program, block, sorter, destination, limit, done)?;
+    }
     program.preassign_label_to_next_insn(done);
-    result
+    Ok(())
 }
 
 fn emit_query_block_without_from(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     block: &hir::QueryBlock,
-    destination: &QueryDestination,
-    limit: Option<QueryLimitRegisters>,
-    done: BranchOffset,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
 ) -> Result<()> {
     match &block.body {
         hir::QueryBlockBody::Select {
-            distinctness: None,
             filter,
             grouping: None,
+            ..
         } => {
-            let start = query_output_registers(program, destination, &block.outputs)?;
+            let start = query_output_registers(program, &block.outputs, output.needs_values())?;
             if let Some(filter) = filter {
                 let emit_row = program.allocate_label();
                 super::expr::translate_condition_expr(
@@ -467,49 +538,47 @@ fn emit_query_block_without_from(
                     ConditionMetadata {
                         jump_if_condition_is_true: false,
                         jump_target_when_true: emit_row,
-                        jump_target_when_false: done,
-                        jump_target_when_null: done,
+                        jump_target_when_false: block_done,
+                        jump_target_when_null: block_done,
                     },
                 )?;
                 program.preassign_label_to_next_insn(emit_row);
             }
-            emit_before_row(program, limit, done);
             emit_query_row(
                 program,
                 document,
-                destination,
+                output,
                 &block.outputs,
                 block.outputs.iter().map(|output| &output.expr),
                 start,
+                block_done,
             )?;
-            emit_after_row(
-                program,
-                limit,
-                destination_stops_after_first_row(destination),
-                done,
-            );
             Ok(())
         }
         hir::QueryBlockBody::Values { rows } => {
-            let start = query_output_registers(program, destination, &block.outputs)?;
-            let stop_after_first = destination_stops_after_first_row(destination);
+            let start = query_output_registers(program, &block.outputs, output.needs_values())?;
             for row in rows {
                 let next_row = program.allocate_label();
-                emit_before_row(program, limit, next_row);
                 emit_query_row(
                     program,
                     document,
-                    destination,
+                    output,
                     &block.outputs,
                     row.iter(),
                     start,
+                    next_row,
                 )?;
-                let needs_runtime_stop =
-                    stop_after_first && limit.and_then(|limit| limit.offset).is_some();
-                emit_after_row(program, limit, needs_runtime_stop, done);
                 program.preassign_label_to_next_insn(next_row);
-                if stop_after_first && !needs_runtime_stop {
-                    break;
+                if let HirRowTarget::Direct {
+                    destination, limit, ..
+                } = &output.target
+                {
+                    let stop_after_first = destination_stops_after_first_row(destination);
+                    let needs_runtime_stop =
+                        stop_after_first && limit.and_then(|limit| limit.offset).is_some();
+                    if stop_after_first && !needs_runtime_stop {
+                        break;
+                    }
                 }
             }
             Ok(())
@@ -545,19 +614,36 @@ pub(crate) fn emit_planned_query_body(
             "HIR query {query_id} has inconsistent compound access plans"
         )));
     }
-    if query.compounds.is_empty() && !query.order_by.is_empty() {
-        return Err(LimboError::InternalError(format!(
-            "HIR query {query_id} is not a supported ordered single-block query"
-        )));
-    }
-
     if !query.compounds.is_empty() {
         return emit_hir_compound_query(program, plan, query, destination);
     }
 
+    let block = &query.blocks[0];
     let done = program.allocate_label();
+    let distinct = initialize_hir_distinct(program, block)?;
+    let sorter = (!query.order_by.is_empty())
+        .then(|| initialize_hir_sorter(program, query, block))
+        .transpose()?;
     let limit = initialize_limit(program, document, query.limit.as_ref(), done)?;
-    emit_planned_query_block(program, plan, query, 0, destination, limit, done)?;
+    let output = if let Some(sorter) = sorter.as_ref() {
+        HirRowOutput {
+            target: HirRowTarget::Sorter(sorter),
+            distinct: distinct.as_ref(),
+        }
+    } else {
+        HirRowOutput {
+            target: HirRowTarget::Direct {
+                destination,
+                limit,
+                done,
+            },
+            distinct: distinct.as_ref(),
+        }
+    };
+    emit_planned_query_block_with_output(program, plan, query, 0, &output, done)?;
+    if let Some(sorter) = sorter.as_ref() {
+        emit_hir_sorted_rows(program, block, sorter, destination, limit, done)?;
+    }
     program.preassign_label_to_next_insn(done);
     Ok(())
 }
@@ -570,6 +656,32 @@ fn emit_planned_query_block(
     destination: &QueryDestination,
     limit: Option<QueryLimitRegisters>,
     done: BranchOffset,
+) -> Result<()> {
+    let block = query.blocks.get(block_index).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR query {} references missing block {block_index}",
+            query.id
+        ))
+    })?;
+    let distinct = initialize_hir_distinct(program, block)?;
+    let output = HirRowOutput {
+        target: HirRowTarget::Direct {
+            destination,
+            limit,
+            done,
+        },
+        distinct: distinct.as_ref(),
+    };
+    emit_planned_query_block_with_output(program, plan, query, block_index, &output, done)
+}
+
+fn emit_planned_query_block_with_output(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    block_index: usize,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
 ) -> Result<()> {
     let block = query.blocks.get(block_index).ok_or_else(|| {
         LimboError::InternalError(format!(
@@ -602,16 +714,9 @@ fn emit_planned_query_block(
                 block.id
             )));
         }
-        return emit_query_block_without_from(
-            program,
-            &plan.document,
-            block,
-            destination,
-            limit,
-            done,
-        );
+        return emit_query_block_without_from(program, &plan.document, block, output, block_done);
     }
-    emit_btree_loops(program, plan, block, block_plan, destination, limit, done)
+    emit_btree_loops(program, plan, block, block_plan, output)
 }
 
 fn emit_hir_compound_query(
@@ -1115,52 +1220,23 @@ fn emit_hir_compound_order_by(
         cursor_id: collection_cursor,
     });
 
-    emit_explain!(
-        program,
-        false,
-        EqpDetail::OrderBy {
-            method: EqpSortMethod::Sorter,
-        }
-    );
-    let sort_loop = program.allocate_label();
-    let sort_next = program.allocate_label();
     let sort_done = program.allocate_label();
     let limit = initialize_limit(program, document, query.limit.as_ref(), sort_done)?;
-    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: sorter_column_count,
-    }));
-    program.emit_insn(Insn::OpenPseudo {
-        cursor_id: pseudo_cursor,
-        content_reg: sorter_record,
-        num_fields: sorter_column_count,
-    });
-    program.emit_insn(Insn::SorterSort {
-        cursor_id: sort_cursor,
-        pc_if_empty: sort_done,
-    });
-    program.preassign_label_to_next_insn(sort_loop);
-    emit_before_row(program, limit, sort_next);
-    program.emit_insn(Insn::SorterData {
-        cursor_id: sort_cursor,
-        dest_reg: sorter_record,
-        pseudo_cursor,
-    });
-    let result_registers = program.alloc_registers(output_count);
-    for (output, (sorter_column, _)) in remappings.iter().enumerate() {
-        program.emit_column_or_rowid(pseudo_cursor, *sorter_column, result_registers + output);
-    }
-    emit_columns_to_destination(program, destination, result_registers, output_count)?;
-    emit_after_row(
+    let output_columns = remappings
+        .iter()
+        .map(|(sorter_column, _)| *sorter_column)
+        .collect::<Vec<_>>();
+    emit_hir_sorter_rows(
         program,
+        &query.blocks[0].outputs,
+        sort_cursor,
+        sorter_record,
+        sorter_column_count,
+        &output_columns,
+        destination,
         limit,
-        destination_stops_after_first_row(destination),
         sort_done,
-    );
-    program.preassign_label_to_next_insn(sort_next);
-    program.emit_insn(Insn::SorterNext {
-        cursor_id: sort_cursor,
-        pc_if_next: sort_loop,
-    });
+    )?;
     program.preassign_label_to_next_insn(sort_done);
     Ok(())
 }
@@ -1296,9 +1372,7 @@ fn emit_btree_loops(
     plan: &HirPlan,
     block: &hir::QueryBlock,
     block_plan: &HirQueryBlockPlan,
-    destination: &QueryDestination,
-    limit: Option<QueryLimitRegisters>,
-    done: BranchOffset,
+    output: &HirRowOutput<'_>,
 ) -> Result<()> {
     let document = &plan.document;
     if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
@@ -1307,12 +1381,7 @@ fn emit_btree_loops(
             block.id
         )));
     }
-    let hir::QueryBlockBody::Select {
-        distinctness: None,
-        grouping: None,
-        ..
-    } = &block.body
-    else {
+    let hir::QueryBlockBody::Select { grouping: None, .. } = &block.body else {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} has unsupported B-tree loop clauses",
             block.id
@@ -1405,22 +1474,16 @@ fn emit_btree_loops(
     }
 
     let innermost_next = loops.last().expect("loop list is non-empty").next;
-    emit_before_row(program, limit, innermost_next);
-    let start = query_output_registers(program, destination, &block.outputs)?;
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
     emit_query_row(
         program,
         document,
-        destination,
+        output,
         &block.outputs,
         block.outputs.iter().map(|output| &output.expr),
         start,
+        innermost_next,
     )?;
-    emit_after_row(
-        program,
-        limit,
-        destination_stops_after_first_row(destination),
-        done,
-    );
 
     for hir_loop in loops.iter().rev() {
         close_hir_btree_loop(program, hir_loop, &left_joins);
@@ -1513,17 +1576,15 @@ fn prepare_hir_left_joins(
                     })
                     .collect::<Vec<_>>()
             } else {
-                vec![
-                    block_plan
-                        .loops
-                        .iter()
-                        .position(|planned_loop| planned_loop.source == *owner)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "HIR LEFT JOIN owner {owner} has no physical loop"
-                            ))
-                        })?,
-                ]
+                vec![block_plan
+                    .loops
+                    .iter()
+                    .position(|planned_loop| planned_loop.source == *owner)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "HIR LEFT JOIN owner {owner} has no physical loop"
+                        ))
+                    })?]
             };
             let Some((&first_loop, &last_loop)) = loop_indices.first().zip(loop_indices.last())
             else {
@@ -2644,6 +2705,308 @@ fn close_hir_btree_loop(
     }
 }
 
+fn initialize_hir_distinct(
+    program: &mut ProgramBuilder,
+    block: &hir::QueryBlock,
+) -> Result<Option<HirDistinctOutput>> {
+    let hir::QueryBlockBody::Select { distinctness, .. } = &block.body else {
+        return Ok(None);
+    };
+    if !matches!(distinctness, Some(Distinctness::Distinct)) {
+        return Ok(None);
+    }
+    if block.outputs.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "DISTINCT HIR query block {:?} has no outputs",
+            block.id
+        )));
+    }
+    let hash_table = program.alloc_hash_table_id();
+    program.emit_insn(Insn::HashClear {
+        hash_table_id: hash_table,
+    });
+    emit_explain!(program, false, EqpDetail::Distinct);
+    Ok(Some(HirDistinctOutput {
+        hash_table,
+        collations: block
+            .outputs
+            .iter()
+            .map(|output| {
+                output
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or(CollationSeq::Binary)
+            })
+            .collect(),
+    }))
+}
+
+fn initialize_hir_sorter<'a>(
+    program: &mut ProgramBuilder,
+    query: &'a hir::Query,
+    block: &hir::QueryBlock,
+) -> Result<HirSorterOutput<'a>> {
+    if query.order_by.is_empty() || block.outputs.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "ordered HIR query block {:?} has no ordering or outputs",
+            block.id
+        )));
+    }
+
+    let mut key_sources = Vec::with_capacity(query.order_by.len());
+    let mut order_collations_nulls = Vec::with_capacity(query.order_by.len());
+    let mut comparators = Vec::with_capacity(query.order_by.len());
+    for term in &query.order_by {
+        let output = hir_order_output_position(block, &term.expr);
+        let custom = term
+            .type_fact
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.custom())
+            .filter(|custom| custom.value().decode().is_some());
+        if let Some(custom) = custom {
+            if !custom
+                .value()
+                .operators()
+                .iter()
+                .any(|operator| operator.op == "<")
+            {
+                if let Some(output) = output {
+                    crate::bail_parse_error!(
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        block.outputs[output].name,
+                        custom.value().name
+                    );
+                }
+                crate::bail_parse_error!(
+                    "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
+                );
+            }
+        }
+        key_sources.push(match (output, custom.is_some()) {
+            (Some(output), false) => HirSortKeySource::Output(output),
+            (Some(output), true) => HirSortKeySource::EncodedOutput(output),
+            (None, _) => HirSortKeySource::Expression,
+        });
+        order_collations_nulls.push((
+            term.order,
+            term.collation.as_ref().map(|collation| *collation.value()),
+            term.nulls,
+        ));
+        comparators.push(custom_type_comparator_from_type_fact(&term.type_fact));
+    }
+
+    let mut next_output_column = query.order_by.len();
+    let output_columns = (0..block.outputs.len())
+        .map(|output| {
+            if let Some(key) = key_sources.iter().position(
+                |source| matches!(source, HirSortKeySource::Output(found) if *found == output),
+            ) {
+                key
+            } else {
+                let column = next_output_column;
+                next_output_column += 1;
+                column
+            }
+        })
+        .collect::<Vec<_>>();
+    let column_count = next_output_column;
+    let cursor = program.alloc_cursor_id(CursorType::Sorter);
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(SorterOpenData {
+            cursor_id: cursor,
+            columns: query.order_by.len(),
+            order_collations_nulls,
+            comparators,
+        }),
+    });
+    Ok(HirSorterOutput {
+        cursor,
+        record: program.alloc_register(),
+        row: program.alloc_registers(column_count),
+        column_count,
+        order_by: &query.order_by,
+        key_sources,
+        output_columns,
+    })
+}
+
+fn hir_order_output_position(block: &hir::QueryBlock, expression: &hir::Expr) -> Option<usize> {
+    let mut expression = expression;
+    while let hir::Expr::Collate { expr, .. } = expression {
+        expression = expr;
+    }
+    if let hir::Expr::Output(output) = expression {
+        return block
+            .outputs
+            .iter()
+            .position(|candidate| candidate.id == *output);
+    }
+    block
+        .outputs
+        .iter()
+        .position(|output| expression.equivalent(&output.expr))
+}
+
+fn emit_hir_sorter_insert(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    outputs: &[hir::Output],
+    output_start: usize,
+    sorter: &HirSorterOutput<'_>,
+) -> Result<()> {
+    for (key, (term, source)) in sorter.order_by.iter().zip(&sorter.key_sources).enumerate() {
+        let target = sorter.row + key;
+        match source {
+            HirSortKeySource::Output(output) => program.emit_insn(Insn::Copy {
+                src_reg: output_start + output,
+                dst_reg: target,
+                extra_amount: 0,
+            }),
+            HirSortKeySource::EncodedOutput(output) => emit_hir_sort_key(
+                program,
+                document,
+                &outputs[*output].expr,
+                &term.type_fact,
+                target,
+            )?,
+            HirSortKeySource::Expression => {
+                emit_hir_sort_key(program, document, &term.expr, &term.type_fact, target)?
+            }
+        }
+    }
+    for (output, column) in sorter.output_columns.iter().enumerate() {
+        if *column < sorter.order_by.len() {
+            continue;
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: output_start + output,
+            dst_reg: sorter.row + column,
+            extra_amount: 0,
+        });
+    }
+    sorter_insert(
+        program,
+        sorter.row,
+        sorter.column_count,
+        sorter.cursor,
+        sorter.record,
+    );
+    Ok(())
+}
+
+fn emit_hir_sort_key(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    expression: &hir::Expr,
+    type_fact: &hir::TypeFact,
+    target: usize,
+) -> Result<()> {
+    let suppress_decode = type_fact
+        .declared
+        .as_ref()
+        .and_then(|declared| declared.custom())
+        .is_some_and(|custom| custom.value().decode().is_some());
+    if suppress_decode {
+        program.flags.set_suppress_custom_type_decode(true);
+    }
+    let result = super::expr::translate_expr_no_constant_opt(program, document, expression, target);
+    if suppress_decode {
+        program.flags.set_suppress_custom_type_decode(false);
+    }
+    result.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_sorted_rows(
+    program: &mut ProgramBuilder,
+    block: &hir::QueryBlock,
+    sorter: &HirSorterOutput<'_>,
+    destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
+) -> Result<()> {
+    emit_hir_sorter_rows(
+        program,
+        &block.outputs,
+        sorter.cursor,
+        sorter.record,
+        sorter.column_count,
+        &sorter.output_columns,
+        destination,
+        limit,
+        done,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_sorter_rows(
+    program: &mut ProgramBuilder,
+    output_definitions: &[hir::Output],
+    sorter_cursor: CursorID,
+    sorter_record: usize,
+    sorter_column_count: usize,
+    output_columns: &[usize],
+    destination: &QueryDestination,
+    limit: Option<QueryLimitRegisters>,
+    done: BranchOffset,
+) -> Result<()> {
+    if output_definitions.len() != output_columns.len() {
+        return Err(LimboError::InternalError(format!(
+            "HIR sorter has {} outputs but {} output columns",
+            output_definitions.len(),
+            output_columns.len()
+        )));
+    }
+    emit_explain!(
+        program,
+        false,
+        EqpDetail::OrderBy {
+            method: EqpSortMethod::Sorter,
+        }
+    );
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: sorter_column_count,
+    }));
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo_cursor,
+        content_reg: sorter_record,
+        num_fields: sorter_column_count,
+    });
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: sorter_cursor,
+        pc_if_empty: done,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    emit_before_row(program, limit, next);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: sorter_cursor,
+        dest_reg: sorter_record,
+        pseudo_cursor,
+    });
+    let outputs = program.alloc_registers(output_definitions.len());
+    for (output, column) in output_columns.iter().enumerate() {
+        program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
+    }
+    emit_array_results(program, output_definitions, outputs);
+    emit_columns_to_destination(program, destination, outputs, output_definitions.len())?;
+    emit_after_row(
+        program,
+        limit,
+        destination_stops_after_first_row(destination),
+        done,
+    );
+    program.preassign_label_to_next_insn(next);
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sorter_cursor,
+        pc_if_next: loop_start,
+    });
+    Ok(())
+}
+
 fn initialize_limit(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -2788,21 +3151,19 @@ fn emit_after_row(
 
 fn query_output_registers(
     program: &mut ProgramBuilder,
-    destination: &QueryDestination,
     outputs: &[hir::Output],
+    needs_values: bool,
 ) -> Result<usize> {
     if outputs.is_empty() {
         return Err(LimboError::InternalError(
             "HIR query has no outputs".to_string(),
         ));
     }
-    Ok(
-        if matches!(destination, QueryDestination::ExistsSubqueryResult { .. }) {
-            0
-        } else {
-            program.alloc_registers(outputs.len())
-        },
-    )
+    Ok(if needs_values {
+        program.alloc_registers(outputs.len())
+    } else {
+        0
+    })
 }
 
 fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
@@ -2816,10 +3177,11 @@ fn destination_stops_after_first_row(destination: &QueryDestination) -> bool {
 fn emit_query_row<'expr>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    destination: &QueryDestination,
+    output: &HirRowOutput<'_>,
     outputs: &[hir::Output],
     expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
     start: usize,
+    skip_row: BranchOffset,
 ) -> Result<()> {
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
@@ -2828,7 +3190,7 @@ fn emit_query_row<'expr>(
             outputs.len()
         )));
     }
-    if matches!(destination, QueryDestination::ExistsSubqueryResult { .. }) {
+    if !output.needs_values() {
         for expression in expressions {
             super::expr::register_parameters(program, expression);
         }
@@ -2842,9 +3204,43 @@ fn emit_query_row<'expr>(
             )?;
             program.bind_output(outputs[position].id, start + position);
         }
+    }
+
+    if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
         emit_array_results(program, outputs, start);
     }
-    emit_columns_to_destination(program, destination, start, outputs.len())?;
+
+    if let Some(distinct) = output.distinct {
+        program.emit_insn(Insn::HashDistinct {
+            data: Box::new(HashDistinctData {
+                hash_table_id: distinct.hash_table,
+                key_start_reg: start,
+                num_keys: outputs.len(),
+                collations: distinct.collations.clone(),
+                target_pc: skip_row,
+            }),
+        });
+    }
+
+    match output.target {
+        HirRowTarget::Direct {
+            destination,
+            limit,
+            done,
+        } => {
+            emit_before_row(program, limit, skip_row);
+            emit_columns_to_destination(program, destination, start, outputs.len())?;
+            emit_after_row(
+                program,
+                limit,
+                destination_stops_after_first_row(destination),
+                done,
+            );
+        }
+        HirRowTarget::Sorter(sorter) => {
+            emit_hir_sorter_insert(program, document, outputs, start, sorter)?;
+        }
+    }
     Ok(())
 }
 
@@ -2882,20 +3278,20 @@ fn row_value_destination(program: &mut ProgramBuilder, width: usize) -> Destinat
 mod tests {
     use super::*;
     use crate::{
-        MAIN_DB_ID, SymbolTable,
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
         translate::{
             optimizer::CostModelParams,
             semantic::{
-                SemanticOptions, SemanticRootInput,
                 catalog::{SemanticCatalog, SemanticCatalogDatabase},
                 context::DoubleQuotedDml,
                 hir::{self, Expr, HirRoot},
+                SemanticOptions, SemanticRootInput,
             },
             semantic_to_plan::HirPlan,
         },
         vdbe::builder::{ProgramBuilderOpts, QueryMode},
+        SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
 
@@ -2996,6 +3392,23 @@ mod tests {
                     .expect("fixed table schema parses"),
             ))
             .expect("fixed table name is unique");
+        schema
+    }
+
+    fn ordered_custom_items_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE amount(value INTEGER, factor INTEGER) BASE INTEGER \
+                 ENCODE value * factor DECODE value / factor OPERATOR '<' numeric_lt",
+            )
+            .expect("custom ordered type parses");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE items(value amount(4), extra TEXT) STRICT", 2)
+                    .expect("custom ordered table parses"),
+            ))
+            .expect("custom ordered table name is unique");
         schema
     }
 
@@ -3142,6 +3555,150 @@ mod tests {
     }
 
     #[test]
+    fn planned_distinct_uses_hir_collations_before_offset() {
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT DISTINCT value COLLATE nocase FROM items LIMIT 1 OFFSET 1",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("DISTINCT HIR query emits");
+        program.resolve_labels().expect("DISTINCT labels resolve");
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::HashClear { .. })));
+        let distinct = program
+            .insns
+            .iter()
+            .position(|(insn, _)| match insn {
+                Insn::HashDistinct { data } => data.collations == [CollationSeq::NoCase],
+                _ => false,
+            })
+            .expect("DISTINCT uses the resolved output collation");
+        let offset = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::IfPos {
+                        decrement_by: 1,
+                        ..
+                    }
+                )
+            })
+            .expect("OFFSET emits");
+        assert!(distinct < offset, "OFFSET counts unique rows");
+    }
+
+    #[test]
+    fn planned_order_by_uses_hir_terms_and_sorts_before_limit() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT value, extra FROM items \
+             ORDER BY extra COLLATE nocase DESC NULLS FIRST LIMIT 2 OFFSET 1",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("ordered HIR query emits");
+        program.resolve_labels().expect("ORDER BY labels resolve");
+
+        let sorter_open = program
+            .insns
+            .iter()
+            .position(|(insn, _)| match insn {
+                Insn::SorterOpen { data } => {
+                    data.order_collations_nulls
+                        == [(
+                            SortOrder::Desc,
+                            Some(CollationSeq::NoCase),
+                            Some(turso_parser::ast::NullsOrder::First),
+                        )]
+                }
+                _ => false,
+            })
+            .expect("sorter uses resolved direction, collation, and NULL order");
+        let sorter_insert = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SorterInsert { .. }))
+            .expect("rows enter sorter");
+        let sorter_sort = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
+            .expect("sorter drains");
+        let offset = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::IfPos {
+                        decrement_by: 1,
+                        ..
+                    }
+                )
+            })
+            .expect("OFFSET emits");
+        assert!(sorter_open < sorter_insert && sorter_insert < sorter_sort);
+        assert!(sorter_sort < offset, "LIMIT/OFFSET applies after sorting");
+    }
+
+    #[test]
+    fn planned_distinct_order_by_deduplicates_before_sorting() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT DISTINCT value FROM items ORDER BY value DESC",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("DISTINCT ordered HIR query emits");
+        program
+            .resolve_labels()
+            .expect("DISTINCT ORDER BY labels resolve");
+
+        let distinct = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::HashDistinct { .. }))
+            .expect("DISTINCT check emits");
+        let sorter_insert = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SorterInsert { .. }))
+            .expect("unique rows enter sorter");
+        assert!(distinct < sorter_insert);
+    }
+
+    #[test]
+    fn planned_order_by_uses_custom_comparator_from_hir_type_fact() {
+        let plan = analyze_plan(
+            ordered_custom_items_schema(),
+            "SELECT value FROM items ORDER BY value",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("custom ordered HIR query emits");
+        program
+            .resolve_labels()
+            .expect("custom ORDER BY labels resolve");
+
+        assert!(program.insns.iter().any(|(insn, _)| match insn {
+            Insn::SorterOpen { data } => {
+                data.comparators == [Some(crate::vdbe::insn::SortComparatorType::NumericLt)]
+            }
+            _ => false,
+        }));
+    }
+
+    #[test]
     fn planned_compound_operators_use_hir_blocks_and_existing_index_operations() {
         for (sql, expected) in [
             ("SELECT 1 UNION SELECT 1", "union"),
@@ -3163,24 +3720,18 @@ mod tests {
                 }
             )));
             match expected {
-                "union" => assert!(
-                    program
-                        .insns
-                        .iter()
-                        .any(|(insn, _)| matches!(insn, Insn::IdxInsert { .. }))
-                ),
-                "except" => assert!(
-                    program
-                        .insns
-                        .iter()
-                        .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
-                ),
-                "intersect" => assert!(
-                    program
-                        .insns
-                        .iter()
-                        .any(|(insn, _)| matches!(insn, Insn::NotFound { .. }))
-                ),
+                "union" => assert!(program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::IdxInsert { .. }))),
+                "except" => assert!(program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))),
+                "intersect" => assert!(program
+                    .insns
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::NotFound { .. }))),
                 _ => unreachable!(),
             }
         }
@@ -3198,12 +3749,10 @@ mod tests {
             .expect("UNION ALL HIR query emits");
         program.resolve_labels().expect("compound labels resolve");
 
-        assert!(
-            !program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. }))
-        );
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. })));
         assert_eq!(
             program
                 .insns
@@ -3221,11 +3770,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(limit_registers.len(), 2);
-        assert!(
-            limit_registers
-                .iter()
-                .all(|register| *register == limit_registers[0])
-        );
+        assert!(limit_registers
+            .iter()
+            .all(|register| *register == limit_registers[0]));
         assert_eq!(
             program
                 .insns
@@ -3248,18 +3795,14 @@ mod tests {
             .expect("ordered compound HIR query emits");
         program.resolve_labels().expect("compound labels resolve");
 
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::SorterOpen { .. }))
-        );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SorterOpen { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SorterSort { .. })));
         assert_eq!(
             program
                 .insns
@@ -3287,18 +3830,14 @@ mod tests {
             .resolve_labels()
             .expect("recursive compound labels resolve");
 
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
-        );
-        assert!(
-            !program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. })));
     }
 
     #[test]
@@ -3407,13 +3946,11 @@ mod tests {
             .expect("correlated subquery destination prepares");
 
         assert!(prepared.correlated);
-        assert!(
-            !document
-                .query(prepared.query)
-                .expect("subquery exists")
-                .captures
-                .is_empty()
-        );
+        assert!(!document
+            .query(prepared.query)
+            .expect("subquery exists")
+            .captures
+            .is_empty());
     }
 
     #[test]
@@ -3519,12 +4056,10 @@ mod tests {
             .expect("correlated wrapper emits");
 
         assert!(prepared.correlated);
-        assert!(
-            !program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Once { .. }))
-        );
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Once { .. })));
     }
 
     #[test]
@@ -3575,29 +4110,25 @@ mod tests {
         .expect("constant SELECT emits");
 
         let start = match program.insns.as_slice() {
-            [
-                (
-                    Insn::Integer {
-                        value: 1,
-                        dest: first,
-                    },
-                    _,
-                ),
-                (
-                    Insn::Integer {
-                        value: 2,
-                        dest: second,
-                    },
-                    _,
-                ),
-                (
-                    Insn::ResultRow {
-                        start_reg,
-                        count: 2,
-                    },
-                    _,
-                ),
-            ] if *second == *first + 1 && *start_reg == *first => *first,
+            [(
+                Insn::Integer {
+                    value: 1,
+                    dest: first,
+                },
+                _,
+            ), (
+                Insn::Integer {
+                    value: 2,
+                    dest: second,
+                },
+                _,
+            ), (
+                Insn::ResultRow {
+                    start_reg,
+                    count: 2,
+                },
+                _,
+            )] if *second == *first + 1 && *start_reg == *first => *first,
             _ => panic!("constant SELECT keeps consecutive output registers"),
         };
         for (position, output) in outputs.iter().enumerate() {
@@ -3658,18 +4189,14 @@ mod tests {
             |program, query, destination| emit_query_body(program, &scalar, query, destination),
         )
         .expect("scalar query emits");
-        assert!(
-            scalar_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Integer { value: 1, .. }))
-        );
-        assert!(
-            !scalar_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Integer { value: 2, .. }))
-        );
+        assert!(scalar_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 1, .. })));
+        assert!(!scalar_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Integer { value: 2, .. })));
         assert_eq!(
             scalar_program
                 .insns
@@ -3715,12 +4242,10 @@ mod tests {
             |program, query, destination| emit_query_body(program, &exists, query, destination),
         )
         .expect("EXISTS query emits");
-        assert!(
-            !exists_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Function { .. }))
-        );
+        assert!(!exists_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Function { .. })));
         let QueryDestination::ExistsSubqueryResult { result_reg } = prepared.destination else {
             panic!("EXISTS uses its result destination");
         };
@@ -3737,12 +4262,10 @@ mod tests {
             &QueryDestination::ResultRows,
         )
         .expect("array SELECT emits");
-        assert!(
-            array_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. }))
-        );
+        assert!(array_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::ArrayDecode { .. })));
     }
 
     #[test]
@@ -3997,18 +4520,14 @@ mod tests {
             )
         });
         assert!(open < rewind && rewind < filter && filter < result && result < next);
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
-        );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
     }
 
     #[test]
@@ -4268,12 +4787,10 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            !program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. }))
-        );
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. })));
     }
 
     #[test]
@@ -4324,24 +4841,18 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. }))
-        );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Goto { .. }))
-        );
-        assert!(
-            !program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Goto { .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. })));
     }
 
     #[test]
@@ -4375,12 +4886,10 @@ mod tests {
                 .count(),
             2
         );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Found { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Found { .. })));
     }
 
     #[test]
@@ -4416,24 +4925,18 @@ mod tests {
             panic!("recursive queue uses an ephemeral index");
         };
         assert_eq!(queue.columns[0].order, SortOrder::Desc);
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. }))
-        );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
-        );
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
     }
 
     #[cfg(feature = "json")]
@@ -4469,12 +4972,10 @@ mod tests {
             program.get_cursor_type(cursor),
             Some(CursorType::VirtualTable(_))
         ));
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::VOpen { cursor_id } if *cursor_id == cursor))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::VOpen { cursor_id } if *cursor_id == cursor)));
         assert!(program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::VFilter {
@@ -5327,12 +5828,10 @@ mod tests {
                     }));
                 }
                 None => {
-                    assert!(
-                        !program
-                            .insns
-                            .iter()
-                            .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. }))
-                    );
+                    assert!(!program
+                        .insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. })));
                     assert!(program.insns.iter().any(|(insn, _)| {
                         matches!(
                             insn,
@@ -5415,12 +5914,10 @@ mod tests {
                     Insn::SeekRowid { cursor_id, .. } if *cursor_id == scan_cursor
                 )
             }));
-            assert!(
-                !program
-                    .insns
-                    .iter()
-                    .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. }))
-            );
+            assert!(!program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::Next { .. } | Insn::Prev { .. })));
         }
     }
 
@@ -5536,12 +6033,10 @@ mod tests {
                 ..
             }
         )));
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::RowId { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::RowId { .. })));
         assert!(program.insns.iter().any(|(insn, _)| matches!(
             insn,
             Insn::Ge { .. } | Insn::Gt { .. } | Insn::Le { .. } | Insn::Lt { .. }
@@ -5588,18 +6083,14 @@ mod tests {
                 .count(),
             3
         );
-        assert!(
-            rowid_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::SeekRowid { .. }))
-        );
-        assert!(
-            !rowid_program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. }))
-        );
+        assert!(rowid_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SeekRowid { .. })));
+        assert!(!rowid_program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
 
         for (sql, table_required) in [
             (
@@ -5684,18 +6175,14 @@ mod tests {
             emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
                 .expect("planned indexed IN seek emits");
 
-            assert!(
-                program
-                    .insns
-                    .iter()
-                    .any(|(insn, _)| matches!(insn, Insn::SeekGE { is_index: true, .. }))
-            );
-            assert!(
-                program
-                    .insns
-                    .iter()
-                    .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. }))
-            );
+            assert!(program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::SeekGE { is_index: true, .. })));
+            assert!(program
+                .insns
+                .iter()
+                .any(|(insn, _)| matches!(insn, Insn::IdxGT { .. })));
             assert_eq!(
                 program
                     .insns
@@ -5844,11 +6331,9 @@ mod tests {
                 ..
             } if *cursor_id == cursor
         )));
-        assert!(
-            program
-                .insns
-                .iter()
-                .any(|(insn, _)| matches!(insn, Insn::Le { .. }))
-        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Le { .. })));
     }
 }

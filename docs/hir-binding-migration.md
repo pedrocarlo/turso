@@ -817,7 +817,14 @@ the existing ephemeral-index opcode flow with resolved output collations.
 Compound ORDER BY uses resolved output identities, HIR type facts, collations,
 sort direction, and NULL ordering; LIMIT/OFFSET is applied after sorting. This
 also permits compound recursive CTE seed queries without rebuilding AST nodes.
-Ordinary single-block ORDER BY and DISTINCT remain later checkpoints.
+Ordinary single-block DISTINCT and ORDER BY now use one HIR row-output path.
+DISTINCT hashes the resolved output registers with their frozen collations
+before applying OFFSET. ORDER BY inserts rows directly from the source loop,
+uses resolved type facts for custom comparators, and drains through the same
+sorter-output helper as compound ordering before applying LIMIT/OFFSET. Combined
+DISTINCT and ORDER BY deduplicates before sorter insertion. No parser expression
+or `TableReferences` sidecar is rebuilt. Aggregate, GROUP BY, and window output
+remain later SELECT checkpoints.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR
