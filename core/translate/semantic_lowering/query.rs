@@ -26,7 +26,9 @@ use crate::{
     util::parse_numeric_literal,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
+        builder::{
+            CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding, SubqueryBinding,
+        },
         insn::Insn,
         BranchOffset, CursorID,
     },
@@ -572,6 +574,7 @@ struct PreparedHirBtreeLoop<'a> {
 struct PreparedHirMaterializedLoop<'a> {
     source: &'a hir::Source,
     cursor: CursorID,
+    table: Arc<BTreeTable>,
 }
 
 #[derive(Clone, Copy)]
@@ -929,6 +932,17 @@ fn prepare_hir_loop<'a>(
                 },
             )?,
         )),
+        HirSourceAccess::Cte {
+            cte,
+            query,
+            materialization: HirCteMaterialization::Shared | HirCteMaterialization::Explicit,
+        } => Ok(PreparedHirLoop::Materialized(prepare_hir_shared_cte_loop(
+            program,
+            plan,
+            planned_loop.source,
+            *cte,
+            *query,
+        )?)),
         _ => Err(LimboError::InternalError(format!(
             "HIR source {} does not use a supported source loop",
             planned_loop.source
@@ -936,12 +950,52 @@ fn prepare_hir_loop<'a>(
     }
 }
 
-fn prepare_hir_materialized_loop<'a>(
+fn prepare_hir_shared_cte_loop<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     source_id: SourceId,
-    materialized_query: HirMaterializedQuery,
+    cte: hir::CteId,
+    query: QueryId,
 ) -> Result<PreparedHirMaterializedLoop<'a>> {
+    let materialized_query = HirMaterializedQuery::Cte { cte, query };
+    let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
+    if let Some(shared) = program.hir_materialized_cte(cte).cloned() {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
+        program.emit_insn(Insn::OpenDup {
+            new_cursor_id: cursor,
+            original_cursor_id: shared.cursor_id,
+        });
+        program.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        return Ok(PreparedHirMaterializedLoop {
+            source,
+            cursor,
+            table: shared.table,
+        });
+    }
+
+    let prepared = prepare_hir_materialized_loop(program, plan, source_id, materialized_query)?;
+    program.register_hir_materialized_cte(
+        cte,
+        MaterializedCteInfo {
+            cursor_id: prepared.cursor,
+            table: prepared.table.clone(),
+            num_columns: prepared.source.columns.len(),
+        },
+    );
+    Ok(prepared)
+}
+
+fn validate_hir_materialized_query<'a>(
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    materialized_query: HirMaterializedQuery,
+) -> Result<&'a hir::Source> {
     let document = &plan.document;
     let query_id = materialized_query.query();
     let source = document.source(source_id).ok_or_else(|| {
@@ -979,6 +1033,17 @@ fn prepare_hir_materialized_loop<'a>(
             query.output.len()
         )));
     }
+    Ok(source)
+}
+
+fn prepare_hir_materialized_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    materialized_query: HirMaterializedQuery,
+) -> Result<PreparedHirMaterializedLoop<'a>> {
+    let query_id = materialized_query.query();
+    let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
 
     let columns = source
         .columns
@@ -1036,7 +1101,7 @@ fn prepare_hir_materialized_loop<'a>(
         query_id,
         &QueryDestination::EphemeralTable {
             cursor_id: cursor,
-            table,
+            table: table.clone(),
             rowid_mode: EphemeralRowidMode::Auto,
         },
     )?;
@@ -1048,7 +1113,11 @@ fn prepare_hir_materialized_loop<'a>(
             table_cursor: None,
         },
     );
-    Ok(PreparedHirMaterializedLoop { source, cursor })
+    Ok(PreparedHirMaterializedLoop {
+        source,
+        cursor,
+        table,
+    })
 }
 
 fn prepare_hir_btree_loop<'a>(
@@ -2877,6 +2946,136 @@ mod tests {
 
         assert_ne!(*cte_query, query);
         assert!(once < open && open < insert && insert < rewind && rewind < result);
+    }
+
+    #[test]
+    fn planned_shared_cte_materializes_once_and_opens_one_cursor_per_reference() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "WITH chosen AS (\
+                 SELECT value FROM items NOT INDEXED WHERE value > 1\
+             ) \
+             SELECT a.value, b.value \
+             FROM chosen AS a JOIN chosen AS b ON b.value = a.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        assert_eq!(block_plan.loops.len(), 2);
+        let ctes = block_plan
+            .loops
+            .iter()
+            .map(|planned_loop| {
+                let HirSourceAccess::Cte {
+                    cte,
+                    materialization,
+                    ..
+                } = &planned_loop.access
+                else {
+                    panic!("both sources use the shared CTE");
+                };
+                assert_eq!(*materialization, HirCteMaterialization::Shared);
+                *cte
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ctes[0], ctes[1]);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("shared CTE query emits");
+
+        let cursors = block_plan
+            .loops
+            .iter()
+            .map(|planned_loop| {
+                let SourceBinding::BTree {
+                    scan_cursor,
+                    table_cursor: None,
+                } = program
+                    .source_binding(planned_loop.source)
+                    .copied()
+                    .expect("shared CTE source is bound")
+                else {
+                    panic!("each CTE reference uses one table cursor");
+                };
+                scan_cursor
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(cursors[0], cursors[1]);
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OpenEphemeral { is_table: true, .. }))
+                .count(),
+            1
+        );
+        let duplicates = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::OpenDup {
+                    new_cursor_id,
+                    original_cursor_id,
+                } => Some((*new_cursor_id, *original_cursor_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [duplicate] = duplicates.as_slice() else {
+            panic!("second CTE reference opens one duplicate cursor");
+        };
+        assert!(cursors.contains(&duplicate.0));
+        assert!(cursors.contains(&duplicate.1));
+        assert!(cursors.iter().all(|cursor| program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::Rewind { cursor_id, .. } if cursor_id == cursor)
+        )));
+        assert!(program.hir_materialized_cte(ctes[0]).is_some());
+    }
+
+    #[test]
+    fn planned_explicit_cte_uses_registered_materialized_storage() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "WITH chosen AS MATERIALIZED (\
+                 SELECT value FROM items NOT INDEXED\
+             ) \
+             SELECT value FROM chosen",
+        );
+        let query = root_query(&plan.document);
+        let planned_loop = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0];
+        let HirSourceAccess::Cte {
+            cte,
+            materialization,
+            ..
+        } = &planned_loop.access
+        else {
+            panic!("explicit CTE keeps its CTE access");
+        };
+        assert_eq!(*materialization, HirCteMaterialization::Explicit);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("explicit CTE query emits");
+
+        assert!(program.hir_materialized_cte(*cte).is_some());
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OpenEphemeral { is_table: true, .. }))
+                .count(),
+            1
+        );
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. })));
     }
 
     #[test]

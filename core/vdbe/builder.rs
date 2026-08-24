@@ -13,7 +13,7 @@ use crate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
-        semantic::hir::{AggregateId, OutputId, QueryId, SourceId, WindowFunctionId},
+        semantic::hir::{AggregateId, CteId, OutputId, QueryId, SourceId, WindowFunctionId},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -310,9 +310,9 @@ pub struct ProgramBuilder {
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
-    /// Registry of materialized CTEs, keyed by cte_id.
+    /// Registry of materialized CTEs, keyed by legacy or HIR identity.
     /// Used to share materialized data across multiple CTE references via OpenDup.
-    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
+    materialized_ctes: HashMap<MaterializedCteKey, MaterializedCteInfo>,
     /// Stack of CTE names currently being planned. Used to detect circular
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
@@ -567,6 +567,12 @@ pub struct MaterializedCteInfo {
     pub table: Arc<BTreeTable>,
     /// Number of result columns.
     pub num_columns: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MaterializedCteKey {
+    Legacy(usize),
+    Hir(CteId),
 }
 
 #[derive(Debug, Clone)]
@@ -857,12 +863,23 @@ impl ProgramBuilder {
     /// Check if a CTE has already been materialized.
     /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
     pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {
-        self.materialized_ctes.get(&cte_id)
+        self.materialized_ctes
+            .get(&MaterializedCteKey::Legacy(cte_id))
     }
 
     /// Register a materialized CTE so that subsequent references can share it via OpenDup.
     pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
-        self.materialized_ctes.insert(cte_id, info);
+        self.materialized_ctes
+            .insert(MaterializedCteKey::Legacy(cte_id), info);
+    }
+
+    pub(crate) fn hir_materialized_cte(&self, cte: CteId) -> Option<&MaterializedCteInfo> {
+        self.materialized_ctes.get(&MaterializedCteKey::Hir(cte))
+    }
+
+    pub(crate) fn register_hir_materialized_cte(&mut self, cte: CteId, info: MaterializedCteInfo) {
+        self.materialized_ctes
+            .insert(MaterializedCteKey::Hir(cte), info);
     }
 
     /// Mark a CTE name as currently being planned. While on the stack,

@@ -796,10 +796,11 @@ Non-correlated derived `FROM` sources now lower directly from their prepared
 `QueryId`. Lowering materializes the child HIR query once into an ephemeral
 table, binds that cursor to the derived `SourceId`, and feeds it through the same
 nested-loop driver as ordinary B-tree scans. No parser expression or synthetic
-table reference is rebuilt. Single-reference, non-correlated ordinary CTEs now
-use that same path with their resolved `CteId` and prepared body `QueryId`.
-Shared or explicitly materialized CTE storage, correlated query-backed sources,
-and recursive CTE runtime loops remain later checkpoints.
+table reference is rebuilt. Non-correlated ordinary CTEs use that same path with
+their resolved `CteId` and prepared body `QueryId`. Shared and explicitly
+materialized CTEs register one ephemeral table in `ProgramBuilder`; later source
+references open duplicate cursors over that storage. Correlated query-backed
+sources and recursive CTE runtime loops remain later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
