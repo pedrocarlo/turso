@@ -800,7 +800,16 @@ table reference is rebuilt. Non-correlated ordinary CTEs use that same path with
 their resolved `CteId` and prepared body `QueryId`. Shared and explicitly
 materialized CTEs register one ephemeral table in `ProgramBuilder`; later source
 references open duplicate cursors over that storage. Correlated query-backed
-sources and recursive CTE runtime loops remain later checkpoints.
+sources remain a later checkpoint.
+
+Recursive CTE sources now use one queue runtime for legacy and HIR plans. The
+legacy adapter still exposes each dequeued row through its pseudo cursor; the
+HIR adapter binds each resolved recursive-input `SourceId` directly to the
+dequeued registers. UNION ALL, UNION seen-row filtering, queue ordering and
+collation, NULL ordering, LIMIT, and OFFSET keep the existing runtime behavior.
+No parser expression, resolver scope, or synthetic table reference is rebuilt.
+Compound seed queries and correlated recursive bodies remain with the compound
+and correlated-query checkpoints.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR

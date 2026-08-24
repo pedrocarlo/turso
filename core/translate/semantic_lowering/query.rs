@@ -1,6 +1,6 @@
 //! Runtime destination preparation for resolved HIR queries.
 
-use turso_parser::ast::{Literal, SortOrder};
+use turso_parser::ast::{CompoundOperator, Literal, SortOrder};
 
 use crate::{
     schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Table, Type},
@@ -16,6 +16,10 @@ use crate::{
         plan::{
             self, EphemeralRowidMode, HirCteMaterialization, HirSeekDef, IterationDirection,
             QueryDestination,
+        },
+        recursive_cte::{
+            emit_recursive_runtime, RecursivePhase, RecursiveRuntimeLimit, RecursiveRuntimeOrder,
+            RecursiveRuntimeSpec,
         },
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
@@ -584,6 +588,10 @@ struct PreparedHirVirtualLoop<'a> {
     cursor: CursorID,
 }
 
+struct PreparedHirRegistersLoop<'a> {
+    source: &'a hir::Source,
+}
+
 #[derive(Clone, Copy)]
 enum HirMaterializedQuery {
     Derived(QueryId),
@@ -602,14 +610,16 @@ enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Virtual(PreparedHirVirtualLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
+    Registers(PreparedHirRegistersLoop<'a>),
 }
 
 impl PreparedHirLoop<'_> {
-    fn cursor(&self) -> CursorID {
+    fn cursor(&self) -> Option<CursorID> {
         match self {
-            Self::BTree(prepared) => prepared.cursor,
-            Self::Virtual(prepared) => prepared.cursor,
-            Self::Materialized(prepared) => prepared.cursor,
+            Self::BTree(prepared) => Some(prepared.cursor),
+            Self::Virtual(prepared) => Some(prepared.cursor),
+            Self::Materialized(prepared) => Some(prepared.cursor),
+            Self::Registers(_) => None,
         }
     }
 
@@ -618,12 +628,13 @@ impl PreparedHirLoop<'_> {
             Self::BTree(prepared) => prepared.table_cursor,
             Self::Virtual(_) => None,
             Self::Materialized(_) => None,
+            Self::Registers(_) => None,
         }
     }
 }
 
 struct HirBtreeLoop {
-    cursor: CursorID,
+    cursor: Option<CursorID>,
     loop_start: BranchOffset,
     /// Reject the current row, then run this loop's advance operation.
     next: BranchOffset,
@@ -892,7 +903,9 @@ fn prepare_hir_left_joins(
             }
             let mut null_cursors = Vec::new();
             for prepared in &prepared_loops[first_loop..=last_loop] {
-                null_cursors.push(prepared.cursor());
+                if let Some(cursor) = prepared.cursor() {
+                    null_cursors.push(cursor);
+                }
                 if let Some(table_cursor) = prepared.table_cursor() {
                     null_cursors.push(table_cursor);
                 }
@@ -956,11 +969,40 @@ fn prepare_hir_loop<'a>(
             *cte,
             *query,
         )?)),
-        _ => Err(LimboError::InternalError(format!(
-            "HIR source {} does not use a supported source loop",
-            planned_loop.source
-        ))),
+        HirSourceAccess::RecursiveCte { cte } => Ok(PreparedHirLoop::Materialized(
+            prepare_hir_recursive_cte_loop(program, plan, planned_loop.source, *cte)?,
+        )),
+        HirSourceAccess::RecursiveInput { cte } => Ok(PreparedHirLoop::Registers(
+            prepare_hir_recursive_input_loop(program, &plan.document, planned_loop.source, *cte)?,
+        )),
     }
+}
+
+fn prepare_hir_recursive_input_loop<'a>(
+    program: &ProgramBuilder,
+    document: &'a HirDocument,
+    source_id: SourceId,
+    cte: hir::CteId,
+) -> Result<PreparedHirRegistersLoop<'a>> {
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR recursive input references missing source {source_id}"
+        ))
+    })?;
+    if !matches!(source.kind, hir::SourceKind::RecursiveInput(source_cte) if source_cte == cte) {
+        return Err(LimboError::InternalError(format!(
+            "HIR recursive input source {source_id} does not match CTE {cte}"
+        )));
+    }
+    if !matches!(
+        program.source_binding(source_id),
+        Some(SourceBinding::Registers { .. })
+    ) {
+        return Err(LimboError::InternalError(format!(
+            "HIR recursive input source {source_id} has no row binding"
+        )));
+    }
+    Ok(PreparedHirRegistersLoop { source })
 }
 
 fn prepare_hir_virtual_loop<'a>(
@@ -1040,6 +1082,204 @@ fn prepare_hir_shared_cte_loop<'a>(
     Ok(prepared)
 }
 
+fn prepare_hir_recursive_cte_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    cte_id: hir::CteId,
+) -> Result<PreparedHirMaterializedLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR recursive CTE loop references missing source {source_id}"
+        ))
+    })?;
+    if !matches!(source.kind, hir::SourceKind::Cte(source_cte) if source_cte == cte_id) {
+        return Err(LimboError::InternalError(format!(
+            "HIR recursive CTE source {source_id} does not match CTE {cte_id}"
+        )));
+    }
+    let cte = document.cte(cte_id).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR references missing recursive CTE {cte_id}"))
+    })?;
+    let hir::CteBody::Recursive(recursive) = &cte.body else {
+        return Err(LimboError::InternalError(format!(
+            "HIR CTE {cte_id} is not recursive"
+        )));
+    };
+    if source.columns.len() != cte.columns.len() {
+        return Err(LimboError::InternalError(format!(
+            "HIR recursive CTE source {source_id} width does not match CTE {cte_id}"
+        )));
+    }
+    if let Some(shared) = program.hir_materialized_cte(cte_id).cloned() {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
+        program.emit_insn(Insn::OpenDup {
+            new_cursor_id: cursor,
+            original_cursor_id: shared.cursor_id,
+        });
+        program.bind_source(
+            source_id,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        return Ok(PreparedHirMaterializedLoop {
+            source,
+            cursor,
+            table: shared.table,
+        });
+    }
+
+    let table = hir_materialized_table(source);
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let materialized = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: materialized,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: true,
+    });
+    emit_hir_recursive_cte(
+        program,
+        plan,
+        cte,
+        recursive,
+        &QueryDestination::EphemeralTable {
+            cursor_id: cursor,
+            table: table.clone(),
+            rowid_mode: EphemeralRowidMode::Auto,
+        },
+    )?;
+    program.preassign_label_to_next_insn(materialized);
+    program.bind_source(
+        source_id,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    program.register_hir_materialized_cte(
+        cte_id,
+        MaterializedCteInfo {
+            cursor_id: cursor,
+            table: table.clone(),
+            num_columns: source.columns.len(),
+        },
+    );
+    Ok(PreparedHirMaterializedLoop {
+        source,
+        cursor,
+        table,
+    })
+}
+
+fn emit_hir_recursive_cte(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    cte: &hir::Cte,
+    recursive: &hir::RecursiveCte,
+    destination: &QueryDestination,
+) -> Result<usize> {
+    let union_all = match recursive.arms.first().map(|arm| arm.operator) {
+        Some(CompoundOperator::UnionAll) => true,
+        Some(CompoundOperator::Union) => false,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "recursive CTE {} does not use UNION or UNION ALL",
+                cte.id
+            )))
+        }
+    };
+    if recursive.arms.iter().any(|arm| {
+        arm.operator
+            != if union_all {
+                CompoundOperator::UnionAll
+            } else {
+                CompoundOperator::Union
+            }
+    }) {
+        return Err(LimboError::InternalError(format!(
+            "recursive CTE {} mixes recursive operators",
+            cte.id
+        )));
+    }
+    let query_is_uncorrelated = |query_id| {
+        plan.document
+            .query(query_id)
+            .is_some_and(|query| query.captures.is_empty())
+    };
+    if !query_is_uncorrelated(recursive.seed)
+        || recursive
+            .arms
+            .iter()
+            .any(|arm| !query_is_uncorrelated(arm.query))
+    {
+        return Err(LimboError::InternalError(format!(
+            "HIR recursive CTE {} is correlated",
+            cte.id
+        )));
+    }
+
+    let comparison_collations = recursive
+        .comparison_collations
+        .iter()
+        .map(|collation| collation.as_ref().map(|collation| *collation.value()))
+        .collect::<Vec<_>>();
+    let queue_order = recursive
+        .queue_order
+        .iter()
+        .map(|term| RecursiveRuntimeOrder {
+            result_column: term.output,
+            order: term.order,
+            nulls: term.nulls,
+            explicit_collation: term
+                .explicit_collation
+                .as_ref()
+                .map(|collation| *collation.value()),
+        })
+        .collect::<Vec<_>>();
+    let spec = RecursiveRuntimeSpec {
+        name: &cte.name,
+        result_columns: cte.columns.len(),
+        union_all,
+        comparison_collations: &comparison_collations,
+        queue_order: &queue_order,
+    };
+    emit_recursive_runtime(
+        program,
+        &spec,
+        destination,
+        |program, done| {
+            initialize_limit(program, &plan.document, recursive.limit.as_ref(), done).map(|limit| {
+                RecursiveRuntimeLimit {
+                    limit: limit.map(|limit| limit.limit),
+                    offset: limit.and_then(|limit| limit.offset),
+                }
+            })
+        },
+        |program, input_start| {
+            for source in &recursive.input_sources {
+                program.bind_source(*source, SourceBinding::Registers { start: input_start });
+            }
+            Ok(())
+        },
+        |program, phase, queue_destination| match phase {
+            RecursivePhase::Seed => {
+                emit_planned_query_body(program, plan, recursive.seed, queue_destination)
+            }
+            RecursivePhase::Step => {
+                for arm in &recursive.arms {
+                    emit_planned_query_body(program, plan, arm.query, queue_destination)?;
+                }
+                Ok(())
+            }
+        },
+    )
+}
+
 fn validate_hir_materialized_query<'a>(
     plan: &'a HirPlan,
     source_id: SourceId,
@@ -1094,47 +1334,7 @@ fn prepare_hir_materialized_loop<'a>(
     let query_id = materialized_query.query();
     let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
 
-    let columns = source
-        .columns
-        .iter()
-        .map(|column| {
-            let storage = column.type_fact.storage.unwrap_or(Type::Null);
-            let ty_str = match column.affinity {
-                Affinity::Blob => "BLOB",
-                Affinity::Text => "TEXT",
-                Affinity::Numeric => "NUMERIC",
-                Affinity::Integer => "INTEGER",
-                Affinity::Real => "REAL",
-                Affinity::None => "",
-            };
-            Column::new(
-                Some(column.name.clone()),
-                ty_str.to_string(),
-                None,
-                None,
-                storage,
-                column
-                    .collation
-                    .as_ref()
-                    .map(|collation| *collation.value()),
-                ColDef {
-                    hidden: column.hidden,
-                    ..ColDef::default()
-                },
-            )
-        })
-        .collect();
-    let table = Arc::new(BTreeTable::new(
-        0,
-        source.name.clone(),
-        Vec::new(),
-        columns,
-        BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-    ));
+    let table = hir_materialized_table(source);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
     let materialized = program.allocate_label();
     program.emit_insn(Insn::Once {
@@ -1167,6 +1367,50 @@ fn prepare_hir_materialized_loop<'a>(
         cursor,
         table,
     })
+}
+
+fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
+    let columns = source
+        .columns
+        .iter()
+        .map(|column| {
+            let storage = column.type_fact.storage.unwrap_or(Type::Null);
+            let ty_str = match column.affinity {
+                Affinity::Blob => "BLOB",
+                Affinity::Text => "TEXT",
+                Affinity::Numeric => "NUMERIC",
+                Affinity::Integer => "INTEGER",
+                Affinity::Real => "REAL",
+                Affinity::None => "",
+            };
+            Column::new(
+                Some(column.name.clone()),
+                ty_str.to_string(),
+                None,
+                None,
+                storage,
+                column
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value()),
+                ColDef {
+                    hidden: column.hidden,
+                    ..ColDef::default()
+                },
+            )
+        })
+        .collect();
+    Arc::new(BTreeTable::new(
+        0,
+        source.name.clone(),
+        Vec::new(),
+        columns,
+        BTreeCharacteristics::HAS_ROWID,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    ))
 }
 
 fn prepare_hir_btree_loop<'a>(
@@ -1387,6 +1631,29 @@ fn start_hir_loop(
         PreparedHirLoop::Virtual(prepared) => {
             start_hir_virtual_loop(program, document, prepared, left_join)
         }
+        PreparedHirLoop::Registers(prepared) => {
+            if !matches!(
+                program.source_binding(prepared.source.id),
+                Some(SourceBinding::Registers { .. })
+            ) {
+                return Err(LimboError::InternalError(format!(
+                    "HIR register source {} lost its row binding",
+                    prepared.source.id
+                )));
+            }
+            let loop_start = program.allocate_label();
+            let next = program.allocate_label();
+            let exhausted = program.allocate_label();
+            program.preassign_label_to_next_insn(loop_start);
+            Ok(HirBtreeLoop {
+                cursor: None,
+                loop_start,
+                next,
+                exhausted,
+                advance: HirLoopAdvance::None,
+                left_join,
+            })
+        }
         PreparedHirLoop::Materialized(prepared) => {
             if !matches!(
                 program.source_binding(prepared.source.id),
@@ -1409,7 +1676,7 @@ fn start_hir_loop(
             });
             program.preassign_label_to_next_insn(loop_start);
             Ok(HirBtreeLoop {
-                cursor: prepared.cursor,
+                cursor: Some(prepared.cursor),
                 loop_start,
                 next,
                 exhausted,
@@ -1463,7 +1730,7 @@ fn start_hir_virtual_loop(
     });
     program.preassign_label_to_next_insn(loop_start);
     Ok(HirBtreeLoop {
-        cursor: prepared.cursor,
+        cursor: Some(prepared.cursor),
         loop_start,
         next,
         exhausted,
@@ -1560,7 +1827,7 @@ fn start_hir_btree_loop(
         }
     }
     Ok(HirBtreeLoop {
-        cursor: prepared.cursor,
+        cursor: Some(prepared.cursor),
         loop_start,
         next,
         exhausted,
@@ -1696,30 +1963,39 @@ fn close_hir_btree_loop(
         HirLoopAdvance::Cursor {
             direction,
             fullscan,
-        } => match direction {
-            IterationDirection::Forwards => program.emit_insn(Insn::Next {
-                cursor_id: hir_loop.cursor,
-                pc_if_next: hir_loop.loop_start,
-                fullscan: *fullscan,
-            }),
-            IterationDirection::Backwards => program.emit_insn(Insn::Prev {
-                cursor_id: hir_loop.cursor,
-                pc_if_prev: hir_loop.loop_start,
-                fullscan: *fullscan,
-            }),
-        },
+        } => {
+            let cursor = hir_loop
+                .cursor
+                .expect("cursor advance has a physical cursor");
+            match direction {
+                IterationDirection::Forwards => program.emit_insn(Insn::Next {
+                    cursor_id: cursor,
+                    pc_if_next: hir_loop.loop_start,
+                    fullscan: *fullscan,
+                }),
+                IterationDirection::Backwards => program.emit_insn(Insn::Prev {
+                    cursor_id: cursor,
+                    pc_if_prev: hir_loop.loop_start,
+                    fullscan: *fullscan,
+                }),
+            }
+        }
         HirLoopAdvance::InSeek {
             state,
             index_backed,
         } => emit_in_seek_advance(
             program,
             state,
-            hir_loop.cursor,
+            hir_loop
+                .cursor
+                .expect("IN seek advance has a physical cursor"),
             *index_backed,
             hir_loop.loop_start,
         ),
         HirLoopAdvance::Virtual => program.emit_insn(Insn::VNext {
-            cursor_id: hir_loop.cursor,
+            cursor_id: hir_loop
+                .cursor
+                .expect("virtual advance has a physical cursor"),
             pc_if_next: hir_loop.loop_start,
         }),
     }
@@ -3181,6 +3457,152 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. })));
+    }
+
+    #[test]
+    fn planned_recursive_cte_uses_queue_and_register_bound_input() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "WITH RECURSIVE numbers(value) AS (\
+                 VALUES (1) \
+                 UNION ALL \
+                 SELECT value + 1 FROM numbers WHERE value < 3\
+             ) \
+             SELECT value FROM numbers",
+        );
+        let query = root_query(&plan.document);
+        let planned_loop = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0];
+        let HirSourceAccess::RecursiveCte { cte } = planned_loop.access else {
+            panic!("recursive CTE keeps recursive access");
+        };
+        let hir::CteBody::Recursive(recursive) = &plan.document.cte(cte).expect("CTE exists").body
+        else {
+            panic!("CTE body is recursive");
+        };
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("recursive CTE query emits");
+
+        assert!(recursive.input_sources.iter().all(|source| matches!(
+            program.source_binding(*source),
+            Some(SourceBinding::Registers { .. })
+        )));
+        assert!(program.hir_materialized_cte(cte).is_some());
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(
+                    insn,
+                    Insn::OpenEphemeral {
+                        is_table: false,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IdxDelete { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Goto { .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OpenPseudo { .. })));
+    }
+
+    #[test]
+    fn planned_recursive_union_uses_seen_rows_index() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "WITH RECURSIVE numbers(value) AS (\
+                 VALUES (1) \
+                 UNION \
+                 SELECT value + 1 FROM numbers WHERE value < 3\
+             ) \
+             SELECT value FROM numbers",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("recursive UNION query emits");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(
+                    insn,
+                    Insn::OpenEphemeral {
+                        is_table: false,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Found { .. })));
+    }
+
+    #[test]
+    fn planned_recursive_queue_keeps_order_limit_and_offset() {
+        let plan = analyze_plan(
+            Schema::new(),
+            "WITH RECURSIVE numbers(value) AS (\
+                 VALUES (1) \
+                 UNION ALL \
+                 SELECT value + 1 FROM numbers WHERE value < 5 \
+                 ORDER BY 1 DESC LIMIT 3 OFFSET 1\
+             ) \
+             SELECT value FROM numbers",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("ordered recursive query emits");
+
+        let queue_cursor = program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| match insn {
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_table: false,
+                } => Some(*cursor_id),
+                _ => None,
+            })
+            .expect("recursive queue opens");
+        let Some(CursorType::BTreeIndex(queue)) = program.get_cursor_type(queue_cursor) else {
+            panic!("recursive queue uses an ephemeral index");
+        };
+        assert_eq!(queue.columns[0].order, SortOrder::Desc);
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::OffsetLimit { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::IfPos { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
     }
 
     #[cfg(feature = "json")]
