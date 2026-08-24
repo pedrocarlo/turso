@@ -62,7 +62,7 @@ mod seek;
 use body::emit_unmatched_row_conditions_and_loop;
 pub(crate) use body::LoopBodyEmitter;
 pub(crate) use close::CloseLoop;
-use close::{emit_autoindex, AutoIndexResult};
+pub(crate) use close::{emit_autoindex, AutoIndexBuild, AutoIndexResult};
 use in_seek::open_in_seek_source_cursor;
 pub(crate) use in_seek::{
     emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,

@@ -9,11 +9,11 @@ use crate::{
         eqp::EqpDetail,
         expr::ConditionMetadata,
         main_loop::{
-            emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
-            SeekEmitter, SeekExpressionLowering,
+            emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
+            AutoIndexBuild, InSeekLoop, SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource},
-        plan::{IterationDirection, QueryDestination},
+        plan::{self, HirSeekDef, IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
         semantic_to_plan::{
@@ -562,6 +562,8 @@ struct PreparedHirBtreeLoop<'a> {
     index: Option<&'a Arc<Index>>,
     cursor: usize,
     table_cursor: Option<usize>,
+    autoindex_source_cursor: Option<usize>,
+    table_has_rowid: bool,
 }
 
 struct HirBtreeLoop {
@@ -702,9 +704,11 @@ fn prepare_hir_btree_loop<'a>(
         | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
         HirBtreeOperation::RowidEq { .. } => None,
     };
-    if index.is_some_and(|index| index.ephemeral) {
+    if index.is_some_and(|index| index.ephemeral)
+        && !matches!(operation, HirBtreeOperation::Seek { .. })
+    {
         return Err(LimboError::InternalError(
-            "HIR automatic-index seek lowering is not implemented".to_string(),
+            "HIR automatic indexes require a seek operation".to_string(),
         ));
     }
     let source = document.source(planned_loop.source).ok_or_else(|| {
@@ -738,7 +742,7 @@ fn prepare_hir_btree_loop<'a>(
         ))
     })?;
     program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
-    let (cursor, table_cursor) = if let Some(index) = index {
+    let (cursor, table_cursor, autoindex_source_cursor) = if let Some(index) = index {
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         let table_cursor = match table_lookup {
             BtreeTableLookup::ScanOnly => None,
@@ -746,7 +750,15 @@ fn prepare_hir_btree_loop<'a>(
                 Some(program.alloc_cursor_id(CursorType::BTreeTable(table.clone())))
             }
         };
-        (index_cursor, table_cursor)
+        let autoindex_source_cursor =
+            if index.ephemeral {
+                Some(table_cursor.unwrap_or_else(|| {
+                    program.alloc_cursor_id(CursorType::BTreeTable(table.clone()))
+                }))
+            } else {
+                None
+            };
+        (index_cursor, table_cursor, autoindex_source_cursor)
     } else {
         if *table_lookup != BtreeTableLookup::ScanOnly {
             return Err(LimboError::InternalError(format!(
@@ -757,6 +769,7 @@ fn prepare_hir_btree_loop<'a>(
         (
             program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
             None,
+            None,
         )
     };
     program.bind_source(
@@ -766,14 +779,16 @@ fn prepare_hir_btree_loop<'a>(
             table_cursor,
         },
     );
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: cursor,
-        root_page: index.map_or(table.root_page, |index| index.root_page),
-        db: database.index(),
-    });
-    if let Some(table_cursor) = table_cursor {
+    if index.is_none_or(|index| !index.ephemeral) {
         program.emit_insn(Insn::OpenRead {
-            cursor_id: table_cursor,
+            cursor_id: cursor,
+            root_page: index.map_or(table.root_page, |index| index.root_page),
+            db: database.index(),
+        });
+    }
+    if let Some(source_cursor) = autoindex_source_cursor.or(table_cursor) {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: source_cursor,
             root_page: table.root_page,
             db: database.index(),
         });
@@ -785,7 +800,92 @@ fn prepare_hir_btree_loop<'a>(
         index,
         cursor,
         table_cursor,
+        autoindex_source_cursor,
+        table_has_rowid: table.has_rowid,
     })
+}
+
+fn build_hir_autoindex(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirBtreeLoop<'_>,
+    seek_def: &HirSeekDef,
+) -> Result<bool> {
+    let Some(index) = prepared.index.filter(|index| index.ephemeral) else {
+        return Ok(false);
+    };
+    let table_cursor = prepared
+        .autoindex_source_cursor
+        .expect("automatic index has a source table cursor");
+    let num_seek_keys = seek_def.size(&seek_def.start);
+    let lowering = HirSeekExpressionLowering {
+        document,
+        source: prepared.source,
+    };
+    let has_null_matching_key = seek_def.prefix.iter().take(num_seek_keys).any(|component| {
+        component
+            .eq
+            .as_ref()
+            .is_some_and(|(operator, expression, _)| {
+                lowering.is_null_matching(*operator, expression)
+            })
+    });
+    let affinity_str = plan::synthesized_seek_affinity_str(index, seek_def);
+
+    // Generated expressions must read the base-table row while the automatic
+    // index is being populated. Restore the planned index binding before the seek.
+    program.bind_source(
+        prepared.source.id,
+        SourceBinding::BTree {
+            scan_cursor: table_cursor,
+            table_cursor: None,
+        },
+    );
+    let result = emit_autoindex(
+        program,
+        AutoIndexBuild {
+            index,
+            table_cursor_id: table_cursor,
+            index_cursor_id: prepared.cursor,
+            table_has_rowid: prepared.table_has_rowid,
+            num_seek_keys,
+            has_null_matching_key,
+            seek_def,
+            affinity_str: affinity_str.as_ref(),
+        },
+        |program, column, target| {
+            let Some(expression) = prepared.source.generated_expressions.get(column) else {
+                return Err(LimboError::InternalError(format!(
+                    "automatic index column {column} is outside source {}",
+                    prepared.source.id
+                )));
+            };
+            match expression {
+                hir::ColumnReadExpression::Absent => {
+                    program.emit_column_or_rowid(table_cursor, column, target);
+                    Ok(())
+                }
+                hir::ColumnReadExpression::Planned(expression) => {
+                    super::expr::translate_expr_no_constant_opt(
+                        program, document, expression, target,
+                    )?;
+                    Ok(())
+                }
+                hir::ColumnReadExpression::NotRequired => Err(LimboError::InternalError(format!(
+                    "automatic index requires unplanned generated column {column} from source {}",
+                    prepared.source.id
+                ))),
+            }
+        },
+    );
+    program.bind_source(
+        prepared.source.id,
+        SourceBinding::BTree {
+            scan_cursor: prepared.cursor,
+            table_cursor: prepared.table_cursor,
+        },
+    );
+    Ok(result?.use_bloom_filter)
 }
 
 fn start_hir_btree_loop(
@@ -825,6 +925,7 @@ fn start_hir_btree_loop(
             HirLoopAdvance::None
         }
         HirBtreeOperation::Seek { seek_def, .. } => {
+            let use_bloom_filter = build_hir_autoindex(program, document, prepared, seek_def)?;
             let key_registers = seek_def
                 .size(&seek_def.start)
                 .max(seek_def.size(&seek_def.end));
@@ -841,7 +942,7 @@ fn start_hir_btree_loop(
                 exhausted,
                 prepared.index,
             )
-            .emit(loop_start, false)?;
+            .emit(loop_start, use_bloom_filter)?;
             HirLoopAdvance::Cursor {
                 direction: seek_def.iter_dir,
                 fullscan: false,
@@ -1389,6 +1490,57 @@ mod tests {
                 on_conflict: None,
             }))
             .expect("right index name is unique");
+        schema
+    }
+
+    fn automatic_join_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                    .expect("left table schema parses"),
+            ))
+            .expect("left table name is unique");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
+                    .expect("right table schema parses"),
+            ))
+            .expect("right table name is unique");
+        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut("right_items")
+            .row_count = Some(1);
+        schema
+    }
+
+    fn automatic_generated_join_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                    .expect("left table schema parses"),
+            ))
+            .expect("left table name is unique");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE right_items(\
+                         value INTEGER, \
+                         generated INTEGER AS (value + 1) VIRTUAL, \
+                         extra TEXT\
+                     )",
+                    3,
+                )
+                .expect("generated table schema parses"),
+            ))
+            .expect("right table name is unique");
+        schema.analyze_stats.table_stats_mut("left_items").row_count = Some(1_000);
+        schema
+            .analyze_stats
+            .table_stats_mut("right_items")
+            .row_count = Some(1);
         schema
     }
 
@@ -2303,6 +2455,186 @@ mod tests {
                 usize::from(table_required)
             );
         }
+    }
+
+    #[test]
+    fn planned_inner_join_builds_and_probes_automatic_index() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             CROSS JOIN right_items AS r \
+             WHERE r.value = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index), ..
+                },
+            ..
+        } = &block_plan.loops[1].access
+        else {
+            panic!("right join source uses an automatic-index seek");
+        };
+        assert!(index.ephemeral);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("automatic-index join emits");
+
+        let SourceBinding::BTree {
+            scan_cursor,
+            table_cursor,
+        } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("automatic-index source is bound")
+        else {
+            panic!("automatic-index source has a B-tree binding");
+        };
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let open = position(
+            &|insn| matches!(insn, Insn::OpenAutoindex { cursor_id } if *cursor_id == scan_cursor),
+        );
+        let insert = position(
+            &|insn| matches!(insn, Insn::IdxInsert { cursor_id, .. } if *cursor_id == scan_cursor),
+        );
+        let filter = position(
+            &|insn| matches!(insn, Insn::Filter { cursor_id, .. } if *cursor_id == scan_cursor),
+        );
+        let seek = position(&|insn| {
+            matches!(
+                insn,
+                Insn::SeekGE {
+                    cursor_id,
+                    is_index: true,
+                    ..
+                } if *cursor_id == scan_cursor
+            )
+        });
+
+        assert!(open < insert && insert < filter && filter < seek);
+        assert!(program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::FilterAdd { cursor_id, .. } if *cursor_id == scan_cursor)
+        ));
+        assert!(!program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::OpenRead { cursor_id, .. } if *cursor_id == scan_cursor)
+        ));
+        assert!(
+            table_cursor.is_none(),
+            "payload makes the automatic index covering"
+        );
+    }
+
+    #[test]
+    fn null_matching_automatic_index_does_not_use_bloom_filter() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT r.extra \
+             FROM left_items AS l NOT INDEXED \
+             CROSS JOIN right_items AS r \
+             WHERE r.value IS l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index), ..
+                },
+            ..
+        } = &block_plan.loops[1].access
+        else {
+            panic!("right join source uses an automatic-index seek");
+        };
+        assert!(index.ephemeral);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("NULL-matching automatic-index join emits");
+
+        let SourceBinding::BTree { scan_cursor, .. } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("automatic-index source is bound")
+        else {
+            panic!("automatic-index source has a B-tree binding");
+        };
+        assert!(program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::OpenAutoindex { cursor_id } if *cursor_id == scan_cursor)
+        ));
+        assert!(!program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::FilterAdd { cursor_id, .. } | Insn::Filter { cursor_id, .. }
+                if *cursor_id == scan_cursor
+        )));
+    }
+
+    #[test]
+    fn automatic_index_build_lowers_virtual_generated_column_from_base_table() {
+        let plan = analyze_plan(
+            automatic_generated_join_schema(),
+            "SELECT r.extra \
+             FROM left_items AS l NOT INDEXED \
+             CROSS JOIN right_items AS r \
+             WHERE r.generated = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index), ..
+                },
+            ..
+        } = &block_plan.loops[1].access
+        else {
+            panic!("generated join key uses an automatic-index seek");
+        };
+        assert!(index.ephemeral);
+        assert_eq!(index.columns[0].pos_in_table, 1);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("generated automatic-index join emits");
+
+        let SourceBinding::BTree { scan_cursor, .. } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("automatic-index source is bound")
+        else {
+            panic!("automatic-index source has a B-tree binding");
+        };
+        let add = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Add { .. }))
+            .expect("generated expression is lowered while building the index");
+        let insert = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(insn, Insn::IdxInsert { cursor_id, .. } if *cursor_id == scan_cursor)
+            })
+            .expect("automatic index is populated");
+        assert!(add < insert);
     }
 
     #[test]

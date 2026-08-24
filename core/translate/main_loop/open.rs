@@ -1,7 +1,6 @@
 use super::*;
 use crate::translate::main_loop::{conditions::LoopConditionEmitter, hash::HashProbeSetupEmitter};
 use crate::translate::{
-    main_loop::close::AutoIndexBuild,
     plan::{self, SubqueryEvalPhase},
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
@@ -329,15 +328,42 @@ impl OpenLoop {
                                             ),
                                             table_has_rowid,
                                             num_seek_keys,
+                                            has_null_matching_key: (0..num_seek_keys).any(|i| {
+                                                seek_def.is_null_matching_key_component(i)
+                                            }),
                                             seek_def,
                                             affinity_str: plan::synthesized_seek_affinity_str(
                                                 index, seek_def,
                                             )
                                             .as_ref(),
-                                            table_columns,
-                                            table_ref_id: table.internal_id,
-                                            table_references,
-                                            resolver: &t_ctx.resolver,
+                                        },
+                                        |program, column, target| {
+                                            if let Some(column_def) = table_columns
+                                                .and_then(|columns| columns.get(column))
+                                            {
+                                                if column_def.is_virtual_generated() {
+                                                    return crate::translate::expr::emit_table_column(
+                                                        program,
+                                                        table_cursor_id.expect(
+                                                            "an automatic index must have a source table cursor",
+                                                        ),
+                                                        table.internal_id,
+                                                        table_references,
+                                                        column_def,
+                                                        column,
+                                                        target,
+                                                        &t_ctx.resolver,
+                                                    );
+                                                }
+                                            }
+                                            program.emit_column_or_rowid(
+                                                table_cursor_id.expect(
+                                                    "an automatic index must have a source table cursor",
+                                                ),
+                                                column,
+                                                target,
+                                            );
+                                            Ok(())
                                         },
                                     )?;
                                     bloom_filter = use_bloom_filter;

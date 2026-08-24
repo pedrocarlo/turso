@@ -773,6 +773,14 @@ and loop advances close from inner to outer. Later index seeks read outer HIR
 columns directly and retain covering and deferred-table behavior. Outer joins,
 automatic indexes, and non-B-tree sources remain later checkpoints.
 
+Automatic indexes for later ordinary-join sources now use one shared build
+emitter for legacy AST and HIR plans. HIR lowering opens the base table but
+creates the ephemeral cursor only through `OpenAutoindex`, builds covering
+payload and virtual generated-column keys from the resolved source, restores
+the index source binding before probing, and keeps the existing affinity,
+NULL-matching, bloom-filter, and seek behavior. Outer joins and non-B-tree
+sources remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
