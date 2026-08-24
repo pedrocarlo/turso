@@ -129,6 +129,7 @@ pub(crate) struct HirQueryBlockPlanInput {
 /// Access choices for one resolved HIR query block.
 pub(crate) struct HirQueryBlockPlan {
     pub(crate) block: QueryBlockId,
+    pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) output_cardinality: f64,
@@ -137,6 +138,7 @@ pub(crate) struct HirQueryBlockPlan {
 
 /// Access choices and estimates shared by query blocks and DML scans.
 pub(crate) struct HirAccessPlan {
+    pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
     pub(crate) output_cardinality: f64,
@@ -843,6 +845,7 @@ impl<'a> HirPlanContext<'a> {
             };
             return Ok(HirQueryBlockPlan {
                 block: block.id,
+                groups: input.groups,
                 loops: Vec::new(),
                 predicates: input.predicates,
                 output_cardinality,
@@ -871,6 +874,7 @@ impl<'a> HirPlanContext<'a> {
             })?;
         Ok(HirQueryBlockPlan {
             block: block.id,
+            groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
             output_cardinality: access.output_cardinality,
@@ -1058,6 +1062,7 @@ impl<'a> HirPlanContext<'a> {
         }
 
         Ok(Some(HirAccessPlan {
+            groups: input.groups,
             loops,
             predicates: input.predicates,
             output_cardinality: result.best_plan.output_cardinality,
@@ -1967,6 +1972,9 @@ mod tests {
         };
 
         assert_eq!(block_plan.loops.len(), 3);
+        assert_eq!(block_plan.groups.len(), 1);
+        assert_eq!(block_plan.groups[0].source, group);
+        assert_eq!(block_plan.groups[0].source_range, 1..3);
         assert_eq!(block_plan.loops[0].source, outer);
         assert!(block_plan.loops[1..]
             .iter()
