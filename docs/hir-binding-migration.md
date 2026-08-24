@@ -766,6 +766,13 @@ lookups still use `SeekRowid`; index lookups still use `SeekGE`/`IdxGT`, scan
 duplicate keys, and defer table lookup only when the selected index is not
 covering. Joins and automatic indexes remain later checkpoints.
 
+Ordinary comma, inner, and cross joins now lower as nested HIR B-tree loops.
+All cursors open before entering the outer loop, each residual predicate runs
+at the first loop where all of its resolved `SourceId` inputs are positioned,
+and loop advances close from inner to outer. Later index seeks read outer HIR
+columns directly and retain covering and deferred-table behavior. Outer joins,
+automatic indexes, and non-B-tree sources remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

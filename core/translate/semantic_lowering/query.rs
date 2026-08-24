@@ -9,14 +9,16 @@ use crate::{
         eqp::EqpDetail,
         expr::ConditionMetadata,
         main_loop::{
-            emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, SeekEmitter,
-            SeekExpressionLowering,
+            emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
+            SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource},
         plan::{IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
-        semantic_to_plan::{BtreeTableLookup, HirPlan, HirQueryBlockPlan, HirSourceAccess},
+        semantic_to_plan::{
+            BtreeTableLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan, HirSourceAccess,
+        },
     },
     util::parse_numeric_literal,
     vdbe::{
@@ -532,7 +534,7 @@ pub(crate) fn emit_planned_query_body(
     if block.from.is_none() {
         return emit_query_body(program, document, query_id, destination);
     }
-    emit_single_btree_loop(
+    emit_btree_loops(
         program,
         document,
         query.limit.as_ref(),
@@ -542,7 +544,37 @@ pub(crate) fn emit_planned_query_body(
     )
 }
 
-fn emit_single_btree_loop(
+enum HirLoopAdvance {
+    None,
+    Cursor {
+        direction: IterationDirection,
+        fullscan: bool,
+    },
+    InSeek {
+        state: InSeekLoop,
+        index_backed: bool,
+    },
+}
+
+struct PreparedHirBtreeLoop<'a> {
+    source: &'a hir::Source,
+    operation: &'a HirBtreeOperation,
+    index: Option<&'a Arc<Index>>,
+    cursor: usize,
+    table_cursor: Option<usize>,
+}
+
+struct HirBtreeLoop {
+    cursor: usize,
+    loop_start: BranchOffset,
+    /// Reject the current row, then run this loop's advance operation.
+    next: BranchOffset,
+    /// This access produced no row, so skip its advance operation.
+    exhausted: BranchOffset,
+    advance: HirLoopAdvance,
+}
+
+fn emit_btree_loops(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     query_limit: Option<&hir::Limit>,
@@ -567,20 +599,101 @@ fn emit_single_btree_loop(
             block.id
         )));
     };
-    let [planned_loop] = block_plan.loops.as_slice() else {
+    if block_plan.loops.is_empty() {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} does not have one source loop",
+            "HIR query block {:?} does not have a source loop",
             block.id
         )));
+    }
+    let from = block.from.as_ref().expect("FROM query block has a source");
+    if !inner_btree_from(document, from) {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} contains an unsupported join",
+            block.id
+        )));
+    }
+
+    let done = program.allocate_label();
+    let limit = initialize_limit(program, document, query_limit, done)?;
+    let prepared_loops = block_plan
+        .loops
+        .iter()
+        .map(|planned_loop| prepare_hir_btree_loop(program, document, planned_loop))
+        .collect::<Result<Vec<_>>>()?;
+
+    emit_ready_predicates(program, document, block_plan, None, done)?;
+    let mut loops = Vec::with_capacity(prepared_loops.len());
+    for (loop_index, prepared_loop) in prepared_loops.iter().enumerate() {
+        let hir_loop = start_hir_btree_loop(program, document, prepared_loop)?;
+        emit_ready_predicates(
+            program,
+            document,
+            block_plan,
+            Some(loop_index),
+            hir_loop.next,
+        )?;
+        loops.push(hir_loop);
+    }
+
+    let innermost_next = loops.last().expect("loop list is non-empty").next;
+    emit_before_row(program, limit, innermost_next);
+    let start = query_output_registers(program, destination, &block.outputs)?;
+    emit_query_row(
+        program,
+        document,
+        destination,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+    )?;
+    emit_after_row(
+        program,
+        limit,
+        destination_stops_after_first_row(destination),
+        done,
+    );
+
+    for hir_loop in loops.iter().rev() {
+        close_hir_btree_loop(program, hir_loop);
+    }
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
+fn inner_btree_from(document: &HirDocument, from: &hir::From) -> bool {
+    let ordinary_join = |join: &hir::Join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross
+        )
     };
+    from.joins.iter().all(ordinary_join)
+        && std::iter::once(from.first)
+            .chain(from.joins.iter().map(|join| join.right))
+            .all(|source| {
+                document.source(source).is_some_and(|source| {
+                    if let hir::SourceKind::FromGroup(group) = &source.kind {
+                        inner_btree_from(document, &group.from)
+                    } else {
+                        true
+                    }
+                })
+            })
+}
+
+fn prepare_hir_btree_loop<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a HirDocument,
+    planned_loop: &'a HirPlannedLoop,
+) -> Result<PreparedHirBtreeLoop<'a>> {
     let HirSourceAccess::BTree {
         operation,
         table_lookup,
     } = &planned_loop.access
     else {
         return Err(LimboError::InternalError(format!(
-            "HIR query block {:?} does not use a B-tree loop",
-            block.id
+            "HIR source {} does not use a B-tree loop",
+            planned_loop.source
         )));
     };
     let index = match operation {
@@ -589,6 +702,11 @@ fn emit_single_btree_loop(
         | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
         HirBtreeOperation::RowidEq { .. } => None,
     };
+    if index.is_some_and(|index| index.ephemeral) {
+        return Err(LimboError::InternalError(
+            "HIR automatic-index seek lowering is not implemented".to_string(),
+        ));
+    }
     let source = document.source(planned_loop.source).ok_or_else(|| {
         LimboError::InternalError(format!(
             "HIR B-tree loop references missing source {}",
@@ -619,11 +737,6 @@ fn emit_single_btree_loop(
             source.id
         ))
     })?;
-
-    let done = program.allocate_label();
-    let next = program.allocate_label();
-    let loop_start = program.allocate_label();
-    let limit = initialize_limit(program, document, query_limit, done)?;
     program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
     let (cursor, table_cursor) = if let Some(index) = index {
         let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
@@ -665,36 +778,53 @@ fn emit_single_btree_loop(
             db: database.index(),
         });
     }
-    let mut in_seek = None;
-    match operation {
+
+    Ok(PreparedHirBtreeLoop {
+        source,
+        operation,
+        index,
+        cursor,
+        table_cursor,
+    })
+}
+
+fn start_hir_btree_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirBtreeLoop<'_>,
+) -> Result<HirBtreeLoop> {
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    let advance = match prepared.operation {
         HirBtreeOperation::Scan { iter_dir, .. } => {
             match iter_dir {
                 IterationDirection::Forwards => program.emit_insn(Insn::Rewind {
-                    cursor_id: cursor,
-                    pc_if_empty: done,
+                    cursor_id: prepared.cursor,
+                    pc_if_empty: exhausted,
                 }),
                 IterationDirection::Backwards => program.emit_insn(Insn::Last {
-                    cursor_id: cursor,
-                    pc_if_empty: done,
+                    cursor_id: prepared.cursor,
+                    pc_if_empty: exhausted,
                 }),
             }
             program.preassign_label_to_next_insn(loop_start);
+            HirLoopAdvance::Cursor {
+                direction: *iter_dir,
+                fullscan: true,
+            }
         }
         HirBtreeOperation::RowidEq { cmp_expr } => {
             let key = program.alloc_register();
             super::expr::translate_expr(program, document, cmp_expr, key)?;
             program.emit_insn(Insn::SeekRowid {
-                cursor_id: cursor,
+                cursor_id: prepared.cursor,
                 src_reg: key,
-                target_pc: next,
+                target_pc: exhausted,
             });
+            HirLoopAdvance::None
         }
         HirBtreeOperation::Seek { seek_def, .. } => {
-            if index.is_some_and(|index| index.ephemeral) {
-                return Err(LimboError::InternalError(
-                    "HIR automatic-index seek lowering is not implemented".to_string(),
-                ));
-            }
             let key_registers = seek_def
                 .size(&seek_def.start)
                 .max(seek_def.size(&seek_def.end));
@@ -702,42 +832,72 @@ fn emit_single_btree_loop(
             SeekEmitter::with_lowering(
                 program,
                 seek_def,
-                HirSeekExpressionLowering { document, source },
-                cursor,
+                HirSeekExpressionLowering {
+                    document,
+                    source: prepared.source,
+                },
+                prepared.cursor,
                 start_register,
-                done,
-                index,
+                exhausted,
+                prepared.index,
             )
             .emit(loop_start, false)?;
+            HirLoopAdvance::Cursor {
+                direction: seek_def.iter_dir,
+                fullscan: false,
+            }
         }
         HirBtreeOperation::InSeek { source, .. } => {
-            let source_cursor = open_hir_in_seek_source_cursor(program, document, index, source)?;
-            in_seek = Some(emit_in_seek_start(
+            let source_cursor =
+                open_hir_in_seek_source_cursor(program, document, prepared.index, source)?;
+            let state = emit_in_seek_start(
                 program,
                 source_cursor,
-                cursor,
-                table_cursor,
-                index.is_some(),
+                prepared.cursor,
+                prepared.table_cursor,
+                prepared.index.is_some(),
                 loop_start,
-                done,
-            ));
+                exhausted,
+            );
+            HirLoopAdvance::InSeek {
+                state,
+                index_backed: prepared.index.is_some(),
+            }
         }
-    }
-    if !matches!(operation, HirBtreeOperation::InSeek { .. }) {
-        if let Some(table_cursor) = table_cursor {
+    };
+    if !matches!(prepared.operation, HirBtreeOperation::InSeek { .. }) {
+        if let Some(table_cursor) = prepared.table_cursor {
             program.emit_insn(Insn::DeferredSeek {
-                index_cursor_id: cursor,
+                index_cursor_id: prepared.cursor,
                 table_cursor_id: table_cursor,
             });
         }
     }
+    Ok(HirBtreeLoop {
+        cursor: prepared.cursor,
+        loop_start,
+        next,
+        exhausted,
+        advance,
+    })
+}
 
+fn emit_ready_predicates(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block_plan: &HirQueryBlockPlan,
+    loop_index: Option<usize>,
+    fail: BranchOffset,
+) -> Result<()> {
     for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
         if predicate.from_outer_join.is_some() {
             return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} full scan contains an outer-join predicate",
-                block.id
+                "HIR query block {:?} contains an outer-join predicate",
+                block_plan.block
             )));
+        }
+        if predicate_loop(program, document, &predicate.expr, &block_plan.loops)? != loop_index {
+            continue;
         }
         let passed = program.allocate_label();
         super::expr::translate_condition_expr(
@@ -747,61 +907,95 @@ fn emit_single_btree_loop(
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
-                jump_target_when_false: next,
-                jump_target_when_null: next,
+                jump_target_when_false: fail,
+                jump_target_when_null: fail,
             },
         )?;
         program.preassign_label_to_next_insn(passed);
     }
+    Ok(())
+}
 
-    emit_before_row(program, limit, next);
-    let start = query_output_registers(program, destination, &block.outputs)?;
-    emit_query_row(
-        program,
-        document,
-        destination,
-        &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
-        start,
-    )?;
-    emit_after_row(
-        program,
-        limit,
-        destination_stops_after_first_row(destination),
-        done,
-    );
-    program.preassign_label_to_next_insn(next);
-    let iter_dir = match operation {
-        HirBtreeOperation::Scan { iter_dir, .. } => Some(*iter_dir),
-        HirBtreeOperation::Seek { seek_def, .. } => Some(seek_def.iter_dir),
-        _ => None,
+fn predicate_loop(
+    program: &ProgramBuilder,
+    document: &HirDocument,
+    expression: &hir::Expr,
+    loops: &[HirPlannedLoop],
+) -> Result<Option<usize>> {
+    let mut eval_at = None;
+    let mut missing = None;
+    let mut missing_query = None;
+    let mut record_source = |source| {
+        if let Some(position) = loops.iter().position(|hir_loop| hir_loop.source == source) {
+            eval_at = Some(eval_at.map_or(position, |current: usize| current.max(position)));
+        } else if program.source_binding(source).is_none() {
+            missing = Some(source);
+        }
     };
-    if let Some(iter_dir) = iter_dir {
-        match iter_dir {
+    expression.for_each(&mut |expression| match expression {
+        hir::Expr::Column(reference) => record_source(reference.source),
+        hir::Expr::RowId(source) => record_source(*source),
+        hir::Expr::Subquery(subquery) => {
+            let query = match subquery {
+                SubqueryExpr::Scalar { query, .. }
+                | SubqueryExpr::Row { query }
+                | SubqueryExpr::In { query, .. }
+                | SubqueryExpr::Exists(query) => *query,
+            };
+            if let Some(query) = document.query(query) {
+                for source in &query.captures {
+                    record_source(*source);
+                }
+            } else {
+                missing_query = Some(query);
+            }
+        }
+        _ => {}
+    });
+    if let Some(query) = missing_query {
+        return Err(LimboError::InternalError(format!(
+            "HIR predicate references missing subquery {query}"
+        )));
+    }
+    if let Some(source) = missing {
+        return Err(LimboError::InternalError(format!(
+            "HIR predicate references source {source} outside its loop plan"
+        )));
+    }
+    Ok(eval_at)
+}
+
+fn close_hir_btree_loop(program: &mut ProgramBuilder, hir_loop: &HirBtreeLoop) {
+    program.preassign_label_to_next_insn(hir_loop.next);
+    match &hir_loop.advance {
+        HirLoopAdvance::None => {}
+        HirLoopAdvance::Cursor {
+            direction,
+            fullscan,
+        } => match direction {
             IterationDirection::Forwards => program.emit_insn(Insn::Next {
-                cursor_id: cursor,
-                pc_if_next: loop_start,
-                fullscan: matches!(operation, HirBtreeOperation::Scan { .. }),
+                cursor_id: hir_loop.cursor,
+                pc_if_next: hir_loop.loop_start,
+                fullscan: *fullscan,
             }),
             IterationDirection::Backwards => program.emit_insn(Insn::Prev {
-                cursor_id: cursor,
-                pc_if_prev: loop_start,
-                fullscan: matches!(operation, HirBtreeOperation::Scan { .. }),
+                cursor_id: hir_loop.cursor,
+                pc_if_prev: hir_loop.loop_start,
+                fullscan: *fullscan,
             }),
-        }
-    } else if matches!(operation, HirBtreeOperation::InSeek { .. }) {
-        emit_in_seek_advance(
+        },
+        HirLoopAdvance::InSeek {
+            state,
+            index_backed,
+        } => emit_in_seek_advance(
             program,
-            in_seek
-                .as_ref()
-                .expect("HIR IN seek start must produce loop state"),
-            cursor,
-            index.is_some(),
-            loop_start,
-        );
+            state,
+            hir_loop.cursor,
+            *index_backed,
+            hir_loop.loop_start,
+        ),
     }
-    program.preassign_label_to_next_insn(done);
-    Ok(())
+    program.preassign_label_to_next_insn(hir_loop.exhausted);
 }
 
 fn initialize_limit(
@@ -1156,6 +1350,45 @@ mod tests {
                     .expect("fixed table schema parses"),
             ))
             .expect("fixed table name is unique");
+        schema
+    }
+
+    fn joined_items_schema() -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                    .expect("left table schema parses"),
+            ))
+            .expect("left table name is unique");
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE right_items(value INTEGER, extra TEXT)", 3)
+                    .expect("right table schema parses"),
+            ))
+            .expect("right table name is unique");
+        schema
+            .add_index(Arc::new(Index {
+                name: "right_items_value".to_string(),
+                table_name: "right_items".to_string(),
+                root_page: 4,
+                columns: vec![IndexColumn {
+                    name: "value".to_string(),
+                    order: SortOrder::Asc,
+                    nulls_order: None,
+                    pos_in_table: 0,
+                    collation: None,
+                    default: None,
+                    expr: None,
+                }],
+                unique: false,
+                ephemeral: false,
+                has_rowid: true,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            }))
+            .expect("right index name is unique");
         schema
     }
 
@@ -1888,6 +2121,188 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
+    }
+
+    #[test]
+    fn planned_cross_join_nests_loops_and_places_predicates_when_ready() {
+        let plan = analyze_plan(
+            joined_items_schema(),
+            "SELECT l.value, r.value \
+             FROM left_items AS l NOT INDEXED CROSS JOIN right_items AS r NOT INDEXED \
+             WHERE l.value AND r.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        assert_eq!(block_plan.loops.len(), 2);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("planned cross join emits");
+
+        let cursors = block_plan
+            .loops
+            .iter()
+            .map(|planned_loop| {
+                let SourceBinding::BTree {
+                    scan_cursor,
+                    table_cursor: None,
+                } = program
+                    .source_binding(planned_loop.source)
+                    .copied()
+                    .expect("join source is bound")
+                else {
+                    panic!("table scan uses one cursor");
+                };
+                scan_cursor
+            })
+            .collect::<Vec<_>>();
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let outer_rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == cursors[0]),
+        );
+        let outer_column = position(
+            &|insn| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == cursors[0]),
+        );
+        let inner_rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == cursors[1]),
+        );
+        let inner_column = position(
+            &|insn| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == cursors[1]),
+        );
+        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 2, .. }));
+        let advances = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::Next {
+                    cursor_id,
+                    fullscan: true,
+                    ..
+                } => Some(*cursor_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let empty_targets = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::Rewind {
+                    cursor_id,
+                    pc_if_empty,
+                } if cursors.contains(cursor_id) => Some(*pc_if_empty),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let predicate_failures = program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::IfNot {
+                    target_pc,
+                    jump_if_null: true,
+                    ..
+                } => Some(*target_pc),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(outer_rewind < outer_column && outer_column < inner_rewind);
+        assert!(inner_rewind < inner_column && inner_column < result);
+        assert_eq!(advances, vec![cursors[1], cursors[0]]);
+        assert_eq!(empty_targets.len(), 2);
+        assert_eq!(predicate_failures.len(), 2);
+        for (empty, predicate_failure) in empty_targets.iter().zip(&predicate_failures) {
+            assert_ne!(empty, predicate_failure);
+        }
+    }
+
+    #[test]
+    fn planned_inner_join_seek_reads_its_outer_hir_source() {
+        for (output, table_required) in [("r.value", false), ("r.extra", true)] {
+            let sql = format!(
+                "SELECT l.value, {output} \
+                 FROM left_items AS l NOT INDEXED \
+                 JOIN right_items AS r INDEXED BY right_items_value \
+                 ON r.value = l.value"
+            );
+            let plan = analyze_plan(joined_items_schema(), &sql);
+            let query = root_query(&plan.document);
+            let block_plan = &plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0];
+            assert_eq!(block_plan.loops.len(), 2);
+            let HirSourceAccess::BTree {
+                operation:
+                    HirBtreeOperation::Seek {
+                        index: Some(index), ..
+                    },
+                table_lookup,
+            } = &block_plan.loops[1].access
+            else {
+                panic!("right join source uses its requested index seek");
+            };
+            assert_eq!(index.name, "right_items_value");
+            assert_eq!(
+                *table_lookup,
+                if table_required {
+                    BtreeTableLookup::TableRequired
+                } else {
+                    BtreeTableLookup::ScanOnly
+                }
+            );
+            let mut program = program();
+
+            emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+                .expect("planned inner seek emits");
+
+            let outer_cursor = match program
+                .source_binding(block_plan.loops[0].source)
+                .copied()
+                .expect("outer source is bound")
+            {
+                SourceBinding::BTree { scan_cursor, .. } => scan_cursor,
+                _ => panic!("outer source is a B-tree"),
+            };
+            let outer_key = program
+                .insns
+                .iter()
+                .position(|(insn, _)| {
+                    matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == outer_cursor)
+                })
+                .expect("seek reads its outer HIR column");
+            let seek = program
+                .insns
+                .iter()
+                .position(|(insn, _)| {
+                    matches!(
+                        insn,
+                        Insn::SeekGE { is_index: true, .. }
+                            | Insn::SeekGT { is_index: true, .. }
+                            | Insn::SeekLE { is_index: true, .. }
+                            | Insn::SeekLT { is_index: true, .. }
+                    )
+                })
+                .expect("inner source emits an index seek");
+            assert!(outer_key < seek);
+            assert_eq!(
+                program
+                    .insns
+                    .iter()
+                    .filter(|(insn, _)| matches!(insn, Insn::DeferredSeek { .. }))
+                    .count(),
+                usize::from(table_required)
+            );
+        }
     }
 
     #[test]
