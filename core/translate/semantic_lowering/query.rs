@@ -12,7 +12,7 @@ use crate::{
             emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
             AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
         },
-        optimizer::{HirBtreeOperation, HirInSeekSource},
+        optimizer::{HirBtreeOperation, HirInSeekSource, HirVirtualTableOperation},
         plan::{
             self, EphemeralRowidMode, HirCteMaterialization, HirSeekDef, IterationDirection,
             QueryDestination,
@@ -559,6 +559,7 @@ enum HirLoopAdvance {
         state: InSeekLoop,
         index_backed: bool,
     },
+    Virtual,
 }
 
 struct PreparedHirBtreeLoop<'a> {
@@ -577,6 +578,12 @@ struct PreparedHirMaterializedLoop<'a> {
     table: Arc<BTreeTable>,
 }
 
+struct PreparedHirVirtualLoop<'a> {
+    source: &'a hir::Source,
+    operation: &'a HirVirtualTableOperation,
+    cursor: CursorID,
+}
+
 #[derive(Clone, Copy)]
 enum HirMaterializedQuery {
     Derived(QueryId),
@@ -593,6 +600,7 @@ impl HirMaterializedQuery {
 
 enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
+    Virtual(PreparedHirVirtualLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
 }
 
@@ -600,6 +608,7 @@ impl PreparedHirLoop<'_> {
     fn cursor(&self) -> CursorID {
         match self {
             Self::BTree(prepared) => prepared.cursor,
+            Self::Virtual(prepared) => prepared.cursor,
             Self::Materialized(prepared) => prepared.cursor,
         }
     }
@@ -607,6 +616,7 @@ impl PreparedHirLoop<'_> {
     fn table_cursor(&self) -> Option<CursorID> {
         match self {
             Self::BTree(prepared) => prepared.table_cursor,
+            Self::Virtual(_) => None,
             Self::Materialized(_) => None,
         }
     }
@@ -909,6 +919,9 @@ fn prepare_hir_loop<'a>(
             &plan.document,
             planned_loop,
         )?)),
+        HirSourceAccess::Virtual(operation) => Ok(PreparedHirLoop::Virtual(
+            prepare_hir_virtual_loop(program, &plan.document, planned_loop.source, operation)?,
+        )),
         HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
             prepare_hir_materialized_loop(
                 program,
@@ -948,6 +961,42 @@ fn prepare_hir_loop<'a>(
             planned_loop.source
         ))),
     }
+}
+
+fn prepare_hir_virtual_loop<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a HirDocument,
+    source_id: SourceId,
+    operation: &'a HirVirtualTableOperation,
+) -> Result<PreparedHirVirtualLoop<'a>> {
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR virtual-table loop references missing source {source_id}"
+        ))
+    })?;
+    let table = match &source.kind {
+        hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => table,
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "HIR virtual-table loop source {} is not a table",
+                source.id
+            )))
+        }
+    };
+    let Table::Virtual(table) = table.value() else {
+        return Err(LimboError::InternalError(format!(
+            "HIR virtual-table loop source {} is not a virtual table",
+            source.id
+        )));
+    };
+    let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
+    program.emit_insn(Insn::VOpen { cursor_id: cursor });
+    program.bind_source(source.id, SourceBinding::Virtual { cursor });
+    Ok(PreparedHirVirtualLoop {
+        source,
+        operation,
+        cursor,
+    })
 }
 
 fn prepare_hir_shared_cte_loop<'a>(
@@ -1335,6 +1384,9 @@ fn start_hir_loop(
         PreparedHirLoop::BTree(prepared) => {
             start_hir_btree_loop(program, document, prepared, left_join)
         }
+        PreparedHirLoop::Virtual(prepared) => {
+            start_hir_virtual_loop(program, document, prepared, left_join)
+        }
         PreparedHirLoop::Materialized(prepared) => {
             if !matches!(
                 program.source_binding(prepared.source.id),
@@ -1369,6 +1421,55 @@ fn start_hir_loop(
             })
         }
     }
+}
+
+fn start_hir_virtual_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirVirtualLoop<'_>,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    if !matches!(
+        program.source_binding(prepared.source.id),
+        Some(SourceBinding::Virtual { cursor }) if *cursor == prepared.cursor
+    ) {
+        return Err(LimboError::InternalError(format!(
+            "HIR virtual-table source {} lost its cursor binding",
+            prepared.source.id
+        )));
+    }
+    let loop_start = program.allocate_label();
+    let next = program.allocate_label();
+    let exhausted = program.allocate_label();
+    let args_reg = program.alloc_registers(prepared.operation.arguments.len());
+    for (index, argument) in prepared.operation.arguments.iter().enumerate() {
+        super::expr::translate_expr(program, document, argument, args_reg + index)?;
+    }
+    let idx_str = prepared.operation.idx_str.as_ref().map(|value| {
+        let register = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            dest: register,
+            value: value.clone(),
+        });
+        register
+    });
+    program.emit_insn(Insn::VFilter {
+        cursor_id: prepared.cursor,
+        pc_if_empty: exhausted,
+        arg_count: prepared.operation.arguments.len(),
+        args_reg,
+        idx_str,
+        idx_num: prepared.operation.idx_num as usize,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+    Ok(HirBtreeLoop {
+        cursor: prepared.cursor,
+        loop_start,
+        next,
+        exhausted,
+        advance: HirLoopAdvance::Virtual,
+        left_join,
+    })
 }
 
 fn start_hir_btree_loop(
@@ -1617,6 +1718,10 @@ fn close_hir_btree_loop(
             *index_backed,
             hir_loop.loop_start,
         ),
+        HirLoopAdvance::Virtual => program.emit_insn(Insn::VNext {
+            cursor_id: hir_loop.cursor,
+            pc_if_next: hir_loop.loop_start,
+        }),
     }
     program.preassign_label_to_next_insn(hir_loop.exhausted);
     if let Some(left_join) = hir_loop.left_join.map(|index| &left_joins[index]) {
@@ -3076,6 +3181,62 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::OpenDup { .. })));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn planned_virtual_table_uses_resolved_arguments_and_virtual_cursor() {
+        let plan = analyze_plan(Schema::new(), "SELECT value FROM json_each('[1]')");
+        let query = root_query(&plan.document);
+        let planned_loop = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0];
+        let HirSourceAccess::Virtual(operation) = &planned_loop.access else {
+            panic!("table function uses virtual-table access");
+        };
+        assert!(matches!(
+            operation.arguments.as_slice(),
+            [Expr::Literal(Literal::String(_))]
+        ));
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("virtual-table query emits");
+
+        let SourceBinding::Virtual { cursor } = program
+            .source_binding(planned_loop.source)
+            .copied()
+            .expect("virtual source is bound")
+        else {
+            panic!("virtual source uses one virtual cursor");
+        };
+        assert!(matches!(
+            program.get_cursor_type(cursor),
+            Some(CursorType::VirtualTable(_))
+        ));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::VOpen { cursor_id } if *cursor_id == cursor)));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::VFilter {
+                cursor_id,
+                arg_count: 1,
+                idx_num,
+                ..
+            } if *cursor_id == cursor && *idx_num == operation.idx_num as usize
+        )));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::VColumn { cursor_id, .. } if *cursor_id == cursor
+        )));
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::VNext { cursor_id, .. } if *cursor_id == cursor
+        )));
     }
 
     #[test]
