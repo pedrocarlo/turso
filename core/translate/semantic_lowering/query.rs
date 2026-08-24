@@ -13,7 +13,10 @@ use crate::{
             AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource},
-        plan::{self, EphemeralRowidMode, HirSeekDef, IterationDirection, QueryDestination},
+        plan::{
+            self, EphemeralRowidMode, HirCteMaterialization, HirSeekDef, IterationDirection,
+            QueryDestination,
+        },
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
         semantic_to_plan::{
@@ -571,6 +574,20 @@ struct PreparedHirMaterializedLoop<'a> {
     cursor: CursorID,
 }
 
+#[derive(Clone, Copy)]
+enum HirMaterializedQuery {
+    Derived(QueryId),
+    Cte { cte: hir::CteId, query: QueryId },
+}
+
+impl HirMaterializedQuery {
+    fn query(self) -> QueryId {
+        match self {
+            Self::Derived(query) | Self::Cte { query, .. } => query,
+        }
+    }
+}
+
 enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
@@ -890,7 +907,27 @@ fn prepare_hir_loop<'a>(
             planned_loop,
         )?)),
         HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
-            prepare_hir_materialized_loop(program, plan, planned_loop.source, *query)?,
+            prepare_hir_materialized_loop(
+                program,
+                plan,
+                planned_loop.source,
+                HirMaterializedQuery::Derived(*query),
+            )?,
+        )),
+        HirSourceAccess::Cte {
+            cte,
+            query,
+            materialization: HirCteMaterialization::PerReference,
+        } => Ok(PreparedHirLoop::Materialized(
+            prepare_hir_materialized_loop(
+                program,
+                plan,
+                planned_loop.source,
+                HirMaterializedQuery::Cte {
+                    cte: *cte,
+                    query: *query,
+                },
+            )?,
         )),
         _ => Err(LimboError::InternalError(format!(
             "HIR source {} does not use a supported source loop",
@@ -903,32 +940,41 @@ fn prepare_hir_materialized_loop<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     source_id: SourceId,
-    query_id: QueryId,
+    materialized_query: HirMaterializedQuery,
 ) -> Result<PreparedHirMaterializedLoop<'a>> {
     let document = &plan.document;
+    let query_id = materialized_query.query();
     let source = document.source(source_id).ok_or_else(|| {
         LimboError::InternalError(format!(
             "HIR materialized loop references missing source {source_id}"
         ))
     })?;
-    if !matches!(source.kind, hir::SourceKind::Derived(query) if query == query_id) {
+    let source_matches = match materialized_query {
+        HirMaterializedQuery::Derived(query) => {
+            matches!(source.kind, hir::SourceKind::Derived(source_query) if source_query == query)
+        }
+        HirMaterializedQuery::Cte { cte, .. } => {
+            matches!(source.kind, hir::SourceKind::Cte(source_cte) if source_cte == cte)
+        }
+    };
+    if !source_matches {
         return Err(LimboError::InternalError(format!(
-            "HIR materialized loop source {source_id} does not match derived query {query_id}"
+            "HIR materialized loop source {source_id} does not match query {query_id}"
         )));
     }
     let query = document.query(query_id).ok_or_else(|| {
         LimboError::InternalError(format!(
-            "HIR derived source {source_id} references missing query {query_id}"
+            "HIR materialized source {source_id} references missing query {query_id}"
         ))
     })?;
     if !query.captures.is_empty() {
         return Err(LimboError::InternalError(format!(
-            "HIR derived source {source_id} is correlated"
+            "HIR materialized source {source_id} is correlated"
         )));
     }
     if source.columns.len() != query.output.len() {
         return Err(LimboError::InternalError(format!(
-            "HIR derived source {source_id} width {} does not match query {query_id} width {}",
+            "HIR materialized source {source_id} width {} does not match query {query_id} width {}",
             source.columns.len(),
             query.output.len()
         )));
@@ -2768,6 +2814,69 @@ mod tests {
         assert_ne!(derived_query, query);
         assert!(once < open && open < insert && insert < rewind);
         assert!(rewind < result && result < next);
+    }
+
+    #[test]
+    fn planned_single_reference_cte_materializes_its_hir_query() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "WITH chosen AS (\
+                 SELECT value FROM items NOT INDEXED WHERE value > 1\
+             ) \
+             SELECT c.value FROM chosen AS c WHERE c.value < 5",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let [planned_loop] = block_plan.loops.as_slice() else {
+            panic!("CTE reference has one physical loop");
+        };
+        let HirSourceAccess::Cte {
+            query: cte_query,
+            materialization,
+            ..
+        } = &planned_loop.access
+        else {
+            panic!("CTE source keeps its prepared HIR query");
+        };
+        assert_eq!(*materialization, HirCteMaterialization::PerReference);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("single-reference CTE query emits");
+
+        let SourceBinding::BTree {
+            scan_cursor,
+            table_cursor: None,
+        } = program
+            .source_binding(planned_loop.source)
+            .copied()
+            .expect("CTE source is bound")
+        else {
+            panic!("materialized CTE source uses one table cursor");
+        };
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let once = position(&|insn| matches!(insn, Insn::Once { .. }));
+        let open = position(
+            &|insn| matches!(insn, Insn::OpenEphemeral { cursor_id, is_table: true } if *cursor_id == scan_cursor),
+        );
+        let insert =
+            position(&|insn| matches!(insn, Insn::Insert { cursor, .. } if *cursor == scan_cursor));
+        let rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == scan_cursor),
+        );
+        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 1, .. }));
+
+        assert_ne!(*cte_query, query);
+        assert!(once < open && open < insert && insert < rewind && rewind < result);
     }
 
     #[test]
