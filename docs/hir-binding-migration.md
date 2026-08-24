@@ -792,6 +792,13 @@ match flag. Downstream loops restart for the unmatched row. Indexed and
 automatic-index right sides use the same path. RIGHT/FULL joins and nested outer
 joins inside a parenthesized right side remain later checkpoints.
 
+Non-correlated derived `FROM` sources now lower directly from their prepared
+`QueryId`. Lowering materializes the child HIR query once into an ephemeral
+table, binds that cursor to the derived `SourceId`, and feeds it through the same
+nested-loop driver as ordinary B-tree scans. No parser expression or synthetic
+table reference is rebuilt. Correlated derived sources, CTE sharing, and
+recursive CTE runtime loops remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

@@ -3,7 +3,7 @@
 use turso_parser::ast::{Literal, SortOrder};
 
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Table, Type},
     sync::Arc,
     translate::{
         eqp::EqpDetail,
@@ -13,7 +13,7 @@ use crate::{
             AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource},
-        plan::{self, HirSeekDef, IterationDirection, QueryDestination},
+        plan::{self, EphemeralRowidMode, HirSeekDef, IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
         semantic_to_plan::{
@@ -536,7 +536,7 @@ pub(crate) fn emit_planned_query_body(
     }
     emit_btree_loops(
         program,
-        document,
+        plan,
         query.limit.as_ref(),
         block,
         block_plan,
@@ -566,6 +566,32 @@ struct PreparedHirBtreeLoop<'a> {
     table_has_rowid: bool,
 }
 
+struct PreparedHirMaterializedLoop<'a> {
+    source: &'a hir::Source,
+    cursor: CursorID,
+}
+
+enum PreparedHirLoop<'a> {
+    BTree(PreparedHirBtreeLoop<'a>),
+    Materialized(PreparedHirMaterializedLoop<'a>),
+}
+
+impl PreparedHirLoop<'_> {
+    fn cursor(&self) -> CursorID {
+        match self {
+            Self::BTree(prepared) => prepared.cursor,
+            Self::Materialized(prepared) => prepared.cursor,
+        }
+    }
+
+    fn table_cursor(&self) -> Option<CursorID> {
+        match self {
+            Self::BTree(prepared) => prepared.table_cursor,
+            Self::Materialized(_) => None,
+        }
+    }
+}
+
 struct HirBtreeLoop {
     cursor: CursorID,
     loop_start: BranchOffset,
@@ -593,12 +619,13 @@ enum HirPredicateKind {
 
 fn emit_btree_loops(
     program: &mut ProgramBuilder,
-    document: &HirDocument,
+    plan: &HirPlan,
     query_limit: Option<&hir::Limit>,
     block: &hir::QueryBlock,
     block_plan: &HirQueryBlockPlan,
     destination: &QueryDestination,
 ) -> Result<()> {
+    let document = &plan.document;
     if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} is not a supported B-tree loop",
@@ -646,7 +673,7 @@ fn emit_btree_loops(
     let prepared_loops = block_plan
         .loops
         .iter()
-        .map(|planned_loop| prepare_hir_btree_loop(program, document, planned_loop))
+        .map(|planned_loop| prepare_hir_loop(program, plan, planned_loop))
         .collect::<Result<Vec<_>>>()?;
     let left_joins =
         prepare_hir_left_joins(program, block_plan, &prepared_loops, &left_join_owners)?;
@@ -675,7 +702,7 @@ fn emit_btree_loops(
                 "HIR loop {loop_index} starts overlapping LEFT JOIN boundaries"
             )));
         }
-        let hir_loop = start_hir_btree_loop(program, document, prepared_loop, left_join)?;
+        let hir_loop = start_hir_loop(program, document, prepared_loop, left_join)?;
         for left_join in left_joins
             .iter()
             .filter(|left_join| left_join.last_loop == loop_index)
@@ -789,7 +816,7 @@ fn ordinary_btree_from(document: &HirDocument, from: &hir::From) -> bool {
 fn prepare_hir_left_joins(
     program: &mut ProgramBuilder,
     block_plan: &HirQueryBlockPlan,
-    prepared_loops: &[PreparedHirBtreeLoop<'_>],
+    prepared_loops: &[PreparedHirLoop<'_>],
     owners: &[SourceId],
 ) -> Result<Vec<HirLeftJoin>> {
     owners
@@ -835,8 +862,8 @@ fn prepare_hir_left_joins(
             }
             let mut null_cursors = Vec::new();
             for prepared in &prepared_loops[first_loop..=last_loop] {
-                null_cursors.push(prepared.cursor);
-                if let Some(table_cursor) = prepared.table_cursor {
+                null_cursors.push(prepared.cursor());
+                if let Some(table_cursor) = prepared.table_cursor() {
                     null_cursors.push(table_cursor);
                 }
             }
@@ -849,6 +876,133 @@ fn prepare_hir_left_joins(
             })
         })
         .collect()
+}
+
+fn prepare_hir_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    planned_loop: &'a HirPlannedLoop,
+) -> Result<PreparedHirLoop<'a>> {
+    match &planned_loop.access {
+        HirSourceAccess::BTree { .. } => Ok(PreparedHirLoop::BTree(prepare_hir_btree_loop(
+            program,
+            &plan.document,
+            planned_loop,
+        )?)),
+        HirSourceAccess::Derived { query } => Ok(PreparedHirLoop::Materialized(
+            prepare_hir_materialized_loop(program, plan, planned_loop.source, *query)?,
+        )),
+        _ => Err(LimboError::InternalError(format!(
+            "HIR source {} does not use a supported source loop",
+            planned_loop.source
+        ))),
+    }
+}
+
+fn prepare_hir_materialized_loop<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    source_id: SourceId,
+    query_id: QueryId,
+) -> Result<PreparedHirMaterializedLoop<'a>> {
+    let document = &plan.document;
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR materialized loop references missing source {source_id}"
+        ))
+    })?;
+    if !matches!(source.kind, hir::SourceKind::Derived(query) if query == query_id) {
+        return Err(LimboError::InternalError(format!(
+            "HIR materialized loop source {source_id} does not match derived query {query_id}"
+        )));
+    }
+    let query = document.query(query_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR derived source {source_id} references missing query {query_id}"
+        ))
+    })?;
+    if !query.captures.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "HIR derived source {source_id} is correlated"
+        )));
+    }
+    if source.columns.len() != query.output.len() {
+        return Err(LimboError::InternalError(format!(
+            "HIR derived source {source_id} width {} does not match query {query_id} width {}",
+            source.columns.len(),
+            query.output.len()
+        )));
+    }
+
+    let columns = source
+        .columns
+        .iter()
+        .map(|column| {
+            let storage = column.type_fact.storage.unwrap_or(Type::Null);
+            let ty_str = match column.affinity {
+                Affinity::Blob => "BLOB",
+                Affinity::Text => "TEXT",
+                Affinity::Numeric => "NUMERIC",
+                Affinity::Integer => "INTEGER",
+                Affinity::Real => "REAL",
+                Affinity::None => "",
+            };
+            Column::new(
+                Some(column.name.clone()),
+                ty_str.to_string(),
+                None,
+                None,
+                storage,
+                column
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value()),
+                ColDef {
+                    hidden: column.hidden,
+                    ..ColDef::default()
+                },
+            )
+        })
+        .collect();
+    let table = Arc::new(BTreeTable::new(
+        0,
+        source.name.clone(),
+        Vec::new(),
+        columns,
+        BTreeCharacteristics::HAS_ROWID,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    ));
+    let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let materialized = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: materialized,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: cursor,
+        is_table: true,
+    });
+    emit_planned_query_body(
+        program,
+        plan,
+        query_id,
+        &QueryDestination::EphemeralTable {
+            cursor_id: cursor,
+            table,
+            rowid_mode: EphemeralRowidMode::Auto,
+        },
+    )?;
+    program.preassign_label_to_next_insn(materialized);
+    program.bind_source(
+        source_id,
+        SourceBinding::BTree {
+            scan_cursor: cursor,
+            table_cursor: None,
+        },
+    );
+    Ok(PreparedHirMaterializedLoop { source, cursor })
 }
 
 fn prepare_hir_btree_loop<'a>(
@@ -1054,6 +1208,52 @@ fn build_hir_autoindex(
         },
     );
     Ok(result?.use_bloom_filter)
+}
+
+fn start_hir_loop(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    prepared: &PreparedHirLoop<'_>,
+    left_join: Option<usize>,
+) -> Result<HirBtreeLoop> {
+    match prepared {
+        PreparedHirLoop::BTree(prepared) => {
+            start_hir_btree_loop(program, document, prepared, left_join)
+        }
+        PreparedHirLoop::Materialized(prepared) => {
+            if !matches!(
+                program.source_binding(prepared.source.id),
+                Some(SourceBinding::BTree {
+                    scan_cursor,
+                    table_cursor: None,
+                }) if *scan_cursor == prepared.cursor
+            ) {
+                return Err(LimboError::InternalError(format!(
+                    "HIR materialized source {} lost its cursor binding",
+                    prepared.source.id
+                )));
+            }
+            let loop_start = program.allocate_label();
+            let next = program.allocate_label();
+            let exhausted = program.allocate_label();
+            program.emit_insn(Insn::Rewind {
+                cursor_id: prepared.cursor,
+                pc_if_empty: exhausted,
+            });
+            program.preassign_label_to_next_insn(loop_start);
+            Ok(HirBtreeLoop {
+                cursor: prepared.cursor,
+                loop_start,
+                next,
+                exhausted,
+                advance: HirLoopAdvance::Cursor {
+                    direction: IterationDirection::Forwards,
+                    fullscan: true,
+                },
+                left_join,
+            })
+        }
+    }
 }
 
 fn start_hir_btree_loop(
@@ -2498,6 +2698,76 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. })));
+    }
+
+    #[test]
+    fn planned_derived_table_materializes_once_and_scans_its_hir_query() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT d.value \
+             FROM (SELECT value FROM items NOT INDEXED WHERE value > 1) AS d \
+             WHERE d.value < 5",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let [planned_loop] = block_plan.loops.as_slice() else {
+            panic!("derived table has one physical loop");
+        };
+        let HirSourceAccess::Derived {
+            query: derived_query,
+        } = planned_loop.access
+        else {
+            panic!("derived source keeps its prepared HIR query");
+        };
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("derived-table query emits");
+
+        let SourceBinding::BTree {
+            scan_cursor,
+            table_cursor: None,
+        } = program
+            .source_binding(planned_loop.source)
+            .copied()
+            .expect("derived source is bound")
+        else {
+            panic!("materialized derived source uses one table cursor");
+        };
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let once = position(&|insn| matches!(insn, Insn::Once { .. }));
+        let open = position(
+            &|insn| matches!(insn, Insn::OpenEphemeral { cursor_id, is_table: true } if *cursor_id == scan_cursor),
+        );
+        let insert =
+            position(&|insn| matches!(insn, Insn::Insert { cursor, .. } if *cursor == scan_cursor));
+        let rewind = program
+            .insns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (insn, _))| {
+                matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == scan_cursor)
+                    .then_some(position)
+            })
+            .last()
+            .expect("materialized table is scanned");
+        let result = position(&|insn| matches!(insn, Insn::ResultRow { count: 1, .. }));
+        let next = position(
+            &|insn| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == scan_cursor),
+        );
+
+        assert_ne!(derived_query, query);
+        assert!(once < open && open < insert && insert < rewind);
+        assert!(rewind < result && result < next);
     }
 
     #[test]
