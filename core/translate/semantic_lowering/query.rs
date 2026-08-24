@@ -10,12 +10,12 @@ use crate::{
         expr::ConditionMetadata,
         main_loop::{
             emit_autoindex, emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor,
-            AutoIndexBuild, InSeekLoop, SeekEmitter, SeekExpressionLowering,
+            AutoIndexBuild, InSeekLoop, LeftJoinMetadata, SeekEmitter, SeekExpressionLowering,
         },
         optimizer::{HirBtreeOperation, HirInSeekSource},
         plan::{self, HirSeekDef, IterationDirection, QueryDestination},
         result_row::emit_columns_to_destination,
-        semantic::hir::{self, HirDocument, QueryId, SubqueryExpr},
+        semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
         semantic_to_plan::{
             BtreeTableLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan, HirSourceAccess,
         },
@@ -25,7 +25,7 @@ use crate::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder, SourceBinding, SubqueryBinding},
         insn::Insn,
-        BranchOffset,
+        BranchOffset, CursorID,
     },
     LimboError, Numeric, Result, Value,
 };
@@ -54,7 +54,7 @@ fn open_hir_in_seek_source_cursor(
     document: &HirDocument,
     index: Option<&Arc<Index>>,
     source: &HirInSeekSource,
-) -> Result<usize> {
+) -> Result<CursorID> {
     match source {
         HirInSeekSource::Values { values, affinity } => open_in_seek_values_cursor(
             program,
@@ -560,20 +560,33 @@ struct PreparedHirBtreeLoop<'a> {
     source: &'a hir::Source,
     operation: &'a HirBtreeOperation,
     index: Option<&'a Arc<Index>>,
-    cursor: usize,
-    table_cursor: Option<usize>,
-    autoindex_source_cursor: Option<usize>,
+    cursor: CursorID,
+    table_cursor: Option<CursorID>,
+    autoindex_source_cursor: Option<CursorID>,
     table_has_rowid: bool,
 }
 
 struct HirBtreeLoop {
-    cursor: usize,
+    cursor: CursorID,
     loop_start: BranchOffset,
     /// Reject the current row, then run this loop's advance operation.
     next: BranchOffset,
     /// This access produced no row, so skip its advance operation.
     exhausted: BranchOffset,
     advance: HirLoopAdvance,
+    left_join: Option<HirLeftJoin>,
+}
+
+struct HirLeftJoin {
+    metadata: LeftJoinMetadata,
+    scan_cursor: CursorID,
+    table_cursor: Option<CursorID>,
+}
+
+#[derive(Clone, Copy)]
+enum HirPredicateKind {
+    Join(SourceId),
+    Where,
 }
 
 fn emit_btree_loops(
@@ -608,9 +621,20 @@ fn emit_btree_loops(
         )));
     }
     let from = block.from.as_ref().expect("FROM query block has a source");
-    if !inner_btree_from(document, from) {
+    let mut left_join_sources = Vec::new();
+    if !supported_btree_from(document, from, &mut left_join_sources) {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} contains an unsupported join",
+            block.id
+        )));
+    }
+    if block_plan.predicates.iter().any(|predicate| {
+        predicate
+            .from_outer_join
+            .is_some_and(|source| !left_join_sources.contains(&source))
+    }) {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} contains an unsupported outer-join predicate owner",
             block.id
         )));
     }
@@ -623,16 +647,46 @@ fn emit_btree_loops(
         .map(|planned_loop| prepare_hir_btree_loop(program, document, planned_loop))
         .collect::<Result<Vec<_>>>()?;
 
-    emit_ready_predicates(program, document, block_plan, None, done)?;
+    emit_ready_predicates(
+        program,
+        document,
+        block_plan,
+        None,
+        done,
+        HirPredicateKind::Where,
+    )?;
     let mut loops = Vec::with_capacity(prepared_loops.len());
     for (loop_index, prepared_loop) in prepared_loops.iter().enumerate() {
-        let hir_loop = start_hir_btree_loop(program, document, prepared_loop)?;
+        let left_join = left_join_sources
+            .contains(&prepared_loop.source.id)
+            .then(|| {
+                let metadata = LeftJoinMetadata::new(program);
+                metadata.reset(program);
+                HirLeftJoin {
+                    metadata,
+                    scan_cursor: prepared_loop.cursor,
+                    table_cursor: prepared_loop.table_cursor,
+                }
+            });
+        let hir_loop = start_hir_btree_loop(program, document, prepared_loop, left_join)?;
+        if let Some(left_join) = &hir_loop.left_join {
+            emit_ready_predicates(
+                program,
+                document,
+                block_plan,
+                Some(loop_index),
+                hir_loop.next,
+                HirPredicateKind::Join(prepared_loop.source.id),
+            )?;
+            left_join.metadata.mark_matched(program);
+        }
         emit_ready_predicates(
             program,
             document,
             block_plan,
             Some(loop_index),
             hir_loop.next,
+            HirPredicateKind::Where,
         )?;
         loops.push(hir_loop);
     }
@@ -662,25 +716,37 @@ fn emit_btree_loops(
     Ok(())
 }
 
-fn inner_btree_from(document: &HirDocument, from: &hir::From) -> bool {
-    let ordinary_join = |join: &hir::Join| {
-        matches!(
-            join.kind,
-            hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross
-        )
-    };
-    from.joins.iter().all(ordinary_join)
-        && std::iter::once(from.first)
-            .chain(from.joins.iter().map(|join| join.right))
-            .all(|source| {
-                document.source(source).is_some_and(|source| {
-                    if let hir::SourceKind::FromGroup(group) = &source.kind {
-                        inner_btree_from(document, &group.from)
-                    } else {
-                        true
-                    }
-                })
+fn supported_btree_from(
+    document: &HirDocument,
+    from: &hir::From,
+    left_join_sources: &mut Vec<SourceId>,
+) -> bool {
+    for join in &from.joins {
+        match join.kind {
+            hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => {}
+            hir::JoinKind::Left => {
+                let Some(source) = document.source(join.right) else {
+                    return false;
+                };
+                if matches!(source.kind, hir::SourceKind::FromGroup(_)) {
+                    return false;
+                }
+                left_join_sources.push(join.right);
+            }
+            hir::JoinKind::Right | hir::JoinKind::Full => return false,
+        }
+    }
+    std::iter::once(from.first)
+        .chain(from.joins.iter().map(|join| join.right))
+        .all(|source| {
+            document.source(source).is_some_and(|source| {
+                if let hir::SourceKind::FromGroup(group) = &source.kind {
+                    supported_btree_from(document, &group.from, left_join_sources)
+                } else {
+                    true
+                }
             })
+        })
 }
 
 fn prepare_hir_btree_loop<'a>(
@@ -892,6 +958,7 @@ fn start_hir_btree_loop(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     prepared: &PreparedHirBtreeLoop<'_>,
+    left_join: Option<HirLeftJoin>,
 ) -> Result<HirBtreeLoop> {
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
@@ -980,6 +1047,7 @@ fn start_hir_btree_loop(
         next,
         exhausted,
         advance,
+        left_join,
     })
 }
 
@@ -989,15 +1057,39 @@ fn emit_ready_predicates(
     block_plan: &HirQueryBlockPlan,
     loop_index: Option<usize>,
     fail: BranchOffset,
+    kind: HirPredicateKind,
 ) -> Result<()> {
     for predicate in block_plan.predicates.iter().filter(|term| !term.consumed) {
-        if predicate.from_outer_join.is_some() {
-            return Err(LimboError::InternalError(format!(
-                "HIR query block {:?} contains an outer-join predicate",
-                block_plan.block
-            )));
+        let selected = match kind {
+            HirPredicateKind::Join(source) => predicate.from_outer_join == Some(source),
+            HirPredicateKind::Where => predicate.from_outer_join.is_none(),
+        };
+        if !selected {
+            continue;
         }
-        if predicate_loop(program, document, &predicate.expr, &block_plan.loops)? != loop_index {
+        let references_ready_at =
+            predicate_loop(program, document, &predicate.expr, &block_plan.loops)?;
+        let evaluate_at = match kind {
+            HirPredicateKind::Join(source) => {
+                let owner = block_plan
+                    .loops
+                    .iter()
+                    .position(|hir_loop| hir_loop.source == source)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "HIR outer-join predicate owner {source} has no loop"
+                        ))
+                    })?;
+                if references_ready_at.is_some_and(|ready| ready > owner) {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR outer-join predicate owned by {source} references a later loop"
+                    )));
+                }
+                Some(owner)
+            }
+            HirPredicateKind::Where => references_ready_at,
+        };
+        if evaluate_at != loop_index {
             continue;
         }
         let passed = program.allocate_label();
@@ -1097,6 +1189,18 @@ fn close_hir_btree_loop(program: &mut ProgramBuilder, hir_loop: &HirBtreeLoop) {
         ),
     }
     program.preassign_label_to_next_insn(hir_loop.exhausted);
+    if let Some(left_join) = &hir_loop.left_join {
+        let finished = left_join.metadata.begin_unmatched_row(program);
+        program.emit_insn(Insn::NullRow {
+            cursor_id: left_join.scan_cursor,
+        });
+        if let Some(table_cursor) = left_join.table_cursor {
+            program.emit_insn(Insn::NullRow {
+                cursor_id: table_cursor,
+            });
+        }
+        left_join.metadata.finish_unmatched_row(program, finished);
+    }
 }
 
 fn initialize_limit(
@@ -1541,6 +1645,17 @@ mod tests {
             .analyze_stats
             .table_stats_mut("right_items")
             .row_count = Some(1);
+        schema
+    }
+
+    fn left_join_with_tail_schema() -> Schema {
+        let mut schema = automatic_join_schema();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE tail_items(value INTEGER, extra TEXT)", 4)
+                    .expect("tail table schema parses"),
+            ))
+            .expect("tail table name is unique");
         schema
     }
 
@@ -2635,6 +2750,280 @@ mod tests {
             })
             .expect("automatic index is populated");
         assert!(add < insert);
+    }
+
+    #[test]
+    fn left_join_checks_on_before_marking_match_and_where_afterward() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             LEFT JOIN right_items AS r NOT INDEXED ON r.value = l.value \
+             WHERE r.extra IS NULL",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let right_loop = &block_plan.loops[1];
+        assert_eq!(block_plan.predicates.len(), 2);
+        assert_eq!(
+            block_plan.predicates[0].from_outer_join,
+            Some(right_loop.source)
+        );
+        assert_eq!(block_plan.predicates[1].from_outer_join, None);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("LEFT JOIN emits");
+
+        let SourceBinding::BTree {
+            scan_cursor: right_cursor,
+            table_cursor: None,
+        } = program
+            .source_binding(right_loop.source)
+            .copied()
+            .expect("right source is bound")
+        else {
+            panic!("NOT INDEXED right source uses one B-tree cursor");
+        };
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let reset = position(&|insn| matches!(insn, Insn::Integer { value: 0, .. }));
+        let match_register = match program.insns[reset].0 {
+            Insn::Integer { dest, .. } => dest,
+            _ => unreachable!(),
+        };
+        let rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == right_cursor),
+        );
+        let matched = position(
+            &|insn| matches!(insn, Insn::Integer { value: 1, dest } if *dest == match_register),
+        );
+        let failures = program
+            .insns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, (insn, _))| {
+                matches!(insn, Insn::IfNot { .. }).then_some(position)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        let [on_failure, where_failure] = failures.as_slice() else {
+            unreachable!()
+        };
+        let result = position(&|insn| matches!(insn, Insn::ResultRow { .. }));
+        let next = position(
+            &|insn| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == right_cursor),
+        );
+        let check =
+            position(&|insn| matches!(insn, Insn::IfPos { reg, .. } if *reg == match_register));
+        let null_row = position(
+            &|insn| matches!(insn, Insn::NullRow { cursor_id } if *cursor_id == right_cursor),
+        );
+        let retry = program
+            .insns
+            .iter()
+            .enumerate()
+            .skip(null_row + 1)
+            .find_map(|(position, (insn, _))| matches!(insn, Insn::Goto { .. }).then_some(position))
+            .expect("NULL row re-enters after ON predicates");
+
+        assert!(reset < rewind && rewind < *on_failure && *on_failure < matched);
+        assert!(matched < *where_failure && *where_failure < result && result < next);
+        assert!(next < check && check < null_row && null_row < retry);
+    }
+
+    #[test]
+    fn left_join_constant_on_runs_at_the_right_loop_boundary() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             LEFT JOIN right_items AS r NOT INDEXED ON 0",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        assert_eq!(
+            block_plan.predicates[0].from_outer_join,
+            Some(block_plan.loops[1].source)
+        );
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("constant-ON LEFT JOIN emits");
+
+        let reset = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Integer { value: 0, .. }))
+            .expect("match flag is reset");
+        let match_register = match program.insns[reset].0 {
+            Insn::Integer { dest, .. } => dest,
+            _ => unreachable!(),
+        };
+        let on_failure = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::IfNot { .. }))
+            .expect("constant ON predicate is checked");
+        let matched = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(insn, Insn::Integer { value: 1, dest } if *dest == match_register)
+            })
+            .expect("match flag is set after ON");
+        assert!(reset < on_failure && on_failure < matched);
+    }
+
+    #[test]
+    fn left_join_uses_automatic_index_and_null_extends_its_scan_cursor() {
+        let plan = analyze_plan(
+            automatic_join_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             LEFT JOIN right_items AS r ON r.value = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let HirSourceAccess::BTree {
+            operation:
+                HirBtreeOperation::Seek {
+                    index: Some(index), ..
+                },
+            ..
+        } = &block_plan.loops[1].access
+        else {
+            panic!("right source uses an automatic-index seek");
+        };
+        assert!(index.ephemeral);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("automatic-index LEFT JOIN emits");
+
+        let SourceBinding::BTree { scan_cursor, .. } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("right source is bound")
+        else {
+            panic!("right source has a B-tree binding");
+        };
+        assert!(program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::OpenAutoindex { cursor_id } if *cursor_id == scan_cursor)
+        ));
+        assert!(program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::NullRow { cursor_id } if *cursor_id == scan_cursor)
+        ));
+    }
+
+    #[test]
+    fn left_join_null_extends_index_and_table_cursors() {
+        let plan = analyze_plan(
+            joined_items_schema(),
+            "SELECT l.value, r.extra \
+             FROM left_items AS l NOT INDEXED \
+             LEFT JOIN right_items AS r INDEXED BY right_items_value \
+                 ON r.value = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("indexed LEFT JOIN emits");
+
+        let SourceBinding::BTree {
+            scan_cursor,
+            table_cursor: Some(table_cursor),
+        } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("right source is bound")
+        else {
+            panic!("uncovered output uses index and table cursors");
+        };
+        for cursor in [scan_cursor, table_cursor] {
+            assert!(program.insns.iter().any(
+                |(insn, _)| matches!(insn, Insn::NullRow { cursor_id } if *cursor_id == cursor)
+            ));
+        }
+    }
+
+    #[test]
+    fn unmatched_left_join_row_restarts_downstream_loop() {
+        let plan = analyze_plan(
+            left_join_with_tail_schema(),
+            "SELECT l.value, r.extra, t.extra \
+             FROM left_items AS l NOT INDEXED \
+             LEFT JOIN right_items AS r NOT INDEXED ON r.value = l.value \
+             CROSS JOIN tail_items AS t NOT INDEXED \
+             WHERE t.value = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        assert_eq!(block_plan.loops.len(), 3);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("LEFT JOIN with downstream loop emits");
+
+        let cursor = |source| match program
+            .source_binding(source)
+            .copied()
+            .expect("source is bound")
+        {
+            SourceBinding::BTree { scan_cursor, .. } => scan_cursor,
+            _ => panic!("source uses a B-tree cursor"),
+        };
+        let right_cursor = cursor(block_plan.loops[1].source);
+        let tail_cursor = cursor(block_plan.loops[2].source);
+        let position = |matches: &dyn Fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .expect("expected instruction is emitted")
+        };
+        let matched = position(&|insn| matches!(insn, Insn::Integer { value: 1, .. }));
+        let tail_rewind = position(
+            &|insn| matches!(insn, Insn::Rewind { cursor_id, .. } if *cursor_id == tail_cursor),
+        );
+        let tail_next = position(
+            &|insn| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == tail_cursor),
+        );
+        let null_row = position(
+            &|insn| matches!(insn, Insn::NullRow { cursor_id } if *cursor_id == right_cursor),
+        );
+        let retry = program
+            .insns
+            .iter()
+            .enumerate()
+            .skip(null_row + 1)
+            .find_map(|(position, (insn, _))| matches!(insn, Insn::Goto { .. }).then_some(position))
+            .expect("NULL row re-enters the downstream loop");
+
+        assert!(matched < tail_rewind && tail_rewind < tail_next);
+        assert!(tail_next < null_row && null_row < retry);
     }
 
     #[test]

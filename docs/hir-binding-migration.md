@@ -781,6 +781,15 @@ the index source binding before probing, and keeps the existing affinity,
 NULL-matching, bloom-filter, and seek behavior. Outer joins and non-B-tree
 sources remain later checkpoints.
 
+Direct-table LEFT JOINs now lower with the same match-flag control used by the
+legacy main loop. Shared metadata helpers reset and set the flag, check it at
+right-loop exhaustion, null-extend every active index/table cursor, and re-enter
+after ON predicates so post-join WHERE predicates see the synthetic NULL row.
+HIR predicate ownership keeps ON terms before the match flag and WHERE terms
+after it; downstream loops restart for the unmatched row. Indexed and automatic
+index right sides use the same path. RIGHT/FULL joins and a parenthesized group
+as the direct right side remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

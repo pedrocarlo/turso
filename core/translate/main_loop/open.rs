@@ -93,10 +93,7 @@ impl OpenLoop {
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
-                    program.emit_insn(Insn::Integer {
-                        value: 0,
-                        dest: lj_meta.reg_match_flag,
-                    });
+                    lj_meta.reset(program);
                 }
             }
 
@@ -559,11 +556,7 @@ impl OpenLoop {
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() && !is_outer_hj_probe {
                     let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
-                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
-                    program.emit_insn(Insn::Integer {
-                        value: 1,
-                        dest: lj_meta.reg_match_flag,
-                    });
+                    lj_meta.mark_matched(program);
                 }
             }
 
@@ -581,11 +574,7 @@ impl OpenLoop {
                     if matches!(hj.join_type, HashJoinType::FullOuter) {
                         let probe_idx = hj.probe_table_idx;
                         if let Some(lj_meta) = t_ctx.meta_left_joins[probe_idx].as_ref() {
-                            program.preassign_label_to_next_insn(lj_meta.label_match_flag_set_true);
-                            program.emit_insn(Insn::Integer {
-                                value: 1,
-                                dest: lj_meta.reg_match_flag,
-                            });
+                            lj_meta.mark_matched(program);
                         }
                     }
                 }

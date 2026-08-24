@@ -135,11 +135,7 @@ impl InitLoop {
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() {
-                    let lj_metadata = LeftJoinMetadata {
-                        reg_match_flag: program.alloc_register(),
-                        label_match_flag_set_true: program.allocate_label(),
-                        label_match_flag_check_value: program.allocate_label(),
-                    };
+                    let lj_metadata = LeftJoinMetadata::new(program);
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
                 }
                 if join_info.is_semi_or_anti() {

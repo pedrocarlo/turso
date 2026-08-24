@@ -363,13 +363,7 @@ impl CloseLoop {
                     // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
                     // If the left join match flag has been set to 1, we jump to the next row on the outer table,
                     // i.e. continue to the next row of t1 in our example.
-                    program.preassign_label_to_next_insn(lj_meta.label_match_flag_check_value);
-                    let label_when_right_table_notnull = program.allocate_label();
-                    program.emit_insn(Insn::IfPos {
-                        reg: lj_meta.reg_match_flag,
-                        target_pc: label_when_right_table_notnull,
-                        decrement_by: 0,
-                    });
+                    let label_when_right_table_notnull = lj_meta.begin_unmatched_row(program);
                     // If the left join match flag is still 0, it means there was no match on the right table,
                     // but since it's a LEFT JOIN, we still need to emit a row with NULLs for the right table.
                     // In that case, we now enter the routine that does exactly that.
@@ -400,10 +394,7 @@ impl CloseLoop {
                     }
                     // Re-enter the loop body at match-flag set so
                     // post-join predicates are re-evaluated with right-table NULLs.
-                    program.emit_insn(Insn::Goto {
-                        target_pc: lj_meta.label_match_flag_set_true,
-                    });
-                    program.preassign_label_to_next_insn(label_when_right_table_notnull);
+                    lj_meta.finish_unmatched_row(program, label_when_right_table_notnull);
                 }
             }
         }
