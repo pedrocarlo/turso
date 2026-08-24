@@ -72,6 +72,7 @@ pub(crate) enum SourceBinding {
     },
     Registers {
         start: usize,
+        rowid: Option<usize>,
     },
     /// Runtime value plus separately allocated arguments for a schema program.
     SchemaInputs {
@@ -2534,7 +2535,13 @@ mod tests {
                 table_cursor: Some(table_cursor),
             },
         );
-        program.bind_source(register_source, SourceBinding::Registers { start: 7 });
+        program.bind_source(
+            register_source,
+            SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            },
+        );
 
         assert_eq!(
             program.source_binding(table_source),
@@ -2545,7 +2552,10 @@ mod tests {
         );
         assert_eq!(
             program.source_binding(register_source),
-            Some(&SourceBinding::Registers { start: 7 })
+            Some(&SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            })
         );
         assert_eq!(program.source_binding(SourceId::new(2)), None);
     }

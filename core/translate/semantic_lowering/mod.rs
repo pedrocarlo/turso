@@ -1,4 +1,4 @@
 //! Bytecode lowering from resolved semantic HIR.
 
-mod expr;
+pub(super) mod expr;
 mod query;

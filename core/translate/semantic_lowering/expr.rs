@@ -1254,6 +1254,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1301,6 +1302,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1335,6 +1337,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1370,6 +1373,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1408,6 +1412,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1444,6 +1449,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1501,6 +1507,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1542,6 +1549,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1574,6 +1582,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -1603,6 +1612,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2162,6 +2172,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2192,6 +2203,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2280,6 +2292,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2369,6 +2382,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2409,6 +2423,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2441,6 +2456,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2469,6 +2485,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2507,6 +2524,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2540,6 +2558,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2583,6 +2602,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -2619,6 +2639,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr> {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } = &call.arguments
                 else {
                     return Err(LimboError::InternalError(
@@ -3069,7 +3090,7 @@ impl ExprLowerer<'_, '_> {
         };
 
         match binding {
-            SourceBinding::Registers { start } => {
+            SourceBinding::Registers { start, .. } => {
                 self.program.emit_insn(Insn::Copy {
                     src_reg: start + reference.column,
                     dst_reg: target,
@@ -3186,12 +3207,24 @@ impl ExprLowerer<'_, '_> {
                 "HIR source {source} has no physical binding"
             )));
         };
-        let SourceBinding::BTree { scan_cursor, .. } = binding else {
-            return Err(LimboError::InternalError(format!(
-                "HIR rowid source {source} is not bound to a B-tree cursor"
-            )));
-        };
-        self.emit_btree_rowid(scan_cursor, target)?;
+        match binding {
+            SourceBinding::BTree { scan_cursor, .. } => {
+                self.emit_btree_rowid(scan_cursor, target)?;
+            }
+            SourceBinding::Registers {
+                rowid: Some(register),
+                ..
+            } => self.program.emit_insn(Insn::Copy {
+                src_reg: register,
+                dst_reg: target,
+                extra_amount: 0,
+            }),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "HIR rowid source {source} has no rowid runtime binding"
+                )))
+            }
+        }
         Ok(target)
     }
 
@@ -5081,7 +5114,13 @@ mod tests {
             false,
         ));
         let mut program = program();
-        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+        program.bind_source(
+            source_id,
+            SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            },
+        );
 
         super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 0), 3)
             .expect("bound register column lowers");
@@ -5116,7 +5155,13 @@ mod tests {
         let mut document = document(Vec::new());
         document.sources.push(definition);
         let mut program = program();
-        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+        program.bind_source(
+            source_id,
+            SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            },
+        );
 
         super::translate_expr(&mut program, &document, &hir::Expr::column(source_id, 1), 3)
             .expect("generated column lowers");
@@ -5515,7 +5560,13 @@ mod tests {
         let mut document = document(Vec::new());
         document.sources.push(definition);
         let mut program = program();
-        program.bind_source(source_id, SourceBinding::Registers { start: 7 });
+        program.bind_source(
+            source_id,
+            SourceBinding::Registers {
+                start: 7,
+                rowid: None,
+            },
+        );
 
         super::translate_expr(
             &mut program,
@@ -5632,6 +5683,13 @@ mod tests {
             function: resolved_function(function),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
+                facts: vec![
+                    hir::FunctionArgumentFacts {
+                        type_fact: TypeFact::dynamic(),
+                        collation: None,
+                    };
+                    values.len()
+                ],
                 values,
                 distinctness: None,
                 order_by: Vec::new(),
@@ -5650,6 +5708,13 @@ mod tests {
             function: resolved_function(Func::Scalar(function)),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
+                facts: vec![
+                    hir::FunctionArgumentFacts {
+                        type_fact: TypeFact::dynamic(),
+                        collation: None,
+                    };
+                    values.len()
+                ],
                 values,
                 distinctness: None,
                 order_by: Vec::new(),
@@ -5681,6 +5746,13 @@ mod tests {
             function: resolved_function(Func::Scalar(function)),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
+                facts: vec![
+                    hir::FunctionArgumentFacts {
+                        type_fact: TypeFact::dynamic(),
+                        collation: None,
+                    };
+                    values.len()
+                ],
                 values,
                 distinctness: None,
                 order_by: Vec::new(),

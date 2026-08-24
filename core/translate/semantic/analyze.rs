@@ -9060,6 +9060,7 @@ mod tests {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
@@ -9114,6 +9115,7 @@ mod tests {
                     values,
                     distinctness: None,
                     order_by,
+                    ..
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
@@ -9126,6 +9128,7 @@ mod tests {
                 values,
                 distinctness: None,
                 order_by,
+                ..
             } if values.is_empty() && order_by.is_empty()
         ));
 
@@ -9188,6 +9191,7 @@ mod tests {
             values,
             distinctness: None,
             order_by,
+            ..
         } = &call.arguments
         else {
             panic!("expanded star becomes expression arguments");
@@ -9589,6 +9593,7 @@ mod tests {
                             values,
                             distinctness: None,
                             order_by,
+                            ..
                         } if values.len() == 1 && order_by.is_empty()
                     )
             )
@@ -9609,6 +9614,7 @@ mod tests {
                 values,
                 distinctness: Some(ast::Distinctness::Distinct),
                 order_by,
+                ..
             } if values.len() == 1 && order_by.is_empty()
         ));
         let Expr::Function(ordered_concat) = &block.outputs[5].expr else {
@@ -9618,6 +9624,7 @@ mod tests {
             values,
             distinctness,
             order_by,
+            ..
         } = &ordered_concat.arguments
         else {
             panic!("ordered aggregate has expression arguments");

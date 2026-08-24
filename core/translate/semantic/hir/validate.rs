@@ -1815,6 +1815,18 @@ impl<'document> HirValidator<'document> {
             call.arguments.order_terms().is_empty() || (aggregate && !window_evaluation),
             "argument ORDER BY belongs to a non-aggregate call",
         )?;
+        if let FunctionArguments::Expressions { values, facts, .. } = &call.arguments {
+            self.require(
+                values.len() == facts.len(),
+                "function argument facts do not match argument count",
+            )?;
+            for facts in facts {
+                self.visit_type_fact(&facts.type_fact)?;
+                if let Some(collation) = &facts.collation {
+                    self.visit_catalog_object(collation, "function argument collation")?;
+                }
+            }
+        }
         self.visit_ordered_set_arguments(call)?;
         match &call.evaluation {
             FunctionEvaluation::Scalar => self.require(

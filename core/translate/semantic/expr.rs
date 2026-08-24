@@ -593,14 +593,26 @@ impl FunctionInput {
                 distinctness,
                 values,
                 order_by,
-            } => hir::FunctionArguments::Expressions {
-                values: values.into_iter().map(|value| value.expr).collect(),
-                distinctness,
-                order_by: order_by
-                    .into_iter()
-                    .map(FunctionOrderTerm::into_hir)
-                    .collect(),
-            },
+            } => {
+                let mut expressions = Vec::with_capacity(values.len());
+                let mut facts = Vec::with_capacity(values.len());
+                for value in values {
+                    expressions.push(value.expr);
+                    facts.push(hir::FunctionArgumentFacts {
+                        type_fact: value.type_fact,
+                        collation: value.collation.value().cloned(),
+                    });
+                }
+                hir::FunctionArguments::Expressions {
+                    values: expressions,
+                    facts,
+                    distinctness,
+                    order_by: order_by
+                        .into_iter()
+                        .map(FunctionOrderTerm::into_hir)
+                        .collect(),
+                }
+            }
             Self::OrderedSet {
                 direct, order_by, ..
             } => hir::FunctionArguments::OrderedSet {

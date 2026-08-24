@@ -206,6 +206,12 @@ pub struct FunctionCall {
     pub operation: FunctionOperation,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FunctionArgumentFacts {
+    pub type_fact: TypeFact,
+    pub collation: Option<ResolvedCollation>,
+}
+
 /// Resolved function argument shape. Star cannot coexist with expression
 /// arguments.
 #[derive(Clone, Debug)]
@@ -213,6 +219,7 @@ pub enum FunctionArguments {
     Star,
     Expressions {
         values: Vec<Expr>,
+        facts: Vec<FunctionArgumentFacts>,
         distinctness: Option<Distinctness>,
         order_by: Vec<OrderTerm>,
     },
@@ -1179,16 +1186,19 @@ fn function_arguments_match<'expr>(
         (
             FunctionArguments::Expressions {
                 values: left_values,
+                facts: left_facts,
                 distinctness: left_distinctness,
                 order_by: left_order,
             },
             FunctionArguments::Expressions {
                 values: right_values,
+                facts: right_facts,
                 distinctness: right_distinctness,
                 order_by: right_order,
             },
         ) => {
             push_pairs(pending, left_values, right_values)
+                && left_facts == right_facts
                 && left_distinctness == right_distinctness
                 && order_terms_match(left_order, right_order, pending)
         }

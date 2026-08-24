@@ -1,16 +1,21 @@
 //! Runtime destination preparation for resolved HIR queries.
 
+use std::ops::ControlFlow;
 use turso_parser::ast::{CompoundOperator, Distinctness, Literal, SortOrder};
 
 use crate::translate::collate::CollationSeq;
 use crate::{
     emit_explain,
+    function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, PseudoCursorType,
         Table, Type,
     },
     sync::Arc,
     translate::{
+        aggregation::{
+            hir_aggregate_function, translate_hir_aggregation_step, HirAggregateDistinct,
+        },
         eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod},
         expr::ConditionMetadata,
         main_loop::{
@@ -98,6 +103,30 @@ enum HirRowTarget<'a> {
 struct HirRowOutput<'a> {
     target: HirRowTarget<'a>,
     distinct: Option<&'a HirDistinctOutput>,
+}
+
+struct HirAggregateRuntime<'a> {
+    call: &'a hir::FunctionCall,
+    accumulator: usize,
+    distinct: Option<HirAggregateDistinct>,
+}
+
+struct HirAggregateState<'a> {
+    aggregates: Vec<HirAggregateRuntime<'a>>,
+    bare_columns: Vec<hir::ColumnRef>,
+    bare_rowids: Vec<SourceId>,
+}
+
+enum HirLoopBody<'a> {
+    Rows(&'a HirRowOutput<'a>),
+    UngroupedAggregate(&'a HirAggregateState<'a>),
+}
+
+struct HirAggregateCapture {
+    source: SourceId,
+    columns_start: usize,
+    columns: Vec<usize>,
+    rowid: Option<usize>,
 }
 
 impl HirRowOutput<'_> {
@@ -705,18 +734,127 @@ fn emit_planned_query_block_with_output(
         )));
     }
     if block.from.is_none() {
-        if block.aggregate_count != 0
-            || block.window_function_count != 0
-            || !block.windows.is_empty()
-        {
+        if block.window_function_count != 0 || !block.windows.is_empty() {
             return Err(LimboError::InternalError(format!(
                 "HIR query block {:?} is not a supported non-FROM query body",
                 block.id
             )));
         }
+        if is_hir_ungrouped_aggregate(block) {
+            return emit_hir_ungrouped_without_from(
+                program,
+                &plan.document,
+                query,
+                block,
+                output,
+                block_done,
+            );
+        }
         return emit_query_block_without_from(program, &plan.document, block, output, block_done);
     }
-    emit_btree_loops(program, plan, block, block_plan, output)
+    if is_hir_ungrouped_aggregate(block) {
+        emit_hir_ungrouped_aggregate(program, plan, query, block, block_plan, output, block_done)
+    } else {
+        emit_btree_loops(program, plan, block, block_plan, HirLoopBody::Rows(output))
+    }
+}
+
+fn emit_hir_ungrouped_without_from(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
+) -> Result<()> {
+    let state = initialize_hir_aggregates(program, document, query, block)?;
+    let scan_done = program.allocate_label();
+    let hir::QueryBlockBody::Select { filter, .. } = &block.body else {
+        return Err(LimboError::InternalError(format!(
+            "HIR aggregate block {:?} is not a SELECT",
+            block.id
+        )));
+    };
+    if let Some(filter) = filter {
+        let emit_step = program.allocate_label();
+        super::expr::translate_condition_expr(
+            program,
+            document,
+            filter,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: emit_step,
+                jump_target_when_false: scan_done,
+                jump_target_when_null: scan_done,
+            },
+        )?;
+        program.preassign_label_to_next_insn(emit_step);
+    }
+    emit_hir_aggregate_steps(program, document, &state)?;
+    program.preassign_label_to_next_insn(scan_done);
+    emit_hir_aggregate_result(program, document, block, output, block_done, &state)
+}
+
+fn emit_hir_ungrouped_aggregate(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    query: &hir::Query,
+    block: &hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
+) -> Result<()> {
+    let state = initialize_hir_aggregates(program, &plan.document, query, block)?;
+    emit_btree_loops(
+        program,
+        plan,
+        block,
+        block_plan,
+        HirLoopBody::UngroupedAggregate(&state),
+    )?;
+    emit_hir_aggregate_result(program, &plan.document, block, output, block_done, &state)
+}
+
+fn emit_hir_aggregate_result(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    block_done: BranchOffset,
+    state: &HirAggregateState<'_>,
+) -> Result<()> {
+    finalize_hir_aggregates(program, state)?;
+    let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
+        unreachable!("aggregate block is a SELECT")
+    };
+    if let Some(having) = grouping
+        .as_ref()
+        .and_then(|grouping| grouping.having.as_ref())
+    {
+        let emit_row = program.allocate_label();
+        super::expr::translate_condition_expr(
+            program,
+            document,
+            having,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: emit_row,
+                jump_target_when_false: block_done,
+                jump_target_when_null: block_done,
+            },
+        )?;
+        program.preassign_label_to_next_insn(emit_row);
+    }
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+    emit_query_row(
+        program,
+        document,
+        output,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+        block_done,
+    )
 }
 
 fn emit_hir_compound_query(
@@ -1367,26 +1505,478 @@ enum HirPredicateKind {
     Where,
 }
 
+fn is_hir_ungrouped_aggregate(block: &hir::QueryBlock) -> bool {
+    block.aggregate_count != 0
+        || matches!(
+            &block.body,
+            hir::QueryBlockBody::Select {
+                grouping: Some(grouping),
+                ..
+            } if grouping.keys.is_empty()
+        )
+}
+
+struct HirAggregateCollector<'a> {
+    block: hir::QueryBlockId,
+    aggregates: Vec<Option<&'a hir::FunctionCall>>,
+}
+
+struct HirBareAggregateColumnCollector<'a> {
+    document: &'a HirDocument,
+    columns: Vec<hir::ColumnRef>,
+    rowids: Vec<SourceId>,
+}
+
+impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
+    type Context = ();
+    type Output = ();
+    type Error = LimboError;
+
+    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        if let hir::Expr::Output(output) = expression {
+            return (index == 0).then(|| {
+                &self
+                    .document
+                    .output(*output)
+                    .expect("validated HIR output reference exists")
+                    .expr
+            });
+        }
+        expression.child(index)
+    }
+
+    fn pre_order(
+        &mut self,
+        _parent: &'expr hir::Expr,
+        _context: &mut (),
+        _child_index: usize,
+        child: &'expr hir::Expr,
+    ) -> Result<ControlFlow<(), ()>> {
+        if matches!(
+            child,
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Aggregate { .. },
+                ..
+            })
+        ) {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &'expr hir::Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<()> {
+        match expression {
+            hir::Expr::Column(reference) if !self.columns.contains(reference) => {
+                self.columns.push(*reference);
+            }
+            hir::Expr::RowId(source) if !self.rowids.contains(source) => {
+                self.rowids.push(*source);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl<'expr> HirBareAggregateColumnCollector<'expr> {
+    fn collect(&mut self, expression: &'expr hir::Expr) -> Result<()> {
+        if matches!(
+            expression,
+            hir::Expr::Function(hir::FunctionCall {
+                evaluation: hir::FunctionEvaluation::Aggregate { .. },
+                ..
+            })
+        ) {
+            return Ok(());
+        }
+        expression.walk((), self)
+    }
+}
+
+impl<'expr> hir::ExprVisitor<'expr> for HirAggregateCollector<'expr> {
+    type Context = ();
+    type Output = ();
+    type Error = LimboError;
+
+    fn pre_order(
+        &mut self,
+        _parent: &'expr hir::Expr,
+        _context: &mut (),
+        _child_index: usize,
+        _child: &'expr hir::Expr,
+    ) -> Result<ControlFlow<(), ()>> {
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &'expr hir::Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<()> {
+        let hir::Expr::Function(call) = expression else {
+            return Ok(());
+        };
+        let hir::FunctionEvaluation::Aggregate { id, .. } = call.evaluation else {
+            return Ok(());
+        };
+        if id.block != self.block || id.index >= self.aggregates.len() {
+            return Err(LimboError::InternalError(format!(
+                "HIR aggregate {id:?} is outside query block {:?}",
+                self.block
+            )));
+        }
+        if self.aggregates[id.index].replace(call).is_some() {
+            return Err(LimboError::InternalError(format!(
+                "HIR aggregate {id:?} has more than one definition"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn collect_hir_aggregates<'a>(
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+) -> Result<Vec<&'a hir::FunctionCall>> {
+    let mut collector = HirAggregateCollector {
+        block: block.id,
+        aggregates: (0..block.aggregate_count).map(|_| None).collect(),
+    };
+    let mut collect = |expression: &'a hir::Expr| expression.walk((), &mut collector);
+    for output in &block.outputs {
+        collect(&output.expr)?;
+    }
+    if let hir::QueryBlockBody::Select {
+        filter, grouping, ..
+    } = &block.body
+    {
+        if let Some(filter) = filter {
+            collect(filter)?;
+        }
+        if let Some(grouping) = grouping {
+            for key in &grouping.keys {
+                collect(key)?;
+            }
+            if let Some(having) = &grouping.having {
+                collect(having)?;
+            }
+        }
+    }
+    for term in &query.order_by {
+        collect(&term.expr)?;
+    }
+    collector
+        .aggregates
+        .into_iter()
+        .enumerate()
+        .map(|(index, aggregate)| {
+            aggregate.ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "HIR query block {:?} has no definition for aggregate {index}",
+                    block.id
+                ))
+            })
+        })
+        .collect()
+}
+
+fn initialize_hir_aggregates<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a HirDocument,
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+) -> Result<HirAggregateState<'a>> {
+    let calls = collect_hir_aggregates(query, block)?;
+    let mut aggregates = Vec::with_capacity(calls.len());
+    for (index, call) in calls.into_iter().enumerate() {
+        let hir::FunctionEvaluation::Aggregate { id, .. } = call.evaluation else {
+            unreachable!("aggregate collection only returns aggregate calls")
+        };
+        if id != hir::AggregateId::new(block.id, index) {
+            return Err(LimboError::InternalError(format!(
+                "HIR aggregate {id:?} does not match block aggregate {index}"
+            )));
+        }
+        let func = hir_aggregate_function(call)?;
+        if matches!(func, AggFunc::PercentileCont | AggFunc::PercentileDisc) {
+            return Err(LimboError::InternalError(
+                "HIR percentile aggregate initialization is not lowered yet".to_string(),
+            ));
+        }
+        let accumulator = program.alloc_register();
+        program.emit_insn(Insn::Null {
+            dest: accumulator,
+            dest_end: None,
+        });
+        program.bind_aggregate_result(id, accumulator);
+        let distinct = if matches!(call.arguments.distinctness(), Some(Distinctness::Distinct)) {
+            let hir::FunctionArguments::Expressions { values, facts, .. } = &call.arguments else {
+                return Err(LimboError::InternalError(format!(
+                    "HIR DISTINCT aggregate {id:?} has non-expression arguments"
+                )));
+            };
+            if values.len() != 1 || facts.len() != 1 {
+                return Err(LimboError::InternalError(format!(
+                    "HIR DISTINCT aggregate {id:?} does not have one argument"
+                )));
+            }
+            let hash_table = program.alloc_hash_table_id();
+            program.emit_insn(Insn::HashClear {
+                hash_table_id: hash_table,
+            });
+            Some(HirAggregateDistinct {
+                hash_table,
+                collation: facts[0]
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or(CollationSeq::Binary),
+                on_conflict: program.allocate_label(),
+            })
+        } else {
+            None
+        };
+        aggregates.push(HirAggregateRuntime {
+            call,
+            accumulator,
+            distinct,
+        });
+    }
+    let mut bare = HirBareAggregateColumnCollector {
+        document,
+        columns: Vec::new(),
+        rowids: Vec::new(),
+    };
+    for output in &block.outputs {
+        bare.collect(&output.expr)?;
+    }
+    if let hir::QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    {
+        if let Some(having) = &grouping.having {
+            bare.collect(having)?;
+        }
+    }
+    for term in &query.order_by {
+        bare.collect(&term.expr)?;
+    }
+    bare.columns
+        .sort_unstable_by_key(|reference| (reference.source.index(), reference.column));
+    bare.rowids.sort_unstable();
+    Ok(HirAggregateState {
+        aggregates,
+        bare_columns: bare.columns,
+        bare_rowids: bare.rowids,
+    })
+}
+
+fn emit_hir_aggregate_steps(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    state: &HirAggregateState<'_>,
+) -> Result<()> {
+    for aggregate in &state.aggregates {
+        let filter = aggregate.call.evaluation.filter();
+        let skip = aggregate
+            .distinct
+            .as_ref()
+            .map(|distinct| distinct.on_conflict)
+            .or_else(|| filter.map(|_| program.allocate_label()));
+        if let Some(filter) = filter {
+            let register = program.alloc_register();
+            super::expr::translate_expr(program, document, filter, register)?;
+            program.emit_insn(Insn::IfNot {
+                reg: register,
+                target_pc: skip.expect("aggregate filter has a skip label"),
+                jump_if_null: true,
+            });
+        }
+        translate_hir_aggregation_step(
+            program,
+            document,
+            aggregate.call,
+            aggregate.accumulator,
+            aggregate.distinct.as_ref(),
+            None,
+        )?;
+        if let Some(skip) = skip {
+            program.preassign_label_to_next_insn(skip);
+        }
+    }
+    Ok(())
+}
+
+fn finalize_hir_aggregates(
+    program: &mut ProgramBuilder,
+    state: &HirAggregateState<'_>,
+) -> Result<()> {
+    for aggregate in &state.aggregates {
+        program.emit_insn(Insn::AggFinal {
+            register: aggregate.accumulator,
+            func: AccumulatorFunc::Agg(hir_aggregate_function(aggregate.call)?),
+        });
+    }
+    Ok(())
+}
+
+fn initialize_hir_aggregate_captures(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block_plan: &HirQueryBlockPlan,
+    state: &HirAggregateState<'_>,
+) -> Result<(usize, Vec<HirAggregateCapture>)> {
+    let first_row = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: first_row,
+    });
+    let mut captures = Vec::with_capacity(block_plan.loops.len());
+    for planned_loop in &block_plan.loops {
+        let mut columns = state
+            .bare_columns
+            .iter()
+            .filter(|reference| reference.source == planned_loop.source)
+            .map(|reference| reference.column)
+            .collect::<Vec<_>>();
+        columns.sort_unstable();
+        columns.dedup();
+        let needs_rowid = state.bare_rowids.contains(&planned_loop.source);
+        if columns.is_empty() && !needs_rowid {
+            continue;
+        }
+        if captures
+            .iter()
+            .any(|capture: &HirAggregateCapture| capture.source == planned_loop.source)
+        {
+            return Err(LimboError::InternalError(format!(
+                "HIR aggregate query has more than one loop for source {}",
+                planned_loop.source
+            )));
+        }
+        let source = document.source(planned_loop.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR aggregate capture references missing source {}",
+                planned_loop.source
+            ))
+        })?;
+        let columns_start = if source.columns.is_empty() {
+            0
+        } else {
+            let start = program.alloc_registers(source.columns.len());
+            program.emit_insn(Insn::Null {
+                dest: start,
+                dest_end: (source.columns.len() > 1).then_some(start + source.columns.len() - 1),
+            });
+            start
+        };
+        let rowid = needs_rowid.then(|| {
+            let register = program.alloc_register();
+            program.emit_insn(Insn::Null {
+                dest: register,
+                dest_end: None,
+            });
+            register
+        });
+        captures.push(HirAggregateCapture {
+            source: source.id,
+            columns_start,
+            columns,
+            rowid,
+        });
+    }
+    Ok((first_row, captures))
+}
+
+fn emit_hir_aggregate_capture(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    first_row: usize,
+    captures: &[HirAggregateCapture],
+) -> Result<()> {
+    let captured = program.allocate_label();
+    program.emit_insn(Insn::If {
+        reg: first_row,
+        target_pc: captured,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: first_row,
+    });
+    for capture in captures {
+        let source = document.source(capture.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR aggregate capture references missing source {}",
+                capture.source
+            ))
+        })?;
+        for column in &capture.columns {
+            super::expr::translate_expr(
+                program,
+                document,
+                &hir::Expr::column(source.id, *column),
+                capture.columns_start + column,
+            )?;
+        }
+        if let Some(rowid) = capture.rowid {
+            super::expr::translate_expr(program, document, &hir::Expr::rowid(source.id), rowid)?;
+        }
+    }
+    program.preassign_label_to_next_insn(captured);
+    Ok(())
+}
+
+fn bind_hir_aggregate_captures(program: &mut ProgramBuilder, captures: &[HirAggregateCapture]) {
+    for capture in captures {
+        program.bind_source(
+            capture.source,
+            SourceBinding::Registers {
+                start: capture.columns_start,
+                rowid: capture.rowid,
+            },
+        );
+    }
+}
+
 fn emit_btree_loops(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     block: &hir::QueryBlock,
     block_plan: &HirQueryBlockPlan,
-    output: &HirRowOutput<'_>,
+    body: HirLoopBody<'_>,
 ) -> Result<()> {
     let document = &plan.document;
-    if block.aggregate_count != 0 || block.window_function_count != 0 || !block.windows.is_empty() {
+    if block.window_function_count != 0 || !block.windows.is_empty() {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} is not a supported B-tree loop",
             block.id
         )));
     }
-    let hir::QueryBlockBody::Select { grouping: None, .. } = &block.body else {
+    let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} has unsupported B-tree loop clauses",
             block.id
         )));
     };
+    match (&body, grouping) {
+        (HirLoopBody::Rows(_), None) if block.aggregate_count == 0 => {}
+        (HirLoopBody::UngroupedAggregate(_), None) if block.aggregate_count != 0 => {}
+        (HirLoopBody::UngroupedAggregate(_), Some(grouping)) if grouping.keys.is_empty() => {}
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "HIR query block {:?} has a mismatched loop body",
+                block.id
+            )))
+        }
+    }
     if block_plan.loops.is_empty() {
         return Err(LimboError::InternalError(format!(
             "HIR query block {:?} does not have a source loop",
@@ -1418,6 +2008,14 @@ fn emit_btree_loops(
         .iter()
         .map(|planned_loop| prepare_hir_loop(program, plan, planned_loop))
         .collect::<Result<Vec<_>>>()?;
+    let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(_))
+        .then(|| {
+            let HirLoopBody::UngroupedAggregate(state) = &body else {
+                unreachable!()
+            };
+            initialize_hir_aggregate_captures(program, document, block_plan, state)
+        })
+        .transpose()?;
     let left_joins =
         prepare_hir_left_joins(program, block_plan, &prepared_loops, &left_join_owners)?;
 
@@ -1474,21 +2072,35 @@ fn emit_btree_loops(
     }
 
     let innermost_next = loops.last().expect("loop list is non-empty").next;
-    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
-    emit_query_row(
-        program,
-        document,
-        output,
-        &block.outputs,
-        block.outputs.iter().map(|output| &output.expr),
-        start,
-        innermost_next,
-    )?;
+    match body {
+        HirLoopBody::Rows(output) => {
+            let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+            emit_query_row(
+                program,
+                document,
+                output,
+                &block.outputs,
+                block.outputs.iter().map(|output| &output.expr),
+                start,
+                innermost_next,
+            )?;
+        }
+        HirLoopBody::UngroupedAggregate(state) => {
+            let (first_row, captures) = aggregate_captures
+                .as_ref()
+                .expect("aggregate loop initializes first-row captures");
+            emit_hir_aggregate_capture(program, document, *first_row, captures)?;
+            emit_hir_aggregate_steps(program, document, state)?;
+        }
+    }
 
     for hir_loop in loops.iter().rev() {
         close_hir_btree_loop(program, hir_loop, &left_joins);
     }
     program.preassign_label_to_next_insn(block_done);
+    if let Some((_, captures)) = aggregate_captures {
+        bind_hir_aggregate_captures(program, &captures);
+    }
     Ok(())
 }
 
@@ -1958,7 +2570,13 @@ fn emit_hir_recursive_cte(
         },
         |program, input_start| {
             for source in &recursive.input_sources {
-                program.bind_source(*source, SourceBinding::Registers { start: input_start });
+                program.bind_source(
+                    *source,
+                    SourceBinding::Registers {
+                        start: input_start,
+                        rowid: None,
+                    },
+                );
             }
             Ok(())
         },
@@ -3552,6 +4170,177 @@ mod tests {
             panic!("root filter is a subquery expression");
         };
         subquery
+    }
+
+    #[test]
+    fn planned_ungrouped_aggregates_use_hir_ids_and_shared_steps() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT sum(value), count(*) FROM items WHERE value > 0",
+        );
+        let query_id = root_query(&plan.document);
+        let query = plan.document.query(query_id).expect("root query exists");
+        let block = &query.blocks[0];
+        assert_eq!(block.aggregate_count, 2);
+
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query_id, &QueryDestination::ResultRows)
+            .expect("ungrouped aggregate HIR query emits");
+        program.resolve_labels().expect("aggregate labels resolve");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::AggFinal { .. }))
+                .count(),
+            2
+        );
+        for index in 0..block.aggregate_count {
+            assert!(program
+                .aggregate_result_register(hir::AggregateId::new(block.id, index))
+                .is_some());
+        }
+
+        let last_step = program
+            .insns
+            .iter()
+            .rposition(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+            .expect("aggregate step emits");
+        let scan_advance = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Next { .. }))
+            .expect("table scan advances");
+        let first_final = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::AggFinal { .. }))
+            .expect("aggregate final emits");
+        assert!(last_step < scan_advance && scan_advance < first_final);
+    }
+
+    #[test]
+    fn planned_filtered_distinct_aggregate_uses_hir_argument_collation() {
+        let plan = analyze_plan(
+            rowid_items_schema(),
+            "SELECT count(DISTINCT value COLLATE nocase) FILTER (WHERE id > 0) FROM items",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("filtered DISTINCT aggregate HIR query emits");
+        program
+            .resolve_labels()
+            .expect("filtered DISTINCT labels resolve");
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::HashClear { .. })));
+        let filter = program
+            .insns
+            .iter()
+            .position(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::IfNot {
+                        jump_if_null: true,
+                        ..
+                    }
+                )
+            })
+            .expect("aggregate FILTER emits");
+        let distinct = program
+            .insns
+            .iter()
+            .position(|(insn, _)| match insn {
+                Insn::HashDistinct { data } => data.collations == [CollationSeq::NoCase],
+                _ => false,
+            })
+            .expect("DISTINCT uses resolved argument collation");
+        let step = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+            .expect("aggregate step emits");
+        assert!(filter < distinct && distinct < step);
+    }
+
+    #[test]
+    fn planned_ungrouped_aggregate_captures_bare_columns_from_first_row() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT rowid, extra, sum(value) FROM items",
+        );
+        let query = root_query(&plan.document);
+        let source = plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0]
+            .loops[0]
+            .source;
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("bare-column aggregate HIR query emits");
+
+        let Some(SourceBinding::Registers { start, rowid }) = program.source_binding(source) else {
+            panic!("aggregate source is rebound to captured registers");
+        };
+        assert!(rowid.is_some());
+        assert!(program.insns.iter().any(|(insn, _)| {
+            matches!(
+                insn,
+                Insn::Column {
+                    column: 1,
+                    dest,
+                    ..
+                } if *dest == start + 1
+            )
+        }));
+    }
+
+    #[test]
+    fn function_argument_facts_are_resolved_and_validated() {
+        let mut document = analyze_sql(
+            rowid_items_schema(),
+            "SELECT min(value COLLATE nocase) FROM items",
+        );
+        let Expr::Function(call) = root_expression(&document) else {
+            panic!("root expression is aggregate call");
+        };
+        let hir::FunctionArguments::Expressions { values, facts, .. } = &call.arguments else {
+            panic!("aggregate has expression arguments");
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].collation.as_ref().map(|value| *value.value()),
+            Some(CollationSeq::NoCase)
+        );
+
+        let Expr::Function(call) = &mut document.queries[0].blocks[0].outputs[0].expr else {
+            panic!("root expression is aggregate call");
+        };
+        let hir::FunctionArguments::Expressions { facts, .. } = &mut call.arguments else {
+            panic!("aggregate has expression arguments");
+        };
+        facts.clear();
+        assert_eq!(
+            document
+                .validate()
+                .expect_err("argument/fact width mismatch is invalid")
+                .message(),
+            "function argument facts do not match argument count"
+        );
     }
 
     #[test]

@@ -826,6 +826,16 @@ DISTINCT and ORDER BY deduplicates before sorter insertion. No parser expression
 or `TableReferences` sidecar is rebuilt. Aggregate, GROUP BY, and window output
 remain later SELECT checkpoints.
 
+Ungrouped aggregate SELECT now lowers from planned HIR. Stable `AggregateId`
+values own accumulator registers; aggregate arguments, filters, DISTINCT
+collations, custom comparators, and final calls use semantic HIR facts. HIR and
+legacy paths share one aggregate-step opcode switch, so this adds no second
+copy of function behavior. Bare columns and rowid reads capture only values
+needed after the scan, preserving SQLite first-row and empty-input behavior
+without forcing unused columns into covering-index plans. GROUP BY, aggregate
+argument ORDER BY, percentile initialization, and windows remain later SELECT
+checkpoints.
+
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR
 arguments into the `VFilter` argument registers, and advances with `VNext`.
