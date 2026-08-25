@@ -833,8 +833,11 @@ legacy paths share one aggregate-step opcode switch, so this adds no second
 copy of function behavior. Bare columns and rowid reads capture only values
 needed after the scan, preserving SQLite first-row and empty-input behavior
 without forcing unused columns into covering-index plans. GROUP BY, aggregate
-argument ORDER BY, percentile initialization, and windows remain later SELECT
-checkpoints.
+argument ORDER BY, and windows remain later SELECT checkpoints. Ordered-set
+percentile aggregates evaluate their direct fraction once before opening the
+input scan, reject local-row and subquery dependencies with the legacy error,
+and reuse the same range-check and aggregate-step opcode helpers as legacy
+lowering.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR

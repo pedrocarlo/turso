@@ -109,6 +109,7 @@ struct HirAggregateRuntime<'a> {
     call: &'a hir::FunctionCall,
     accumulator: usize,
     distinct: Option<HirAggregateDistinct>,
+    percentile_fraction: Option<usize>,
 }
 
 struct HirAggregateState<'a> {
@@ -1704,11 +1705,28 @@ fn initialize_hir_aggregates<'a>(
             )));
         }
         let func = hir_aggregate_function(call)?;
-        if matches!(func, AggFunc::PercentileCont | AggFunc::PercentileDisc) {
-            return Err(LimboError::InternalError(
-                "HIR percentile aggregate initialization is not lowered yet".to_string(),
-            ));
-        }
+        let percentile_fraction =
+            if matches!(func, AggFunc::PercentileCont | AggFunc::PercentileDisc) {
+                let hir::FunctionArguments::OrderedSet { direct, .. } = &call.arguments else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR percentile aggregate {id:?} has non-ordered-set arguments"
+                    )));
+                };
+                let [fraction] = direct.as_slice() else {
+                    return Err(LimboError::InternalError(format!(
+                        "HIR percentile aggregate {id:?} does not have one direct argument"
+                    )));
+                };
+                validate_hir_percentile_fraction(document, block, fraction, &func)?;
+                let register = program.alloc_register();
+                super::expr::translate_expr(program, document, fraction, register)?;
+                crate::translate::aggregation::emit_percentile_fraction_range_check(
+                    program, register,
+                );
+                Some(register)
+            } else {
+                None
+            };
         let accumulator = program.alloc_register();
         program.emit_insn(Insn::Null {
             dest: accumulator,
@@ -1746,6 +1764,7 @@ fn initialize_hir_aggregates<'a>(
             call,
             accumulator,
             distinct,
+            percentile_fraction,
         });
     }
     let mut bare = HirBareAggregateColumnCollector {
@@ -1778,6 +1797,31 @@ fn initialize_hir_aggregates<'a>(
     })
 }
 
+fn validate_hir_percentile_fraction(
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    fraction: &hir::Expr,
+    function: &AggFunc,
+) -> Result<()> {
+    let mut invalid = false;
+    fraction.for_each(&mut |expression| {
+        invalid |= matches!(expression, hir::Expr::Subquery(_));
+    });
+    document.visit_expr_sources(fraction, &mut |source| {
+        invalid |= matches!(
+            document.source(source).map(|source| source.owner),
+            Some(hir::SourceOwner::QueryBlock(owner)) if owner == block.id
+        );
+    });
+    if invalid {
+        crate::bail_parse_error!(
+            "the fraction argument of {}() must be a constant expression that does not depend on the aggregated rows",
+            function
+        );
+    }
+    Ok(())
+}
+
 fn emit_hir_aggregate_steps(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -1805,7 +1849,7 @@ fn emit_hir_aggregate_steps(
             aggregate.call,
             aggregate.accumulator,
             aggregate.distinct.as_ref(),
-            None,
+            aggregate.percentile_fraction,
         )?;
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
@@ -4273,6 +4317,78 @@ mod tests {
             .position(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
             .expect("aggregate step emits");
         assert!(filter < distinct && distinct < step);
+    }
+
+    #[test]
+    fn planned_percentile_checks_fraction_once_before_the_scan() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY value) FROM items",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("percentile HIR query emits");
+        program.resolve_labels().expect("percentile labels resolve");
+
+        let (check, fraction) = program
+            .insns
+            .iter()
+            .enumerate()
+            .find_map(|(index, (insn, _))| match insn {
+                Insn::IsNull { reg, .. } => Some((index, *reg)),
+                _ => None,
+            })
+            .expect("percentile fraction range check emits");
+        let scan = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Rewind { .. }))
+            .expect("table scan emits");
+        let (step, delimiter) = program
+            .insns
+            .iter()
+            .enumerate()
+            .find_map(|(index, (insn, _))| match insn {
+                Insn::AggStep { data }
+                    if matches!(
+                        &data.func,
+                        AccumulatorFunc::Agg(AggFunc::PercentileCont)
+                    ) =>
+                {
+                    Some((index, data.delimiter))
+                }
+                _ => None,
+            })
+            .expect("percentile step emits");
+        assert_eq!(delimiter, fraction);
+        assert!(check < scan && scan < step);
+        assert!(program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Halt { description, .. }
+                if description == "percentile value is not between 0 and 1"
+        )));
+    }
+
+    #[test]
+    fn planned_percentile_rejects_fraction_that_depends_on_aggregated_rows() {
+        for sql in [
+            "SELECT percentile_cont(value) WITHIN GROUP (ORDER BY extra) FROM items",
+            "SELECT percentile_disc((SELECT 0.5)) WITHIN GROUP (ORDER BY value) FROM items",
+        ] {
+            let plan = analyze_plan(indexed_items_schema(), sql);
+            let query = root_query(&plan.document);
+            let error = emit_planned_query_body(
+                &mut program(),
+                &plan,
+                query,
+                &QueryDestination::ResultRows,
+            )
+            .expect_err("row-dependent percentile fraction fails");
+            assert!(error.to_string().contains(
+                "must be a constant expression that does not depend on the aggregated rows"
+            ));
+        }
     }
 
     #[test]

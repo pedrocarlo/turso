@@ -568,46 +568,7 @@ fn emit_percentile_fraction_check(
     let fraction_reg = program.alloc_register();
     translate_expr(program, Some(tables), &agg.args[1], fraction_reg, resolver)?;
 
-    // NULL skips the range check and propagates to a NULL result in finalize.
-    // Use one scratch register for both bounds: success falls through to `done`
-    // via `Le` on the upper bound; failure on either bound jumps to `bad: Halt`.
-    let done = program.allocate_label();
-    let bad = program.allocate_label();
-    let bound_reg = program.alloc_register();
-    program.emit_insn(Insn::IsNull {
-        reg: fraction_reg,
-        target_pc: done,
-    });
-    program.emit_insn(Insn::Real {
-        value: 0.0,
-        dest: bound_reg,
-    });
-    program.emit_insn(Insn::Lt {
-        lhs: fraction_reg,
-        rhs: bound_reg,
-        target_pc: bad,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.emit_insn(Insn::Real {
-        value: 1.0,
-        dest: bound_reg,
-    });
-    program.emit_insn(Insn::Le {
-        lhs: fraction_reg,
-        rhs: bound_reg,
-        target_pc: done,
-        flags: CmpInsFlags::default(),
-        collation: None,
-    });
-    program.preassign_label_to_next_insn(bad);
-    program.emit_insn(Insn::Halt {
-        err_code: crate::error::SQLITE_ERROR,
-        description: "percentile value is not between 0 and 1".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(done);
+    crate::translate::aggregation::emit_percentile_fraction_range_check(program, fraction_reg);
     agg.fraction_reg = Some(fraction_reg);
     Ok(())
 }

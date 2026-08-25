@@ -7,10 +7,55 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{AggStepData, HashDistinctData, Insn},
+        insn::{AggStepData, CmpInsFlags, HashDistinctData, Insn},
     },
     LimboError, Result,
 };
+
+/// Emit the runtime range check shared by legacy and HIR percentile lowering.
+/// NULL is accepted here and propagated by aggregate finalization.
+pub(crate) fn emit_percentile_fraction_range_check(program: &mut ProgramBuilder, fraction: usize) {
+    // NULL skips the range check and propagates to a NULL result in finalize.
+    // Use one scratch register for both bounds: success falls through to `done`
+    // via `Le` on the upper bound; failure on either bound jumps to `bad: Halt`.
+    let done = program.allocate_label();
+    let bad = program.allocate_label();
+    let bound = program.alloc_register();
+    program.emit_insn(Insn::IsNull {
+        reg: fraction,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::Real {
+        value: 0.0,
+        dest: bound,
+    });
+    program.emit_insn(Insn::Lt {
+        lhs: fraction,
+        rhs: bound,
+        target_pc: bad,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Real {
+        value: 1.0,
+        dest: bound,
+    });
+    program.emit_insn(Insn::Le {
+        lhs: fraction,
+        rhs: bound,
+        target_pc: done,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.preassign_label_to_next_insn(bad);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: "percentile value is not between 0 and 1".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(done);
+}
 
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
