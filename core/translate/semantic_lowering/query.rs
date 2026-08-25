@@ -38,6 +38,7 @@ use crate::{
             BtreeTableLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan, HirSourceAccess,
         },
     },
+    types::KeyInfo,
     util::parse_numeric_literal,
     vdbe::{
         affinity::Affinity,
@@ -121,6 +122,7 @@ struct HirAggregateState<'a> {
 enum HirLoopBody<'a> {
     Rows(&'a HirRowOutput<'a>),
     UngroupedAggregate(&'a HirAggregateState<'a>),
+    GroupSorter(&'a HirGroupRuntime<'a>),
 }
 
 struct HirAggregateCapture {
@@ -128,6 +130,53 @@ struct HirAggregateCapture {
     columns_start: usize,
     columns: Vec<usize>,
     rowid: Option<usize>,
+}
+
+struct HirGroupRuntime<'a> {
+    grouping: &'a hir::Grouping,
+    aggregates: HirAggregateState<'a>,
+    sorter: HirGroupSorter,
+    inputs: Vec<HirGroupInput>,
+    sources: Vec<HirGroupSource>,
+}
+
+struct HirGroupSorter {
+    cursor: CursorID,
+    pseudo_cursor: CursorID,
+    record: usize,
+    inputs_start: usize,
+}
+
+enum HirGroupInput {
+    Key(usize),
+    Column {
+        reference: hir::ColumnRef,
+        row_register: usize,
+        group_register: usize,
+    },
+    RowId {
+        source: SourceId,
+        row_register: usize,
+        group_register: usize,
+    },
+}
+
+struct HirGroupSource {
+    source: SourceId,
+    row_start: usize,
+    group_start: usize,
+    rowid: Option<HirGroupRowId>,
+}
+
+struct HirGroupRowId {
+    row_register: usize,
+    group_register: usize,
+}
+
+#[derive(Clone, Copy)]
+enum HirGroupSourceValues {
+    Row,
+    Group,
 }
 
 impl HirRowOutput<'_> {
@@ -755,6 +804,8 @@ fn emit_planned_query_block_with_output(
     }
     if is_hir_ungrouped_aggregate(block) {
         emit_hir_ungrouped_aggregate(program, plan, query, block, block_plan, output, block_done)
+    } else if hir_grouping(block).is_some() {
+        emit_hir_grouped_aggregate(program, plan, query, block, block_plan, output)
     } else {
         emit_btree_loops(program, plan, block, block_plan, HirLoopBody::Rows(output))
     }
@@ -814,6 +865,466 @@ fn emit_hir_ungrouped_aggregate(
         HirLoopBody::UngroupedAggregate(&state),
     )?;
     emit_hir_aggregate_result(program, &plan.document, block, output, block_done, &state)
+}
+
+fn emit_hir_grouped_aggregate<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+    output: &HirRowOutput<'_>,
+) -> Result<()> {
+    let runtime = initialize_hir_group_runtime(program, plan, query, block, block_plan)?;
+    emit_btree_loops(
+        program,
+        plan,
+        block,
+        block_plan,
+        HirLoopBody::GroupSorter(&runtime),
+    )?;
+    emit_hir_group_sorter_rows(program, &plan.document, block, output, &runtime)
+}
+
+fn initialize_hir_group_runtime<'a>(
+    program: &mut ProgramBuilder,
+    plan: &'a HirPlan,
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+    block_plan: &HirQueryBlockPlan,
+) -> Result<HirGroupRuntime<'a>> {
+    let grouping = hir_grouping(block).expect("grouped lowering has non-empty keys");
+    if grouping.keys.len() != grouping.key_type_facts.len()
+        || grouping.keys.len() != grouping.key_collations.len()
+    {
+        return Err(LimboError::InternalError(format!(
+            "HIR query block {:?} has inconsistent grouping facts",
+            block.id
+        )));
+    }
+    let aggregates = initialize_hir_aggregates(program, &plan.document, query, block)?;
+    let usage = query.direct_column_usage(|source| plan.document.source(source));
+    let rowids = hir_group_rowids(query, block);
+    let mut inputs = (0..grouping.keys.len())
+        .map(HirGroupInput::Key)
+        .collect::<Vec<_>>();
+    let mut sources = Vec::with_capacity(block_plan.loops.len());
+    for planned_loop in &block_plan.loops {
+        if sources
+            .iter()
+            .any(|source: &HirGroupSource| source.source == planned_loop.source)
+        {
+            return Err(LimboError::InternalError(format!(
+                "HIR grouped query has more than one loop for source {}",
+                planned_loop.source
+            )));
+        }
+        let source = plan.document.source(planned_loop.source).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR grouped query references missing source {}",
+                planned_loop.source
+            ))
+        })?;
+        let row_start = if source.columns.is_empty() {
+            0
+        } else {
+            program.alloc_registers(source.columns.len())
+        };
+        let group_start = if source.columns.is_empty() {
+            0
+        } else {
+            program.alloc_registers(source.columns.len())
+        };
+        for column in usage
+            .iter()
+            .filter(|usage| usage.reference.source == source.id)
+            .map(|usage| usage.reference.column)
+        {
+            inputs.push(HirGroupInput::Column {
+                reference: hir::ColumnRef {
+                    source: source.id,
+                    column,
+                },
+                row_register: row_start + column,
+                group_register: group_start + column,
+            });
+        }
+        let rowid = rowids.contains(&source.id).then(|| {
+            let row_register = program.alloc_register();
+            let group_register = program.alloc_register();
+            inputs.push(HirGroupInput::RowId {
+                source: source.id,
+                row_register,
+                group_register,
+            });
+            HirGroupRowId {
+                row_register,
+                group_register,
+            }
+        });
+        sources.push(HirGroupSource {
+            source: source.id,
+            row_start,
+            group_start,
+            rowid,
+        });
+    }
+    let order_collations_nulls = grouping
+        .key_collations
+        .iter()
+        .map(|collation| {
+            (
+                SortOrder::Asc,
+                collation.as_ref().map(|collation| *collation.value()),
+                None,
+            )
+        })
+        .collect();
+    let comparators = grouping
+        .key_type_facts
+        .iter()
+        .map(custom_type_comparator_from_type_fact)
+        .collect();
+    let cursor = program.alloc_cursor_id(CursorType::Sorter);
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(SorterOpenData {
+            cursor_id: cursor,
+            columns: inputs.len(),
+            order_collations_nulls,
+            comparators,
+        }),
+    });
+    emit_explain!(
+        program,
+        false,
+        EqpDetail::GroupBy {
+            method: EqpSortMethod::Sorter,
+        }
+    );
+    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+        column_count: inputs.len(),
+    }));
+    let sorter = HirGroupSorter {
+        cursor,
+        pseudo_cursor,
+        record: program.alloc_register(),
+        inputs_start: program.alloc_registers(inputs.len()),
+    };
+    Ok(HirGroupRuntime {
+        grouping,
+        aggregates,
+        sorter,
+        inputs,
+        sources,
+    })
+}
+
+fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId> {
+    let mut rowids = Vec::new();
+    let mut collect = |expression: &hir::Expr| {
+        expression.for_each(&mut |expression| {
+            if let hir::Expr::RowId(source) = expression {
+                if !rowids.contains(source) {
+                    rowids.push(*source);
+                }
+            }
+        });
+    };
+    for output in &block.outputs {
+        collect(&output.expr);
+    }
+    if let hir::QueryBlockBody::Select { grouping, .. } = &block.body {
+        if let Some(grouping) = grouping {
+            for key in &grouping.keys {
+                collect(key);
+            }
+            if let Some(having) = &grouping.having {
+                collect(having);
+            }
+        }
+    }
+    for term in &query.order_by {
+        collect(&term.expr);
+    }
+    rowids.sort_unstable();
+    rowids
+}
+
+fn emit_hir_group_sorter_input(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    runtime: &HirGroupRuntime<'_>,
+) -> Result<()> {
+    for (position, input) in runtime.inputs.iter().enumerate() {
+        let target = runtime.sorter.inputs_start + position;
+        let expression = match input {
+            HirGroupInput::Key(index) => &runtime.grouping.keys[*index],
+            HirGroupInput::Column { reference, .. } => {
+                super::expr::translate_expr(
+                    program,
+                    document,
+                    &hir::Expr::Column(*reference),
+                    target,
+                )?;
+                continue;
+            }
+            HirGroupInput::RowId { source, .. } => {
+                super::expr::translate_expr(
+                    program,
+                    document,
+                    &hir::Expr::RowId(*source),
+                    target,
+                )?;
+                continue;
+            }
+        };
+        super::expr::translate_expr(program, document, expression, target)?;
+    }
+    sorter_insert(
+        program,
+        runtime.sorter.inputs_start,
+        runtime.inputs.len(),
+        runtime.sorter.cursor,
+        runtime.sorter.record,
+    );
+    Ok(())
+}
+
+fn bind_hir_group_sources(
+    program: &mut ProgramBuilder,
+    sources: &[HirGroupSource],
+    values: HirGroupSourceValues,
+) {
+    for source in sources {
+        let (start, rowid) = match values {
+            HirGroupSourceValues::Row => (
+                source.row_start,
+                source.rowid.as_ref().map(|rowid| rowid.row_register),
+            ),
+            HirGroupSourceValues::Group => (
+                source.group_start,
+                source.rowid.as_ref().map(|rowid| rowid.group_register),
+            ),
+        };
+        program.bind_source(source.source, SourceBinding::Registers { start, rowid });
+    }
+}
+
+fn reset_hir_group_aggregates(program: &mut ProgramBuilder, state: &HirAggregateState<'_>) {
+    for aggregate in &state.aggregates {
+        program.emit_insn(Insn::Null {
+            dest: aggregate.accumulator,
+            dest_end: None,
+        });
+        if let Some(distinct) = &aggregate.distinct {
+            program.emit_insn(Insn::HashClear {
+                hash_table_id: distinct.hash_table,
+            });
+        }
+    }
+}
+
+fn emit_hir_group_sorter_rows(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    runtime: &HirGroupRuntime<'_>,
+) -> Result<()> {
+    let sort_loop = program.allocate_label();
+    let sort_end = program.allocate_label();
+    let new_group = program.allocate_label();
+    let aggregate_step = program.allocate_label();
+    let captured = program.allocate_label();
+    let output_group = program.allocate_label();
+    let output_done = program.allocate_label();
+    let finalize_group = program.allocate_label();
+    let clear_group = program.allocate_label();
+    let group_end = program.allocate_label();
+    let output_return = program.alloc_register();
+    let clear_return = program.alloc_register();
+    let data_in_group = program.alloc_register();
+    let previous_keys = program.alloc_registers(runtime.grouping.keys.len());
+    let current_keys = program.alloc_registers(runtime.grouping.keys.len());
+
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: data_in_group,
+    });
+    program.emit_insn(Insn::Null {
+        dest: previous_keys,
+        dest_end: (runtime.grouping.keys.len() > 1)
+            .then_some(previous_keys + runtime.grouping.keys.len() - 1),
+    });
+    program.emit_insn(Insn::Gosub {
+        target_pc: clear_group,
+        return_reg: clear_return,
+    });
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: runtime.sorter.pseudo_cursor,
+        content_reg: runtime.sorter.record,
+        num_fields: runtime.inputs.len(),
+    });
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: runtime.sorter.cursor,
+        pc_if_empty: sort_end,
+    });
+    program.preassign_label_to_next_insn(sort_loop);
+    program.emit_insn(Insn::SorterData {
+        cursor_id: runtime.sorter.cursor,
+        dest_reg: runtime.sorter.record,
+        pseudo_cursor: runtime.sorter.pseudo_cursor,
+    });
+    for (position, input) in runtime.inputs.iter().enumerate() {
+        let target = match input {
+            HirGroupInput::Key(index) => current_keys + index,
+            HirGroupInput::Column { row_register, .. }
+            | HirGroupInput::RowId { row_register, .. } => *row_register,
+        };
+        program.emit_column_or_rowid(runtime.sorter.pseudo_cursor, position, target);
+    }
+    let key_info = runtime
+        .grouping
+        .key_collations
+        .iter()
+        .map(|collation| KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation: collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default(),
+            nulls_order: None,
+        })
+        .collect();
+    program.emit_insn(Insn::Compare {
+        start_reg_a: previous_keys,
+        start_reg_b: current_keys,
+        count: runtime.grouping.keys.len(),
+        key_info,
+    });
+    program.emit_insn(Insn::Jump {
+        target_pc_lt: new_group,
+        target_pc_eq: aggregate_step,
+        target_pc_gt: new_group,
+    });
+    program.preassign_label_to_next_insn(new_group);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_group,
+        return_reg: output_return,
+    });
+    program.emit_insn(Insn::Move {
+        source_reg: current_keys,
+        dest_reg: previous_keys,
+        count: runtime.grouping.keys.len(),
+    });
+    program.emit_insn(Insn::Gosub {
+        target_pc: clear_group,
+        return_reg: clear_return,
+    });
+
+    program.preassign_label_to_next_insn(aggregate_step);
+    bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Row);
+    emit_hir_aggregate_steps(program, document, &runtime.aggregates)?;
+    program.emit_insn(Insn::If {
+        reg: data_in_group,
+        target_pc: captured,
+        jump_if_null: false,
+    });
+    for input in &runtime.inputs {
+        match input {
+            HirGroupInput::Key(_) => {}
+            HirGroupInput::Column {
+                row_register,
+                group_register,
+                ..
+            }
+            | HirGroupInput::RowId {
+                row_register,
+                group_register,
+                ..
+            } => program.emit_insn(Insn::Copy {
+                src_reg: *row_register,
+                dst_reg: *group_register,
+                extra_amount: 0,
+            }),
+        }
+    }
+    program.preassign_label_to_next_insn(captured);
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: data_in_group,
+    });
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: runtime.sorter.cursor,
+        pc_if_next: sort_loop,
+    });
+
+    program.preassign_label_to_next_insn(sort_end);
+    program.emit_insn(Insn::Gosub {
+        target_pc: output_group,
+        return_reg: output_return,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: group_end,
+    });
+
+    program.preassign_label_to_next_insn(output_group);
+    program.emit_insn(Insn::IfPos {
+        reg: data_in_group,
+        target_pc: finalize_group,
+        decrement_by: 0,
+    });
+    program.preassign_label_to_next_insn(output_done);
+    program.emit_insn(Insn::Return {
+        return_reg: output_return,
+        can_fallthrough: false,
+    });
+
+    program.preassign_label_to_next_insn(finalize_group);
+    finalize_hir_aggregates(program, &runtime.aggregates)?;
+    bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Group);
+    if let Some(having) = &runtime.grouping.having {
+        let emit_row = program.allocate_label();
+        super::expr::translate_condition_expr(
+            program,
+            document,
+            having,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: emit_row,
+                jump_target_when_false: output_done,
+                jump_target_when_null: output_done,
+            },
+        )?;
+        program.preassign_label_to_next_insn(emit_row);
+    }
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+    emit_query_row(
+        program,
+        document,
+        output,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+        output_done,
+    )?;
+    program.emit_insn(Insn::Return {
+        return_reg: output_return,
+        can_fallthrough: false,
+    });
+
+    program.preassign_label_to_next_insn(clear_group);
+    reset_hir_group_aggregates(program, &runtime.aggregates);
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: data_in_group,
+    });
+    program.emit_insn(Insn::Return {
+        return_reg: clear_return,
+        can_fallthrough: false,
+    });
+    program.preassign_label_to_next_insn(group_end);
+    Ok(())
 }
 
 fn emit_hir_aggregate_result(
@@ -1507,14 +2018,25 @@ enum HirPredicateKind {
 }
 
 fn is_hir_ungrouped_aggregate(block: &hir::QueryBlock) -> bool {
-    block.aggregate_count != 0
-        || matches!(
-            &block.body,
-            hir::QueryBlockBody::Select {
-                grouping: Some(grouping),
-                ..
-            } if grouping.keys.is_empty()
-        )
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } => grouping.keys.is_empty(),
+        hir::QueryBlockBody::Select { grouping: None, .. } => block.aggregate_count != 0,
+        _ => false,
+    }
+}
+
+fn hir_grouping(block: &hir::QueryBlock) -> Option<&hir::Grouping> {
+    let hir::QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    else {
+        return None;
+    };
+    (!grouping.keys.is_empty()).then_some(grouping)
 }
 
 struct HirAggregateCollector<'a> {
@@ -2014,6 +2536,7 @@ fn emit_btree_loops(
         (HirLoopBody::Rows(_), None) if block.aggregate_count == 0 => {}
         (HirLoopBody::UngroupedAggregate(_), None) if block.aggregate_count != 0 => {}
         (HirLoopBody::UngroupedAggregate(_), Some(grouping)) if grouping.keys.is_empty() => {}
+        (HirLoopBody::GroupSorter(_), Some(grouping)) if !grouping.keys.is_empty() => {}
         _ => {
             return Err(LimboError::InternalError(format!(
                 "HIR query block {:?} has a mismatched loop body",
@@ -2135,6 +2658,9 @@ fn emit_btree_loops(
                 .expect("aggregate loop initializes first-row captures");
             emit_hir_aggregate_capture(program, document, *first_row, captures)?;
             emit_hir_aggregate_steps(program, document, state)?;
+        }
+        HirLoopBody::GroupSorter(runtime) => {
+            emit_hir_group_sorter_input(program, document, runtime)?;
         }
     }
 
@@ -4422,6 +4948,113 @@ mod tests {
                 } if *dest == start + 1
             )
         }));
+    }
+
+    #[test]
+    fn planned_grouped_aggregate_sorts_then_uses_shared_aggregate_steps() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT extra COLLATE nocase, sum(value) FROM items \
+             GROUP BY extra COLLATE nocase HAVING extra <> ''",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("grouped aggregate HIR query emits");
+        program.resolve_labels().expect("GROUP BY labels resolve");
+
+        let sorter_open = program
+            .insns
+            .iter()
+            .position(|(insn, _)| match insn {
+                Insn::SorterOpen { data } => {
+                    data.order_collations_nulls.first()
+                        == Some(&(SortOrder::Asc, Some(CollationSeq::NoCase), None))
+                }
+                _ => false,
+            })
+            .expect("GROUP BY sorter uses resolved key collation");
+        let sorter_insert = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SorterInsert { .. }))
+            .expect("scan rows enter GROUP BY sorter");
+        let sorter_sort = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
+            .expect("GROUP BY sorter drains");
+        let aggregate_step = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+            .expect("group uses shared aggregate step");
+        let aggregate_final = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::AggFinal { .. }))
+            .expect("group uses shared aggregate final");
+        assert!(sorter_open < sorter_insert && sorter_insert < sorter_sort);
+        assert!(sorter_sort < aggregate_step && aggregate_step < aggregate_final);
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Compare { .. })));
+    }
+
+    #[test]
+    fn planned_group_by_without_aggregates_still_emits_one_row_per_group() {
+        let plan = analyze_plan(indexed_items_schema(), "SELECT extra FROM items GROUP BY extra");
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("aggregate-free GROUP BY HIR query emits");
+        program
+            .resolve_labels()
+            .expect("aggregate-free GROUP BY labels resolve");
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SorterInsert { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Compare { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::ResultRow { .. })));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::AggStep { .. } | Insn::AggFinal { .. })));
+    }
+
+    #[test]
+    fn planned_grouped_distinct_aggregate_clears_each_group_state() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT extra, count(DISTINCT value) FROM items GROUP BY extra",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("grouped DISTINCT aggregate HIR query emits");
+        program
+            .resolve_labels()
+            .expect("grouped DISTINCT aggregate labels resolve");
+
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::HashDistinct { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .filter(|(insn, _)| matches!(insn, Insn::HashClear { .. }))
+            .count()
+            >= 2);
     }
 
     #[test]

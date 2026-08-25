@@ -823,8 +823,8 @@ before applying OFFSET. ORDER BY inserts rows directly from the source loop,
 uses resolved type facts for custom comparators, and drains through the same
 sorter-output helper as compound ordering before applying LIMIT/OFFSET. Combined
 DISTINCT and ORDER BY deduplicates before sorter insertion. No parser expression
-or `TableReferences` sidecar is rebuilt. Aggregate, GROUP BY, and window output
-remain later SELECT checkpoints.
+or `TableReferences` sidecar is rebuilt. Aggregate argument ORDER BY and window
+output remain later SELECT checkpoints.
 
 Ungrouped aggregate SELECT now lowers from planned HIR. Stable `AggregateId`
 values own accumulator registers; aggregate arguments, filters, DISTINCT
@@ -832,12 +832,16 @@ collations, custom comparators, and final calls use semantic HIR facts. HIR and
 legacy paths share one aggregate-step opcode switch, so this adds no second
 copy of function behavior. Bare columns and rowid reads capture only values
 needed after the scan, preserving SQLite first-row and empty-input behavior
-without forcing unused columns into covering-index plans. GROUP BY, aggregate
-argument ORDER BY, and windows remain later SELECT checkpoints. Ordered-set
+without forcing unused columns into covering-index plans. Ordered-set
 percentile aggregates evaluate their direct fraction once before opening the
 input scan, reject local-row and subquery dependencies with the legacy error,
 and reuse the same range-check and aggregate-step opcode helpers as legacy
-lowering.
+lowering. Sorter-backed GROUP BY now stores resolved key and source values,
+detects boundaries with HIR key collations, and reuses the same aggregate
+step/finalize state for each group. HAVING and output expressions read the
+captured group row directly from register-bound HIR sources. Aggregate-free and
+DISTINCT-aggregate groups use the same path. Input-order GROUP BY elision,
+aggregate argument ORDER BY, and windows remain later SELECT checkpoints.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR
