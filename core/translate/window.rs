@@ -707,7 +707,8 @@ impl<E> WindowFunctionRuntime<E> {
     }
 }
 
-trait WindowValueEmitter<E> {
+/// Reads one prepared window value from the current buffered row.
+pub(crate) trait WindowValueEmitter<E> {
     fn emit_buffered_value(
         &mut self,
         program: &mut ProgramBuilder,
@@ -3205,16 +3206,18 @@ impl WindowValueEmitter<&Expr> for LegacyWindowValueEmitter<'_, '_> {
     }
 }
 
+/// Runtime locations and flags needed to add one row to a window frame.
 #[derive(Clone, Copy)]
-struct WindowStepContext {
-    accumulator_registers_start: usize,
-    read_cursor: CursorID,
-    current_cursor: CursorID,
-    has_exclude: bool,
-    custom_types_enabled: bool,
+pub(crate) struct WindowStepContext {
+    pub(crate) accumulator_registers_start: usize,
+    pub(crate) read_cursor: CursorID,
+    pub(crate) current_cursor: CursorID,
+    pub(crate) has_exclude: bool,
+    pub(crate) custom_types_enabled: bool,
 }
 
-fn emit_function_step_runtime<E>(
+/// Add one buffered row to every prepared window function.
+pub(crate) fn emit_function_step_runtime<E>(
     program: &mut ProgramBuilder,
     functions: &[WindowFunctionRuntime<E>],
     emitter: &mut impl WindowValueEmitter<E>,
@@ -3438,7 +3441,8 @@ fn emit_function_inverse(
     Ok(())
 }
 
-fn emit_function_inverse_runtime<E>(
+/// Remove one buffered row from every prepared window function.
+pub(crate) fn emit_function_inverse_runtime<E>(
     program: &mut ProgramBuilder,
     functions: &[WindowFunctionRuntime<E>],
     emitter: &mut impl WindowValueEmitter<E>,

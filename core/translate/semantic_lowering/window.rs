@@ -2,6 +2,8 @@
 
 use std::ops::ControlFlow;
 
+use smallvec::SmallVec;
+
 use crate::{
     function::{AccumulatorFunc, Func},
     translate::{
@@ -9,12 +11,14 @@ use crate::{
         collate::CollationSeq,
         order_by::custom_type_comparator_from_type_fact,
         semantic::hir::{self, ExprVisitor},
+        semantic_lowering::expr::{translate_expr_with_inputs, ExprRegisterInput},
         window::{
+            emit_function_inverse_runtime, emit_function_step_runtime,
             window_function_uses_subtypes, BufferedWindowValue, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec,
+            WindowFunctionRuntimeSpec, WindowStepContext, WindowValueEmitter,
         },
     },
-    vdbe::builder::ProgramBuilder,
+    vdbe::{builder::ProgramBuilder, insn::Insn, CursorID},
     LimboError, Result,
 };
 
@@ -28,6 +32,15 @@ use crate::{
 pub(super) enum HirWindowBufferColumn<'a> {
     Evaluate(&'a hir::Expr),
     Source(hir::ColumnRef),
+}
+
+/// One exact HIR leaf and the window-buffer column holding its value.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct HirWindowLateInput<'a> {
+    owner: &'a hir::Expr,
+    expression: &'a hir::Expr,
+    column: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -51,6 +64,7 @@ pub(super) struct HirWindowBufferPlan<'a> {
     pub(super) window: &'a hir::ResolvedWindow,
     pub(super) columns: Vec<HirWindowBufferColumn<'a>>,
     pub(super) functions: Vec<HirWindowFunction<'a>>,
+    late_inputs: Vec<HirWindowLateInput<'a>>,
 }
 
 struct WindowCallCollector<'a> {
@@ -101,7 +115,9 @@ impl<'expr> ExprVisitor<'expr> for WindowCallCollector<'expr> {
 }
 
 struct LateArgumentCollector<'columns, 'expr> {
+    owner: &'expr hir::Expr,
     columns: &'columns mut Vec<HirWindowBufferColumn<'expr>>,
+    inputs: &'columns mut Vec<HirWindowLateInput<'expr>>,
 }
 
 impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
@@ -148,7 +164,12 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
             }) => HirWindowBufferColumn::Evaluate(expression),
             _ => return Ok(()),
         };
-        push_reused_column(self.columns, column);
+        let column = push_reused_column(self.columns, column);
+        self.inputs.push(HirWindowLateInput {
+            owner: self.owner,
+            expression,
+            column,
+        });
         Ok(())
     }
 }
@@ -281,6 +302,7 @@ pub(super) fn plan_hir_window_buffer<'a>(
 
     let calls = collect_window_calls(query, block)?;
     let mut functions = Vec::new();
+    let mut late_inputs = Vec::new();
     for call in calls {
         let hir::FunctionEvaluation::Window {
             id,
@@ -315,7 +337,9 @@ pub(super) fn plan_hir_window_buffer<'a>(
                 value.walk(
                     (),
                     &mut LateArgumentCollector {
+                        owner: value,
                         columns: &mut columns,
+                        inputs: &mut late_inputs,
                     },
                 )?;
             }
@@ -348,6 +372,7 @@ pub(super) fn plan_hir_window_buffer<'a>(
         window,
         columns,
         functions,
+        late_inputs,
     })
 }
 
@@ -412,12 +437,97 @@ pub(super) fn prepare_hir_window_runtime<'a>(
     Ok(runtimes)
 }
 
+struct HirWindowValueEmitter<'document, 'inputs> {
+    document: &'document hir::HirDocument,
+    late_inputs: &'inputs [HirWindowLateInput<'document>],
+}
+
+impl<'a> WindowValueEmitter<&'a hir::Expr> for HirWindowValueEmitter<'a, '_> {
+    fn emit_buffered_value(
+        &mut self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        value: &BufferedWindowValue<&'a hir::Expr>,
+        target: usize,
+    ) -> Result<()> {
+        match value {
+            BufferedWindowValue::Column(column) => program.emit_insn(Insn::Column {
+                cursor_id: cursor,
+                column: *column,
+                dest: target,
+                default: None,
+            }),
+            BufferedWindowValue::Recompute(expression) => {
+                let mut inputs: SmallVec<[ExprRegisterInput<'a>; 4]> = SmallVec::new();
+                for input in self
+                    .late_inputs
+                    .iter()
+                    .filter(|input| std::ptr::eq(input.owner, *expression))
+                {
+                    let register = program.alloc_register();
+                    program.emit_insn(Insn::Column {
+                        cursor_id: cursor,
+                        column: input.column,
+                        dest: register,
+                        default: None,
+                    });
+                    inputs.push(ExprRegisterInput::new(input.expression, register));
+                }
+                translate_expr_with_inputs(program, self.document, expression, target, &inputs)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Emit one HIR window step through the representation-neutral frame logic.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_step<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    context: WindowStepContext,
+) -> Result<()> {
+    emit_function_step_runtime(
+        program,
+        functions,
+        &mut HirWindowValueEmitter {
+            document,
+            late_inputs: &plan.late_inputs,
+        },
+        context,
+    )
+}
+
+/// Emit one HIR window inverse through the representation-neutral frame logic.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_inverse<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    accumulator_registers_start: usize,
+    start_cursor: CursorID,
+) -> Result<()> {
+    emit_function_inverse_runtime(
+        program,
+        functions,
+        &mut HirWindowValueEmitter {
+            document,
+            late_inputs: &plan.late_inputs,
+        },
+        accumulator_registers_start,
+        start_cursor,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         dialect::SqliteDialect,
-        schema::{BTreeTable, Schema},
+        schema::{BTreeTable, PseudoCursorType, Schema},
         sync::Arc,
         translate::semantic::{
             catalog::{SemanticCatalog, SemanticCatalogDatabase},
@@ -425,10 +535,7 @@ mod tests {
             hir::{DatabaseId, HirDocument, HirRoot},
             SemanticOptions, SemanticRootInput,
         },
-        vdbe::{
-            builder::{ProgramBuilderOpts, QueryMode},
-            insn::Insn,
-        },
+        vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode},
         SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
@@ -486,6 +593,12 @@ mod tests {
 
     fn program() -> ProgramBuilder {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
+    }
+
+    fn buffer_cursor(program: &mut ProgramBuilder, columns: usize) -> CursorID {
+        program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: columns,
+        }))
     }
 
     fn column_reference(column: &HirWindowBufferColumn<'_>) -> Option<hir::ColumnRef> {
@@ -634,5 +747,116 @@ mod tests {
             function.arguments.as_slice(),
             [BufferedWindowValue::Recompute(hir::Expr::Function(_))]
         ));
+    }
+
+    #[test]
+    fn hir_window_step_reads_direct_argument_and_filter_columns() {
+        let document = analyze_sql(
+            "SELECT sum(value) FILTER (WHERE keep) OVER window_frame FROM items \
+             WINDOW window_frame AS (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let functions =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        let cursor = buffer_cursor(&mut program, plan.columns.len());
+        let accumulator_registers_start = program.alloc_registers(functions.len());
+
+        emit_hir_window_step(
+            &mut program,
+            &document,
+            &plan,
+            &functions,
+            WindowStepContext {
+                accumulator_registers_start,
+                read_cursor: cursor,
+                current_cursor: cursor,
+                has_exclude: false,
+                custom_types_enabled: true,
+            },
+        )
+        .expect("HIR window step emits");
+
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::ColumnRange {
+                cursor_id,
+                start_column: 0,
+                defaults,
+                ..
+            } if *cursor_id == cursor && defaults.len() == 2
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::AggStep { .. })));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn hir_window_step_and_inverse_recompute_json_from_buffered_leaves() {
+        let document = analyze_sql(
+            "SELECT json_group_array(json_array(value)) OVER window_frame FROM items \
+             WINDOW window_frame AS (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let functions =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        let cursor = buffer_cursor(&mut program, plan.columns.len());
+        let accumulator_registers_start = program.alloc_registers(functions.len());
+
+        emit_hir_window_step(
+            &mut program,
+            &document,
+            &plan,
+            &functions,
+            WindowStepContext {
+                accumulator_registers_start,
+                read_cursor: cursor,
+                current_cursor: cursor,
+                has_exclude: false,
+                custom_types_enabled: true,
+            },
+        )
+        .expect("HIR window step emits");
+        emit_hir_window_inverse(
+            &mut program,
+            &document,
+            &plan,
+            &functions,
+            accumulator_registers_start,
+            cursor,
+        )
+        .expect("HIR window inverse emits");
+
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Column { cursor_id, column: 0, .. } if *cursor_id == cursor))
+                .count(),
+            2
+        );
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(instruction, _)| matches!(instruction, Insn::Function { .. }))
+                .count(),
+            2
+        );
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::AggStep { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(instruction, _)| matches!(instruction, Insn::AggInverse { .. })));
     }
 }

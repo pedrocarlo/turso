@@ -880,6 +880,14 @@ registers, and resolved frame facts drive the shared moving min/max setup. The
 HIR adapter needs no resolver, parser expression, or `TableReferences` sidecar.
 Frame movement and row buffering are still not routed to HIR.
 
+HIR window step and inverse emission now read direct arguments and filters from
+their planned buffer columns. Subtype-sensitive arguments load only their
+planned HIR leaves from the buffer and recompute through the existing HIR
+expression walker using scoped node-to-register inputs. The same generic
+step/inverse loops serve legacy and HIR expressions; HIR does not create AST
+nodes or mutate global source bindings. Production partition buffering and
+frame-loop routing remain later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
