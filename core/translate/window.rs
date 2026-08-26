@@ -2,14 +2,16 @@ use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
-use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
+use crate::translate::aggregation::{
+    agg_arg_collation, translate_prepared_aggregation_step, PreparedAggregateArguments,
+};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
     walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
-use crate::translate::order_by::EmitOrderBy;
+use crate::translate::order_by::{custom_type_comparator, EmitOrderBy};
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
     RewrittenWindowCall, SelectPlan, TableReferences, Window, WindowFunction,
@@ -580,19 +582,38 @@ pub struct WindowMetadata<'a> {
     /// to their corresponding column indexes in the subquery’s result.
     pub expressions_referencing_subquery: Vec<(&'a Expr, usize)>,
     pub buffer_table_name: String,
-    /// For each window function, a sorted index used to compute `min()` or
-    /// `max()` when the frame's start can move (so rows leave the frame as
-    /// it slides). Most aggregates can cheaply undo one row's contribution
-    /// when it leaves, but min/max can't: if you drop the current maximum,
-    /// you have no way to know the next-largest value. So instead of a
-    /// single running value we keep every in-frame value in a sorted index.
-    /// A row joining the frame inserts its value, a row leaving deletes it,
-    /// and the current answer is always the largest (or smallest) value
-    /// still in the index. Each entry is a `(value, sequence)` pair; the
-    /// ever-increasing sequence number keeps equal values apart, so a
-    /// leaving row deletes exactly its own entry. `None` for any function
-    /// that isn't a min/max needing this index.
-    pub minmax: Vec<Option<WindowMinMax>>,
+    pub functions: Vec<WindowFunctionRuntime<&'a Expr>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BufferedWindowValue<E> {
+    Column(usize),
+    Recompute(E),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WindowFunctionRuntime<E> {
+    function: AccumulatorFunc,
+    arguments: Vec<BufferedWindowValue<E>>,
+    filter: Option<BufferedWindowValue<E>>,
+    argument_collations: Vec<CollationSeq>,
+    argument_comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>>,
+    result_register: usize,
+    /// Sorted index used by min/max when rows can leave the frame. Most
+    /// aggregates can undo one row directly, but min/max must retain every
+    /// in-frame `(value, sequence)` entry so removing the current answer
+    /// still leaves the next answer available.
+    minmax: Option<WindowMinMax>,
+}
+
+trait WindowValueEmitter<E> {
+    fn emit_buffered_value(
+        &mut self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        value: &BufferedWindowValue<E>,
+        target: usize,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -606,84 +627,125 @@ pub struct WindowMinMax {
     pub registers: usize,
 }
 
-/// Create the sorted index that a `min()` / `max()` window function uses
-/// when the frame's start can move (see `WindowMetadata::minmax`). The
+/// Prepare the values and runtime state used while stepping each function.
+///
+/// This also creates the sorted index that a `min()` / `max()` window
+/// function uses when the frame's start can move. The
 /// index sorts on two columns: the argument value, then an
 /// always-increasing sequence number so equal values still get separate
 /// entries. For `max()` the value sorts ascending and for `min()` it sorts
 /// descending, so in both cases the current answer is just the last entry
 /// in the index — one code path serves both. The index is ephemeral: it
 /// exists only for the duration of this query.
-fn allocate_window_minmax(
+fn prepare_window_functions<'a>(
     program: &mut ProgramBuilder,
-    window: &Window,
+    window: &'a Window,
     table_references: &TableReferences,
-) -> Result<Vec<Option<WindowMinMax>>> {
+    resolver: &Resolver,
+    result_registers_start: usize,
+) -> Result<Vec<WindowFunctionRuntime<&'a Expr>>> {
     let moving_start = !matches!(
         window.frame.start,
         crate::translate::plan::FrameBoundary::UnboundedPreceding
     );
-    let mut states = Vec::with_capacity(window.functions.len());
+    let mut functions = Vec::with_capacity(window.functions.len());
 
     for (i, func) in window.functions.iter().enumerate() {
-        let agg = match &func.func {
+        let arguments: Vec<&Expr> = match func.current_expr() {
+            Expr::FunctionCall { args, .. } => args.iter().map(|arg| arg.as_ref()).collect(),
+            Expr::FunctionCallStar { .. } => Vec::new(),
+            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
+        };
+        let minmax_function = match &func.func {
             AccumulatorFunc::Agg(agg @ (AggFunc::Min | AggFunc::Max))
                 if moving_start && window.frame.exclude.is_none() =>
             {
-                agg
+                Some(agg)
             }
-            _ => {
-                states.push(None);
-                continue;
-            }
+            _ => None,
         };
-        let Expr::FunctionCall { args, .. } = func.current_expr() else {
-            unreachable!("min/max window calls must have one argument");
-        };
-        let arg = args
-            .first()
-            .expect("min/max window calls must have one argument");
-        let collation = get_collseq_from_expr(arg, table_references)?;
-        let index = Arc::new(Index {
-            name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
-            table_name: String::new(),
-            root_page: 0,
-            columns: crate::alloc::vec![
-                IndexColumn {
-                    name: "0".to_string(),
-                    order: if matches!(agg, AggFunc::Min) {
-                        SortOrder::Desc
-                    } else {
-                        SortOrder::Asc
+        let minmax_collation = minmax_function
+            .and_then(|_| arguments.first())
+            .map(|argument| get_collseq_from_expr(argument, table_references))
+            .transpose()?
+            .flatten();
+        let argument_collations = arguments
+            .iter()
+            .map(|argument| agg_arg_collation(table_references, argument, resolver))
+            .collect();
+        let argument_comparators = arguments
+            .iter()
+            .map(|argument| custom_type_comparator(argument, table_references, resolver.schema()))
+            .collect();
+        let arguments = arguments
+            .into_iter()
+            .map(|argument| match argument {
+                Expr::Column { column, .. } => BufferedWindowValue::Column(*column),
+                _ => BufferedWindowValue::Recompute(argument),
+            })
+            .collect();
+        let filter = func
+            .rewritten
+            .as_ref()
+            .and_then(|rewritten| rewritten.filter_expr.as_ref())
+            .map(|filter| match filter {
+                Expr::Column { column, .. } => BufferedWindowValue::Column(*column),
+                _ => BufferedWindowValue::Recompute(filter),
+            });
+
+        let minmax = if let Some(agg) = minmax_function {
+            let index = Arc::new(Index {
+                name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
+                table_name: String::new(),
+                root_page: 0,
+                columns: crate::alloc::vec![
+                    IndexColumn {
+                        name: "0".to_string(),
+                        order: if matches!(agg, AggFunc::Min) {
+                            SortOrder::Desc
+                        } else {
+                            SortOrder::Asc
+                        },
+                        nulls_order: None,
+                        pos_in_table: 0,
+                        collation: minmax_collation,
+                        default: None,
+                        expr: None,
                     },
-                    nulls_order: None,
-                    pos_in_table: 0,
-                    collation,
-                    default: None,
-                    expr: None,
-                },
-                IndexColumn::new("1", 1),
-            ],
-            unique: false,
-            ephemeral: true,
-            has_rowid: false,
-            where_clause: None,
-            index_method: None,
-            on_conflict: None,
+                    IndexColumn::new("1", 1),
+                ],
+                unique: false,
+                ephemeral: true,
+                has_rowid: false,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            });
+            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+            let registers = program.alloc_registers(3);
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: cursor,
+                is_table: false,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: registers + 1,
+            });
+            Some(WindowMinMax { cursor, registers })
+        } else {
+            None
+        };
+        functions.push(WindowFunctionRuntime {
+            function: func.func.clone(),
+            arguments,
+            filter,
+            argument_collations,
+            argument_comparators,
+            result_register: result_registers_start + i,
+            minmax,
         });
-        let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
-        let registers = program.alloc_registers(3);
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: cursor,
-            is_table: false,
-        });
-        program.emit_insn(Insn::Integer {
-            value: 0,
-            dest: registers + 1,
-        });
-        states.push(Some(WindowMinMax { cursor, registers }));
     }
-    Ok(states)
+    Ok(functions)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1224,21 +1286,26 @@ impl EmitWindow {
                 new_cursor_id: csr_app,
             });
         }
-        let minmax = allocate_window_minmax(program, window, &plan.table_references)?;
-
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
         // result register. Later, when bytecode generation encounters the expression, the value is
         // copied from the result register instead of generating code to evaluate the expression.
         let reg_acc_start = program.alloc_registers(window_function_count);
         let reg_acc_result_start = program.alloc_registers(window_function_count);
-        for (i, func) in window.functions.iter().enumerate() {
+        let functions = prepare_window_functions(
+            program,
+            window,
+            &plan.table_references,
+            &t_ctx.resolver,
+            reg_acc_result_start,
+        )?;
+        for (func, runtime) in window.functions.iter().zip(&functions) {
             // Cache by the rewritten form (when available) so lookups against the
             // result-column / ORDER-BY expressions — which were rewritten to
             // reference this window's subquery — find the cached register.
             t_ctx.resolver.cache_expr_reg(
                 std::borrow::Cow::Borrowed(func.current_expr()),
-                reg_acc_result_start + i,
+                runtime.result_register,
                 false,
                 None,
             );
@@ -1339,7 +1406,7 @@ impl EmitWindow {
             src_column_count,
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
-            minmax,
+            functions,
         });
 
         Ok(())
@@ -1401,7 +1468,11 @@ impl EmitWindow {
         let cursors = meta.cursors;
         let src_column_count = meta.src_column_count;
         let buffer_table_name = meta.buffer_table_name.clone();
-        let minmax = meta.minmax.clone();
+        let minmax: Vec<_> = meta
+            .functions
+            .iter()
+            .map(|function| function.minmax)
+            .collect();
 
         emit_load_order_by_columns(program, window, &registers);
         emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
@@ -2298,7 +2369,11 @@ fn emit_window_full_scan(
     let window = plan.window.as_ref().expect("missing window");
     let registers = meta.registers;
     let cursors = meta.cursors;
-    let minmax = meta.minmax.clone();
+    let minmax: Vec<_> = meta
+        .functions
+        .iter()
+        .map(|function| function.minmax)
+        .collect();
     let exclude = window
         .frame
         .exclude
@@ -2683,7 +2758,11 @@ fn emit_window_op(
     let registers = meta.registers;
     let cursors = meta.cursors;
     let buffer_table_name = meta.buffer_table_name.clone();
-    let minmax = meta.minmax.clone();
+    let minmax: Vec<_> = meta
+        .functions
+        .iter()
+        .map(|function| function.minmax)
+        .collect();
     let order_by_len = window.order_by.len();
     let frame_mode = window.frame.mode;
     // Under RANGE / GROUPS frames one advance steps over every row with
@@ -2998,31 +3077,15 @@ fn emit_window_op(
 /// `csr_start`, the row leaving). Caller is responsible for pinning
 /// the returned label to the instruction the filtered emit should
 /// skip past.
-fn emit_filter_skip(
+fn emit_filter_skip<E>(
     program: &mut ProgramBuilder,
-    table_references: &TableReferences,
-    resolver: &Resolver,
+    emitter: &mut impl WindowValueEmitter<E>,
     cursor: CursorID,
-    filter_expr: &Expr,
+    filter: &BufferedWindowValue<E>,
 ) -> Result<BranchOffset> {
     let label = program.allocate_label();
     let filter_reg = program.alloc_register();
-    if let Expr::Column { column, .. } = filter_expr {
-        program.emit_insn(Insn::Column {
-            cursor_id: cursor,
-            column: *column,
-            dest: filter_reg,
-            default: None,
-        });
-    } else {
-        translate_expr(
-            program,
-            Some(table_references),
-            filter_expr,
-            filter_reg,
-            resolver,
-        )?;
-    }
+    emitter.emit_buffered_value(program, cursor, filter, filter_reg)?;
     program.emit_insn(Insn::IfNot {
         reg: filter_reg,
         target_pc: label,
@@ -3031,174 +3094,125 @@ fn emit_filter_skip(
     Ok(label)
 }
 
-/// Read one window-function argument from a buffered row. Most arguments are
-/// a single source column. A few JSON arguments intentionally remain scalar
-/// expressions so their JSON subtype is created after the record buffer; for
-/// those, load and cache every source column the expression reads, then
-/// evaluate the expression into `dest`.
-fn emit_window_arg_from_cursor(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
-    cursor: CursorID,
-    arg: &Expr,
-    dest: usize,
-) -> Result<()> {
-    if let Expr::Column { column, .. } = arg {
-        program.emit_insn(Insn::Column {
-            cursor_id: cursor,
-            column: *column,
-            dest,
-            default: None,
-        });
-    } else {
-        walk_expr(arg, &mut |node| {
-            if let Expr::Column { column, .. } = node {
-                let value_reg = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: cursor,
-                    column: *column,
-                    dest: value_reg,
-                    default: None,
-                });
-                t_ctx.resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(node.clone()),
-                    value_reg,
-                    false,
-                    None,
-                );
-                return Ok(WalkControl::SkipChildren);
-            }
-            Ok(WalkControl::Continue)
-        })?;
-        t_ctx.resolver.expr_to_reg_cache_enabled = true;
-        translate_expr(
-            program,
-            Some(&plan.table_references),
-            arg,
-            dest,
-            &t_ctx.resolver,
-        )?;
-    }
-    t_ctx
-        .resolver
-        .cache_expr_reg(std::borrow::Cow::Owned(arg.clone()), dest, false, None);
-    Ok(())
+struct LegacyWindowValueEmitter<'a, 'resolver> {
+    resolver: &'a mut Resolver<'resolver>,
+    table_references: &'a TableReferences,
 }
 
-/// Emit the code that adds one row into each function's running total (an
-/// AGGSTEP step), reading that row's argument values from `read_csr` — the
-/// cursor sitting on the row that just joined the frame.
-///
-/// Mirrors SQLite's `windowAggStep` (`window.c:1658-1762`). For each
-/// function, its argument values are loaded from the cursor's current row
-/// into their own small block of registers, and the aggregate step is
-/// emitted against that block. Those load registers are kept deliberately
-/// apart from `src_columns_start` (where the source loop puts the next
-/// row's columns), so stepping the previous partition here can't overwrite
-/// the first row of the next one.
-///
-/// While emitting, each argument expression is pushed into the resolver's
-/// expression cache, so that when the aggregate-step translation looks up
-/// a column it finds the register we just loaded instead of
-/// `src_columns_start`. The cache is put back to how it was on the way out.
-fn emit_function_step(
+impl WindowValueEmitter<&Expr> for LegacyWindowValueEmitter<'_, '_> {
+    fn emit_buffered_value(
+        &mut self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        value: &BufferedWindowValue<&Expr>,
+        target: usize,
+    ) -> Result<()> {
+        match value {
+            BufferedWindowValue::Column(column) => program.emit_insn(Insn::Column {
+                cursor_id: cursor,
+                column: *column,
+                dest: target,
+                default: None,
+            }),
+            BufferedWindowValue::Recompute(expression) => {
+                walk_expr(expression, &mut |node| {
+                    if let Expr::Column { column, .. } = node {
+                        let value_reg = program.alloc_register();
+                        program.emit_insn(Insn::Column {
+                            cursor_id: cursor,
+                            column: *column,
+                            dest: value_reg,
+                            default: None,
+                        });
+                        self.resolver.cache_expr_reg(
+                            std::borrow::Cow::Owned(node.clone()),
+                            value_reg,
+                            false,
+                            None,
+                        );
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+                self.resolver.expr_to_reg_cache_enabled = true;
+                translate_expr(
+                    program,
+                    Some(self.table_references),
+                    expression,
+                    target,
+                    self.resolver,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WindowStepContext {
+    accumulator_registers_start: usize,
+    read_cursor: CursorID,
+    current_cursor: CursorID,
+    has_exclude: bool,
+    custom_types_enabled: bool,
+}
+
+fn emit_function_step_runtime<E>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
-    read_csr: CursorID,
+    functions: &[WindowFunctionRuntime<E>],
+    emitter: &mut impl WindowValueEmitter<E>,
+    context: WindowStepContext,
 ) -> Result<()> {
-    let (acc_start, minmax, csr_current) = {
-        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-        (
-            meta.registers.acc_start,
-            meta.minmax.clone(),
-            meta.cursors.csr_current,
-        )
-    };
-    let window = plan.window.as_ref().expect("missing window");
-
-    // Save cache state so the per-arg overrides we push below don't leak
-    // out to other parts of the emit pipeline (e.g. emit_return_one_row).
-    let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
-    let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
-
-    for (i, func) in window.functions.iter().enumerate() {
-        // Normally first_value / nth_value / lag / lead take no part in the
-        // running totals — at output time they just jump straight to the
-        // row they need. But an EXCLUDE clause can punch holes in the
-        // frame, so first_value / nth_value switch to the slower approach
-        // of being stepped row by row, which lets them skip the excluded
-        // rows. (lag / lead ignore the frame entirely, so they are always
-        // looked up directly and never stepped here.)
+    for (i, function) in functions.iter().enumerate() {
         let positional = matches!(
-            &func.func,
+            &function.function,
             AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
         );
         let always_lookup = matches!(
-            &func.func,
+            &function.function,
             AccumulatorFunc::Window(WindowFunc::Lag | WindowFunc::Lead)
         );
-        if always_lookup || (positional && window.frame.exclude.is_none()) {
+        if always_lookup || (positional && !context.has_exclude) {
             continue;
         }
-        let acc_reg = acc_start + i;
-        let args: Vec<Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
-            Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
-        };
-
-        // Load each argument from the frame cursor into a fresh register.
-        // Most arguments are one buffered column; JSON subtype-producing
-        // arguments are evaluated here from their buffered input columns.
-        // Cache entries make the aggregate-step translation reuse those
-        // freshly loaded values.
-        let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
+        let acc_reg = context.accumulator_registers_start + i;
+        let arg_load_start = (!function.arguments.is_empty())
+            .then(|| program.alloc_registers(function.arguments.len()));
         if let Some(base) = arg_load_start {
-            for (j, arg) in args.iter().enumerate() {
+            for (j, argument) in function.arguments.iter().enumerate() {
                 // SQLite's slow nth_value() path reads the value from each
                 // included scan row, but keeps N fixed to the current output
                 // row (window.c:1679-1683).
-                let arg_cursor = if window.frame.exclude.is_some()
+                let argument_cursor = if context.has_exclude
                     && j == 1
-                    && matches!(&func.func, AccumulatorFunc::Window(WindowFunc::NthValue))
-                {
-                    csr_current
+                    && matches!(
+                        &function.function,
+                        AccumulatorFunc::Window(WindowFunc::NthValue)
+                    ) {
+                    context.current_cursor
                 } else {
-                    read_csr
+                    context.read_cursor
                 };
-                emit_window_arg_from_cursor(program, t_ctx, plan, arg_cursor, arg, base + j)?;
+                emitter.emit_buffered_value(program, argument_cursor, argument, base + j)?;
             }
         }
-        t_ctx.resolver.expr_to_reg_cache_enabled = true;
 
-        match &func.func {
+        match &function.function {
             AccumulatorFunc::Agg(agg_func) => {
-                let filter_skip_label = func
-                    .rewritten
+                let filter_skip_label = function
+                    .filter
                     .as_ref()
-                    .and_then(|r| r.filter_expr.as_ref())
-                    .map(|f| {
-                        emit_filter_skip(
-                            program,
-                            &plan.table_references,
-                            &t_ctx.resolver,
-                            read_csr,
-                            f,
-                        )
-                    })
+                    .map(|filter| emit_filter_skip(program, emitter, context.read_cursor, filter))
                     .transpose()?;
 
-                if let Some(state) = minmax[i] {
+                if let Some(state) = function.minmax {
                     let label_skip = filter_skip_label.unwrap_or_else(|| program.allocate_label());
-                    translate_expr(
-                        program,
-                        Some(&plan.table_references),
-                        &args[0],
-                        state.registers,
-                        &t_ctx.resolver,
-                    )?;
+                    let argument = arg_load_start.expect("min/max has one argument");
+                    program.emit_insn(Insn::Copy {
+                        src_reg: argument,
+                        dst_reg: state.registers,
+                        extra_amount: 0,
+                    });
                     program.emit_insn(Insn::IsNull {
                         reg: state.registers,
                         target_pc: label_skip,
@@ -3223,17 +3237,17 @@ fn emit_function_step(
                     });
                     program.preassign_label_to_next_insn(label_skip);
                 } else {
-                    translate_aggregation_step(
+                    translate_prepared_aggregation_step(
                         program,
-                        &plan.table_references,
-                        AggArgumentSource::new_from_expression(
-                            agg_func,
-                            &args,
-                            &Distinctness::NonDistinct,
-                        ),
+                        PreparedAggregateArguments {
+                            function: agg_func,
+                            registers_start: arg_load_start.unwrap_or(0),
+                            count: function.arguments.len(),
+                            collations: &function.argument_collations,
+                            comparators: &function.argument_comparators,
+                            custom_types_enabled: context.custom_types_enabled,
+                        },
                         acc_reg,
-                        &t_ctx.resolver,
-                        None,
                     )?;
 
                     if let Some(label) = filter_skip_label {
@@ -3242,8 +3256,6 @@ fn emit_function_step(
                 }
             }
             AccumulatorFunc::Window(win_func) => {
-                // 0-ary window funcs (row_number) ignore `col`; the runtime
-                // only reads `state.registers[col + i]` for i in 0..arity.
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
                         acc_reg,
@@ -3257,12 +3269,74 @@ fn emit_function_step(
             }
         }
     }
+    Ok(())
+}
+
+/// Emit the code that adds one row into each function's running total (an
+/// AGGSTEP step), reading that row's argument values from `read_csr` — the
+/// cursor sitting on the row that just joined the frame.
+///
+/// Mirrors SQLite's `windowAggStep` (`window.c:1658-1762`). For each
+/// function, its argument values are loaded from the cursor's current row
+/// into their own small block of registers, and the aggregate step is
+/// emitted against that block. Those load registers are kept deliberately
+/// apart from `src_columns_start` (where the source loop puts the next
+/// row's columns), so stepping the previous partition here can't overwrite
+/// the first row of the next one.
+///
+/// `WindowFunctionRuntime` keeps this loop independent of the expression
+/// representation. The legacy adapter either reads one buffered column or
+/// recomputes an expression after loading its buffered inputs; HIR can supply
+/// another adapter without changing the stepping rules below.
+fn emit_function_step(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+    read_csr: CursorID,
+) -> Result<()> {
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    let acc_start = meta.registers.acc_start;
+    let functions = &meta.functions;
+    let csr_current = meta.cursors.csr_current;
+    let has_exclude = plan
+        .window
+        .as_ref()
+        .expect("missing window")
+        .frame
+        .exclude
+        .is_some();
+
+    // Save cache state so the per-arg overrides we push below don't leak
+    // out to other parts of the emit pipeline (e.g. emit_return_one_row).
+    let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
+    let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
+    let custom_types_enabled = t_ctx.resolver.custom_types_enabled();
+    let mut emitter = LegacyWindowValueEmitter {
+        resolver: &mut t_ctx.resolver,
+        table_references: &plan.table_references,
+    };
+
+    emit_function_step_runtime(
+        program,
+        functions,
+        &mut emitter,
+        WindowStepContext {
+            accumulator_registers_start: acc_start,
+            read_cursor: read_csr,
+            current_cursor: csr_current,
+            has_exclude,
+            custom_types_enabled,
+        },
+    )?;
 
     // Restore expr-cache state so the per-function arg overrides don't
     // leak into later emit calls (e.g. emit_return_one_row's outer-query
     // result emission, which expects its own result_columns_start mapping).
-    t_ctx.resolver.expr_to_reg_cache.truncate(initial_cache_len);
-    t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
+    emitter
+        .resolver
+        .expr_to_reg_cache
+        .truncate(initial_cache_len);
+    emitter.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
 
     Ok(())
 }
@@ -3285,27 +3359,43 @@ fn emit_function_inverse(
     plan: &SelectPlan,
 ) -> Result<()> {
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-    let window = plan.window.as_ref().expect("missing window");
     let acc_start = meta.registers.acc_start;
-    let minmax = meta.minmax.clone();
+    let functions = &meta.functions;
     let csr_start = meta.cursors.csr_start.expect(
         "emit_function_inverse: csr_start must be allocated when any AGGINVERSE is emitted",
     );
     let initial_cache_len = t_ctx.resolver.expr_to_reg_cache.len();
     let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
+    let mut emitter = LegacyWindowValueEmitter {
+        resolver: &mut t_ctx.resolver,
+        table_references: &plan.table_references,
+    };
 
-    for (i, func) in window.functions.iter().enumerate() {
-        let acc_reg = acc_start + i;
-        let args: Vec<Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| (**a).clone()).collect(),
-            Expr::FunctionCallStar { .. } => vec![],
-            _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
-        };
+    emit_function_inverse_runtime(program, functions, &mut emitter, acc_start, csr_start)?;
 
-        let arg_load_start = (!args.is_empty()).then(|| program.alloc_registers(args.len()));
+    emitter
+        .resolver
+        .expr_to_reg_cache
+        .truncate(initial_cache_len);
+    emitter.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
+    Ok(())
+}
+
+fn emit_function_inverse_runtime<E>(
+    program: &mut ProgramBuilder,
+    functions: &[WindowFunctionRuntime<E>],
+    emitter: &mut impl WindowValueEmitter<E>,
+    accumulator_registers_start: usize,
+    start_cursor: CursorID,
+) -> Result<()> {
+    for (i, function) in functions.iter().enumerate() {
+        let acc_reg = accumulator_registers_start + i;
+
+        let arg_load_start = (!function.arguments.is_empty())
+            .then(|| program.alloc_registers(function.arguments.len()));
         if let Some(base) = arg_load_start {
-            for (j, arg) in args.iter().enumerate() {
-                emit_window_arg_from_cursor(program, t_ctx, plan, csr_start, arg, base + j)?;
+            for (j, argument) in function.arguments.iter().enumerate() {
+                emitter.emit_buffered_value(program, start_cursor, argument, base + j)?;
             }
         }
 
@@ -3313,22 +3403,13 @@ fn emit_function_inverse(
         // totals (AggStep), so it must not be subtracted (AggInverse)
         // either — otherwise the running totals go wrong and `count(*)`
         // would go negative.
-        let filter_skip_label = func
-            .rewritten
+        let filter_skip_label = function
+            .filter
             .as_ref()
-            .and_then(|r| r.filter_expr.as_ref())
-            .map(|f| {
-                emit_filter_skip(
-                    program,
-                    &plan.table_references,
-                    &t_ctx.resolver,
-                    csr_start,
-                    f,
-                )
-            })
+            .map(|filter| emit_filter_skip(program, emitter, start_cursor, filter))
             .transpose()?;
 
-        if let Some(state) = minmax[i] {
+        if let Some(state) = function.minmax {
             let label_skip = filter_skip_label.unwrap_or_else(|| program.allocate_label());
             let arg_reg = arg_load_start.expect("min/max has one argument");
             program.emit_insn(Insn::Copy {
@@ -3360,7 +3441,7 @@ fn emit_function_inverse(
                 acc_reg,
                 col: arg_load_start.unwrap_or(0),
                 delimiter: 0,
-                func: func.func.clone(),
+                func: function.function.clone(),
                 comparator: None,
             });
 
@@ -3369,8 +3450,6 @@ fn emit_function_inverse(
             }
         }
     }
-    t_ctx.resolver.expr_to_reg_cache.truncate(initial_cache_len);
-    t_ctx.resolver.expr_to_reg_cache_enabled = cache_was_enabled;
     Ok(())
 }
 

@@ -853,6 +853,16 @@ arguments into the `VFilter` argument registers, and advances with `VNext`.
 Column reads already use the shared HIR expression lowering through `VColumn`;
 no parser expression, resolver, or table-reference sidecar is rebuilt.
 
+Window function stepping now consumes a representation-neutral runtime record.
+It owns prepared argument and FILTER value sources, result registers,
+collations, custom comparators, and moving-frame min/max state. The legacy
+adapter preserves direct buffered-column reads and late JSON expression
+recomputation, while aggregate opcode selection is shared with HIR lowering
+through prepared argument registers. Frame movement, peer handling, positional
+lookups, partition buffering, and row output still use the existing legacy
+window plan; adding the HIR adapter and then removing that remaining plan
+dependency are later checkpoints.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
