@@ -3,13 +3,19 @@
 use std::ops::ControlFlow;
 
 use crate::{
-    LimboError, Result,
     function::{AccumulatorFunc, Func},
     translate::{
         aggregation::hir_aggregate_function,
+        collate::CollationSeq,
+        order_by::custom_type_comparator_from_type_fact,
         semantic::hir::{self, ExprVisitor},
-        window::{BufferedWindowValue, window_function_uses_subtypes},
+        window::{
+            window_function_uses_subtypes, BufferedWindowValue, WindowFunctionRuntime,
+            WindowFunctionRuntimeSpec,
+        },
     },
+    vdbe::builder::ProgramBuilder,
+    LimboError, Result,
 };
 
 /// One value stored for a window layer.
@@ -345,20 +351,85 @@ pub(super) fn plan_hir_window_buffer<'a>(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn prepare_hir_window_runtime<'a>(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'a>,
+) -> Result<Vec<WindowFunctionRuntime<&'a hir::Expr>>> {
+    if plan.functions.is_empty() {
+        return Err(LimboError::InternalError(format!(
+            "HIR window {:?} has no functions",
+            plan.window.id
+        )));
+    }
+
+    let moving_start = !matches!(
+        plan.window.frame.start,
+        hir::WindowFrameBound::UnboundedPreceding
+    );
+    let result_registers_start = program.alloc_registers(plan.functions.len());
+    let mut runtimes = Vec::with_capacity(plan.functions.len());
+    for (ordinal, function) in plan.functions.iter().enumerate() {
+        let argument_collations = function
+            .argument_facts
+            .iter()
+            .map(|facts| {
+                facts
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or(CollationSeq::Binary)
+            })
+            .collect();
+        let argument_comparators = function
+            .argument_facts
+            .iter()
+            .map(|facts| custom_type_comparator_from_type_fact(&facts.type_fact))
+            .collect();
+        let minmax_collation = function
+            .argument_facts
+            .first()
+            .and_then(|facts| facts.collation.as_ref())
+            .map(|collation| *collation.value());
+        let result_register = result_registers_start + ordinal;
+        program.bind_window_result(function.id, result_register);
+        runtimes.push(WindowFunctionRuntime::prepare(
+            program,
+            ordinal,
+            WindowFunctionRuntimeSpec {
+                function: function.function.clone(),
+                arguments: function.arguments.clone(),
+                filter: function.filter,
+                argument_collations,
+                argument_comparators,
+                result_register,
+                moving_start,
+                frame_excludes_rows: plan.window.frame.exclude.is_some(),
+                minmax_collation,
+            },
+        ));
+    }
+    Ok(runtimes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        MAIN_DB_ID, SymbolTable,
         dialect::SqliteDialect,
         schema::{BTreeTable, Schema},
         sync::Arc,
         translate::semantic::{
-            SemanticOptions, SemanticRootInput,
             catalog::{SemanticCatalog, SemanticCatalogDatabase},
             context::DoubleQuotedDml,
             hir::{DatabaseId, HirDocument, HirRoot},
+            SemanticOptions, SemanticRootInput,
         },
+        vdbe::{
+            builder::{ProgramBuilderOpts, QueryMode},
+            insn::Insn,
+        },
+        SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
 
@@ -411,6 +482,10 @@ mod tests {
             .query_block(query.first)
             .expect("first query block exists");
         (query, block)
+    }
+
+    fn program() -> ProgramBuilder {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
     }
 
     fn column_reference(column: &HirWindowBufferColumn<'_>) -> Option<hir::ColumnRef> {
@@ -499,10 +574,44 @@ mod tests {
         let (query, block) = root_query(&document);
         let error = plan_hir_window_buffer(query, block, block.windows[0].id)
             .expect_err("missing identity is rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("has no definition for window function 1")
+        assert!(error
+            .to_string()
+            .contains("has no definition for window function 1"));
+    }
+
+    #[test]
+    fn runtime_uses_resolved_collations_and_binds_function_results() {
+        let document = analyze_sql(
+            "SELECT min(value COLLATE nocase) OVER window_frame, \
+                    max(value COLLATE nocase) OVER window_frame FROM items \
+             WINDOW window_frame AS \
+                    (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        );
+        let (query, block) = root_query(&document);
+        let mut program = program();
+        assert_eq!(block.windows.len(), 2);
+        for window in &block.windows {
+            let plan =
+                plan_hir_window_buffer(query, block, window.id).expect("window buffer plans");
+            let runtimes =
+                prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+            let [runtime] = runtimes.as_slice() else {
+                panic!("one function belongs to each effective window");
+            };
+            assert_eq!(runtime.argument_collations(), &[CollationSeq::NoCase]);
+            assert!(runtime.has_minmax_state());
+            assert_eq!(
+                program.window_result_register(plan.functions[0].id),
+                Some(runtime.result_register())
+            );
+        }
+        assert_eq!(
+            program
+                .insns
+                .iter()
+                .filter(|(insn, _)| matches!(insn, Insn::OpenEphemeral { .. }))
+                .count(),
+            2
         );
     }
 

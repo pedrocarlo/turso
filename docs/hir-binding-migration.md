@@ -873,6 +873,13 @@ AST nodes. Stable `WindowFunctionId` values select calls for each window and
 missing or mismatched identities fail as HIR invariants. This plan is not yet
 routed into production frame lowering.
 
+HIR window-buffer plans now create the same representation-neutral
+`WindowFunctionRuntime` used by legacy lowering. Resolved argument facts supply
+collations and custom comparators, stable window identities bind result
+registers, and resolved frame facts drive the shared moving min/max setup. The
+HIR adapter needs no resolver, parser expression, or `TableReferences` sidecar.
+Frame movement and row buffering are still not routed to HIR.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

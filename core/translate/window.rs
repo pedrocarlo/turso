@@ -606,6 +606,107 @@ pub(crate) struct WindowFunctionRuntime<E> {
     minmax: Option<WindowMinMax>,
 }
 
+/// Resolved inputs needed to create window function state.
+///
+/// Legacy and HIR adapters resolve their own expression metadata before this
+/// representation-neutral boundary.
+pub(crate) struct WindowFunctionRuntimeSpec<E> {
+    pub(crate) function: AccumulatorFunc,
+    pub(crate) arguments: Vec<BufferedWindowValue<E>>,
+    pub(crate) filter: Option<BufferedWindowValue<E>>,
+    pub(crate) argument_collations: Vec<CollationSeq>,
+    pub(crate) argument_comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>>,
+    pub(crate) result_register: usize,
+    pub(crate) moving_start: bool,
+    pub(crate) frame_excludes_rows: bool,
+    pub(crate) minmax_collation: Option<CollationSeq>,
+}
+
+impl<E> WindowFunctionRuntime<E> {
+    pub(crate) fn prepare(
+        program: &mut ProgramBuilder,
+        ordinal: usize,
+        spec: WindowFunctionRuntimeSpec<E>,
+    ) -> Self {
+        let minmax_function = match &spec.function {
+            AccumulatorFunc::Agg(agg @ (AggFunc::Min | AggFunc::Max))
+                if spec.moving_start && !spec.frame_excludes_rows =>
+            {
+                Some(agg)
+            }
+            _ => None,
+        };
+        let minmax = minmax_function.map(|aggregate| {
+            let index = Arc::new(Index {
+                name: format!(
+                    "window_minmax_{}_{}",
+                    program.offset().as_offset_int(),
+                    ordinal
+                ),
+                table_name: String::new(),
+                root_page: 0,
+                columns: crate::alloc::vec![
+                    IndexColumn {
+                        name: "0".to_string(),
+                        order: if matches!(aggregate, AggFunc::Min) {
+                            SortOrder::Desc
+                        } else {
+                            SortOrder::Asc
+                        },
+                        nulls_order: None,
+                        pos_in_table: 0,
+                        collation: spec.minmax_collation,
+                        default: None,
+                        expr: None,
+                    },
+                    IndexColumn::new("1", 1),
+                ],
+                unique: false,
+                ephemeral: true,
+                has_rowid: false,
+                where_clause: None,
+                index_method: None,
+                on_conflict: None,
+            });
+            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
+            let registers = program.alloc_registers(3);
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id: cursor,
+                is_table: false,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: registers + 1,
+            });
+            WindowMinMax { cursor, registers }
+        });
+        Self {
+            function: spec.function,
+            arguments: spec.arguments,
+            filter: spec.filter,
+            argument_collations: spec.argument_collations,
+            argument_comparators: spec.argument_comparators,
+            result_register: spec.result_register,
+            minmax,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn argument_collations(&self) -> &[CollationSeq] {
+        &self.argument_collations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn result_register(&self) -> usize {
+        self.result_register
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_minmax_state(&self) -> bool {
+        self.minmax.is_some()
+    }
+}
+
 trait WindowValueEmitter<E> {
     fn emit_buffered_value(
         &mut self,
@@ -656,16 +757,8 @@ fn prepare_window_functions<'a>(
             Expr::FunctionCallStar { .. } => Vec::new(),
             _ => unreachable!("window functions are FunctionCall or FunctionCallStar expressions"),
         };
-        let minmax_function = match &func.func {
-            AccumulatorFunc::Agg(agg @ (AggFunc::Min | AggFunc::Max))
-                if moving_start && window.frame.exclude.is_none() =>
-            {
-                Some(agg)
-            }
-            _ => None,
-        };
-        let minmax_collation = minmax_function
-            .and_then(|_| arguments.first())
+        let minmax_collation = arguments
+            .first()
             .map(|argument| get_collseq_from_expr(argument, table_references))
             .transpose()?
             .flatten();
@@ -693,57 +786,21 @@ fn prepare_window_functions<'a>(
                 _ => BufferedWindowValue::Recompute(filter),
             });
 
-        let minmax = if let Some(agg) = minmax_function {
-            let index = Arc::new(Index {
-                name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
-                table_name: String::new(),
-                root_page: 0,
-                columns: crate::alloc::vec![
-                    IndexColumn {
-                        name: "0".to_string(),
-                        order: if matches!(agg, AggFunc::Min) {
-                            SortOrder::Desc
-                        } else {
-                            SortOrder::Asc
-                        },
-                        nulls_order: None,
-                        pos_in_table: 0,
-                        collation: minmax_collation,
-                        default: None,
-                        expr: None,
-                    },
-                    IndexColumn::new("1", 1),
-                ],
-                unique: false,
-                ephemeral: true,
-                has_rowid: false,
-                where_clause: None,
-                index_method: None,
-                on_conflict: None,
-            });
-            let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
-            let registers = program.alloc_registers(3);
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id: cursor,
-                is_table: false,
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: registers + 1,
-            });
-            Some(WindowMinMax { cursor, registers })
-        } else {
-            None
-        };
-        functions.push(WindowFunctionRuntime {
-            function: func.func.clone(),
-            arguments,
-            filter,
-            argument_collations,
-            argument_comparators,
-            result_register: result_registers_start + i,
-            minmax,
-        });
+        functions.push(WindowFunctionRuntime::prepare(
+            program,
+            i,
+            WindowFunctionRuntimeSpec {
+                function: func.func.clone(),
+                arguments,
+                filter,
+                argument_collations,
+                argument_comparators,
+                result_register: result_registers_start + i,
+                moving_start,
+                frame_excludes_rows: window.frame.exclude.is_some(),
+                minmax_collation,
+            },
+        ));
     }
     Ok(functions)
 }
