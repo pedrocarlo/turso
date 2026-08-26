@@ -122,7 +122,7 @@ struct HirAggregateState<'a> {
 enum HirLoopBody<'a> {
     Rows(&'a HirRowOutput<'a>),
     UngroupedAggregate(&'a HirAggregateState<'a>),
-    GroupSorter(&'a HirGroupRuntime<'a>),
+    Group(&'a HirGroupRuntime<'a>),
 }
 
 struct HirAggregateCapture {
@@ -135,9 +135,15 @@ struct HirAggregateCapture {
 struct HirGroupRuntime<'a> {
     grouping: &'a hir::Grouping,
     aggregates: HirAggregateState<'a>,
-    sorter: HirGroupSorter,
+    rows: HirGroupRows,
     inputs: Vec<HirGroupInput>,
     sources: Vec<HirGroupSource>,
+    state: HirGroupState,
+}
+
+enum HirGroupRows {
+    Sorter(HirGroupSorter),
+    InputOrdered,
 }
 
 struct HirGroupSorter {
@@ -145,6 +151,19 @@ struct HirGroupSorter {
     pseudo_cursor: CursorID,
     record: usize,
     inputs_start: usize,
+}
+
+struct HirGroupState {
+    output_group: BranchOffset,
+    output_done: BranchOffset,
+    finalize_group: BranchOffset,
+    clear_group: BranchOffset,
+    group_end: BranchOffset,
+    output_return: usize,
+    clear_return: usize,
+    data_in_group: usize,
+    previous_keys: usize,
+    current_keys: usize,
 }
 
 enum HirGroupInput {
@@ -881,9 +900,12 @@ fn emit_hir_grouped_aggregate<'a>(
         plan,
         block,
         block_plan,
-        HirLoopBody::GroupSorter(&runtime),
+        HirLoopBody::Group(&runtime),
     )?;
-    emit_hir_group_sorter_rows(program, &plan.document, block, output, &runtime)
+    if matches!(runtime.rows, HirGroupRows::Sorter(_)) {
+        emit_hir_group_sorter_rows(program, &plan.document, &runtime)?;
+    }
+    emit_hir_group_result(program, &plan.document, block, output, &runtime)
 }
 
 fn initialize_hir_group_runtime<'a>(
@@ -969,53 +991,82 @@ fn initialize_hir_group_runtime<'a>(
             rowid,
         });
     }
-    let order_collations_nulls = grouping
-        .key_collations
-        .iter()
-        .map(|collation| {
-            (
-                SortOrder::Asc,
-                collation.as_ref().map(|collation| *collation.value()),
-                None,
-            )
+    let rows = if block_plan.group_sort_elided {
+        HirGroupRows::InputOrdered
+    } else {
+        let order_collations_nulls = grouping
+            .key_collations
+            .iter()
+            .map(|collation| {
+                (
+                    SortOrder::Asc,
+                    collation.as_ref().map(|collation| *collation.value()),
+                    None,
+                )
+            })
+            .collect();
+        let comparators = grouping
+            .key_type_facts
+            .iter()
+            .map(custom_type_comparator_from_type_fact)
+            .collect();
+        let cursor = program.alloc_cursor_id(CursorType::Sorter);
+        program.emit_insn(Insn::SorterOpen {
+            data: Box::new(SorterOpenData {
+                cursor_id: cursor,
+                columns: inputs.len(),
+                order_collations_nulls,
+                comparators,
+            }),
+        });
+        emit_explain!(
+            program,
+            false,
+            EqpDetail::GroupBy {
+                method: EqpSortMethod::Sorter,
+            }
+        );
+        HirGroupRows::Sorter(HirGroupSorter {
+            cursor,
+            pseudo_cursor: program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+                column_count: inputs.len(),
+            })),
+            record: program.alloc_register(),
+            inputs_start: program.alloc_registers(inputs.len()),
         })
-        .collect();
-    let comparators = grouping
-        .key_type_facts
-        .iter()
-        .map(custom_type_comparator_from_type_fact)
-        .collect();
-    let cursor = program.alloc_cursor_id(CursorType::Sorter);
-    program.emit_insn(Insn::SorterOpen {
-        data: Box::new(SorterOpenData {
-            cursor_id: cursor,
-            columns: inputs.len(),
-            order_collations_nulls,
-            comparators,
-        }),
-    });
-    emit_explain!(
-        program,
-        false,
-        EqpDetail::GroupBy {
-            method: EqpSortMethod::Sorter,
-        }
-    );
-    let pseudo_cursor = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
-        column_count: inputs.len(),
-    }));
-    let sorter = HirGroupSorter {
-        cursor,
-        pseudo_cursor,
-        record: program.alloc_register(),
-        inputs_start: program.alloc_registers(inputs.len()),
     };
+    let state = HirGroupState {
+        output_group: program.allocate_label(),
+        output_done: program.allocate_label(),
+        finalize_group: program.allocate_label(),
+        clear_group: program.allocate_label(),
+        group_end: program.allocate_label(),
+        output_return: program.alloc_register(),
+        clear_return: program.alloc_register(),
+        data_in_group: program.alloc_register(),
+        previous_keys: program.alloc_registers(grouping.keys.len()),
+        current_keys: program.alloc_registers(grouping.keys.len()),
+    };
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: state.data_in_group,
+    });
+    program.emit_insn(Insn::Null {
+        dest: state.previous_keys,
+        dest_end: (grouping.keys.len() > 1)
+            .then_some(state.previous_keys + grouping.keys.len() - 1),
+    });
+    program.emit_insn(Insn::Gosub {
+        target_pc: state.clear_group,
+        return_reg: state.clear_return,
+    });
     Ok(HirGroupRuntime {
         grouping,
         aggregates,
-        sorter,
+        rows,
         inputs,
         sources,
+        state,
     })
 }
 
@@ -1050,13 +1101,46 @@ fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId
     rowids
 }
 
-fn emit_hir_group_sorter_input(
+fn emit_hir_group_input(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     runtime: &HirGroupRuntime<'_>,
 ) -> Result<()> {
+    let HirGroupRows::Sorter(sorter) = &runtime.rows else {
+        for input in &runtime.inputs {
+            match input {
+                HirGroupInput::Key(index) => super::expr::translate_expr(
+                    program,
+                    document,
+                    &runtime.grouping.keys[*index],
+                    runtime.state.current_keys + index,
+                )?,
+                HirGroupInput::Column {
+                    reference,
+                    row_register,
+                    ..
+                } => super::expr::translate_expr(
+                    program,
+                    document,
+                    &hir::Expr::Column(*reference),
+                    *row_register,
+                )?,
+                HirGroupInput::RowId {
+                    source,
+                    row_register,
+                    ..
+                } => super::expr::translate_expr(
+                    program,
+                    document,
+                    &hir::Expr::RowId(*source),
+                    *row_register,
+                )?,
+            };
+        }
+        return emit_hir_group_row(program, document, runtime);
+    };
     for (position, input) in runtime.inputs.iter().enumerate() {
-        let target = runtime.sorter.inputs_start + position;
+        let target = sorter.inputs_start + position;
         let expression = match input {
             HirGroupInput::Key(index) => &runtime.grouping.keys[*index],
             HirGroupInput::Column { reference, .. } => {
@@ -1082,10 +1166,10 @@ fn emit_hir_group_sorter_input(
     }
     sorter_insert(
         program,
-        runtime.sorter.inputs_start,
+        sorter.inputs_start,
         runtime.inputs.len(),
-        runtime.sorter.cursor,
-        runtime.sorter.record,
+        sorter.cursor,
+        sorter.record,
     );
     Ok(())
 }
@@ -1127,62 +1211,53 @@ fn reset_hir_group_aggregates(program: &mut ProgramBuilder, state: &HirAggregate
 fn emit_hir_group_sorter_rows(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    block: &hir::QueryBlock,
-    output: &HirRowOutput<'_>,
     runtime: &HirGroupRuntime<'_>,
 ) -> Result<()> {
+    let HirGroupRows::Sorter(sorter) = &runtime.rows else {
+        unreachable!("sorter drain requires grouped sorter rows")
+    };
     let sort_loop = program.allocate_label();
     let sort_end = program.allocate_label();
-    let new_group = program.allocate_label();
-    let aggregate_step = program.allocate_label();
-    let captured = program.allocate_label();
-    let output_group = program.allocate_label();
-    let output_done = program.allocate_label();
-    let finalize_group = program.allocate_label();
-    let clear_group = program.allocate_label();
-    let group_end = program.allocate_label();
-    let output_return = program.alloc_register();
-    let clear_return = program.alloc_register();
-    let data_in_group = program.alloc_register();
-    let previous_keys = program.alloc_registers(runtime.grouping.keys.len());
-    let current_keys = program.alloc_registers(runtime.grouping.keys.len());
-
-    program.emit_insn(Insn::Integer {
-        value: 0,
-        dest: data_in_group,
-    });
-    program.emit_insn(Insn::Null {
-        dest: previous_keys,
-        dest_end: (runtime.grouping.keys.len() > 1)
-            .then_some(previous_keys + runtime.grouping.keys.len() - 1),
-    });
-    program.emit_insn(Insn::Gosub {
-        target_pc: clear_group,
-        return_reg: clear_return,
-    });
     program.emit_insn(Insn::OpenPseudo {
-        cursor_id: runtime.sorter.pseudo_cursor,
-        content_reg: runtime.sorter.record,
+        cursor_id: sorter.pseudo_cursor,
+        content_reg: sorter.record,
         num_fields: runtime.inputs.len(),
     });
     program.emit_insn(Insn::SorterSort {
-        cursor_id: runtime.sorter.cursor,
+        cursor_id: sorter.cursor,
         pc_if_empty: sort_end,
     });
     program.preassign_label_to_next_insn(sort_loop);
     program.emit_insn(Insn::SorterData {
-        cursor_id: runtime.sorter.cursor,
-        dest_reg: runtime.sorter.record,
-        pseudo_cursor: runtime.sorter.pseudo_cursor,
+        cursor_id: sorter.cursor,
+        dest_reg: sorter.record,
+        pseudo_cursor: sorter.pseudo_cursor,
     });
     for (position, input) in runtime.inputs.iter().enumerate() {
         let target = match input {
-            HirGroupInput::Key(index) => current_keys + index,
+            HirGroupInput::Key(index) => runtime.state.current_keys + index,
             HirGroupInput::Column { row_register, .. }
             | HirGroupInput::RowId { row_register, .. } => *row_register,
         };
-        program.emit_column_or_rowid(runtime.sorter.pseudo_cursor, position, target);
+        program.emit_column_or_rowid(sorter.pseudo_cursor, position, target);
     }
+    emit_hir_group_row(program, document, runtime)?;
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: sorter.cursor,
+        pc_if_next: sort_loop,
+    });
+    program.preassign_label_to_next_insn(sort_end);
+    Ok(())
+}
+
+fn emit_hir_group_row(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    runtime: &HirGroupRuntime<'_>,
+) -> Result<()> {
+    let new_group = program.allocate_label();
+    let aggregate_step = program.allocate_label();
+    let captured = program.allocate_label();
     let key_info = runtime
         .grouping
         .key_collations
@@ -1197,8 +1272,8 @@ fn emit_hir_group_sorter_rows(
         })
         .collect();
     program.emit_insn(Insn::Compare {
-        start_reg_a: previous_keys,
-        start_reg_b: current_keys,
+        start_reg_a: runtime.state.previous_keys,
+        start_reg_b: runtime.state.current_keys,
         count: runtime.grouping.keys.len(),
         key_info,
     });
@@ -1209,24 +1284,24 @@ fn emit_hir_group_sorter_rows(
     });
     program.preassign_label_to_next_insn(new_group);
     program.emit_insn(Insn::Gosub {
-        target_pc: output_group,
-        return_reg: output_return,
+        target_pc: runtime.state.output_group,
+        return_reg: runtime.state.output_return,
     });
     program.emit_insn(Insn::Move {
-        source_reg: current_keys,
-        dest_reg: previous_keys,
+        source_reg: runtime.state.current_keys,
+        dest_reg: runtime.state.previous_keys,
         count: runtime.grouping.keys.len(),
     });
     program.emit_insn(Insn::Gosub {
-        target_pc: clear_group,
-        return_reg: clear_return,
+        target_pc: runtime.state.clear_group,
+        return_reg: runtime.state.clear_return,
     });
 
     program.preassign_label_to_next_insn(aggregate_step);
     bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Row);
     emit_hir_aggregate_steps(program, document, &runtime.aggregates)?;
     program.emit_insn(Insn::If {
-        reg: data_in_group,
+        reg: runtime.state.data_in_group,
         target_pc: captured,
         jump_if_null: false,
     });
@@ -1252,35 +1327,39 @@ fn emit_hir_group_sorter_rows(
     program.preassign_label_to_next_insn(captured);
     program.emit_insn(Insn::Integer {
         value: 1,
-        dest: data_in_group,
+        dest: runtime.state.data_in_group,
     });
-    program.emit_insn(Insn::SorterNext {
-        cursor_id: runtime.sorter.cursor,
-        pc_if_next: sort_loop,
-    });
+    Ok(())
+}
 
-    program.preassign_label_to_next_insn(sort_end);
+fn emit_hir_group_result(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    runtime: &HirGroupRuntime<'_>,
+) -> Result<()> {
     program.emit_insn(Insn::Gosub {
-        target_pc: output_group,
-        return_reg: output_return,
+        target_pc: runtime.state.output_group,
+        return_reg: runtime.state.output_return,
     });
     program.emit_insn(Insn::Goto {
-        target_pc: group_end,
+        target_pc: runtime.state.group_end,
     });
 
-    program.preassign_label_to_next_insn(output_group);
+    program.preassign_label_to_next_insn(runtime.state.output_group);
     program.emit_insn(Insn::IfPos {
-        reg: data_in_group,
-        target_pc: finalize_group,
+        reg: runtime.state.data_in_group,
+        target_pc: runtime.state.finalize_group,
         decrement_by: 0,
     });
-    program.preassign_label_to_next_insn(output_done);
+    program.preassign_label_to_next_insn(runtime.state.output_done);
     program.emit_insn(Insn::Return {
-        return_reg: output_return,
+        return_reg: runtime.state.output_return,
         can_fallthrough: false,
     });
 
-    program.preassign_label_to_next_insn(finalize_group);
+    program.preassign_label_to_next_insn(runtime.state.finalize_group);
     finalize_hir_aggregates(program, &runtime.aggregates)?;
     bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Group);
     if let Some(having) = &runtime.grouping.having {
@@ -1292,8 +1371,8 @@ fn emit_hir_group_sorter_rows(
             ConditionMetadata {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_row,
-                jump_target_when_false: output_done,
-                jump_target_when_null: output_done,
+                jump_target_when_false: runtime.state.output_done,
+                jump_target_when_null: runtime.state.output_done,
             },
         )?;
         program.preassign_label_to_next_insn(emit_row);
@@ -1306,24 +1385,24 @@ fn emit_hir_group_sorter_rows(
         &block.outputs,
         block.outputs.iter().map(|output| &output.expr),
         start,
-        output_done,
+        runtime.state.output_done,
     )?;
     program.emit_insn(Insn::Return {
-        return_reg: output_return,
+        return_reg: runtime.state.output_return,
         can_fallthrough: false,
     });
 
-    program.preassign_label_to_next_insn(clear_group);
+    program.preassign_label_to_next_insn(runtime.state.clear_group);
     reset_hir_group_aggregates(program, &runtime.aggregates);
     program.emit_insn(Insn::Integer {
         value: 0,
-        dest: data_in_group,
+        dest: runtime.state.data_in_group,
     });
     program.emit_insn(Insn::Return {
-        return_reg: clear_return,
+        return_reg: runtime.state.clear_return,
         can_fallthrough: false,
     });
-    program.preassign_label_to_next_insn(group_end);
+    program.preassign_label_to_next_insn(runtime.state.group_end);
     Ok(())
 }
 
@@ -2536,7 +2615,7 @@ fn emit_btree_loops(
         (HirLoopBody::Rows(_), None) if block.aggregate_count == 0 => {}
         (HirLoopBody::UngroupedAggregate(_), None) if block.aggregate_count != 0 => {}
         (HirLoopBody::UngroupedAggregate(_), Some(grouping)) if grouping.keys.is_empty() => {}
-        (HirLoopBody::GroupSorter(_), Some(grouping)) if !grouping.keys.is_empty() => {}
+        (HirLoopBody::Group(_), Some(grouping)) if !grouping.keys.is_empty() => {}
         _ => {
             return Err(LimboError::InternalError(format!(
                 "HIR query block {:?} has a mismatched loop body",
@@ -2659,8 +2738,8 @@ fn emit_btree_loops(
             emit_hir_aggregate_capture(program, document, *first_row, captures)?;
             emit_hir_aggregate_steps(program, document, state)?;
         }
-        HirLoopBody::GroupSorter(runtime) => {
-            emit_hir_group_sorter_input(program, document, runtime)?;
+        HirLoopBody::Group(runtime) => {
+            emit_hir_group_input(program, document, runtime)?;
         }
     }
 
@@ -5000,6 +5079,72 @@ mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Compare { .. })));
+    }
+
+    #[test]
+    fn planned_grouped_aggregate_uses_index_order_without_a_sorter() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT value, count(*) FROM items GROUP BY value",
+        );
+        let query = root_query(&plan.document);
+        assert!(
+            plan.planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .group_sort_elided
+        );
+
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("index-ordered GROUP BY HIR query emits");
+        program
+            .resolve_labels()
+            .expect("index-ordered GROUP BY labels resolve");
+
+        assert!(!program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::SorterOpen { .. } | Insn::SorterInsert { .. } | Insn::SorterSort { .. }
+        )));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Compare { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::AggStep { .. })));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::ResultRow { .. })));
+    }
+
+    #[test]
+    fn planned_grouped_aggregate_keeps_sorter_when_index_collation_differs() {
+        let plan = analyze_plan(
+            indexed_items_schema(),
+            "SELECT value COLLATE nocase, count(*) FROM items GROUP BY value COLLATE nocase",
+        );
+        let query = root_query(&plan.document);
+        assert!(
+            !plan
+                .planned_query(query)
+                .expect("root query is planned")
+                .blocks[0]
+                .group_sort_elided
+        );
+
+        let mut program = program();
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("collation-mismatched GROUP BY HIR query emits");
+        assert!(program.insns.iter().any(|(insn, _)| match insn {
+            Insn::SorterOpen { data } => {
+                data.order_collations_nulls.first()
+                    == Some(&(SortOrder::Asc, Some(CollationSeq::NoCase), None))
+            }
+            _ => false,
+        }));
     }
 
     #[test]

@@ -840,8 +840,12 @@ lowering. Sorter-backed GROUP BY now stores resolved key and source values,
 detects boundaries with HIR key collations, and reuses the same aggregate
 step/finalize state for each group. HAVING and output expressions read the
 captured group row directly from register-bound HIR sources. Aggregate-free and
-DISTINCT-aggregate groups use the same path. Input-order GROUP BY elision,
-aggregate argument ORDER BY, and windows remain later SELECT checkpoints.
+DISTINCT-aggregate groups use the same path. Single-source B-tree plans now
+reuse the shared HIR index-order proof to skip the GROUP BY sorter only when it
+consumes every resolved key with the required collation and custom comparator.
+Both sorted and input-ordered rows use one group-boundary and aggregate path.
+Multi-source and combined GROUP BY/ORDER BY proofs, aggregate argument ORDER BY,
+and windows remain later SELECT checkpoints.
 
 Virtual-table SELECT sources now use their planned HIR access directly.
 Lowering opens and binds a virtual cursor, evaluates the optimizer-selected HIR

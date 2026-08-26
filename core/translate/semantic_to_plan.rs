@@ -7,8 +7,8 @@ use super::{
         cost::{Cost, RowCountEstimate},
         join::compute_hir_greedy_join_order,
         order::{
-            ColumnOrder, ColumnTarget, EliminatesSortBy, HirOrderTarget, OrderTarget,
-            OrderTargetPurpose,
+            hir_plan_satisfies_order_target, ColumnOrder, ColumnTarget, EliminatesSortBy,
+            HirOrderTarget, OrderTarget, OrderTargetPurpose,
         },
         CostModelParams, HirBtreeOperation, HirVirtualTableOperation,
     },
@@ -132,6 +132,7 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    pub(crate) group_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -141,6 +142,7 @@ pub(crate) struct HirAccessPlan {
     pub(crate) groups: Vec<HirFromGroupBoundary>,
     pub(crate) loops: Vec<HirPlannedLoop>,
     pub(crate) predicates: Vec<HirWhereTerm>,
+    pub(crate) group_sort_elided: bool,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -848,16 +850,21 @@ impl<'a> HirPlanContext<'a> {
                 groups: input.groups,
                 loops: Vec::new(),
                 predicates: input.predicates,
+                group_sort_elided: false,
                 output_cardinality,
                 cost: Cost(0.0),
             });
         }
 
         let input = self.query_block_input(block, order_by, &usage)?;
-        let order_target = self.order_target(
-            order_by,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-        );
+        let order_target = if order_by.is_empty() {
+            self.grouping_target(block)
+        } else {
+            self.order_target(
+                order_by,
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
+            )
+        };
         let access = self
             .plan_source_access(
                 input,
@@ -877,6 +884,7 @@ impl<'a> HirPlanContext<'a> {
             groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
+            group_sort_elided: access.group_sort_elided,
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         })
@@ -958,6 +966,23 @@ impl<'a> HirPlanContext<'a> {
 
         let Some(result) = result else {
             return Ok(None);
+        };
+        let group_sort_elided = if order_target.is_some_and(|target| {
+            matches!(
+                &target.purpose,
+                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group)
+            )
+        }) {
+            hir_plan_satisfies_order_target(
+                &result.best_plan,
+                &access_methods,
+                &input.sources,
+                self.document,
+                order_target.expect("GROUP BY order target exists"),
+                schema,
+            )?
+        } else {
+            false
         };
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops = Vec::with_capacity(input.sources.len());
@@ -1065,6 +1090,7 @@ impl<'a> HirPlanContext<'a> {
             groups: input.groups,
             loops,
             predicates: input.predicates,
+            group_sort_elided,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
@@ -1087,6 +1113,42 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
+    fn grouping_target<'term>(
+        &self,
+        block: &'term hir::QueryBlock,
+    ) -> Option<HirOrderTarget<'term>>
+    where
+        'a: 'term,
+    {
+        let hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } = &block.body
+        else {
+            return None;
+        };
+        let columns = grouping
+            .keys
+            .iter()
+            .zip(&grouping.key_collations)
+            .map(|(expression, collation)| {
+                self.ordering_column(
+                    expression,
+                    turso_parser::ast::SortOrder::Asc,
+                    collation
+                        .as_ref()
+                        .map(|collation| *collation.value())
+                        .unwrap_or_default(),
+                    None,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!columns.is_empty()).then_some(OrderTarget {
+            columns,
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+        })
+    }
+
     fn order_column<'term>(
         &self,
         term: &'term hir::OrderTerm,
@@ -1094,7 +1156,27 @@ impl<'a> HirPlanContext<'a> {
     where
         'a: 'term,
     {
-        let mut expression = &term.expr;
+        self.ordering_column(
+            &term.expr,
+            term.order,
+            term.collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default(),
+            term.nulls,
+        )
+    }
+
+    fn ordering_column<'term>(
+        &self,
+        mut expression: &'term hir::Expr,
+        order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+        nulls_order: Option<turso_parser::ast::NullsOrder>,
+    ) -> Option<ColumnOrder<SourceId, &'term hir::Expr>>
+    where
+        'a: 'term,
+    {
         while let hir::Expr::Output(output) = expression {
             expression = &self.document.output(*output)?.expr;
         }
@@ -1111,13 +1193,9 @@ impl<'a> HirPlanContext<'a> {
         Some(ColumnOrder {
             source,
             target,
-            order: term.order,
-            collation: term
-                .collation
-                .as_ref()
-                .map(|collation| *collation.value())
-                .unwrap_or_default(),
-            nulls_order: term.nulls,
+            order,
+            collation,
+            nulls_order,
         })
     }
 
