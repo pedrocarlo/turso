@@ -11,7 +11,7 @@ use crate::{
         collate::CollationSeq,
         order_by::custom_type_comparator_from_type_fact,
         semantic::hir::{self, ExprVisitor},
-        semantic_lowering::expr::{translate_expr_with_inputs, ExprRegisterInput},
+        semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime,
             window_function_uses_subtypes, BufferedWindowValue, WindowFunctionRuntime,
@@ -31,7 +31,26 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub(super) enum HirWindowBufferColumn<'a> {
     Evaluate(&'a hir::Expr),
-    Source(hir::ColumnRef),
+    Source {
+        expression: &'a hir::Expr,
+        reference: hir::ColumnRef,
+    },
+}
+
+impl<'a> HirWindowBufferColumn<'a> {
+    fn expression(&self) -> &'a hir::Expr {
+        match self {
+            Self::Evaluate(expression) | Self::Source { expression, .. } => expression,
+        }
+    }
+}
+
+/// Contiguous registers holding one source row in window-buffer order.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HirWindowInputRow {
+    pub(super) start: usize,
+    pub(super) count: usize,
 }
 
 /// One exact HIR leaf and the window-buffer column holding its value.
@@ -155,7 +174,10 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
         _children: &[()],
     ) -> Result<()> {
         let column = match expression {
-            hir::Expr::Column(reference) => HirWindowBufferColumn::Source(*reference),
+            hir::Expr::Column(reference) => HirWindowBufferColumn::Source {
+                expression,
+                reference: *reference,
+            },
             hir::Expr::RowId(_)
             | hir::Expr::Subquery(_)
             | hir::Expr::Function(hir::FunctionCall {
@@ -179,15 +201,25 @@ fn columns_are_equivalent(
     right: &HirWindowBufferColumn<'_>,
 ) -> bool {
     match (left, right) {
-        (HirWindowBufferColumn::Source(left), HirWindowBufferColumn::Source(right)) => {
-            left == right
-        }
+        (
+            HirWindowBufferColumn::Source {
+                reference: left, ..
+            },
+            HirWindowBufferColumn::Source {
+                reference: right, ..
+            },
+        ) => left == right,
         (HirWindowBufferColumn::Evaluate(left), HirWindowBufferColumn::Evaluate(right)) => {
             left.equivalent(right)
         }
-        (HirWindowBufferColumn::Source(reference), HirWindowBufferColumn::Evaluate(expression))
-        | (HirWindowBufferColumn::Evaluate(expression), HirWindowBufferColumn::Source(reference)) =>
-        {
+        (
+            HirWindowBufferColumn::Source { reference, .. },
+            HirWindowBufferColumn::Evaluate(expression),
+        )
+        | (
+            HirWindowBufferColumn::Evaluate(expression),
+            HirWindowBufferColumn::Source { reference, .. },
+        ) => {
             matches!(expression, hir::Expr::Column(other) if other == reference)
         }
     }
@@ -210,7 +242,10 @@ fn push_reused_column<'a>(
 
 fn expression_column(expression: &hir::Expr) -> HirWindowBufferColumn<'_> {
     match expression {
-        hir::Expr::Column(reference) => HirWindowBufferColumn::Source(*reference),
+        hir::Expr::Column(reference) => HirWindowBufferColumn::Source {
+            expression,
+            reference: *reference,
+        },
         _ => HirWindowBufferColumn::Evaluate(expression),
     }
 }
@@ -376,6 +411,24 @@ pub(super) fn plan_hir_window_buffer<'a>(
     })
 }
 
+/// Lower one source row into the exact register layout stored by the window
+/// buffer. Each slot keeps and lowers its original resolved HIR expression.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_input_row(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    plan: &HirWindowBufferPlan<'_>,
+) -> Result<HirWindowInputRow> {
+    let row = HirWindowInputRow {
+        start: program.alloc_registers(plan.columns.len()),
+        count: plan.columns.len(),
+    };
+    for (offset, column) in plan.columns.iter().enumerate() {
+        translate_expr(program, document, column.expression(), row.start + offset)?;
+    }
+    Ok(row)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_hir_window_runtime<'a>(
     program: &mut ProgramBuilder,
@@ -535,7 +588,7 @@ mod tests {
             hir::{DatabaseId, HirDocument, HirRoot},
             SemanticOptions, SemanticRootInput,
         },
-        vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode},
+        vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode, SourceBinding},
         SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
@@ -603,7 +656,7 @@ mod tests {
 
     fn column_reference(column: &HirWindowBufferColumn<'_>) -> Option<hir::ColumnRef> {
         match column {
-            HirWindowBufferColumn::Source(reference)
+            HirWindowBufferColumn::Source { reference, .. }
             | HirWindowBufferColumn::Evaluate(hir::Expr::Column(reference)) => Some(*reference),
             HirWindowBufferColumn::Evaluate(_) => None,
         }
@@ -643,6 +696,65 @@ mod tests {
             Some(BufferedWindowValue::Column(3))
         ));
         assert_eq!(function.argument_facts.len(), 1);
+    }
+
+    #[test]
+    fn input_row_lowers_original_expressions_in_buffer_order() {
+        let document = analyze_sql(
+            "SELECT sum(value) FILTER (WHERE keep) \
+             OVER (PARTITION BY group_id ORDER BY sort_key) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let source = column_reference(&plan.columns[0]).expect("partition column is buffered");
+        let mut program = program();
+        let source_start = program.alloc_registers(4);
+        program.bind_source(
+            source.source,
+            SourceBinding::Registers {
+                start: source_start,
+                rowid: None,
+            },
+        );
+
+        let row = emit_hir_window_input_row(&mut program, &document, &plan)
+            .expect("window input row lowers");
+
+        assert_eq!(row.count, 4);
+        for (offset, source_column) in [2, 3, 0, 1].into_iter().enumerate() {
+            assert!(program.insns.iter().any(|(instruction, _)| matches!(
+                instruction,
+                Insn::Copy {
+                    src_reg,
+                    dst_reg,
+                    extra_amount: 0,
+                } if *src_reg == source_start + source_column && *dst_reg == row.start + offset
+            )));
+        }
+    }
+
+    #[test]
+    fn empty_window_input_row_allocates_no_registers() {
+        let document = analyze_sql("SELECT row_number() OVER () FROM items");
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        assert!(plan.columns.is_empty());
+        let mut program = program();
+        let expected_start = program.alloc_registers(0);
+
+        let row = emit_hir_window_input_row(&mut program, &document, &plan)
+            .expect("empty window input row lowers");
+
+        assert_eq!(
+            row,
+            HirWindowInputRow {
+                start: expected_start,
+                count: 0
+            }
+        );
+        assert!(program.insns.is_empty());
     }
 
     #[test]
@@ -738,7 +850,8 @@ mod tests {
 
         assert!(matches!(
             plan.columns.as_slice(),
-            [HirWindowBufferColumn::Source(reference)] if reference.column == 0
+            [HirWindowBufferColumn::Source { expression: hir::Expr::Column(expression_reference), reference }]
+                if reference.column == 0 && expression_reference == reference
         ));
         let [function] = plan.functions.as_slice() else {
             panic!("one JSON window function is planned");

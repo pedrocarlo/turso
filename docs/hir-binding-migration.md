@@ -888,6 +888,14 @@ step/inverse loops serve legacy and HIR expressions; HIR does not create AST
 nodes or mutate global source bindings. Production partition buffering and
 frame-loop routing remain later checkpoints.
 
+HIR window-buffer columns now retain their original resolved expression even
+for direct source-column slots. A source row can be lowered into one contiguous
+register range in the planned partition, order, argument, and filter order by
+the existing HIR expression walker. Direct columns are not reconstructed as
+new expression nodes, and windows with no buffered values consume no
+registers. The row is not yet inserted into the production window buffer or
+driven through the frame loop.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged
