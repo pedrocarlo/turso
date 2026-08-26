@@ -863,6 +863,16 @@ lookups, partition buffering, and row output still use the existing legacy
 window plan; adding the HIR adapter and then removing that remaining plan
 dependency are later checkpoints.
 
+Resolved HIR now builds an explicit input layout for one effective window.
+PARTITION BY and ORDER BY values are deduplicated in legacy order; ordinary
+arguments and FILTER predicates receive stable buffer slots. JSON aggregates
+keep their argument expression for late recomputation and buffer only its
+resolved column, rowid, aggregate, and subquery leaves, matching the existing
+subtype-preserving rule without rewriting expressions into subquery-column
+AST nodes. Stable `WindowFunctionId` values select calls for each window and
+missing or mismatched identities fail as HIR invariants. This plan is not yet
+routed into production frame lowering.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

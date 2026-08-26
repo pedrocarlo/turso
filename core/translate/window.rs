@@ -466,7 +466,7 @@ fn rewrite_expr_referencing_current_window(
 /// JSON aggregates inspect their arguments' runtime subtypes. SQLite records
 /// do not carry subtypes, so every argument expression must run after its row
 /// is read back from the window buffer.
-fn window_function_uses_subtypes(window_func: &AccumulatorFunc) -> bool {
+pub(crate) fn window_function_uses_subtypes(window_func: &AccumulatorFunc) -> bool {
     #[cfg(feature = "json")]
     {
         matches!(
