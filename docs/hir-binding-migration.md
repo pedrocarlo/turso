@@ -896,6 +896,12 @@ new expression nodes, and windows with no buffered values consume no
 registers. The row is not yet inserted into the production window buffer or
 driven through the frame loop.
 
+Window buffer cursor creation is now shared below the legacy/HIR boundary.
+Both paths can open the same ephemeral table roles in the same order: current,
+write, end, and the optional moving-start and positional-lookup cursors. Legacy
+window initialization uses this helper without changing its frame plan or
+opcode flow. HIR does not open or populate the buffer yet.
+
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
 and `IN` query expressions. FROM groups preserve their nested joins, merged

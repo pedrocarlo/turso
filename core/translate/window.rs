@@ -1028,6 +1028,58 @@ pub struct WindowCursors {
     pub csr_app: Option<CursorID>,
 }
 
+/// Open cursors that share one ephemeral window buffer.
+///
+/// Legacy and HIR lowering decide independently which rows and expressions
+/// the table stores. The cursor roles and their opening order are shared.
+#[derive(Debug)]
+pub(crate) struct WindowBufferRuntime {
+    pub(crate) table: Arc<BTreeTable>,
+    pub(crate) cursors: WindowCursors,
+}
+
+pub(crate) fn open_window_buffer(
+    program: &mut ProgramBuilder,
+    table: Arc<BTreeTable>,
+    needs_start_cursor: bool,
+    needs_app_cursor: bool,
+) -> WindowBufferRuntime {
+    // `csr_current` owns the ephemeral table. The other cursors share its
+    // B-tree but keep independent positions for their frame roles.
+    let csr_current = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let csr_write = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let csr_end = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let csr_start =
+        needs_start_cursor.then(|| program.alloc_cursor_id(CursorType::BTreeTable(table.clone())));
+    let csr_app =
+        needs_app_cursor.then(|| program.alloc_cursor_id(CursorType::BTreeTable(table.clone())));
+
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: csr_current,
+        is_table: true,
+    });
+    for cursor in [Some(csr_write), Some(csr_end), csr_start, csr_app]
+        .into_iter()
+        .flatten()
+    {
+        program.emit_insn(Insn::OpenDup {
+            original_cursor_id: csr_current,
+            new_cursor_id: cursor,
+        });
+    }
+
+    WindowBufferRuntime {
+        table,
+        cursors: WindowCursors {
+            csr_write,
+            csr_current,
+            csr_end,
+            csr_start,
+            csr_app,
+        },
+    }
+}
+
 /// Builds `KeyInfo` entries for the window's ORDER BY columns, populating
 /// each entry's collation from the expression. Used everywhere two rows
 /// are compared to see whether they are peers (have equal ORDER BY
@@ -1252,14 +1304,6 @@ impl EmitWindow {
             crate::alloc::vec![],
             None,
         ));
-        // `csr_current` is the primary cursor on the ephemeral buffer;
-        // the others are OpenDup'd duplicates that share the same B-tree
-        // with independent positions.
-        let cursor_csr_current =
-            program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-        let cursor_csr_write =
-            program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
-        let cursor_csr_end = program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone()));
         // `csr_start` follows the start of the frame. Only needed when the
         // frame start can move off the first row of the partition (ntile,
         // percent_rank, cume_dist); AggInverse reads from this cursor as
@@ -1268,11 +1312,6 @@ impl EmitWindow {
             window.frame.start,
             crate::translate::plan::FrameBoundary::UnboundedPreceding
         );
-        let cursor_csr_start = if has_moving_start {
-            Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
-        } else {
-            None
-        };
         // `csr_app` either seeks positional values or scans the inclusive
         // frame bounds for an explicit EXCLUDE clause.
         let needs_csr_app = window.frame.exclude.is_some()
@@ -1287,11 +1326,6 @@ impl EmitWindow {
                     ),
                 )
             });
-        let cursor_csr_app = if needs_csr_app {
-            Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
-        } else {
-            None
-        };
         // Frame-index counters for the positional lookups; see
         // `WindowRegisters::frame_counters`. Only first_value / nth_value
         // consult them — lag / lead seek relative to the emitted row's own
@@ -1320,30 +1354,7 @@ impl EmitWindow {
         } else {
             (None, None)
         };
-        program.emit_insn(Insn::OpenEphemeral {
-            cursor_id: cursor_csr_current,
-            is_table: true,
-        });
-        program.emit_insn(Insn::OpenDup {
-            original_cursor_id: cursor_csr_current,
-            new_cursor_id: cursor_csr_write,
-        });
-        program.emit_insn(Insn::OpenDup {
-            original_cursor_id: cursor_csr_current,
-            new_cursor_id: cursor_csr_end,
-        });
-        if let Some(csr_start) = cursor_csr_start {
-            program.emit_insn(Insn::OpenDup {
-                original_cursor_id: cursor_csr_current,
-                new_cursor_id: csr_start,
-            });
-        }
-        if let Some(csr_app) = cursor_csr_app {
-            program.emit_insn(Insn::OpenDup {
-                original_cursor_id: cursor_csr_current,
-                new_cursor_id: csr_app,
-            });
-        }
+        let buffer = open_window_buffer(program, buffer_table, has_moving_start, needs_csr_app);
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
         // result register. Later, when bytecode generation encounters the expression, the value is
@@ -1454,16 +1465,10 @@ impl EmitWindow {
                 row_output_return: program.alloc_register(),
                 frame_counters,
             },
-            cursors: WindowCursors {
-                csr_write: cursor_csr_write,
-                csr_current: cursor_csr_current,
-                csr_end: cursor_csr_end,
-                csr_start: cursor_csr_start,
-                csr_app: cursor_csr_app,
-            },
+            cursors: buffer.cursors,
             src_column_count,
             expressions_referencing_subquery,
-            buffer_table_name: buffer_table.name.clone(),
+            buffer_table_name: buffer.table.name.clone(),
             functions,
         });
 
@@ -4203,4 +4208,83 @@ pub fn emit_window_flush(
     program.preassign_label_to_next_insn(labels.window_processing_end);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+
+    fn program() -> ProgramBuilder {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 4, 0))
+    }
+
+    fn buffer_table() -> Arc<BTreeTable> {
+        Arc::new(BTreeTable::new(
+            0,
+            "window-buffer".to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ))
+    }
+
+    fn assert_buffer_cursors(needs_start_cursor: bool, needs_app_cursor: bool) {
+        let mut program = program();
+        let table = buffer_table();
+
+        let runtime = open_window_buffer(
+            &mut program,
+            table.clone(),
+            needs_start_cursor,
+            needs_app_cursor,
+        );
+
+        assert!(Arc::ptr_eq(&runtime.table, &table));
+        assert_eq!(runtime.cursors.csr_start.is_some(), needs_start_cursor);
+        assert_eq!(runtime.cursors.csr_app.is_some(), needs_app_cursor);
+        let expected_duplicates =
+            2 + usize::from(needs_start_cursor) + usize::from(needs_app_cursor);
+        assert_eq!(program.insns.len(), 1 + expected_duplicates);
+        assert!(matches!(
+            program.insns.first(),
+            Some((
+                Insn::OpenEphemeral {
+                    cursor_id,
+                    is_table: true,
+                },
+                _
+            )) if *cursor_id == runtime.cursors.csr_current
+        ));
+        let expected = [
+            Some(runtime.cursors.csr_write),
+            Some(runtime.cursors.csr_end),
+            runtime.cursors.csr_start,
+            runtime.cursors.csr_app,
+        ];
+        for ((instruction, _), cursor) in program.insns[1..]
+            .iter()
+            .zip(expected.into_iter().flatten())
+        {
+            assert!(matches!(
+                instruction,
+                Insn::OpenDup {
+                    original_cursor_id,
+                    new_cursor_id,
+                } if *original_cursor_id == runtime.cursors.csr_current && *new_cursor_id == cursor
+            ));
+        }
+    }
+
+    #[test]
+    fn window_buffer_opens_only_requested_duplicate_cursors() {
+        assert_buffer_cursors(false, false);
+        assert_buffer_cursors(true, false);
+        assert_buffer_cursors(false, true);
+        assert_buffer_cursors(true, true);
+    }
 }
