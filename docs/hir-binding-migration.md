@@ -917,6 +917,9 @@ construction.
 Window key metadata stays iterator-based until `Insn::Compare` requires its
 owned vector. Legacy and HIR partition/peer comparisons use the same compare
 and branch emitter; HIR keys take collations directly from resolved terms.
+The partition-change sequence is shared too: compare keys, flush the previous
+partition, reset rowid, then save the new keys. The emitted key width drives
+the copy without collecting or walking the key iterator a second time.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

@@ -909,6 +909,79 @@ mod tests {
     }
 
     #[test]
+    fn hir_window_partition_change_uses_shared_runtime_sequence() {
+        let document =
+            analyze_sql("SELECT sum(value) OVER (PARTITION BY group_id COLLATE nocase) FROM items");
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let current_keys = program.alloc_register();
+        let previous_keys = program.alloc_register();
+        let rowid = program.alloc_register();
+        let flush_return = program.alloc_register();
+        let flush_buffer = program.allocate_label();
+
+        crate::translate::window::emit_window_partition_change(
+            &mut program,
+            current_keys,
+            crate::translate::window::WindowPartitionState {
+                previous_keys,
+                rowid,
+                flush_return,
+            },
+            flush_buffer,
+            plan.partition_key_info(),
+        )
+        .expect("resolved partition keys drive the shared runtime sequence");
+
+        let [compare, jump, gosub, null, copy] = program.insns.as_slice() else {
+            panic!("partition change emits compare, branch, flush, reset, and key copy");
+        };
+        assert!(matches!(
+            &compare.0,
+            Insn::Compare {
+                start_reg_a,
+                start_reg_b,
+                count: 1,
+                key_info,
+            } if *start_reg_a == current_keys
+                && *start_reg_b == previous_keys
+                && key_info[0].collation == CollationSeq::NoCase
+        ));
+        assert!(matches!(
+            &jump.0,
+            Insn::Jump {
+                target_pc_lt,
+                target_pc_eq,
+                target_pc_gt,
+            } if target_pc_lt == target_pc_gt && target_pc_eq != target_pc_lt
+        ));
+        assert!(matches!(
+            &gosub.0,
+            Insn::Gosub {
+                target_pc,
+                return_reg,
+            } if *target_pc == flush_buffer && *return_reg == flush_return
+        ));
+        assert!(matches!(
+            &null.0,
+            Insn::Null {
+                dest,
+                dest_end: None,
+            } if *dest == rowid
+        ));
+        assert!(matches!(
+            &copy.0,
+            Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 0,
+            } if *src_reg == current_keys && *dst_reg == previous_keys
+        ));
+    }
+
+    #[test]
     fn input_row_lowers_original_expressions_in_buffer_order() {
         let document = analyze_sql(
             "SELECT sum(value) FILTER (WHERE keep) \

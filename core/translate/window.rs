@@ -1147,7 +1147,7 @@ pub(crate) fn emit_window_key_compare(
     key_info: impl IntoIterator<Item = Result<KeyInfo>>,
     if_equal: BranchOffset,
     if_different: BranchOffset,
-) -> Result<()> {
+) -> Result<usize> {
     let key_info = key_info.into_iter().collect::<Result<Vec<_>>>()?;
     let count = key_info.len();
     turso_assert!(count > 0, "window key comparison requires at least one key");
@@ -1165,6 +1165,58 @@ pub(crate) fn emit_window_key_compare(
         target_pc_eq: if_equal,
         target_pc_gt: if_different,
     });
+    Ok(count)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WindowPartitionState {
+    pub(crate) previous_keys: usize,
+    pub(crate) rowid: usize,
+    pub(crate) flush_return: usize,
+}
+
+/// Flush the previous partition when the current row has different keys.
+pub(crate) fn emit_window_partition_change(
+    program: &mut ProgramBuilder,
+    current_keys: usize,
+    state: WindowPartitionState,
+    flush_buffer: BranchOffset,
+    key_info: impl IntoIterator<Item = Result<KeyInfo>>,
+) -> Result<()> {
+    let same_partition_label = program.allocate_label();
+    let new_partition_label = program.allocate_label();
+
+    program.add_comment(
+        program.offset(),
+        "compare partition keys to detect new partition",
+    );
+    let key_count = emit_window_key_compare(
+        program,
+        current_keys,
+        state.previous_keys,
+        key_info,
+        same_partition_label,
+        new_partition_label,
+    )?;
+
+    program.preassign_label_to_next_insn(new_partition_label);
+    program.add_comment(program.offset(), "detected new partition");
+    program.emit_insn(Insn::Gosub {
+        target_pc: flush_buffer,
+        return_reg: state.flush_return,
+    });
+    // Reset rowid to signal the start of processing a new partition.
+    program.emit_insn(Insn::Null {
+        dest: state.rowid,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: current_keys,
+        dst_reg: state.previous_keys,
+        extra_amount: key_count - 1,
+    });
+
+    program.preassign_label_to_next_insn(same_partition_label);
     Ok(())
 }
 
@@ -2173,19 +2225,12 @@ fn emit_flush_buffer_if_new_partition(
     plan: &SelectPlan,
 ) -> Result<()> {
     if let Some(reg_partition_start) = registers.partition_start {
-        let same_partition_label = program.allocate_label();
-        let new_partition_label = program.allocate_label();
-
         // Compare the first `deduplicated_partition_by_len` source columns with the saved
         // partition keys. If they differ, this row starts a new partition and we flush the buffer.
         let partition_by_len = window
             .deduplicated_partition_by_len
             .expect("deduplicated_partition_by_len must exist");
 
-        program.add_comment(
-            program.offset(),
-            "compare partition keys to detect new partition",
-        );
         let partition_key_info = (0..partition_by_len).map(|i| {
             // After rewriting, partition_by entries are Expr::Column references to the
             // subquery. Duplicates reference the same column index, so we find the entry
@@ -2202,33 +2247,17 @@ fn emit_flush_buffer_if_new_partition(
                 nulls_order: None,
             })
         });
-        emit_window_key_compare(
+        emit_window_partition_change(
             program,
             registers.src_columns_start,
-            reg_partition_start,
+            WindowPartitionState {
+                previous_keys: reg_partition_start,
+                rowid: registers.rowid,
+                flush_return: registers.flush_buffer_return_offset,
+            },
+            labels.flush_buffer,
             partition_key_info,
-            same_partition_label,
-            new_partition_label,
         )?;
-
-        program.preassign_label_to_next_insn(new_partition_label);
-        program.add_comment(program.offset(), "detected new partition");
-        program.emit_insn(Insn::Gosub {
-            target_pc: labels.flush_buffer,
-            return_reg: registers.flush_buffer_return_offset,
-        });
-        // Reset rowid to signal the start of processing a new partition.
-        program.emit_insn(Insn::Null {
-            dest: registers.rowid,
-            dest_end: None,
-        });
-        program.emit_insn(Insn::Copy {
-            src_reg: registers.src_columns_start,
-            dst_reg: reg_partition_start,
-            extra_amount: partition_by_len - 1,
-        });
-
-        program.preassign_label_to_next_insn(same_partition_label);
     }
 
     Ok(())
