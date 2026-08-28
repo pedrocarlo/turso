@@ -907,7 +907,10 @@ remain owned by resolved HIR facts. Window input register ranges and buffer
 insertion are now representation-neutral as well. Legacy and HIR rows use the
 same `MakeRecord`, `NewRowid`, and `Insert` sequence without rebuilding HIR
 expressions or consulting table references. The production HIR window frame
-loop does not call this insertion path yet.
+loop does not call this insertion path yet. HIR window plans also retain the
+exact buffer slot for every PARTITION BY and ORDER BY term. Reused expressions
+share one stored value while repeated terms and their original order remain
+explicit for partition and peer comparisons.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

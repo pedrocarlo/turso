@@ -77,6 +77,8 @@ pub(super) struct HirWindowFunction<'a> {
 pub(super) struct HirWindowBufferPlan<'a> {
     pub(super) window: &'a hir::ResolvedWindow,
     pub(super) columns: Vec<HirWindowBufferColumn<'a>>,
+    pub(super) partition_slots: Vec<usize>,
+    pub(super) order_slots: Vec<usize>,
     pub(super) functions: Vec<HirWindowFunction<'a>>,
     late_inputs: Vec<HirWindowLateInput<'a>>,
 }
@@ -347,12 +349,16 @@ pub(super) fn plan_hir_window_buffer<'a>(
     }
 
     let mut columns = Vec::new();
-    for expression in &window.partition_by {
-        push_reused_column(&mut columns, expression_column(expression));
-    }
-    for term in &window.order_by {
-        push_reused_column(&mut columns, expression_column(&term.expr));
-    }
+    let partition_slots = window
+        .partition_by
+        .iter()
+        .map(|expression| push_reused_column(&mut columns, expression_column(expression)))
+        .collect();
+    let order_slots = window
+        .order_by
+        .iter()
+        .map(|term| push_reused_column(&mut columns, expression_column(&term.expr)))
+        .collect();
 
     let calls = collect_window_calls(query, block)?;
     let mut functions = Vec::new();
@@ -425,6 +431,8 @@ pub(super) fn plan_hir_window_buffer<'a>(
     Ok(HirWindowBufferPlan {
         window,
         columns,
+        partition_slots,
+        order_slots,
         functions,
         late_inputs,
     })
@@ -763,6 +771,41 @@ mod tests {
             Some(BufferedWindowValue::Column(3))
         ));
         assert_eq!(function.argument_facts.len(), 1);
+    }
+
+    #[test]
+    fn partition_and_order_slots_preserve_terms_after_column_reuse() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 PARTITION BY group_id, group_id \
+                 ORDER BY sort_key, group_id\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+
+        assert_eq!(plan.partition_slots, [0, 0]);
+        assert_eq!(plan.order_slots, [1, 0]);
+        assert_eq!(plan.columns.len(), 3);
+        assert_eq!(
+            column_reference(&plan.columns[0])
+                .expect("partition column is buffered")
+                .column,
+            2
+        );
+        assert_eq!(
+            column_reference(&plan.columns[1])
+                .expect("order column is buffered")
+                .column,
+            3
+        );
+        assert_eq!(
+            column_reference(&plan.columns[2])
+                .expect("argument column is buffered")
+                .column,
+            0
+        );
     }
 
     #[test]
