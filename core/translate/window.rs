@@ -31,7 +31,7 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, FrameMode, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
 
@@ -576,6 +576,7 @@ pub struct WindowMetadata<'a> {
     pub labels: WindowLabels,
     pub registers: WindowRegisters,
     pub cursors: WindowCursors,
+    pub(crate) frame: WindowFrameShape,
     /// Number of input columns in the source subquery.
     pub src_column_count: usize,
     /// Maps expressions in the current query that reference subquery columns
@@ -1004,6 +1005,48 @@ pub(crate) fn emit_window_peer_seed(program: &mut ProgramBuilder, state: WindowP
             dst_reg: cursor,
             extra_amount,
         });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowFrameEdge {
+    UnboundedPreceding,
+    Preceding,
+    CurrentRow,
+    Following,
+    UnboundedFollowing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WindowFrameShape {
+    pub(crate) mode: FrameMode,
+    pub(crate) start: WindowFrameEdge,
+    pub(crate) end: WindowFrameEdge,
+    /// Any explicit EXCLUDE clause selects the full-frame scan path,
+    /// including `EXCLUDE NO OTHERS`.
+    pub(crate) has_exclude: bool,
+}
+
+fn legacy_window_frame_edge(boundary: &crate::translate::plan::FrameBoundary) -> WindowFrameEdge {
+    match boundary {
+        crate::translate::plan::FrameBoundary::UnboundedPreceding => {
+            WindowFrameEdge::UnboundedPreceding
+        }
+        crate::translate::plan::FrameBoundary::Preceding(_) => WindowFrameEdge::Preceding,
+        crate::translate::plan::FrameBoundary::CurrentRow => WindowFrameEdge::CurrentRow,
+        crate::translate::plan::FrameBoundary::Following(_) => WindowFrameEdge::Following,
+        crate::translate::plan::FrameBoundary::UnboundedFollowing => {
+            WindowFrameEdge::UnboundedFollowing
+        }
+    }
+}
+
+fn legacy_window_frame_shape(frame: &crate::translate::plan::Frame) -> WindowFrameShape {
+    WindowFrameShape {
+        mode: frame.mode,
+        start: legacy_window_frame_edge(&frame.start),
+        end: legacy_window_frame_edge(&frame.end),
+        has_exclude: frame.exclude.is_some(),
     }
 }
 
@@ -1867,6 +1910,7 @@ impl EmitWindow {
                 row_output: program.allocate_label(),
                 window_processing_end: program.allocate_label(),
             },
+            frame: legacy_window_frame_shape(&window.frame),
             registers: WindowRegisters {
                 rowid: input_state.rowid,
                 partition_start: input_state.previous_partition,
@@ -1963,6 +2007,7 @@ impl EmitWindow {
         let labels = meta.labels;
         let registers = meta.registers;
         let cursors = meta.cursors;
+        let frame = meta.frame;
         let src_column_count = meta.src_column_count;
         let input = WindowBufferInput {
             start: registers.src_columns_start,
@@ -2025,7 +2070,7 @@ impl EmitWindow {
                 &t_ctx.resolver,
                 offset_expr,
                 start_offset_reg,
-                window.frame.mode,
+                frame.mode,
                 WindowFrameBoundSide::Start,
             )?;
         }
@@ -2043,7 +2088,7 @@ impl EmitWindow {
                 &t_ctx.resolver,
                 offset_expr,
                 end_offset_reg,
-                window.frame.mode,
+                frame.mode,
                 WindowFrameBoundSide::End,
             )?;
         }
@@ -2067,16 +2112,11 @@ impl EmitWindow {
         // branch — SQLite gets that re-entry for free because its
         // first-row test is `rowid == 1` and ResetSorter restarts the
         // rowids.
-        let same_kind_bounded = window.frame.mode != turso_parser::ast::FrameMode::Range
+        let same_kind_bounded = frame.mode != FrameMode::Range
             && matches!(
-                (&window.frame.start, &window.frame.end),
-                (
-                    crate::translate::plan::FrameBoundary::Preceding(_),
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                ) | (
-                    crate::translate::plan::FrameBoundary::Following(_),
-                    crate::translate::plan::FrameBoundary::Following(_)
-                )
+                (frame.start, frame.end),
+                (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding)
+                    | (WindowFrameEdge::Following, WindowFrameEdge::Following)
             );
         if same_kind_bounded {
             let start_offset_reg = registers
@@ -2092,10 +2132,7 @@ impl EmitWindow {
             // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
             // valid iff end <= start. Mirrors the Ge/Le pick at
             // window.c:2951.
-            if matches!(
-                window.frame.start,
-                crate::translate::plan::FrameBoundary::Following(_)
-            ) {
+            if frame.start == WindowFrameEdge::Following {
                 program.emit_insn(Insn::Ge {
                     lhs: end_offset_reg,
                     rhs: start_offset_reg,
@@ -2112,7 +2149,7 @@ impl EmitWindow {
                     collation: None,
                 });
             }
-            if window.frame.exclude.is_none() {
+            if !frame.has_exclude {
                 emit_window_agg_final(program, window, &registers, &minmax, false);
             }
             // The row was just inserted, so the empty branch of this
@@ -2142,11 +2179,7 @@ impl EmitWindow {
         // rather than lag emitting the result (RETURN_ROW) by M. So the
         // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
-        if matches!(
-            window.frame.start,
-            crate::translate::plan::FrameBoundary::Following(_)
-        ) && window.frame.mode != turso_parser::ast::FrameMode::Range
-        {
+        if frame.start == WindowFrameEdge::Following && frame.mode != FrameMode::Range {
             if let (Some(start_offset_reg), Some(end_offset_reg)) = (
                 registers.frame_offsets.start(),
                 registers.frame_offsets.end(),
@@ -2203,7 +2236,7 @@ impl EmitWindow {
         // waits and the end-of-partition flush does the work. Mirrors
         // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
         // unconditional jump when there's no ORDER BY, window.c:2076).
-        if window.frame.mode != turso_parser::ast::FrameMode::Rows {
+        if frame.mode != FrameMode::Rows {
             program.add_comment(
                 program.offset(),
                 "peer of previous row: buffer only, handle at group end",
@@ -2223,10 +2256,9 @@ impl EmitWindow {
         // Pick the order to run the three operations in, based on the
         // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
         // cases (window.c:2987-3037).
-        use crate::translate::plan::FrameBoundary;
-        let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
-        let end_is_unbounded = matches!(window.frame.end, FrameBoundary::UnboundedFollowing);
-        if matches!(window.frame.start, FrameBoundary::Following(_)) {
+        let is_range = frame.mode == FrameMode::Range;
+        let end_is_unbounded = frame.end == WindowFrameEdge::UnboundedFollowing;
+        if frame.start == WindowFrameEdge::Following {
             // Pattern A — the frame starts after the current row (`<expr>
             // FOLLOWING` start), e.g. `ROWS BETWEEN 1 FOLLOWING AND 3
             // FOLLOWING` (window.c:2987-3002). Every row is added to the
@@ -2287,7 +2319,7 @@ impl EmitWindow {
                     )?;
                 }
             }
-        } else if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+        } else if frame.end == WindowFrameEdge::Preceding {
             // Pattern B — the frame ends before the current row (`<expr>
             // PRECEDING` end), e.g. `ROWS BETWEEN UNBOUNDED PRECEDING AND
             // 2 PRECEDING` (window.c:3004-3009). A row's result can be
@@ -2309,8 +2341,7 @@ impl EmitWindow {
             // row; this order stops the start cursor from moving past the
             // end cursor when the two offsets differ. SQLite's `bRPS` at
             // window.c:3005.
-            let inverse_before_return =
-                is_range && matches!(window.frame.start, FrameBoundary::Preceding(_));
+            let inverse_before_return = is_range && frame.start == WindowFrameEdge::Preceding;
             if inverse_before_return {
                 emit_window_op(
                     program,
@@ -3097,6 +3128,7 @@ fn emit_window_op(
     let window = plan.window.as_ref().expect("missing window");
     let registers = meta.registers;
     let cursors = meta.cursors;
+    let frame = meta.frame;
     let buffer_table_name = meta.buffer_table_name.clone();
     let minmax: Vec<_> = meta
         .functions
@@ -3104,7 +3136,7 @@ fn emit_window_op(
         .map(|function| function.minmax)
         .collect();
     let order_by_len = window.order_by.len();
-    let frame_mode = window.frame.mode;
+    let frame_mode = frame.mode;
     // Under RANGE / GROUPS frames one advance steps over every row with
     // equal ORDER BY values (a peer group); with no ORDER BY every row
     // counts as equal, so it runs to the end of the partition. Mirrors
@@ -3115,12 +3147,7 @@ fn emit_window_op(
     // PRECEDING: no row ever leaves the frame. Mirrors SQLite's early
     // return at window.c:2252-2257, which lets every caller emit all three
     // operations without first checking for this case.
-    if matches!(op, WindowOp::AggInverse)
-        && matches!(
-            window.frame.start,
-            crate::translate::plan::FrameBoundary::UnboundedPreceding
-        )
-    {
+    if matches!(op, WindowOp::AggInverse) && frame.start == WindowFrameEdge::UnboundedPreceding {
         assert!(
             countdown_reg.is_none() && break_on_eof.is_none(),
             "an AGGINVERSE no-op cannot carry a countdown or an EOF break"
@@ -3158,10 +3185,7 @@ fn emit_window_op(
             program.preassign_label_to_next_insn(label);
             match op {
                 WindowOp::AggInverse => {
-                    if matches!(
-                        window.frame.start,
-                        crate::translate::plan::FrameBoundary::Following(_)
-                    ) {
+                    if frame.start == WindowFrameEdge::Following {
                         emit_window_range_test(
                             program,
                             plan,
@@ -3211,7 +3235,7 @@ fn emit_window_op(
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
-    if matches!(op, WindowOp::ReturnRow) && window.frame.exclude.is_none() {
+    if matches!(op, WindowOp::ReturnRow) && !frame.has_exclude {
         emit_window_agg_final(program, window, &registers, &minmax, false);
     }
 
@@ -3222,17 +3246,12 @@ fn emit_window_op(
     // the frame-end cursor. While the source is still producing rows, also
     // keep csr_end at or before the newest buffered row. During flush SQLite
     // clears its source-rowid register, disabling the latter guard.
-    let same_kind_range_offsets = frame_mode == turso_parser::ast::FrameMode::Range
+    let same_kind_range_offsets = frame_mode == FrameMode::Range
         && countdown_reg.is_some()
         && matches!(
-            (&window.frame.start, &window.frame.end),
-            (
-                crate::translate::plan::FrameBoundary::Preceding(_),
-                crate::translate::plan::FrameBoundary::Preceding(_)
-            ) | (
-                crate::translate::plan::FrameBoundary::Following(_),
-                crate::translate::plan::FrameBoundary::Following(_)
-            )
+            (frame.start, frame.end),
+            (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding)
+                | (WindowFrameEdge::Following, WindowFrameEdge::Following)
         );
     if same_kind_range_offsets {
         match op {
@@ -4136,8 +4155,7 @@ fn emit_return_one_row(
         program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
     }
 
-    let window = plan.window.as_ref().expect("missing window");
-    if window.frame.exclude.is_some() {
+    if meta.frame.has_exclude {
         emit_window_full_scan(program, t_ctx, plan)?;
     } else {
         // Per-row lookups for functions whose value is computed at output
@@ -4250,6 +4268,7 @@ pub fn emit_window_flush(
     let labels = meta.labels;
     let registers = meta.registers;
     let cursors = meta.cursors;
+    let frame = meta.frame;
 
     let label_empty = program.allocate_label();
     let label_break = program.allocate_label();
@@ -4279,9 +4298,7 @@ pub fn emit_window_flush(
     // branch opens with a final AGGSTEP: the last row inserted in the main
     // loop was never added to the totals (under ROWS), or its peer group
     // might still have been incomplete (under RANGE / GROUPS).
-    let window = plan.window.as_ref().expect("missing window");
-    use crate::translate::plan::FrameBoundary;
-    if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+    if frame.end == WindowFrameEdge::Preceding {
         // Pattern B flush (window.c:3052-3056): the main loop emitted a
         // row on every iteration, so exactly one row is still waiting to
         // be output — a single RETURN_ROW with no delay and no loop. The
@@ -4296,8 +4313,8 @@ pub fn emit_window_flush(
             None,
             true,
         )?;
-        let inverse_before_return = window.frame.mode == turso_parser::ast::FrameMode::Range
-            && matches!(window.frame.start, FrameBoundary::Preceding(_));
+        let inverse_before_return =
+            frame.mode == FrameMode::Range && frame.start == WindowFrameEdge::Preceding;
         if inverse_before_return {
             emit_window_op(
                 program,
@@ -4310,7 +4327,7 @@ pub fn emit_window_flush(
             )?;
         }
         emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, true)?;
-    } else if matches!(window.frame.start, FrameBoundary::Following(_)) {
+    } else if frame.start == WindowFrameEdge::Following {
         // Pattern A flush (window.c:3057-3084): two-stage loop.
         //
         //   loop_1:
@@ -4336,21 +4353,20 @@ pub fn emit_window_flush(
         // runs out of rows (csr_start hits EOF), the second loop emits the
         // rows that remain, with the totals now final.
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
-        let (return_row_countdown, agg_inverse_countdown) =
-            if window.frame.mode == turso_parser::ast::FrameMode::Range {
-                (None, registers.frame_offsets.start())
-            } else if matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
-                (registers.frame_offsets.start(), None)
-            } else {
-                (
-                    registers.frame_offsets.end(),
-                    registers.frame_offsets.start(),
-                )
-            };
+        let (return_row_countdown, agg_inverse_countdown) = if frame.mode == FrameMode::Range {
+            (None, registers.frame_offsets.start())
+        } else if frame.end == WindowFrameEdge::UnboundedFollowing {
+            (registers.frame_offsets.start(), None)
+        } else {
+            (
+                registers.frame_offsets.end(),
+                registers.frame_offsets.start(),
+            )
+        };
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_1);
-        if window.frame.mode == turso_parser::ast::FrameMode::Range {
+        if frame.mode == FrameMode::Range {
             emit_window_op(
                 program,
                 t_ctx,

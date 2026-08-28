@@ -24,9 +24,10 @@ use crate::{
             prepare_window_frame_offsets, prepare_window_frame_tracking,
             prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
             BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFrameBoundSide,
-            WindowFrameOffsets, WindowFrameTracking, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
-            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
+            WindowFrameEdge, WindowFrameOffsets, WindowFrameShape, WindowFrameTracking,
+            WindowFunctionRuntime, WindowFunctionRuntimeSpec, WindowInputState,
+            WindowPartitionState, WindowPeerComparison, WindowPeerState, WindowStepContext,
+            WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -751,6 +752,30 @@ pub(super) fn prepare_hir_window_frame_offsets(
             Some(hir::WindowFrameBound::Preceding(_)) | Some(hir::WindowFrameBound::Following(_))
         ),
     )
+}
+
+fn hir_window_frame_edge(boundary: &hir::WindowFrameBound) -> WindowFrameEdge {
+    match boundary {
+        hir::WindowFrameBound::UnboundedPreceding => WindowFrameEdge::UnboundedPreceding,
+        hir::WindowFrameBound::Preceding(_) => WindowFrameEdge::Preceding,
+        hir::WindowFrameBound::CurrentRow => WindowFrameEdge::CurrentRow,
+        hir::WindowFrameBound::Following(_) => WindowFrameEdge::Following,
+        hir::WindowFrameBound::UnboundedFollowing => WindowFrameEdge::UnboundedFollowing,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn hir_window_frame_shape(frame: &hir::WindowFrame) -> WindowFrameShape {
+    WindowFrameShape {
+        mode: frame.mode,
+        start: hir_window_frame_edge(&frame.start),
+        end: frame
+            .end
+            .as_ref()
+            .map(hir_window_frame_edge)
+            .unwrap_or(WindowFrameEdge::CurrentRow),
+        has_exclude: frame.exclude.is_some(),
+    }
 }
 
 fn hir_frame_offset_is_constant(expression: &hir::Expr) -> bool {
@@ -1770,6 +1795,39 @@ mod tests {
             ),
             WindowFrameTracking::Excluded { .. }
         ));
+    }
+
+    #[test]
+    fn hir_window_frame_shape_drops_bound_expressions() {
+        fn shape(sql: &str) -> WindowFrameShape {
+            let document = analyze_sql(sql);
+            let (_, block) = root_query(&document);
+            hir_window_frame_shape(&block.windows[0].frame)
+        }
+
+        assert_eq!(
+            shape("SELECT sum(value) OVER () FROM items"),
+            WindowFrameShape {
+                mode: turso_parser::ast::FrameMode::Range,
+                start: WindowFrameEdge::UnboundedPreceding,
+                end: WindowFrameEdge::CurrentRow,
+                has_exclude: false,
+            }
+        );
+        assert_eq!(
+            shape(
+                "SELECT sum(value) OVER (\
+                     ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING \
+                     EXCLUDE CURRENT ROW\
+                 ) FROM items"
+            ),
+            WindowFrameShape {
+                mode: turso_parser::ast::FrameMode::Rows,
+                start: WindowFrameEdge::Preceding,
+                end: WindowFrameEdge::Following,
+                has_exclude: true,
+            }
+        );
     }
 
     #[test]

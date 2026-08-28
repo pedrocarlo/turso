@@ -948,6 +948,9 @@ columns, functions, subqueries, and current-time values.
 Frame-offset registers now use one explicit `None`, start, end, or both state.
 Legacy and HIR allocate that state from their own frame bounds, while the
 runtime loop consumes the same accessors and keeps the existing opcode order.
+Window step, per-operation, output, and flush routing now consume an
+expression-free frame shape. Legacy and HIR map their own bounds into the same
+edge enum; runtime routing no longer matches legacy `FrameBoundary` values.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
