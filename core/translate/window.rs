@@ -1089,6 +1089,65 @@ pub(crate) fn emit_window_nonempty_branch(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WindowEmptyFrameState {
+    pub(crate) current_cursor: CursorID,
+    pub(crate) rowid: usize,
+    pub(crate) step_end: BranchOffset,
+}
+
+/// Handle a non-RANGE frame that is empty for every row because its same-kind
+/// bounded edges cross: M > N for `N PRECEDING AND M PRECEDING`, or M < N for
+/// `N FOLLOWING AND M FOLLOWING`. Each row emits the result an empty frame
+/// gives: an aggregate that never saw a row (`sum` is NULL, `count` is zero),
+/// while `first_value` and `nth_value` yield NULL because their frame counters
+/// stay zero.
+///
+/// The aggregate result must be emitted before the current cursor is rewound;
+/// the row result must be emitted after it. The buffer is then cleared and
+/// `rowid` is set back to NULL so every subsequent row re-enters this first-row
+/// path. SQLite gets that re-entry for free because its first-row test is
+/// `rowid == 1` and `ResetSorter` restarts the rowids.
+pub(crate) fn emit_window_empty_frame_guard(
+    program: &mut ProgramBuilder,
+    check: WindowFrameOrderCheck,
+    state: WindowEmptyFrameState,
+    emit_aggregate: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+    emit_row: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let frame_valid = program.allocate_label();
+    program.add_comment(program.offset(), "empty-frame check");
+    // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
+    // valid iff end <= start. Mirrors the Ge/Le pick at
+    // window.c:2951.
+    emit_window_nonempty_branch(program, check, frame_valid);
+    emit_aggregate(program)?;
+
+    // The row was just inserted, so the empty branch of this
+    // Rewind is unreachable — the label lands on the next
+    // instruction either way.
+    let unreachable_empty = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: state.current_cursor,
+        pc_if_empty: unreachable_empty,
+    });
+    program.preassign_label_to_next_insn(unreachable_empty);
+    emit_row(program)?;
+
+    program.emit_insn(Insn::ResetSorter {
+        cursor_id: state.current_cursor,
+    });
+    program.emit_insn(Insn::Null {
+        dest: state.rowid,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: state.step_end,
+    });
+    program.preassign_label_to_next_insn(frame_valid);
+    Ok(())
+}
+
 pub(crate) fn emit_window_following_start_delay(
     program: &mut ProgramBuilder,
     frame: WindowFrameShape,
@@ -2200,50 +2259,26 @@ impl EmitWindow {
             registers.rowid,
             &buffer_table_name,
         );
-        // Empty-frame check (window.c:2950-2961): for non-RANGE
-        // frames bounded on both sides by the same kind — `N PRECEDING
-        // AND M PRECEDING` or `N FOLLOWING AND M FOLLOWING` — the frame
-        // is empty for every row whenever the bounds cross (M > N for
-        // PRECEDING pairs, M < N for FOLLOWING pairs). Each row then
-        // emits the result an empty frame gives (an aggregate that never
-        // saw a row — sum → NULL, count → 0; first_value / nth_value yield
-        // NULL because the frame counters stay 0) and the buffer is
-        // cleared. Re-Nulling
-        // `rowid_reg` sends every subsequent row back through this
-        // branch — SQLite gets that re-entry for free because its
-        // first-row test is `rowid == 1` and ResetSorter restarts the
-        // rowids.
+        // Empty-frame check (window.c:2950-2961): for non-RANGE frames
+        // bounded on both sides by the same kind, crossing bounds make the
+        // frame empty for every row.
         if let Some(check) = window_frame_order_check(frame, registers.frame_offsets) {
-            let label_frame_valid = program.allocate_label();
-            program.add_comment(program.offset(), "empty-frame check");
-            // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
-            // valid iff end <= start. Mirrors the Ge/Le pick at
-            // window.c:2951.
-            emit_window_nonempty_branch(program, check, label_frame_valid);
-            if !frame.has_exclude {
-                emit_window_agg_final(program, window, &registers, &minmax, false);
-            }
-            // The row was just inserted, so the empty branch of this
-            // Rewind is unreachable — the label lands on the next
-            // instruction either way.
-            let label_unreachable_empty = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: cursors.csr_current,
-                pc_if_empty: label_unreachable_empty,
-            });
-            program.preassign_label_to_next_insn(label_unreachable_empty);
-            emit_return_one_row(program, t_ctx, plan)?;
-            program.emit_insn(Insn::ResetSorter {
-                cursor_id: cursors.csr_current,
-            });
-            program.emit_insn(Insn::Null {
-                dest: registers.rowid,
-                dest_end: None,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: label_step_end,
-            });
-            program.preassign_label_to_next_insn(label_frame_valid);
+            emit_window_empty_frame_guard(
+                program,
+                check,
+                WindowEmptyFrameState {
+                    current_cursor: cursors.csr_current,
+                    rowid: registers.rowid,
+                    step_end: label_step_end,
+                },
+                |program| {
+                    if !frame.has_exclude {
+                        emit_window_agg_final(program, window, &registers, &minmax, false);
+                    }
+                    Ok(())
+                },
+                |program| emit_return_one_row(program, t_ctx, plan),
+            )?;
         }
         // `N FOLLOWING AND M FOLLOWING`: dropping rows off the start
         // (AGGINVERSE) must lag adding them (AGGSTEP) by M - N rows,

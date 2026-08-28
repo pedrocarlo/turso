@@ -37,7 +37,8 @@ use crate::{
 
 #[cfg(test)]
 use crate::translate::window::{
-    emit_window_nonempty_branch, window_frame_order_check, WindowFrameOrderCheck,
+    emit_window_empty_frame_guard, emit_window_nonempty_branch, window_frame_order_check,
+    WindowEmptyFrameState, WindowFrameOrderCheck,
 };
 
 #[cfg(test)]
@@ -1919,6 +1920,73 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_empty_frame_uses_shared_guard_order() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            .expect("window buffer plans");
+        let mut program = program();
+        let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+        let check = window_frame_order_check(hir_window_frame_shape(&plan.window.frame), offsets)
+            .expect("same-kind bounded frame needs an order check");
+        let current_cursor = buffer_cursor(&mut program, 1);
+        let rowid = program.alloc_register();
+        let aggregate_marker = program.alloc_register();
+        let row_marker = program.alloc_register();
+        let step_end = program.allocate_label();
+
+        emit_window_empty_frame_guard(
+            &mut program,
+            check,
+            WindowEmptyFrameState {
+                current_cursor,
+                rowid,
+                step_end,
+            },
+            |program| {
+                program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: aggregate_marker,
+                });
+                Ok(())
+            },
+            |program| {
+                program.emit_insn(Insn::Integer {
+                    value: 2,
+                    dest: row_marker,
+                });
+                Ok(())
+            },
+        )
+        .expect("empty-frame guard emits");
+
+        let [branch, aggregate, rewind, row, reset, null, jump] = program.insns.as_slice() else {
+            panic!("empty-frame guard preserves the seven legacy operations");
+        };
+        assert!(matches!(branch.0, Insn::Ge { .. }));
+        assert!(matches!(
+            aggregate.0,
+            Insn::Integer { value: 1, dest } if dest == aggregate_marker
+        ));
+        assert!(matches!(
+            rewind.0,
+            Insn::Rewind { cursor_id, .. } if cursor_id == current_cursor
+        ));
+        assert!(matches!(
+            row.0,
+            Insn::Integer { value: 2, dest } if dest == row_marker
+        ));
+        assert!(matches!(
+            reset.0,
+            Insn::ResetSorter { cursor_id } if cursor_id == current_cursor
+        ));
+        assert!(matches!(null.0, Insn::Null { dest, .. } if dest == rowid));
+        assert!(matches!(jump.0, Insn::Goto { target_pc } if target_pc == step_end));
     }
 
     #[test]

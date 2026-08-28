@@ -959,6 +959,9 @@ HIR and legacy lowering rewind the optional start cursor, current cursor, and
 end cursor in the same order.
 The `FOLLOWING` start delay is shared too: bounded `ROWS`/`GROUPS` frames keep
 the existing `end - start` register adjustment, while `RANGE` remains exempt.
+The crossed-bound empty-frame guard now owns the shared branch, cursor rewind,
+rowid reset, and sorter reset sequence. Representation-specific aggregate and
+row output remain callbacks in their original bytecode positions.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
