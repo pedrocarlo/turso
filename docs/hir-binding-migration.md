@@ -945,6 +945,9 @@ Bounded frame offsets now share evaluation timing and runtime checks. HIR
 classifies resolved expressions with the iterative expression fold, lowers
 accepted constants directly, and preserves SQLite's NULL substitution for
 columns, functions, subqueries, and current-time values.
+Frame-offset registers now use one explicit `None`, start, end, or both state.
+Legacy and HIR allocate that state from their own frame bounds, while the
+runtime loop consumes the same accessors and keeps the existing opcode order.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

@@ -21,9 +21,10 @@ use crate::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
             emit_window_frame_offset, emit_window_key_gather, emit_window_partition_change,
             emit_window_partition_reset, emit_window_peer_change, open_window_buffer,
-            prepare_window_frame_tracking, prepare_window_input_state, prepare_window_peer_state,
-            window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
-            WindowBufferRuntime, WindowFrameBoundSide, WindowFrameTracking, WindowFunctionRuntime,
+            prepare_window_frame_offsets, prepare_window_frame_tracking,
+            prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
+            BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFrameBoundSide,
+            WindowFrameOffsets, WindowFrameTracking, WindowFunctionRuntime,
             WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
             WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
         },
@@ -731,6 +732,24 @@ pub(super) fn prepare_hir_window_frame_tracking(
         program,
         plan.window.frame.exclude.is_some(),
         plan.needs_positional_tracking(),
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn prepare_hir_window_frame_offsets(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+) -> WindowFrameOffsets {
+    prepare_window_frame_offsets(
+        program,
+        matches!(
+            plan.window.frame.start,
+            hir::WindowFrameBound::Preceding(_) | hir::WindowFrameBound::Following(_)
+        ),
+        matches!(
+            plan.window.frame.end,
+            Some(hir::WindowFrameBound::Preceding(_)) | Some(hir::WindowFrameBound::Following(_))
+        ),
     )
 }
 
@@ -1750,6 +1769,37 @@ mod tests {
                  ) FROM items"
             ),
             WindowFrameTracking::Excluded { .. }
+        ));
+    }
+
+    #[test]
+    fn hir_window_frame_offsets_have_one_explicit_state() {
+        fn offsets(frame: &str) -> WindowFrameOffsets {
+            let document = analyze_sql(&format!(
+                "SELECT sum(value) OVER (ROWS BETWEEN {frame}) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            prepare_hir_window_frame_offsets(&mut program, &plan)
+        }
+
+        assert!(matches!(
+            offsets("UNBOUNDED PRECEDING AND CURRENT ROW"),
+            WindowFrameOffsets::None
+        ));
+        assert!(matches!(
+            offsets("1 PRECEDING AND CURRENT ROW"),
+            WindowFrameOffsets::Start { .. }
+        ));
+        assert!(matches!(
+            offsets("UNBOUNDED PRECEDING AND 1 FOLLOWING"),
+            WindowFrameOffsets::End { .. }
+        ));
+        assert!(matches!(
+            offsets("1 PRECEDING AND 1 FOLLOWING"),
+            WindowFrameOffsets::Both { .. }
         ));
     }
 

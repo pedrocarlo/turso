@@ -1007,6 +1007,81 @@ pub(crate) fn emit_window_peer_seed(program: &mut ProgramBuilder, state: WindowP
     }
 }
 
+/// Runtime countdown registers for bounded frame edges.
+///
+/// A start boundary "N rows away" means one piece of work has to wait until
+/// we have moved N rows along. `OP_IfPos` skips that work and ticks the start
+/// counter down until it reaches zero:
+/// - `ROWS BETWEEN N PRECEDING AND CURRENT ROW` delays AGGINVERSE, so the
+///   frame first grows to N+1 rows before it starts sliding forward.
+/// - cume_dist's implicit `1 FOLLOWING` start delays RETURN_ROW.
+///
+/// An end boundary "N rows away" delays work until we have moved N rows
+/// further along:
+/// - `N FOLLOWING` delays RETURN_ROW and AGGINVERSE.
+/// - `N PRECEDING` delays AGGSTEP.
+///
+/// The expressions are evaluated at the start of every partition because
+/// these registers are decremented while that partition runs. Mirrors
+/// SQLite's `regStart` and `regEnd` (window.c:2883-2887).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowFrameOffsets {
+    None,
+    /// The offset N from a frame whose start is `N PRECEDING` or
+    /// `N FOLLOWING`, worked out once per partition. This is a countdown:
+    /// `OP_IfPos` skips work and ticks it down until it reaches zero.
+    Start {
+        start: usize,
+    },
+    /// The offset N from a frame whose end is `N PRECEDING` or
+    /// `N FOLLOWING`, worked out once per partition. This is a countdown
+    /// for work that must wait until the end boundary is reached.
+    End {
+        end: usize,
+    },
+    /// Independent countdowns for bounded start and end expressions.
+    Both {
+        start: usize,
+        end: usize,
+    },
+}
+
+impl WindowFrameOffsets {
+    pub(crate) const fn start(self) -> Option<usize> {
+        match self {
+            Self::Start { start } | Self::Both { start, .. } => Some(start),
+            Self::None | Self::End { .. } => None,
+        }
+    }
+
+    pub(crate) const fn end(self) -> Option<usize> {
+        match self {
+            Self::End { end } | Self::Both { end, .. } => Some(end),
+            Self::None | Self::Start { .. } => None,
+        }
+    }
+}
+
+pub(crate) fn prepare_window_frame_offsets(
+    program: &mut ProgramBuilder,
+    has_start: bool,
+    has_end: bool,
+) -> WindowFrameOffsets {
+    match (has_start, has_end) {
+        (false, false) => WindowFrameOffsets::None,
+        (true, false) => WindowFrameOffsets::Start {
+            start: program.alloc_register(),
+        },
+        (false, true) => WindowFrameOffsets::End {
+            end: program.alloc_register(),
+        },
+        (true, true) => WindowFrameOffsets::Both {
+            start: program.alloc_register(),
+            end: program.alloc_register(),
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WindowFrameTracking {
     None,
@@ -1124,40 +1199,9 @@ pub struct WindowRegisters {
     /// The REPLAY side of peer tracking, one entry per frame cursor. See
     /// [`CursorPeerValues`].
     pub cursor_peer_values: CursorPeerValues,
-    /// The offset N from a frame whose start is `N PRECEDING` or
-    /// `N FOLLOWING`, worked out once per partition (N can be an
-    /// expression, not just a literal number).
-    ///
-    /// Like `end_offset_reg`, this is a countdown: a start boundary "N rows
-    /// away" means one piece of work has to wait until we have moved N rows
-    /// along. `OP_IfPos` skips that work and ticks the counter down until it
-    /// reaches zero.
-    /// - `ROWS BETWEEN N PRECEDING AND CURRENT ROW` uses it to delay
-    ///   dropping rows off the start of the frame (AGGINVERSE), so the frame
-    ///   first grows to N+1 rows before it starts sliding forward.
-    /// - cume_dist's implicit `1 FOLLOWING` start uses it to delay emitting
-    ///   results (RETURN_ROW).
-    ///
-    /// Mirrors SQLite's `regStart` (window.c:2883).
-    pub start_offset_reg: Option<usize>,
-    /// The offset N from a frame whose end is `N PRECEDING` or
-    /// `N FOLLOWING`, worked out once at run time (N can be an expression,
-    /// not just a literal number).
-    ///
-    /// We process one row at a time, but an end boundary "N rows away"
-    /// means some work for the current row can't be done yet — we have to
-    /// wait until we have moved N rows further along. This register counts
-    /// those N rows down. Which piece of work waits depends on where the
-    /// frame ends:
-    /// - End is `N FOLLOWING` (the frame reaches N rows past the current
-    ///   row): emitting the current row's result, and dropping rows that
-    ///   have fallen off the start of the frame, both wait N rows.
-    /// - End is `N PRECEDING` (the frame stops N rows before the current
-    ///   row): adding a row to the totals waits N rows.
-    ///
-    /// `None` for any other end (CURRENT ROW, UNBOUNDED FOLLOWING), which
-    /// need no waiting. Mirrors SQLite's `regEnd` (window.c:2885-2887).
-    pub end_offset_reg: Option<usize>,
+    /// Runtime countdowns for bounded frame edges. Mirrors SQLite's
+    /// `regStart` and `regEnd` (window.c:2883-2887).
+    pub(crate) frame_offsets: WindowFrameOffsets,
     pub(crate) frame_tracking: WindowFrameTracking,
     /// The register holding the return address for calls to the
     /// `row_output` subroutine (see `WindowLabels::row_output`): the
@@ -1839,20 +1883,19 @@ impl EmitWindow {
                 // window.c:2892-2896.
                 source_peer_values: peer_state.previous_input,
                 cursor_peer_values: peer_state.cursors,
-                start_offset_reg: match window.frame.start {
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                    | crate::translate::plan::FrameBoundary::Following(_) => {
-                        Some(program.alloc_register())
-                    }
-                    _ => None,
-                },
-                end_offset_reg: match window.frame.end {
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                    | crate::translate::plan::FrameBoundary::Following(_) => {
-                        Some(program.alloc_register())
-                    }
-                    _ => None,
-                },
+                frame_offsets: prepare_window_frame_offsets(
+                    program,
+                    matches!(
+                        window.frame.start,
+                        crate::translate::plan::FrameBoundary::Preceding(_)
+                            | crate::translate::plan::FrameBoundary::Following(_)
+                    ),
+                    matches!(
+                        window.frame.end,
+                        crate::translate::plan::FrameBoundary::Preceding(_)
+                            | crate::translate::plan::FrameBoundary::Following(_)
+                    ),
+                ),
                 frame_tracking,
                 row_output_return: program.alloc_register(),
             },
@@ -1968,7 +2011,7 @@ impl EmitWindow {
         // start of each partition: setting it just once up front would
         // leave the decremented (wrong) value in place from the second
         // partition on. Mirrors SQLite's `regStart` init at `window.c:2942`.
-        if let Some(start_offset_reg) = registers.start_offset_reg {
+        if let Some(start_offset_reg) = registers.frame_offsets.start() {
             let offset_expr = match &window.frame.start {
                 crate::translate::plan::FrameBoundary::Preceding(expr)
                 | crate::translate::plan::FrameBoundary::Following(expr) => expr,
@@ -1986,7 +2029,7 @@ impl EmitWindow {
                 WindowFrameBoundSide::Start,
             )?;
         }
-        if let Some(end_offset_reg) = registers.end_offset_reg {
+        if let Some(end_offset_reg) = registers.frame_offsets.end() {
             let offset_expr = match &window.frame.end {
                 crate::translate::plan::FrameBoundary::Preceding(expr)
                 | crate::translate::plan::FrameBoundary::Following(expr) => expr,
@@ -2037,10 +2080,12 @@ impl EmitWindow {
             );
         if same_kind_bounded {
             let start_offset_reg = registers
-                .start_offset_reg
+                .frame_offsets
+                .start()
                 .expect("same-kind bounded frames carry a start offset");
             let end_offset_reg = registers
-                .end_offset_reg
+                .frame_offsets
+                .end()
                 .expect("same-kind bounded frames carry an end offset");
             let label_frame_valid = program.allocate_label();
             program.add_comment(program.offset(), "empty-frame check");
@@ -2102,9 +2147,10 @@ impl EmitWindow {
             crate::translate::plan::FrameBoundary::Following(_)
         ) && window.frame.mode != turso_parser::ast::FrameMode::Range
         {
-            if let (Some(start_offset_reg), Some(end_offset_reg)) =
-                (registers.start_offset_reg, registers.end_offset_reg)
-            {
+            if let (Some(start_offset_reg), Some(end_offset_reg)) = (
+                registers.frame_offsets.start(),
+                registers.frame_offsets.end(),
+            ) {
                 program.emit_insn(Insn::Subtract {
                     lhs: end_offset_reg,
                     rhs: start_offset_reg,
@@ -2200,7 +2246,8 @@ impl EmitWindow {
                         RangeCmp::Ge,
                         cursors.csr_current,
                         registers
-                            .end_offset_reg
+                            .frame_offsets
+                            .end()
                             .expect("bounded RANGE end has an offset register"),
                         cursors.csr_end,
                         label_done,
@@ -2210,7 +2257,7 @@ impl EmitWindow {
                         t_ctx,
                         plan,
                         WindowOp::AggInverse,
-                        registers.start_offset_reg,
+                        registers.frame_offsets.start(),
                         None,
                         false,
                     )?;
@@ -2225,7 +2272,7 @@ impl EmitWindow {
                         t_ctx,
                         plan,
                         WindowOp::ReturnRow,
-                        registers.end_offset_reg,
+                        registers.frame_offsets.end(),
                         None,
                         false,
                     )?;
@@ -2234,7 +2281,7 @@ impl EmitWindow {
                         t_ctx,
                         plan,
                         WindowOp::AggInverse,
-                        registers.start_offset_reg,
+                        registers.frame_offsets.start(),
                         None,
                         false,
                     )?;
@@ -2252,7 +2299,7 @@ impl EmitWindow {
                 t_ctx,
                 plan,
                 WindowOp::AggStep,
-                registers.end_offset_reg,
+                registers.frame_offsets.end(),
                 None,
                 false,
             )?;
@@ -2270,7 +2317,7 @@ impl EmitWindow {
                     t_ctx,
                     plan,
                     WindowOp::AggInverse,
-                    registers.start_offset_reg,
+                    registers.frame_offsets.start(),
                     None,
                     false,
                 )?;
@@ -2282,7 +2329,7 @@ impl EmitWindow {
                     t_ctx,
                     plan,
                     WindowOp::AggInverse,
-                    registers.start_offset_reg,
+                    registers.frame_offsets.start(),
                     None,
                     false,
                 )?;
@@ -2291,7 +2338,7 @@ impl EmitWindow {
             // Pattern C — everything else (window.c:3010-3037).
             emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
             if !end_is_unbounded {
-                let range_loop = (is_range && registers.end_offset_reg.is_some()).then(|| {
+                let range_loop = (is_range && registers.frame_offsets.end().is_some()).then(|| {
                     let label = program.allocate_label();
                     program.preassign_label_to_next_insn(label);
                     label
@@ -2303,7 +2350,7 @@ impl EmitWindow {
                         plan,
                         RangeCmp::Ge,
                         cursors.csr_current,
-                        registers.end_offset_reg.expect("checked above"),
+                        registers.frame_offsets.end().expect("checked above"),
                         cursors.csr_end,
                         label_done,
                     )?;
@@ -2315,7 +2362,7 @@ impl EmitWindow {
                 // skips both together. SQLite emits it inline at
                 // window.c:3028-3034.
                 let label_skip_pair = (!is_range)
-                    .then_some(registers.end_offset_reg)
+                    .then_some(registers.frame_offsets.end())
                     .flatten()
                     .map(|end_offset_reg| {
                         let label = program.allocate_label();
@@ -2338,7 +2385,7 @@ impl EmitWindow {
                     t_ctx,
                     plan,
                     WindowOp::AggInverse,
-                    registers.start_offset_reg,
+                    registers.frame_offsets.start(),
                     None,
                     false,
                 )?;
@@ -4245,7 +4292,7 @@ pub fn emit_window_flush(
             t_ctx,
             plan,
             WindowOp::AggStep,
-            registers.end_offset_reg,
+            registers.frame_offsets.end(),
             None,
             true,
         )?;
@@ -4257,7 +4304,7 @@ pub fn emit_window_flush(
                 t_ctx,
                 plan,
                 WindowOp::AggInverse,
-                registers.start_offset_reg,
+                registers.frame_offsets.start(),
                 None,
                 true,
             )?;
@@ -4291,11 +4338,14 @@ pub fn emit_window_flush(
         emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
         let (return_row_countdown, agg_inverse_countdown) =
             if window.frame.mode == turso_parser::ast::FrameMode::Range {
-                (None, registers.start_offset_reg)
+                (None, registers.frame_offsets.start())
             } else if matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
-                (registers.start_offset_reg, None)
+                (registers.frame_offsets.start(), None)
             } else {
-                (registers.end_offset_reg, registers.start_offset_reg)
+                (
+                    registers.frame_offsets.end(),
+                    registers.frame_offsets.start(),
+                )
             };
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
@@ -4390,7 +4440,7 @@ pub fn emit_window_flush(
             t_ctx,
             plan,
             WindowOp::AggInverse,
-            registers.start_offset_reg,
+            registers.frame_offsets.start(),
             None,
             true,
         )?;
