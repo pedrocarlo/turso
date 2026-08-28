@@ -1089,6 +1089,24 @@ pub(crate) fn emit_window_nonempty_branch(
     }
 }
 
+pub(crate) fn emit_window_following_start_delay(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    offsets: WindowFrameOffsets,
+) {
+    if frame.mode == FrameMode::Range || frame.start != WindowFrameEdge::Following {
+        return;
+    }
+    let WindowFrameOffsets::Both { start, end } = offsets else {
+        return;
+    };
+    program.emit_insn(Insn::Subtract {
+        lhs: end,
+        rhs: start,
+        dest: start,
+    });
+}
+
 fn legacy_window_frame_edge(boundary: &crate::translate::plan::FrameBoundary) -> WindowFrameEdge {
     match boundary {
         crate::translate::plan::FrameBoundary::UnboundedPreceding => {
@@ -2232,18 +2250,7 @@ impl EmitWindow {
         // rather than lag emitting the result (RETURN_ROW) by M. So the
         // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
-        if frame.start == WindowFrameEdge::Following && frame.mode != FrameMode::Range {
-            if let (Some(start_offset_reg), Some(end_offset_reg)) = (
-                registers.frame_offsets.start(),
-                registers.frame_offsets.end(),
-            ) {
-                program.emit_insn(Insn::Subtract {
-                    lhs: end_offset_reg,
-                    rhs: start_offset_reg,
-                    dest: start_offset_reg,
-                });
-            }
-        }
+        emit_window_following_start_delay(program, frame, registers.frame_offsets);
         // Position each frame cursor at the just-inserted first row.
         // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
         // the frame start isn't UNBOUNDED PRECEDING (otherwise the

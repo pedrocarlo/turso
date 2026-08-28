@@ -41,7 +41,9 @@ use crate::translate::window::{
 };
 
 #[cfg(test)]
-use crate::translate::window::{emit_window_frame_cursor_rewind, WindowCursors};
+use crate::translate::window::{
+    emit_window_following_start_delay, emit_window_frame_cursor_rewind, WindowCursors,
+};
 
 #[cfg(test)]
 use crate::translate::window::emit_window_peer_seed;
@@ -1917,6 +1919,50 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_following_frame_uses_shared_start_delay() {
+        fn delay(sql: &str) -> (WindowFrameOffsets, ProgramBuilder) {
+            let document = analyze_sql(sql);
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+            emit_window_following_start_delay(
+                &mut program,
+                hir_window_frame_shape(&plan.window.frame),
+                offsets,
+            );
+            (offsets, program)
+        }
+
+        let (offsets, program) = delay(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",
+        );
+        let WindowFrameOffsets::Both { start, end } = offsets else {
+            panic!("bounded following frame has both offsets");
+        };
+        let [subtract] = program.insns.as_slice() else {
+            panic!("bounded ROWS following frame emits one delay adjustment");
+        };
+        assert!(matches!(
+            subtract.0,
+            Insn::Subtract { lhs, rhs, dest }
+                if lhs == end && rhs == start && dest == start
+        ));
+
+        let (_, range) = delay(
+            "SELECT sum(value) OVER (ORDER BY sort_key RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING) \
+             FROM items",
+        );
+        assert!(range.insns.is_empty());
+
+        let (_, preceding) = delay(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM items",
+        );
+        assert!(preceding.insns.is_empty());
     }
 
     #[test]

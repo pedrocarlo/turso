@@ -957,6 +957,8 @@ and legacy frame state can classify that check without carrying expressions.
 First-row frame cursor positioning is shared without allocating a cursor list.
 HIR and legacy lowering rewind the optional start cursor, current cursor, and
 end cursor in the same order.
+The `FOLLOWING` start delay is shared too: bounded `ROWS`/`GROUPS` frames keep
+the existing `end - start` register adjustment, while `RANGE` remains exempt.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
