@@ -854,6 +854,55 @@ pub(super) fn emit_hir_window_frame_offset(
     )
 }
 
+/// Evaluate the bounded frame offsets at the start of one partition.
+///
+/// The runtime decrements these registers while walking the partition, so
+/// they must be rebuilt for each partition. Keep start before end to match
+/// the legacy window loop.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_frame_offsets(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    plan: &HirWindowBufferPlan<'_>,
+    offsets: WindowFrameOffsets,
+) -> Result<()> {
+    if let Some(register) = offsets.start() {
+        let expression = match &plan.window.frame.start {
+            hir::WindowFrameBound::Preceding(expression)
+            | hir::WindowFrameBound::Following(expression) => expression,
+            _ => unreachable!("a start offset is only allocated for a bounded frame start"),
+        };
+        emit_hir_window_frame_offset(
+            program,
+            document,
+            expression,
+            register,
+            plan.window.frame.mode,
+            WindowFrameBoundSide::Start,
+        )?;
+    }
+
+    if let Some(register) = offsets.end() {
+        let expression = match &plan.window.frame.end {
+            Some(
+                hir::WindowFrameBound::Preceding(expression)
+                | hir::WindowFrameBound::Following(expression),
+            ) => expression,
+            _ => unreachable!("an end offset is only allocated for a bounded frame end"),
+        };
+        emit_hir_window_frame_offset(
+            program,
+            document,
+            expression,
+            register,
+            plan.window.frame.mode,
+            WindowFrameBoundSide::End,
+        )?;
+    }
+
+    Ok(())
+}
+
 struct HirWindowValueEmitter<'document, 'inputs> {
     document: &'document hir::HirDocument,
     late_inputs: &'inputs [HirWindowLateInput<'document>],
@@ -2172,6 +2221,52 @@ mod tests {
             &instruction.0,
             Insn::Halt { description, .. }
                 if description == "frame starting offset must be a non-negative integer"
+        )));
+    }
+
+    #[test]
+    fn hir_window_frame_offsets_are_rebuilt_in_legacy_order() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+            .expect("window buffer plans");
+        let mut program = program();
+        let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+        let WindowFrameOffsets::Both { start, end } = offsets else {
+            panic!("both bounded frame edges have offset registers");
+        };
+
+        emit_hir_window_frame_offsets(&mut program, &document, &plan, offsets)
+            .expect("frame offsets emit");
+
+        let start_value = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Integer { value: 2, dest } if *dest == start)
+            })
+            .expect("start offset is evaluated");
+        let end_value = program
+            .insns
+            .iter()
+            .position(|(instruction, _)| {
+                matches!(instruction, Insn::Integer { value: 3, dest } if *dest == end)
+            })
+            .expect("end offset is evaluated");
+        assert!(start_value < end_value);
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Halt { description, .. }
+                if description == "frame starting offset must be a non-negative integer"
+        )));
+        assert!(program.insns.iter().any(|(instruction, _)| matches!(
+            instruction,
+            Insn::Halt { description, .. }
+                if description == "frame ending offset must be a non-negative integer"
         )));
     }
 

@@ -965,6 +965,9 @@ row output remain callbacks in their original bytecode positions.
 Window aggregate result emission now consumes the shared function runtime and
 an explicit value/finalize mode. HIR and legacy use the same min/max, positional,
 `AggValue`, and `AggFinal` paths without collecting a temporary min/max vector.
+HIR bounded frame offsets now have one partition-entry emitter. It rebuilds the
+start and end countdown registers in legacy order through the existing shared
+offset checks, ready for the HIR first-row frame path.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
