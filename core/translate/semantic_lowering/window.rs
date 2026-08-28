@@ -16,11 +16,11 @@ use crate::{
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_key_gather,
-            emit_window_partition_change, open_window_buffer, prepare_window_input_state,
-            prepare_window_peer_state, window_function_uses_subtypes, BufferedWindowValue,
-            WindowBufferInput, WindowBufferRuntime, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState, WindowPeerState,
-            WindowStepContext, WindowValueEmitter,
+            emit_window_partition_change, emit_window_peer_change, open_window_buffer,
+            prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
+            BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFunctionRuntime,
+            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
+            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -529,6 +529,21 @@ pub(super) fn prepare_hir_window_peer_state(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_peer_change(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    state: WindowPeerState,
+    target_if_peer: BranchOffset,
+) -> Result<()> {
+    emit_window_peer_change(
+        program,
+        WindowPeerComparison::from_registers(state.key_count, state.current, state.previous_input),
+        plan.order_key_info(),
+        target_if_peer,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_hir_window_input_state(
     program: &mut ProgramBuilder,
     plan: &HirWindowBufferPlan<'_>,
@@ -1015,6 +1030,76 @@ mod tests {
 
         emit_window_peer_seed(&mut rows_program, state);
         assert!(rows_program.insns.is_empty());
+    }
+
+    #[test]
+    fn hir_window_peer_change_uses_resolved_keys_and_no_order_rule() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 ORDER BY sort_key COLLATE nocase \
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut keyed_program = program();
+        let state = prepare_hir_window_peer_state(&mut keyed_program, &plan);
+        let current = state.current.expect("ORDER BY keys are allocated");
+        let previous = state
+            .previous_input
+            .expect("RANGE tracks previous input keys");
+        let peer = keyed_program.allocate_label();
+
+        emit_hir_window_peer_change(&mut keyed_program, &plan, state, peer)
+            .expect("resolved peer keys compare");
+
+        let [compare, jump, copy] = keyed_program.insns.as_slice() else {
+            panic!("keyed peer change emits Compare, Jump, and Copy");
+        };
+        assert!(matches!(
+            &compare.0,
+            Insn::Compare {
+                count: 1,
+                key_info,
+                ..
+            } if key_info[0].collation == CollationSeq::NoCase
+        ));
+        assert!(matches!(
+            jump.0,
+            Insn::Jump {
+                target_pc_eq,
+                ..
+            } if target_pc_eq == peer
+        ));
+        assert!(matches!(
+            copy.0,
+            Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 0,
+            } if src_reg == current && dst_reg == previous
+        ));
+
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut unordered_program = program();
+        let state = prepare_hir_window_peer_state(&mut unordered_program, &plan);
+        let peer = unordered_program.allocate_label();
+
+        emit_hir_window_peer_change(&mut unordered_program, &plan, state, peer)
+            .expect("an unordered partition is one peer group");
+
+        assert!(matches!(
+            unordered_program.insns.as_slice(),
+            [(Insn::Goto { target_pc }, _)] if *target_pc == peer
+        ));
     }
 
     #[test]

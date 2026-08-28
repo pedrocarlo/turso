@@ -877,6 +877,34 @@ pub(crate) struct WindowPeerState {
     pub(crate) cursors: CursorPeerValues,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WindowPeerComparison {
+    AllRows,
+    Keys {
+        current: usize,
+        previous: usize,
+        count: usize,
+    },
+}
+
+impl WindowPeerComparison {
+    pub(crate) fn from_registers(
+        count: usize,
+        current: Option<usize>,
+        previous: Option<usize>,
+    ) -> Self {
+        if count == 0 {
+            Self::AllRows
+        } else {
+            Self::Keys {
+                current: current.expect("current peer keys must exist when ORDER BY is present"),
+                previous: previous.expect("previous peer keys must exist when ORDER BY is present"),
+                count,
+            }
+        }
+    }
+}
+
 pub(crate) fn prepare_window_peer_state(
     program: &mut ProgramBuilder,
     key_count: usize,
@@ -1250,6 +1278,53 @@ pub(crate) fn emit_window_key_compare(
         target_pc_gt: if_different,
     });
     Ok(count)
+}
+
+/// Compare the current ORDER BY values against the remembered ones: jump to
+/// `target_if_peer` when they're equal (the two rows are peers), otherwise
+/// copy the current values into the remembered registers and fall through.
+/// With no ORDER BY every row counts as a peer, so this becomes an
+/// unconditional jump. Mirrors SQLite's `windowIfNewPeer`
+/// (window.c:2057-2078).
+pub(crate) fn emit_window_peer_change(
+    program: &mut ProgramBuilder,
+    comparison: WindowPeerComparison,
+    key_info: impl IntoIterator<Item = Result<KeyInfo>>,
+    target_if_peer: BranchOffset,
+) -> Result<()> {
+    match comparison {
+        WindowPeerComparison::AllRows => {
+            program.emit_insn(Insn::Goto {
+                target_pc: target_if_peer,
+            });
+        }
+        WindowPeerComparison::Keys {
+            current,
+            previous,
+            count,
+        } => {
+            let changed = program.allocate_label();
+            let compared = emit_window_key_compare(
+                program,
+                current,
+                previous,
+                key_info,
+                target_if_peer,
+                changed,
+            )?;
+            turso_assert!(
+                compared == count,
+                "window peer register width must match key metadata"
+            );
+            program.preassign_label_to_next_insn(changed);
+            program.emit_insn(Insn::Copy {
+                src_reg: current,
+                dst_reg: previous,
+                extra_amount: compared - 1,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1994,12 +2069,14 @@ impl EmitWindow {
                 program.offset(),
                 "peer of previous row: buffer only, handle at group end",
             );
-            emit_if_new_peer(
+            emit_window_peer_change(
                 program,
-                window,
-                &plan.table_references,
-                registers.new_order_by_columns_start,
-                registers.source_peer_values,
+                WindowPeerComparison::from_registers(
+                    window.order_by.len(),
+                    registers.new_order_by_columns_start,
+                    registers.source_peer_values,
+                ),
+                order_by_key_info(window, &plan.table_references),
                 label_step_end,
             )?;
         }
@@ -2190,47 +2267,6 @@ impl EmitWindow {
 
         Ok(())
     }
-}
-
-/// Compare the ORDER BY values at `reg_new` against the remembered ones at
-/// `reg_old`: jump to `target_if_peer` when they're equal (the two rows
-/// are peers), otherwise copy the new values into `reg_old` and fall
-/// through. With no ORDER BY every row counts as a peer, so this becomes
-/// an unconditional jump. Mirrors SQLite's `windowIfNewPeer`
-/// (window.c:2057-2078).
-fn emit_if_new_peer(
-    program: &mut ProgramBuilder,
-    window: &Window,
-    table_references: &TableReferences,
-    reg_new: Option<usize>,
-    reg_old: Option<usize>,
-    target_if_peer: BranchOffset,
-) -> Result<()> {
-    let order_by_len = window.order_by.len();
-    if order_by_len == 0 {
-        program.emit_insn(Insn::Goto {
-            target_pc: target_if_peer,
-        });
-        return Ok(());
-    }
-    let reg_new = reg_new.expect("new_order_by_columns_start must exist when ORDER BY is present");
-    let reg_old = reg_old.expect("peer reference register must exist when ORDER BY is present");
-    let label_new_peer = program.allocate_label();
-    emit_window_key_compare(
-        program,
-        reg_new,
-        reg_old,
-        order_by_key_info(window, table_references),
-        target_if_peer,
-        label_new_peer,
-    )?;
-    program.preassign_label_to_next_insn(label_new_peer);
-    program.emit_insn(Insn::Copy {
-        src_reg: reg_new,
-        dst_reg: reg_old,
-        extra_amount: order_by_len - 1,
-    });
-    Ok(())
 }
 
 fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Option<usize> {
@@ -3225,12 +3261,10 @@ fn emit_window_op(
             }
             temp_start
         });
-        emit_if_new_peer(
+        emit_window_peer_change(
             program,
-            window,
-            &plan.table_references,
-            temp_start,
-            peer_ref_reg,
+            WindowPeerComparison::from_registers(order_by_len, temp_start, peer_ref_reg),
+            order_by_key_info(window, &plan.table_references),
             label_continue,
         )?;
     }

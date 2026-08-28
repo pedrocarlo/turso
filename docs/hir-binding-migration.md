@@ -929,6 +929,9 @@ direct register copies without building an intermediate slot vector.
 Legacy and HIR now allocate current ORDER BY keys plus input and cursor peer
 reference registers through the same frame-gated state. First-row peer seeding
 uses the same copy sequence and preserves the legacy register order.
+Peer-group changes now use one shared emitter too. The no-ORDER case is an
+explicit all-rows state; keyed comparisons accept lazy legacy or resolved HIR
+key metadata, then update the remembered keys with the same copy sequence.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
