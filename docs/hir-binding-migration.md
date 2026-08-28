@@ -903,7 +903,11 @@ window initialization uses this helper without changing its frame plan or
 opcode flow. HIR window plans now open this same cursor set from their resolved
 frame and function requirements. Their ephemeral table schema carries only the
 planned record width because expression types, collations, and comparison rules
-remain owned by resolved HIR facts. HIR does not populate the buffer yet.
+remain owned by resolved HIR facts. Window input register ranges and buffer
+insertion are now representation-neutral as well. Legacy and HIR rows use the
+same `MakeRecord`, `NewRowid`, and `Insert` sequence without rebuilding HIR
+expressions or consulting table references. The production HIR window frame
+loop does not call this insertion path yet.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

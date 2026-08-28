@@ -16,9 +16,9 @@ use crate::{
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, open_window_buffer,
-            window_function_uses_subtypes, BufferedWindowValue, WindowBufferRuntime,
-            WindowFunctionRuntime, WindowFunctionRuntimeSpec, WindowStepContext,
-            WindowValueEmitter,
+            window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
+            WindowBufferRuntime, WindowFunctionRuntime, WindowFunctionRuntimeSpec,
+            WindowStepContext, WindowValueEmitter,
         },
     },
     vdbe::{builder::ProgramBuilder, insn::Insn, CursorID},
@@ -46,14 +46,6 @@ impl<'a> HirWindowBufferColumn<'a> {
             Self::Evaluate(expression) | Self::Source { expression, .. } => expression,
         }
     }
-}
-
-/// Contiguous registers holding one source row in window-buffer order.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct HirWindowInputRow {
-    pub(super) start: usize,
-    pub(super) count: usize,
 }
 
 /// One exact HIR leaf and the window-buffer column holding its value.
@@ -445,8 +437,8 @@ pub(super) fn emit_hir_window_input_row(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
     plan: &HirWindowBufferPlan<'_>,
-) -> Result<HirWindowInputRow> {
-    let row = HirWindowInputRow {
+) -> Result<WindowBufferInput> {
+    let row = WindowBufferInput {
         start: program.alloc_registers(plan.columns.len()),
         count: plan.columns.len(),
     };
@@ -663,6 +655,7 @@ mod tests {
             SemanticOptions, SemanticRootInput,
         },
         vdbe::builder::{CursorType, ProgramBuilderOpts, QueryMode, SourceBinding},
+        vdbe::insn::InsertFlags,
         SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
@@ -823,7 +816,7 @@ mod tests {
 
         assert_eq!(
             row,
-            HirWindowInputRow {
+            WindowBufferInput {
                 start: expected_start,
                 count: 0
             }
@@ -874,6 +867,75 @@ mod tests {
             false,
             true,
         );
+    }
+
+    #[test]
+    fn hir_window_row_uses_shared_buffer_insertion() {
+        let document = analyze_sql("SELECT sum(value) OVER () FROM items");
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let source = column_reference(&plan.columns[0]).expect("argument column is buffered");
+        let mut program = program();
+        let runtime = open_hir_window_buffer(&mut program, &plan);
+        let source_start = program.alloc_register();
+        program.bind_source(
+            source.source,
+            SourceBinding::Registers {
+                start: source_start,
+                rowid: None,
+            },
+        );
+        let input = emit_hir_window_input_row(&mut program, &document, &plan)
+            .expect("window input row lowers");
+        let rowid = program.alloc_register();
+        let insertion_start = program.insns.len();
+
+        crate::translate::window::emit_window_buffer_insert(
+            &mut program,
+            &runtime.cursors,
+            input,
+            rowid,
+            &runtime.table.name,
+        );
+
+        let [make_record, new_rowid, insert] = &program.insns[insertion_start..] else {
+            panic!("window insertion emits exactly three instructions");
+        };
+        let Insn::MakeRecord {
+            start_reg,
+            count,
+            dest_reg: record,
+            index_name: None,
+            affinity_str: None,
+        } = &make_record.0
+        else {
+            panic!("window insertion starts by building the input record");
+        };
+        assert_eq!(*start_reg, crate::vdbe::insn::to_u32(input.start));
+        assert_eq!(*count, crate::vdbe::insn::to_u32(input.count));
+        assert!(matches!(
+            &new_rowid.0,
+            Insn::NewRowid {
+                cursor,
+                rowid_reg,
+                prev_largest_reg: 0,
+            } if *cursor == runtime.cursors.csr_write && *rowid_reg == rowid
+        ));
+        assert!(matches!(
+            &insert.0,
+            Insn::Insert {
+                cursor,
+                key_reg,
+                record_reg,
+                flag,
+                table_name,
+            } if *cursor == runtime.cursors.csr_write
+                && *key_reg == rowid
+                && *record_reg == usize::try_from(*record).expect("record register fits usize")
+                && flag.0 == InsertFlags::new().require_seek().0
+                && table_name == &runtime.table.name
+        ));
     }
 
     #[test]

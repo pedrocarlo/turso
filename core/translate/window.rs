@@ -1038,6 +1038,13 @@ pub(crate) struct WindowBufferRuntime {
     pub(crate) cursors: WindowCursors,
 }
 
+/// Consecutive registers holding one row in window-buffer column order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowBufferInput {
+    pub(crate) start: usize,
+    pub(crate) count: usize,
+}
+
 pub(crate) fn open_window_buffer(
     program: &mut ProgramBuilder,
     table: Arc<BTreeTable>,
@@ -1078,6 +1085,36 @@ pub(crate) fn open_window_buffer(
             csr_app,
         },
     }
+}
+
+pub(crate) fn emit_window_buffer_insert(
+    program: &mut ProgramBuilder,
+    cursors: &WindowCursors,
+    input: WindowBufferInput,
+    rowid: usize,
+    table_name: &str,
+) {
+    let record = program.alloc_register();
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(input.start),
+        count: to_u32(input.count),
+        dest_reg: to_u32(record),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: cursors.csr_write,
+        rowid_reg: rowid,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursors.csr_write,
+        key_reg: rowid,
+        record_reg: record,
+        flag: InsertFlags::new().require_seek(),
+        table_name: table_name.to_string(),
+    });
 }
 
 /// Builds `KeyInfo` entries for the window's ORDER BY columns, populating
@@ -1530,6 +1567,10 @@ impl EmitWindow {
         let registers = meta.registers;
         let cursors = meta.cursors;
         let src_column_count = meta.src_column_count;
+        let input = WindowBufferInput {
+            start: registers.src_columns_start,
+            count: src_column_count,
+        };
         let buffer_table_name = meta.buffer_table_name.clone();
         let minmax: Vec<_> = meta
             .functions
@@ -1648,11 +1689,11 @@ impl EmitWindow {
                 FrameBoundPosition::End,
             )?;
         }
-        emit_insert_row_into_buffer(
+        emit_window_buffer_insert(
             program,
-            &registers,
             &cursors,
-            &src_column_count,
+            input,
+            registers.rowid,
             &buffer_table_name,
         );
         // Empty-frame check (window.c:2950-2961): for non-RANGE
@@ -1785,11 +1826,11 @@ impl EmitWindow {
 
         // --- SUBSEQUENT ROW ---
         program.preassign_label_to_next_insn(label_subsequent);
-        emit_insert_row_into_buffer(
+        emit_window_buffer_insert(
             program,
-            &registers,
             &cursors,
-            &src_column_count,
+            input,
+            registers.rowid,
             &buffer_table_name,
         );
 
@@ -2207,36 +2248,6 @@ fn emit_load_order_by_columns(
             }
         }
     }
-}
-
-fn emit_insert_row_into_buffer(
-    program: &mut ProgramBuilder,
-    registers: &WindowRegisters,
-    cursors: &WindowCursors,
-    input_column_count: &usize,
-    table_name: &str,
-) {
-    let reg_record = program.alloc_register();
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(registers.src_columns_start),
-        count: to_u32(*input_column_count),
-        dest_reg: to_u32(reg_record),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::NewRowid {
-        cursor: cursors.csr_write,
-        rowid_reg: registers.rowid,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: cursors.csr_write,
-        key_reg: registers.rowid,
-        record_reg: reg_record,
-        flag: InsertFlags::new().require_seek(),
-        table_name: table_name.to_string(),
-    });
 }
 
 /// The three operations that move the frame forward, one step at a time.
