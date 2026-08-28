@@ -711,7 +711,7 @@ pub(crate) fn emit_window_partition_reset<E>(
     program: &mut ProgramBuilder,
     accumulator_start: usize,
     functions: &[WindowFunctionRuntime<E>],
-    frame_counters: Option<usize>,
+    frame_tracking: WindowFrameTracking,
 ) {
     assert!(
         !functions.is_empty(),
@@ -739,14 +739,14 @@ pub(crate) fn emit_window_partition_reset<E>(
 
     // Zero the frame-index counters for the new partition. Mirrors
     // `windowInitAccum`'s regApp reset (window.c:2010-2013).
-    if let Some(frame_counters) = frame_counters {
+    if let WindowFrameTracking::Positional { counters } = frame_tracking {
         program.emit_insn(Insn::Integer {
             value: 0,
-            dest: frame_counters,
+            dest: counters,
         });
         program.emit_insn(Insn::Integer {
             value: 0,
-            dest: frame_counters + 1,
+            dest: counters + 1,
         });
     }
 }
@@ -1007,6 +1007,70 @@ pub(crate) fn emit_window_peer_seed(program: &mut ProgramBuilder, state: WindowP
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowFrameTracking {
+    None,
+    /// Two counters tracking where the frame's edges are, so `first_value`
+    /// / `nth_value` can jump straight to a particular row of the frame by
+    /// its position:
+    ///
+    /// * `+0` — rows that have left the frame (one per AGGINVERSE), i.e.
+    ///   the frame start's buffer index minus one.
+    /// * `+1` — rows that have entered the frame (one per AGGSTEP), i.e.
+    ///   the frame end's buffer index.
+    ///
+    /// Buffer rowids run 1, 2, 3, ... within each partition, so these
+    /// indexes are also `SeekRowid` targets. One pair per window (not per
+    /// function like SQLite's `pWin->regApp`) since every function in a
+    /// window shares the same frame. Mirrors SQLite's `regApp` pair
+    /// (window.c:1457-1459, 1726, 2010-2013).
+    Positional {
+        counters: usize,
+    },
+    /// The first and last buffer rowid of the frame as it stands right now.
+    /// Only used when the window has an EXCLUDE clause. EXCLUDE means we
+    /// cannot keep a running total as rows come and go, because which rows
+    /// count keeps changing; instead we re-add up the whole frame for every
+    /// output row, and to do that we need to know exactly which rows the
+    /// frame currently spans. AGGSTEP moves the last-rowid forward as rows
+    /// join the frame, AGGINVERSE moves the first-rowid forward as rows
+    /// drop off it. They start at first=1, last=0: with the first rowid
+    /// past the last, the range covers no rows, so the frame starts empty.
+    Excluded {
+        start_rowid: usize,
+        end_rowid: usize,
+    },
+}
+
+pub(crate) fn prepare_window_frame_tracking(
+    program: &mut ProgramBuilder,
+    excluded: bool,
+    positional: bool,
+) -> WindowFrameTracking {
+    if excluded {
+        let start_rowid = program.alloc_register();
+        let end_rowid = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: start_rowid,
+        });
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: end_rowid,
+        });
+        WindowFrameTracking::Excluded {
+            start_rowid,
+            end_rowid,
+        }
+    } else if positional {
+        WindowFrameTracking::Positional {
+            counters: program.alloc_registers(2),
+        }
+    } else {
+        WindowFrameTracking::None
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct WindowRegisters {
     /// The rowid of the last row we inserted into the buffer table. It is
@@ -1094,38 +1158,12 @@ pub struct WindowRegisters {
     /// `None` for any other end (CURRENT ROW, UNBOUNDED FOLLOWING), which
     /// need no waiting. Mirrors SQLite's `regEnd` (window.c:2885-2887).
     pub end_offset_reg: Option<usize>,
-    /// The first and last buffer rowid of the frame as it stands right now.
-    /// Only used when the window has an EXCLUDE clause. EXCLUDE means we
-    /// cannot keep a running total as rows come and go, because which rows
-    /// count keeps changing; instead we re-add up the whole frame for every
-    /// output row, and to do that we need to know exactly which rows the
-    /// frame currently spans. AGGSTEP moves the last-rowid forward as rows
-    /// join the frame, AGGINVERSE moves the first-rowid forward as rows
-    /// drop off it. They start at first=1, last=0: with the first rowid
-    /// past the last, the range covers no rows, so the frame starts empty.
-    pub frame_start_rowid: Option<usize>,
-    pub frame_end_rowid: Option<usize>,
+    pub(crate) frame_tracking: WindowFrameTracking,
     /// The register holding the return address for calls to the
     /// `row_output` subroutine (see `WindowLabels::row_output`): the
     /// subroutine jumps back to whatever address is stored here when it
     /// finishes. Mirrors SQLite's `regGosub` (window.c:2793).
     pub row_output_return: usize,
-    /// Two counters tracking where the frame's edges are, so `first_value`
-    /// / `nth_value` can jump straight to a particular row of the frame by
-    /// its position:
-    ///
-    /// * `+0` — rows that have left the frame (one per AGGINVERSE), i.e.
-    ///   the frame start's buffer index minus one.
-    /// * `+1` — rows that have entered the frame (one per AGGSTEP), i.e.
-    ///   the frame end's buffer index.
-    ///
-    /// Buffer rowids run 1, 2, 3, ... within each partition, so these
-    /// indexes are also `SeekRowid` targets. One pair per window (not per
-    /// function like SQLite's `pWin->regApp`) since every function in a
-    /// window shares the same frame. `None` without first_value /
-    /// nth_value. Mirrors SQLite's `regApp` pair (window.c:1457-1459,
-    /// 1726, 2010-2013).
-    pub frame_counters: Option<usize>,
 }
 
 /// Cursors over the "buffer": a temporary B-tree table, created just for
@@ -1693,33 +1731,18 @@ impl EmitWindow {
                 )
             });
         // Frame-index counters for the positional lookups; see
-        // `WindowRegisters::frame_counters`. Only first_value / nth_value
+        // `WindowFrameTracking::Positional`. Only first_value / nth_value
         // consult them — lag / lead seek relative to the emitted row's own
         // rowid, not the frame bounds. Zeroed per partition alongside the
         // accumulator reset, so no init is needed here.
-        let frame_counters = (window.frame.exclude.is_none()
-            && window.functions.iter().any(|f| {
-                matches!(
-                    &f.func,
-                    AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
-                )
-            }))
-        .then(|| program.alloc_registers(2));
-        let (frame_start_rowid, frame_end_rowid) = if window.frame.exclude.is_some() {
-            let start = program.alloc_register();
-            let end = program.alloc_register();
-            program.emit_insn(Insn::Integer {
-                value: 1,
-                dest: start,
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: end,
-            });
-            (Some(start), Some(end))
-        } else {
-            (None, None)
-        };
+        let positional = window.functions.iter().any(|f| {
+            matches!(
+                &f.func,
+                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue),
+            )
+        });
+        let frame_tracking =
+            prepare_window_frame_tracking(program, window.frame.exclude.is_some(), positional);
         let buffer = open_window_buffer(program, buffer_table, has_moving_start, needs_csr_app);
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -1809,10 +1832,8 @@ impl EmitWindow {
                     }
                     _ => None,
                 },
-                frame_start_rowid,
-                frame_end_rowid,
+                frame_tracking,
                 row_output_return: program.alloc_register(),
-                frame_counters,
             },
             cursors: buffer.cursors,
             src_column_count,
@@ -1919,7 +1940,7 @@ impl EmitWindow {
             program,
             registers.acc_start,
             &meta.functions,
-            registers.frame_counters,
+            registers.frame_tracking,
         );
         // The same register holds the offset for every partition, and the
         // IfPos delays decrement it as they run. Re-evaluate it here at the
@@ -2620,7 +2641,7 @@ fn emit_window_agg_final(
 /// the window has an EXCLUDE clause: because some rows inside the frame are
 /// excluded, we can't keep a simple running total, so for each output row
 /// we re-add the rows the frame currently spans (the
-/// `frame_start_rowid`..`frame_end_rowid` range), skipping the excluded
+/// tracked start-to-end rowid range), skipping the excluded
 /// ones. Re-adding from scratch also sidesteps needing a subtract-a-row
 /// step for aggregates that don't have one, such as min / max and
 /// group_concat.
@@ -2643,12 +2664,13 @@ fn emit_window_full_scan(
         .exclude
         .as_ref()
         .expect("full frame scan requires an explicit EXCLUDE clause");
-    let frame_start_rowid = registers
-        .frame_start_rowid
-        .expect("EXCLUDE frame requires a start-rowid tracker");
-    let frame_end_rowid = registers
-        .frame_end_rowid
-        .expect("EXCLUDE frame requires an end-rowid tracker");
+    let WindowFrameTracking::Excluded {
+        start_rowid: frame_start_rowid,
+        end_rowid: frame_end_rowid,
+    } = registers.frame_tracking
+    else {
+        panic!("EXCLUDE frame requires rowid trackers");
+    };
     let scan_cursor = cursors
         .csr_app
         .expect("EXCLUDE frame requires a full-scan cursor");
@@ -3185,28 +3207,28 @@ fn emit_window_op(
 
     match op {
         WindowOp::AggStep => {
-            if let Some(frame_end_rowid) = registers.frame_end_rowid {
-                assert!(
-                    registers.frame_start_rowid.is_some(),
-                    "EXCLUDE frame rowid trackers must be allocated as a pair"
-                );
-                program.emit_insn(Insn::AddImm {
-                    register: frame_end_rowid,
-                    value: 1,
-                });
-            } else {
-                emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-                // Count the row just added to the frame. This runs once
-                // for every row stepped, so after AGGSTEP has stepped over
-                // a whole peer group the counter holds the frame end's
-                // position in the buffer — the row first_value / nth_value
-                // seek to. Mirrors SQLite's `OP_AddImm regApp+1` inside
-                // `windowAggStep` (window.c:1726).
-                if let Some(frame_counters) = registers.frame_counters {
+            match registers.frame_tracking {
+                WindowFrameTracking::Excluded { end_rowid, .. } => {
                     program.emit_insn(Insn::AddImm {
-                        register: frame_counters + 1,
+                        register: end_rowid,
                         value: 1,
                     });
+                }
+                WindowFrameTracking::Positional { counters } => {
+                    emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
+                    // Count the row just added to the frame. This runs once
+                    // for every row stepped, so after AGGSTEP has stepped over
+                    // a whole peer group the counter holds the frame end's
+                    // position in the buffer — the row first_value / nth_value
+                    // seek to. Mirrors SQLite's `OP_AddImm regApp+1` inside
+                    // `windowAggStep` (window.c:1726).
+                    program.emit_insn(Insn::AddImm {
+                        register: counters + 1,
+                        value: 1,
+                    });
+                }
+                WindowFrameTracking::None => {
+                    emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
                 }
             }
         }
@@ -3214,26 +3236,26 @@ fn emit_window_op(
             emit_return_one_row(program, t_ctx, plan)?;
         }
         WindowOp::AggInverse => {
-            if let Some(frame_start_rowid) = registers.frame_start_rowid {
-                assert!(
-                    registers.frame_end_rowid.is_some(),
-                    "EXCLUDE frame rowid trackers must be allocated as a pair"
-                );
-                program.emit_insn(Insn::AddImm {
-                    register: frame_start_rowid,
-                    value: 1,
-                });
-            } else {
-                emit_function_inverse(program, t_ctx, plan)?;
-                // Count the row that just left the frame; the counter is the
-                // frame start's buffer index minus one. Mirrors SQLite's
-                // `OP_AddImm regApp+0` inside `windowAggStep`
-                // (window.c:1726, `regApp+1-bInverse`).
-                if let Some(frame_counters) = registers.frame_counters {
+            match registers.frame_tracking {
+                WindowFrameTracking::Excluded { start_rowid, .. } => {
                     program.emit_insn(Insn::AddImm {
-                        register: frame_counters,
+                        register: start_rowid,
                         value: 1,
                     });
+                }
+                WindowFrameTracking::Positional { counters } => {
+                    emit_function_inverse(program, t_ctx, plan)?;
+                    // Count the row that just left the frame; the counter is the
+                    // frame start's buffer index minus one. Mirrors SQLite's
+                    // `OP_AddImm regApp+0` inside `windowAggStep`
+                    // (window.c:1726, `regApp+1-bInverse`).
+                    program.emit_insn(Insn::AddImm {
+                        register: counters,
+                        value: 1,
+                    });
+                }
+                WindowFrameTracking::None => {
+                    emit_function_inverse(program, t_ctx, plan)?;
                 }
             }
         }
@@ -3957,9 +3979,12 @@ fn emit_first_value_nth_value_lookup(
         // dense from 1 per partition, so `N + frame_counters` is the
         // target's rowid directly. Mirrors SQLite's
         // `OP_Add tmpReg, regApp` at window.c:1949.
-        let frame_counters = registers
-            .frame_counters
-            .expect("frame_counters must exist when a window contains first_value/nth_value");
+        let WindowFrameTracking::Positional {
+            counters: frame_counters,
+        } = registers.frame_tracking
+        else {
+            panic!("positional frame tracking must exist for first_value/nth_value");
+        };
         program.emit_insn(Insn::Add {
             lhs: target_reg,
             rhs: frame_counters,
@@ -4359,10 +4384,11 @@ pub fn emit_window_flush(
     program.emit_insn(Insn::ResetSorter {
         cursor_id: cursors.csr_current,
     });
-    if let Some(frame_start_rowid) = registers.frame_start_rowid {
-        let frame_end_rowid = registers
-            .frame_end_rowid
-            .expect("EXCLUDE frame rowid trackers must be allocated as a pair");
+    if let WindowFrameTracking::Excluded {
+        start_rowid: frame_start_rowid,
+        end_rowid: frame_end_rowid,
+    } = registers.frame_tracking
+    {
         program.emit_insn(Insn::Integer {
             value: 1,
             dest: frame_start_rowid,

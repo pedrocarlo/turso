@@ -17,11 +17,12 @@ use crate::{
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
             emit_window_key_gather, emit_window_partition_change, emit_window_partition_reset,
-            emit_window_peer_change, open_window_buffer, prepare_window_input_state,
-            prepare_window_peer_state, window_function_uses_subtypes, BufferedWindowValue,
-            WindowBufferInput, WindowBufferRuntime, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
-            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
+            emit_window_peer_change, open_window_buffer, prepare_window_frame_tracking,
+            prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
+            BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFrameTracking,
+            WindowFunctionRuntime, WindowFunctionRuntimeSpec, WindowInputState,
+            WindowPartitionState, WindowPeerComparison, WindowPeerState, WindowStepContext,
+            WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -149,6 +150,15 @@ impl HirWindowBufferPlan<'_> {
                     )
                 )
             })
+    }
+
+    fn needs_positional_tracking(&self) -> bool {
+        self.functions.iter().any(|function| {
+            matches!(
+                &function.function,
+                AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
+            )
+        })
     }
 }
 
@@ -704,9 +714,21 @@ pub(super) fn emit_hir_window_partition_reset(
     program: &mut ProgramBuilder,
     accumulator_start: usize,
     functions: &[WindowFunctionRuntime<&hir::Expr>],
-    frame_counters: Option<usize>,
+    frame_tracking: WindowFrameTracking,
 ) {
-    emit_window_partition_reset(program, accumulator_start, functions, frame_counters);
+    emit_window_partition_reset(program, accumulator_start, functions, frame_tracking);
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn prepare_hir_window_frame_tracking(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+) -> WindowFrameTracking {
+    prepare_window_frame_tracking(
+        program,
+        plan.window.frame.exclude.is_some(),
+        plan.needs_positional_tracking(),
+    )
 }
 
 struct HirWindowValueEmitter<'document, 'inputs> {
@@ -1598,13 +1620,16 @@ mod tests {
             prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
         let accumulator_start = program.alloc_registers(functions.len());
         let frame_counters = program.alloc_registers(2);
+        let frame_tracking = WindowFrameTracking::Positional {
+            counters: frame_counters,
+        };
         let reset_start = program.insns.len();
 
         emit_hir_window_partition_reset(
             &mut program,
             accumulator_start,
             &functions,
-            Some(frame_counters),
+            frame_tracking,
         );
 
         let [clear, reset_minmax, reset_sequence, reset_start_counter, reset_end_counter] =
@@ -1617,7 +1642,7 @@ mod tests {
             Insn::Null {
                 dest,
                 dest_end: Some(end),
-            } if dest == accumulator_start && end == accumulator_start
+            } if dest == accumulator_start && end == accumulator_start + functions.len() - 1
         ));
         assert!(matches!(reset_minmax.0, Insn::ResetSorter { .. }));
         assert!(matches!(reset_sequence.0, Insn::Integer { value: 0, .. }));
@@ -1628,6 +1653,36 @@ mod tests {
         assert!(matches!(
             reset_end_counter.0,
             Insn::Integer { value: 0, dest } if dest == frame_counters + 1
+        ));
+    }
+
+    #[test]
+    fn hir_window_frame_tracking_has_one_explicit_state() {
+        fn tracking(sql: &str) -> WindowFrameTracking {
+            let document = analyze_sql(sql);
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            prepare_hir_window_frame_tracking(&mut program, &plan)
+        }
+
+        assert!(matches!(
+            tracking("SELECT sum(value) OVER () FROM items"),
+            WindowFrameTracking::None
+        ));
+        assert!(matches!(
+            tracking("SELECT first_value(value) OVER () FROM items"),
+            WindowFrameTracking::Positional { .. }
+        ));
+        assert!(matches!(
+            tracking(
+                "SELECT sum(value) OVER (\
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                     EXCLUDE CURRENT ROW\
+                 ) FROM items"
+            ),
+            WindowFrameTracking::Excluded { .. }
         ));
     }
 
