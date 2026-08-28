@@ -13,16 +13,19 @@ use crate::{
         collate::CollationSeq,
         order_by::custom_type_comparator_from_type_fact,
         semantic::hir::{self, ExprVisitor},
-        semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
+        semantic_lowering::expr::{
+            translate_expr, translate_expr_no_constant_opt, translate_expr_with_inputs,
+            ExprRegisterInput,
+        },
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
-            emit_window_key_gather, emit_window_partition_change, emit_window_partition_reset,
-            emit_window_peer_change, open_window_buffer, prepare_window_frame_tracking,
-            prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
-            BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFrameTracking,
-            WindowFunctionRuntime, WindowFunctionRuntimeSpec, WindowInputState,
-            WindowPartitionState, WindowPeerComparison, WindowPeerState, WindowStepContext,
-            WindowValueEmitter,
+            emit_window_frame_offset, emit_window_key_gather, emit_window_partition_change,
+            emit_window_partition_reset, emit_window_peer_change, open_window_buffer,
+            prepare_window_frame_tracking, prepare_window_input_state, prepare_window_peer_state,
+            window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
+            WindowBufferRuntime, WindowFrameBoundSide, WindowFrameTracking, WindowFunctionRuntime,
+            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
+            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -728,6 +731,70 @@ pub(super) fn prepare_hir_window_frame_tracking(
         program,
         plan.window.frame.exclude.is_some(),
         plan.needs_positional_tracking(),
+    )
+}
+
+fn hir_frame_offset_is_constant(expression: &hir::Expr) -> bool {
+    expression.fold(&mut |expression, children| match expression {
+        hir::Expr::Literal(
+            turso_parser::ast::Literal::CurrentDate
+            | turso_parser::ast::Literal::CurrentTime
+            | turso_parser::ast::Literal::CurrentTimestamp,
+        ) => false,
+        hir::Expr::Literal(_) | hir::Expr::Parameter(_) => true,
+        hir::Expr::Column(_)
+        | hir::Expr::MergedColumn(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Function(_)
+        | hir::Expr::Subquery(_)
+        | hir::Expr::Array(_)
+        | hir::Expr::Subscript { .. }
+        | hir::Expr::FieldAccess(_) => false,
+        hir::Expr::Binary { .. } => {
+            let [lhs, rhs, ..] = children else {
+                unreachable!("binary expression has two value children");
+            };
+            *lhs && *rhs
+        }
+        hir::Expr::Cast { .. } => {
+            let Some(value) = children.first() else {
+                unreachable!("cast expression has a value child");
+            };
+            *value
+        }
+        hir::Expr::Unary { .. }
+        | hir::Expr::Between { .. }
+        | hir::Expr::Case { .. }
+        | hir::Expr::Collate { .. }
+        | hir::Expr::IsNull(_)
+        | hir::Expr::NotNull(_)
+        | hir::Expr::TruthTest { .. }
+        | hir::Expr::InList { .. }
+        | hir::Expr::Like { .. }
+        | hir::Expr::Row(_)
+        | hir::Expr::Raise { .. } => children.iter().all(|constant| *constant),
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_frame_offset(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    expression: &hir::Expr,
+    register: usize,
+    mode: turso_parser::ast::FrameMode,
+    side: WindowFrameBoundSide,
+) -> Result<()> {
+    emit_window_frame_offset(
+        program,
+        register,
+        mode,
+        side,
+        hir_frame_offset_is_constant(expression),
+        |program, register| {
+            translate_expr_no_constant_opt(program, document, expression, register).map(|_| ())
+        },
     )
 }
 
@@ -1684,6 +1751,69 @@ mod tests {
             ),
             WindowFrameTracking::Excluded { .. }
         ));
+    }
+
+    #[test]
+    fn hir_window_frame_offsets_keep_legacy_constant_rules() {
+        fn constant(offset: &str) -> bool {
+            let sql = format!(
+                "SELECT sum(value) OVER (\
+                     ROWS BETWEEN {offset} PRECEDING AND CURRENT ROW\
+                 ) FROM items"
+            );
+            let document = analyze_sql(&sql);
+            let (_, block) = root_query(&document);
+            let hir::WindowFrameBound::Preceding(expression) = &block.windows[0].frame.start else {
+                panic!("test window has a PRECEDING start");
+            };
+            hir_frame_offset_is_constant(expression)
+        }
+
+        assert!(constant("1 + 1"));
+        assert!(constant("?1"));
+        assert!(!constant("value"));
+        assert!(!constant("abs(1)"));
+        assert!(!constant("CURRENT_DATE"));
+    }
+
+    #[test]
+    fn hir_window_frame_offset_uses_shared_runtime_error() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 ROWS BETWEEN value PRECEDING AND CURRENT ROW\
+             ) FROM items",
+        );
+        let (_, block) = root_query(&document);
+        let window = &block.windows[0];
+        let hir::WindowFrameBound::Preceding(expression) = &window.frame.start else {
+            panic!("test window has a PRECEDING start");
+        };
+        let mut program = program();
+        let register = program.alloc_register();
+        let start = program.insns.len();
+
+        emit_hir_window_frame_offset(
+            &mut program,
+            &document,
+            expression,
+            register,
+            window.frame.mode,
+            WindowFrameBoundSide::Start,
+        )
+        .expect("frame offset emits");
+
+        assert!(matches!(
+            program.insns[start].0,
+            Insn::Null {
+                dest,
+                dest_end: None,
+            } if dest == register
+        ));
+        assert!(program.insns[start..].iter().any(|instruction| matches!(
+            &instruction.0,
+            Insn::Halt { description, .. }
+                if description == "frame starting offset must be a non-negative integer"
+        )));
     }
 
     #[cfg(feature = "json")]

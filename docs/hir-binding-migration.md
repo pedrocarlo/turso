@@ -941,6 +941,10 @@ counters through one runtime emitter without collecting function state.
 Window frame tracking now has explicit `None`, positional-counter, and
 EXCLUDE-rowid states. Legacy and HIR allocate the same state, so partial
 rowid pairs and simultaneous positional/EXCLUDE tracking are unrepresentable.
+Bounded frame offsets now share evaluation timing and runtime checks. HIR
+classifies resolved expressions with the iterative expression fold, lowers
+accepted constants directly, and preserves SQLite's NULL substitution for
+columns, functions, subqueries, and current-time values.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

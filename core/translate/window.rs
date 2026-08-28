@@ -1512,43 +1512,64 @@ pub(crate) fn emit_window_partition_change(
 /// Which side of the frame an offset belongs to. Selects the error
 /// message wording ("starting" vs "ending").
 #[derive(Clone, Copy)]
-enum FrameBoundPosition {
+pub(crate) enum WindowFrameBoundSide {
     Start,
     End,
 }
 
-/// Evaluate a frame-offset expression into `reg`, then emit the runtime
+/// Evaluate a frame-offset expression, then emit the runtime
 /// non-negative check. A non-constant offset (a per-row column
 /// reference, say) is loaded as NULL rather than evaluated, mirroring
 /// SQLite's substitution at `window.c:1166-1171`: the check then rejects
 /// it, but only once a partition is actually processed — a statement
 /// over an empty table never evaluates the offset and never errors.
-fn emit_frame_offset(
+pub(crate) fn emit_window_frame_offset(
+    program: &mut ProgramBuilder,
+    register: usize,
+    mode: turso_parser::ast::FrameMode,
+    side: WindowFrameBoundSide,
+    constant: bool,
+    emit_value: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
+) -> Result<()> {
+    if constant {
+        emit_value(program, register)?;
+    } else {
+        program.emit_insn(Insn::Null {
+            dest: register,
+            dest_end: None,
+        });
+    }
+    emit_window_check_offset(program, register, mode, side);
+    Ok(())
+}
+
+fn emit_legacy_window_frame_offset(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
     resolver: &Resolver,
     expr: &Expr,
-    reg: usize,
+    register: usize,
     mode: turso_parser::ast::FrameMode,
-    pos: FrameBoundPosition,
+    side: WindowFrameBoundSide,
 ) -> Result<()> {
-    if is_constant_frame_offset(expr, resolver)? {
-        translate_expr_no_constant_opt(
-            program,
-            Some(&plan.table_references),
-            expr,
-            reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: reg,
-            dest_end: None,
-        });
-    }
-    emit_window_check_offset(program, reg, mode, pos);
-    Ok(())
+    emit_window_frame_offset(
+        program,
+        register,
+        mode,
+        side,
+        is_constant_frame_offset(expr, resolver)?,
+        |program, register| {
+            translate_expr_no_constant_opt(
+                program,
+                Some(&plan.table_references),
+                expr,
+                register,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )
+            .map(|_| ())
+        },
+    )
 }
 
 /// SQLite uses a stricter constant-expression rule for frame offsets than it
@@ -1588,7 +1609,7 @@ fn emit_window_check_offset(
     program: &mut ProgramBuilder,
     offset_reg: usize,
     mode: turso_parser::ast::FrameMode,
-    pos: FrameBoundPosition,
+    side: WindowFrameBoundSide,
 ) {
     use turso_parser::ast::FrameMode;
     let label_halt = program.allocate_label();
@@ -1639,15 +1660,15 @@ fn emit_window_check_offset(
         collation: None,
     });
     program.preassign_label_to_next_insn(label_halt);
-    let msg = match (mode, pos) {
-        (FrameMode::Range, FrameBoundPosition::Start) => {
+    let msg = match (mode, side) {
+        (FrameMode::Range, WindowFrameBoundSide::Start) => {
             "frame starting offset must be a non-negative number"
         }
-        (FrameMode::Range, FrameBoundPosition::End) => {
+        (FrameMode::Range, WindowFrameBoundSide::End) => {
             "frame ending offset must be a non-negative number"
         }
-        (_, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
-        (_, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
+        (_, WindowFrameBoundSide::Start) => "frame starting offset must be a non-negative integer",
+        (_, WindowFrameBoundSide::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
         err_code: crate::error::SQLITE_ERROR,
@@ -1955,14 +1976,14 @@ impl EmitWindow {
                     "start_offset_reg is only allocated when frame.start is Preceding/Following"
                 ),
             };
-            emit_frame_offset(
+            emit_legacy_window_frame_offset(
                 program,
                 plan,
                 &t_ctx.resolver,
                 offset_expr,
                 start_offset_reg,
                 window.frame.mode,
-                FrameBoundPosition::Start,
+                WindowFrameBoundSide::Start,
             )?;
         }
         if let Some(end_offset_reg) = registers.end_offset_reg {
@@ -1973,14 +1994,14 @@ impl EmitWindow {
                     "end_offset_reg is only allocated when frame.end is Preceding/Following"
                 ),
             };
-            emit_frame_offset(
+            emit_legacy_window_frame_offset(
                 program,
                 plan,
                 &t_ctx.resolver,
                 offset_expr,
                 end_offset_reg,
                 window.frame.mode,
-                FrameBoundPosition::End,
+                WindowFrameBoundSide::End,
             )?;
         }
         emit_window_buffer_insert(
