@@ -962,6 +962,9 @@ the existing `end - start` register adjustment, while `RANGE` remains exempt.
 The crossed-bound empty-frame guard now owns the shared branch, cursor rewind,
 rowid reset, and sorter reset sequence. Representation-specific aggregate and
 row output remain callbacks in their original bytecode positions.
+Window aggregate result emission now consumes the shared function runtime and
+an explicit value/finalize mode. HIR and legacy use the same min/max, positional,
+`AggValue`, and `AggFinal` paths without collecting a temporary min/max vector.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

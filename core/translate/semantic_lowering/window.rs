@@ -37,7 +37,8 @@ use crate::{
 
 #[cfg(test)]
 use crate::translate::window::{
-    emit_window_empty_frame_guard, emit_window_nonempty_branch, window_frame_order_check,
+    emit_window_aggregate_results, emit_window_empty_frame_guard, emit_window_nonempty_branch,
+    window_frame_order_check, WindowAggregateResultMode, WindowEmptyFrameOutput,
     WindowEmptyFrameState, WindowFrameOrderCheck,
 };
 
@@ -1771,6 +1772,59 @@ mod tests {
     }
 
     #[test]
+    fn hir_window_runtime_uses_shared_aggregate_results() {
+        let document = analyze_sql("SELECT sum(value) OVER () FROM items");
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let functions =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        let accumulator = program.alloc_register();
+        let result = functions[0].result_register();
+
+        let value_start = program.insns.len();
+        emit_window_aggregate_results(
+            &mut program,
+            accumulator,
+            &functions,
+            WindowAggregateResultMode::Value,
+        );
+        let [value] = &program.insns[value_start..] else {
+            panic!("value mode reads one accumulator");
+        };
+        assert!(matches!(
+            value.0,
+            Insn::AggValue {
+                acc_reg,
+                dest_reg,
+                ..
+            } if acc_reg == accumulator && dest_reg == result
+        ));
+
+        let finalize_start = program.insns.len();
+        emit_window_aggregate_results(
+            &mut program,
+            accumulator,
+            &functions,
+            WindowAggregateResultMode::Finalize,
+        );
+        let [finalize, copy, clear] = &program.insns[finalize_start..] else {
+            panic!("finalize mode consumes, copies, and clears the accumulator");
+        };
+        assert!(matches!(finalize.0, Insn::AggFinal { register, .. } if register == accumulator));
+        assert!(matches!(
+            copy.0,
+            Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 0,
+            } if src_reg == accumulator && dst_reg == result
+        ));
+        assert!(matches!(clear.0, Insn::Null { dest, .. } if dest == accumulator));
+    }
+
+    #[test]
     fn hir_window_partition_reset_uses_shared_minmax_and_counter_state() {
         let document = analyze_sql(
             "SELECT min(value) OVER (\
@@ -1948,18 +2002,12 @@ mod tests {
                 rowid,
                 step_end,
             },
-            |program| {
-                program.emit_insn(Insn::Integer {
-                    value: 1,
-                    dest: aggregate_marker,
-                });
-                Ok(())
-            },
-            |program| {
-                program.emit_insn(Insn::Integer {
-                    value: 2,
-                    dest: row_marker,
-                });
+            |program, output| {
+                let (value, dest) = match output {
+                    WindowEmptyFrameOutput::Aggregate => (1, aggregate_marker),
+                    WindowEmptyFrameOutput::Row => (2, row_marker),
+                };
+                program.emit_insn(Insn::Integer { value, dest });
                 Ok(())
             },
         )

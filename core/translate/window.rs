@@ -1096,6 +1096,12 @@ pub(crate) struct WindowEmptyFrameState {
     pub(crate) step_end: BranchOffset,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum WindowEmptyFrameOutput {
+    Aggregate,
+    Row,
+}
+
 /// Handle a non-RANGE frame that is empty for every row because its same-kind
 /// bounded edges cross: M > N for `N PRECEDING AND M PRECEDING`, or M < N for
 /// `N FOLLOWING AND M FOLLOWING`. Each row emits the result an empty frame
@@ -1112,8 +1118,7 @@ pub(crate) fn emit_window_empty_frame_guard(
     program: &mut ProgramBuilder,
     check: WindowFrameOrderCheck,
     state: WindowEmptyFrameState,
-    emit_aggregate: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
-    emit_row: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+    mut emit_output: impl FnMut(&mut ProgramBuilder, WindowEmptyFrameOutput) -> Result<()>,
 ) -> Result<()> {
     let frame_valid = program.allocate_label();
     program.add_comment(program.offset(), "empty-frame check");
@@ -1121,7 +1126,7 @@ pub(crate) fn emit_window_empty_frame_guard(
     // valid iff end <= start. Mirrors the Ge/Le pick at
     // window.c:2951.
     emit_window_nonempty_branch(program, check, frame_valid);
-    emit_aggregate(program)?;
+    emit_output(program, WindowEmptyFrameOutput::Aggregate)?;
 
     // The row was just inserted, so the empty branch of this
     // Rewind is unreachable — the label lands on the next
@@ -1132,7 +1137,7 @@ pub(crate) fn emit_window_empty_frame_guard(
         pc_if_empty: unreachable_empty,
     });
     program.preassign_label_to_next_insn(unreachable_empty);
-    emit_row(program)?;
+    emit_output(program, WindowEmptyFrameOutput::Row)?;
 
     program.emit_insn(Insn::ResetSorter {
         cursor_id: state.current_cursor,
@@ -2174,11 +2179,6 @@ impl EmitWindow {
             count: src_column_count,
         };
         let buffer_table_name = meta.buffer_table_name.clone();
-        let minmax: Vec<_> = meta
-            .functions
-            .iter()
-            .map(|function| function.minmax)
-            .collect();
 
         emit_load_order_by_columns(program, window, &registers, input)?;
         emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
@@ -2271,13 +2271,24 @@ impl EmitWindow {
                     rowid: registers.rowid,
                     step_end: label_step_end,
                 },
-                |program| {
-                    if !frame.has_exclude {
-                        emit_window_agg_final(program, window, &registers, &minmax, false);
+                |program, output| match output {
+                    WindowEmptyFrameOutput::Aggregate => {
+                        if !frame.has_exclude {
+                            let meta = t_ctx
+                                .meta_window
+                                .as_ref()
+                                .expect("missing window metadata");
+                            emit_window_aggregate_results(
+                                program,
+                                registers.acc_start,
+                                &meta.functions,
+                                WindowAggregateResultMode::Value,
+                            );
+                        }
+                        Ok(())
                     }
-                    Ok(())
+                    WindowEmptyFrameOutput::Row => emit_return_one_row(program, t_ctx, plan),
                 },
-                |program| emit_return_one_row(program, t_ctx, plan),
             )?;
         }
         // `N FOLLOWING AND M FOLLOWING`: dropping rows off the start
@@ -2742,38 +2753,46 @@ fn window_expr_gt_zero(expr: &Expr) -> bool {
     false
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowAggregateResultMode {
+    Value,
+    Finalize,
+}
+
 /// Turn each function's running total into the value to output for the
 /// current row, writing it into that function's result register, just
-/// before the row is emitted (RETURN_ROW). When `finalize` is set the
-/// running total is consumed and cleared (done once at the very end);
-/// otherwise it is read without disturbing it (done per row as the frame
-/// slides). first_value / nth_value / lag / lead are the exception: they
-/// have no running total to read, so their result is filled in separately
-/// — by looking up a specific row — inside `emit_return_one_row`. Mirrors
-/// SQLite's `windowAggFinal(p, 0)` (window.c:1777-1808).
-fn emit_window_agg_final(
+/// before the row is emitted (RETURN_ROW). `Finalize` consumes and clears
+/// the running total once at the very end; `Value` reads it without
+/// disturbing it as the frame slides. first_value / nth_value / lag / lead
+/// are the exception: they have no running total to read, so their result is
+/// filled in separately — by looking up a specific row — inside
+/// `emit_return_one_row`. Mirrors SQLite's `windowAggFinal(p, 0)`
+/// (window.c:1777-1808).
+pub(crate) fn emit_window_aggregate_results<E>(
     program: &mut ProgramBuilder,
-    window: &Window,
-    registers: &WindowRegisters,
-    minmax: &[Option<WindowMinMax>],
-    finalize: bool,
+    accumulator_start: usize,
+    functions: &[WindowFunctionRuntime<E>],
+    mode: WindowAggregateResultMode,
 ) {
-    for (i, func) in window.functions.iter().enumerate() {
+    for (ordinal, function) in functions.iter().enumerate() {
         let positional = matches!(
-            &func.func,
+            &function.function,
             AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
         );
         let always_lookup = matches!(
-            &func.func,
+            &function.function,
             AccumulatorFunc::Window(WindowFunc::Lag | WindowFunc::Lead)
         );
-        if always_lookup || (positional && !finalize) {
+        if always_lookup || (positional && mode == WindowAggregateResultMode::Value) {
             continue;
         }
-        let acc_reg = registers.acc_start + i;
-        let result_reg = registers.acc_result_start + i;
-        if let Some(state) = minmax[i] {
-            debug_assert!(!finalize, "EXCLUDE frames do not use min/max indexes");
+        let acc_reg = accumulator_start + ordinal;
+        let result_reg = function.result_register;
+        if let Some(state) = function.minmax {
+            debug_assert!(
+                mode == WindowAggregateResultMode::Value,
+                "EXCLUDE frames do not use min/max indexes"
+            );
             let label_empty = program.allocate_label();
             program.emit_insn(Insn::Null {
                 dest: result_reg,
@@ -2792,26 +2811,29 @@ fn emit_window_agg_final(
             program.preassign_label_to_next_insn(label_empty);
             continue;
         }
-        if finalize {
-            program.emit_insn(Insn::AggFinal {
-                register: acc_reg,
-                func: func.func.clone(),
-            });
-            program.emit_insn(Insn::Copy {
-                src_reg: acc_reg,
-                dst_reg: result_reg,
-                extra_amount: 0,
-            });
-            program.emit_insn(Insn::Null {
-                dest: acc_reg,
-                dest_end: None,
-            });
-        } else {
-            program.emit_insn(Insn::AggValue {
-                acc_reg,
-                dest_reg: result_reg,
-                func: func.func.clone(),
-            });
+        match mode {
+            WindowAggregateResultMode::Finalize => {
+                program.emit_insn(Insn::AggFinal {
+                    register: acc_reg,
+                    func: function.function.clone(),
+                });
+                program.emit_insn(Insn::Copy {
+                    src_reg: acc_reg,
+                    dst_reg: result_reg,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::Null {
+                    dest: acc_reg,
+                    dest_end: None,
+                });
+            }
+            WindowAggregateResultMode::Value => {
+                program.emit_insn(Insn::AggValue {
+                    acc_reg,
+                    dest_reg: result_reg,
+                    func: function.function.clone(),
+                });
+            }
         }
     }
 }
@@ -2833,11 +2855,6 @@ fn emit_window_full_scan(
     let window = plan.window.as_ref().expect("missing window");
     let registers = meta.registers;
     let cursors = meta.cursors;
-    let minmax: Vec<_> = meta
-        .functions
-        .iter()
-        .map(|function| function.minmax)
-        .collect();
     let exclude = window
         .frame
         .exclude
@@ -2967,7 +2984,13 @@ fn emit_window_full_scan(
         fullscan: false,
     });
     program.preassign_label_to_next_insn(label_break);
-    emit_window_agg_final(program, window, &registers, &minmax, true);
+    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+    emit_window_aggregate_results(
+        program,
+        registers.acc_start,
+        &meta.functions,
+        WindowAggregateResultMode::Finalize,
+    );
     Ok(())
 }
 
@@ -3210,11 +3233,6 @@ fn emit_window_op(
     let cursors = meta.cursors;
     let frame = meta.frame;
     let buffer_table_name = meta.buffer_table_name.clone();
-    let minmax: Vec<_> = meta
-        .functions
-        .iter()
-        .map(|function| function.minmax)
-        .collect();
     let order_by_len = window.order_by.len();
     let frame_mode = frame.mode;
     // Under RANGE / GROUPS frames one advance steps over every row with
@@ -3316,7 +3334,13 @@ fn emit_window_op(
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) && !frame.has_exclude {
-        emit_window_agg_final(program, window, &registers, &minmax, false);
+        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+        emit_window_aggregate_results(
+            program,
+            registers.acc_start,
+            &meta.functions,
+            WindowAggregateResultMode::Value,
+        );
     }
 
     let label_continue = program.allocate_label();
