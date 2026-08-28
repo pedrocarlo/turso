@@ -707,6 +707,50 @@ impl<E> WindowFunctionRuntime<E> {
     }
 }
 
+pub(crate) fn emit_window_partition_reset<E>(
+    program: &mut ProgramBuilder,
+    accumulator_start: usize,
+    functions: &[WindowFunctionRuntime<E>],
+    frame_counters: Option<usize>,
+) {
+    assert!(
+        !functions.is_empty(),
+        "window partition reset requires at least one function"
+    );
+    program.add_comment(program.offset(), "reset accumulator registers");
+    program.emit_insn(Insn::Null {
+        dest: accumulator_start,
+        dest_end: Some(accumulator_start + functions.len() - 1),
+    });
+
+    // Reset every min/max index and its insertion sequence at a partition
+    // boundary. Mirrors windowInitAccum (window.c:2000-2009).
+    for function in functions {
+        if let Some(state) = function.minmax {
+            program.emit_insn(Insn::ResetSorter {
+                cursor_id: state.cursor,
+            });
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: state.registers + 1,
+            });
+        }
+    }
+
+    // Zero the frame-index counters for the new partition. Mirrors
+    // `windowInitAccum`'s regApp reset (window.c:2010-2013).
+    if let Some(frame_counters) = frame_counters {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: frame_counters,
+        });
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: frame_counters + 1,
+        });
+    }
+}
+
 /// Reads one prepared window value from the current buffered row.
 pub(crate) trait WindowValueEmitter<E> {
     fn emit_buffered_value(
@@ -1871,34 +1915,12 @@ impl EmitWindow {
                 cursors: registers.cursor_peer_values,
             },
         );
-        program.add_comment(program.offset(), "reset accumulator registers");
-        program.emit_insn(Insn::Null {
-            dest: registers.acc_start,
-            dest_end: Some(registers.acc_start + window.functions.len() - 1),
-        });
-        // Reset every min/max index and its insertion sequence at a partition
-        // boundary. Mirrors windowInitAccum (window.c:2000-2009).
-        for state in minmax.iter().flatten() {
-            program.emit_insn(Insn::ResetSorter {
-                cursor_id: state.cursor,
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: state.registers + 1,
-            });
-        }
-        // Zero the frame-index counters for the new partition. Mirrors
-        // `windowInitAccum`'s regApp reset (window.c:2010-2013).
-        if let Some(frame_counters) = registers.frame_counters {
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: frame_counters,
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: frame_counters + 1,
-            });
-        }
+        emit_window_partition_reset(
+            program,
+            registers.acc_start,
+            &meta.functions,
+            registers.frame_counters,
+        );
         // The same register holds the offset for every partition, and the
         // IfPos delays decrement it as they run. Re-evaluate it here at the
         // start of each partition: setting it just once up front would

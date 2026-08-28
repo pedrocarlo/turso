@@ -935,6 +935,9 @@ key metadata, then update the remembered keys with the same copy sequence.
 All buffered-cursor ORDER BY reads now use one iterator-based emitter. Legacy
 extracts rewritten buffer-column indexes in one place; HIR passes its resolved
 slot iterator directly, including repeated and reordered terms.
+First-row partition reset is now shared too. Legacy and HIR clear the
+accumulator block, reset moving min/max state, and zero positional frame
+counters through one runtime emitter without collecting function state.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

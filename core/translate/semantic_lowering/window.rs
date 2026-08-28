@@ -16,12 +16,12 @@ use crate::{
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
             emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
-            emit_window_key_gather, emit_window_partition_change, emit_window_peer_change,
-            open_window_buffer, prepare_window_input_state, prepare_window_peer_state,
-            window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
-            WindowBufferRuntime, WindowFunctionRuntime, WindowFunctionRuntimeSpec,
-            WindowInputState, WindowPartitionState, WindowPeerComparison, WindowPeerState,
-            WindowStepContext, WindowValueEmitter,
+            emit_window_key_gather, emit_window_partition_change, emit_window_partition_reset,
+            emit_window_peer_change, open_window_buffer, prepare_window_input_state,
+            prepare_window_peer_state, window_function_uses_subtypes, BufferedWindowValue,
+            WindowBufferInput, WindowBufferRuntime, WindowFunctionRuntime,
+            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
+            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -697,6 +697,16 @@ pub(super) fn prepare_hir_window_runtime<'a>(
         ));
     }
     Ok(runtimes)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_partition_reset(
+    program: &mut ProgramBuilder,
+    accumulator_start: usize,
+    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    frame_counters: Option<usize>,
+) {
+    emit_window_partition_reset(program, accumulator_start, functions, frame_counters);
 }
 
 struct HirWindowValueEmitter<'document, 'inputs> {
@@ -1570,6 +1580,55 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn hir_window_partition_reset_uses_shared_minmax_and_counter_state() {
+        let document = analyze_sql(
+            "SELECT min(value) OVER (\
+                 ORDER BY sort_key \
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let functions =
+            prepare_hir_window_runtime(&mut program, &plan).expect("window runtime prepares");
+        let accumulator_start = program.alloc_registers(functions.len());
+        let frame_counters = program.alloc_registers(2);
+        let reset_start = program.insns.len();
+
+        emit_hir_window_partition_reset(
+            &mut program,
+            accumulator_start,
+            &functions,
+            Some(frame_counters),
+        );
+
+        let [clear, reset_minmax, reset_sequence, reset_start_counter, reset_end_counter] =
+            &program.insns[reset_start..]
+        else {
+            panic!("partition reset clears accumulators, min/max, and frame counters");
+        };
+        assert!(matches!(
+            clear.0,
+            Insn::Null {
+                dest,
+                dest_end: Some(end),
+            } if dest == accumulator_start && end == accumulator_start
+        ));
+        assert!(matches!(reset_minmax.0, Insn::ResetSorter { .. }));
+        assert!(matches!(reset_sequence.0, Insn::Integer { value: 0, .. }));
+        assert!(matches!(
+            reset_start_counter.0,
+            Insn::Integer { value: 0, dest } if dest == frame_counters
+        ));
+        assert!(matches!(
+            reset_end_counter.0,
+            Insn::Integer { value: 0, dest } if dest == frame_counters + 1
+        ));
     }
 
     #[cfg(feature = "json")]
