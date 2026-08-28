@@ -1045,6 +1045,24 @@ pub(crate) struct WindowBufferInput {
     pub(crate) count: usize,
 }
 
+/// Copy selected input slots into one consecutive key-register block.
+pub(crate) fn emit_window_key_gather(
+    program: &mut ProgramBuilder,
+    input: WindowBufferInput,
+    slots: impl IntoIterator<Item = usize>,
+    output_start: usize,
+) -> Result<()> {
+    for (output, slot) in slots.into_iter().enumerate() {
+        turso_assert!(slot < input.count, "window key slot outside input row");
+        program.emit_insn(Insn::Copy {
+            src_reg: input.start + slot,
+            dst_reg: output_start + output,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn open_window_buffer(
     program: &mut ProgramBuilder,
     table: Arc<BTreeTable>,
@@ -1673,7 +1691,7 @@ impl EmitWindow {
             .map(|function| function.minmax)
             .collect();
 
-        emit_load_order_by_columns(program, window, &registers);
+        emit_load_order_by_columns(program, window, &registers, input)?;
         emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
 
         // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
@@ -2284,24 +2302,21 @@ fn emit_load_order_by_columns(
     program: &mut ProgramBuilder,
     window: &Window,
     registers: &WindowRegisters,
-) {
+    input: WindowBufferInput,
+) -> Result<()> {
     if let Some(reg_new_order_by_columns_start) = registers.new_order_by_columns_start {
         // Source columns are deduplicated and may appear in a different order than
         // the ORDER BY terms. Therefore, we must restore the original ORDER BY layout
         // here by copying the values into an array of registers.
-        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-            match expr {
-                Expr::Column { column, .. } => {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: registers.src_columns_start + column,
-                        dst_reg: reg_new_order_by_columns_start + i,
-                        extra_amount: 0,
-                    });
-                }
-                _ => unreachable!("expected Column, got {:?}", expr),
-            }
-        }
+        let slots = window.order_by.iter().map(|(expr, _, _)| {
+            let Expr::Column { column, .. } = expr else {
+                unreachable!("expected Column, got {:?}", expr)
+            };
+            *column
+        });
+        emit_window_key_gather(program, input, slots, reg_new_order_by_columns_start)?;
     }
+    Ok(())
 }
 
 /// The three operations that move the frame forward, one step at a time.

@@ -15,7 +15,7 @@ use crate::{
         semantic::hir::{self, ExprVisitor},
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
-            emit_function_inverse_runtime, emit_function_step_runtime,
+            emit_function_inverse_runtime, emit_function_step_runtime, emit_window_key_gather,
             emit_window_partition_change, open_window_buffer, prepare_window_input_state,
             window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
             WindowBufferRuntime, WindowFunctionRuntime, WindowFunctionRuntimeSpec,
@@ -497,6 +497,21 @@ pub(super) fn emit_hir_window_input_row(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_order_keys(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    input: WindowBufferInput,
+    output_start: usize,
+) -> Result<()> {
+    emit_window_key_gather(
+        program,
+        input,
+        plan.order_slots.iter().copied(),
+        output_start,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_hir_window_input_state(
     program: &mut ProgramBuilder,
     plan: &HirWindowBufferPlan<'_>,
@@ -878,6 +893,48 @@ mod tests {
                 .column,
             0
         );
+    }
+
+    #[test]
+    fn hir_window_order_keys_gather_reused_slots_without_collecting() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 PARTITION BY group_id, group_id \
+                 ORDER BY sort_key, group_id\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let input = WindowBufferInput {
+            start: program.alloc_registers(plan.columns.len()),
+            count: plan.columns.len(),
+        };
+        let order_keys = program.alloc_registers(plan.order_slots.len());
+
+        emit_hir_window_order_keys(&mut program, &plan, input, order_keys)
+            .expect("resolved ORDER BY slots gather");
+
+        let [sort_key, group_id] = program.insns.as_slice() else {
+            panic!("two ORDER BY terms emit two copies");
+        };
+        assert!(matches!(
+            sort_key.0,
+            Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 0,
+            } if src_reg == input.start + 1 && dst_reg == order_keys
+        ));
+        assert!(matches!(
+            group_id.0,
+            Insn::Copy {
+                src_reg,
+                dst_reg,
+                extra_amount: 0,
+            } if src_reg == input.start && dst_reg == order_keys + 1
+        ));
     }
 
     #[test]

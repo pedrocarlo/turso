@@ -923,6 +923,9 @@ the copy without collecting or walking the key iterator a second time.
 Legacy and HIR window input paths now allocate the rowid, saved partition keys,
 and flush return register through the same input state. HIR partition handling
 passes its resolved key iterator directly into the shared change sequence.
+Legacy and HIR also use one iterator-based gather operation to restore ORDER BY
+term order from deduplicated input slots. Repeated or reordered terms emit
+direct register copies without building an intermediate slot vector.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
