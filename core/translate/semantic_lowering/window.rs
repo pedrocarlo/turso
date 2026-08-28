@@ -15,12 +15,13 @@ use crate::{
         semantic::hir::{self, ExprVisitor},
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
-            emit_function_inverse_runtime, emit_function_step_runtime, emit_window_key_gather,
-            emit_window_partition_change, emit_window_peer_change, open_window_buffer,
-            prepare_window_input_state, prepare_window_peer_state, window_function_uses_subtypes,
-            BufferedWindowValue, WindowBufferInput, WindowBufferRuntime, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec, WindowInputState, WindowPartitionState,
-            WindowPeerComparison, WindowPeerState, WindowStepContext, WindowValueEmitter,
+            emit_function_inverse_runtime, emit_function_step_runtime, emit_window_cursor_keys,
+            emit_window_key_gather, emit_window_partition_change, emit_window_peer_change,
+            open_window_buffer, prepare_window_input_state, prepare_window_peer_state,
+            window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
+            WindowBufferRuntime, WindowFunctionRuntime, WindowFunctionRuntimeSpec,
+            WindowInputState, WindowPartitionState, WindowPeerComparison, WindowPeerState,
+            WindowStepContext, WindowValueEmitter,
         },
     },
     types::KeyInfo,
@@ -516,6 +517,21 @@ pub(super) fn emit_hir_window_order_keys(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_cursor_keys(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    cursor: CursorID,
+    output_start: usize,
+) -> usize {
+    emit_window_cursor_keys(
+        program,
+        cursor,
+        plan.order_slots.iter().copied(),
+        output_start,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_hir_window_peer_state(
     program: &mut ProgramBuilder,
     plan: &HirWindowBufferPlan<'_>,
@@ -967,6 +983,47 @@ mod tests {
                 extra_amount: 0,
             } if src_reg == input.start && dst_reg == order_keys + 1
         ));
+    }
+
+    #[test]
+    fn hir_window_cursor_keys_read_repeated_reordered_slots() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 PARTITION BY group_id \
+                 ORDER BY sort_key, sort_key, group_id\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        assert_eq!(plan.order_slots, [1, 1, 0]);
+
+        let mut program = program();
+        let runtime = open_hir_window_buffer(&mut program, &plan);
+        let output = program.alloc_registers(plan.order_slots.len());
+        let read_start = program.insns.len();
+
+        let count =
+            emit_hir_window_cursor_keys(&mut program, &plan, runtime.cursors.csr_current, output);
+
+        assert_eq!(count, 3);
+        for ((instruction, _), (column, destination)) in
+            program.insns[read_start..]
+                .iter()
+                .zip([(1, output), (1, output + 1), (0, output + 2)])
+        {
+            assert!(matches!(
+                instruction,
+                Insn::Column {
+                    cursor_id,
+                    column: actual_column,
+                    dest,
+                    default: None,
+                } if *cursor_id == runtime.cursors.csr_current
+                    && *actual_column == column
+                    && *dest == destination
+            ), "unexpected key read {instruction:?}; expected column {column}, register {destination}");
+        }
     }
 
     #[test]

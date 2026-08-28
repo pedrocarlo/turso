@@ -1157,6 +1157,26 @@ pub(crate) fn emit_window_key_gather(
     Ok(())
 }
 
+/// Read selected window-buffer columns into one consecutive key-register block.
+pub(crate) fn emit_window_cursor_keys(
+    program: &mut ProgramBuilder,
+    cursor: CursorID,
+    columns: impl IntoIterator<Item = usize>,
+    output_start: usize,
+) -> usize {
+    let mut count = 0;
+    for (offset, column) in columns.into_iter().enumerate() {
+        program.emit_insn(Insn::Column {
+            cursor_id: cursor,
+            column,
+            dest: output_start + offset,
+            default: None,
+        });
+        count = offset + 1;
+    }
+    count
+}
+
 pub(crate) fn open_window_buffer(
     program: &mut ProgramBuilder,
     table: Arc<BTreeTable>,
@@ -1247,6 +1267,15 @@ fn order_by_key_info<'a>(
             collation,
             nulls_order: None,
         })
+    })
+}
+
+fn window_order_by_columns(window: &Window) -> impl Iterator<Item = usize> + '_ {
+    window.order_by.iter().map(|(expression, _, _)| {
+        let Expr::Column { column, .. } = expression else {
+            unreachable!("window ORDER BY expressions are buffer columns after rewrite");
+        };
+        *column
     })
 }
 
@@ -2619,17 +2648,13 @@ fn emit_window_full_scan(
     let scan_peer =
         (compare_peers && order_by_len > 0).then(|| program.alloc_registers(order_by_len));
     if let Some(current_peer) = current_peer {
-        for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-            let Expr::Column { column, .. } = expr else {
-                unreachable!("window ORDER BY expressions are buffer columns after rewrite");
-            };
-            program.emit_insn(Insn::Column {
-                cursor_id: cursors.csr_current,
-                column: *column,
-                dest: current_peer + i,
-                default: None,
-            });
-        }
+        let count = emit_window_cursor_keys(
+            program,
+            cursors.csr_current,
+            window_order_by_columns(window),
+            current_peer,
+        );
+        turso_assert!(count == order_by_len, "window peer key width changed");
     }
 
     program.emit_insn(Insn::Null {
@@ -2691,19 +2716,13 @@ fn emit_window_full_scan(
             } else {
                 let current_peer = current_peer.expect("allocated above");
                 let scan_peer = scan_peer.expect("allocated above");
-                for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-                    let Expr::Column { column, .. } = expr else {
-                        unreachable!(
-                            "window ORDER BY expressions are buffer columns after rewrite"
-                        );
-                    };
-                    program.emit_insn(Insn::Column {
-                        cursor_id: scan_cursor,
-                        column: *column,
-                        dest: scan_peer + i,
-                        default: None,
-                    });
-                }
+                let count = emit_window_cursor_keys(
+                    program,
+                    scan_cursor,
+                    window_order_by_columns(window),
+                    scan_peer,
+                );
+                turso_assert!(count == order_by_len, "window peer key width changed");
                 emit_window_key_compare(
                     program,
                     current_peer,
@@ -3247,18 +3266,13 @@ fn emit_window_op(
         // whole partition is one group, so this just loops to EOF.
         let temp_start = (order_by_len > 0).then(|| {
             let temp_start = program.alloc_registers(order_by_len);
-            for (i, (expr, _, _)) in window.order_by.iter().enumerate() {
-                if let Expr::Column { column, .. } = expr {
-                    program.emit_insn(Insn::Column {
-                        cursor_id: cursor_for_op,
-                        column: *column,
-                        dest: temp_start + i,
-                        default: None,
-                    });
-                } else {
-                    unreachable!("expected Column in window.order_by, got {:?}", expr);
-                }
-            }
+            let count = emit_window_cursor_keys(
+                program,
+                cursor_for_op,
+                window_order_by_columns(window),
+                temp_start,
+            );
+            turso_assert!(count == order_by_len, "window peer key width changed");
             temp_start
         });
         emit_window_peer_change(

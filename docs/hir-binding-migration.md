@@ -932,6 +932,9 @@ uses the same copy sequence and preserves the legacy register order.
 Peer-group changes now use one shared emitter too. The no-ORDER case is an
 explicit all-rows state; keyed comparisons accept lazy legacy or resolved HIR
 key metadata, then update the remembered keys with the same copy sequence.
+All buffered-cursor ORDER BY reads now use one iterator-based emitter. Legacy
+extracts rewritten buffer-column indexes in one place; HIR passes its resolved
+slot iterator directly, including repeated and reordered terms.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
