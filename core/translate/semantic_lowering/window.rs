@@ -41,6 +41,9 @@ use crate::translate::window::{
 };
 
 #[cfg(test)]
+use crate::translate::window::{emit_window_frame_cursor_rewind, WindowCursors};
+
+#[cfg(test)]
 use crate::translate::window::emit_window_peer_seed;
 
 /// One value stored for a window layer.
@@ -1565,6 +1568,50 @@ mod tests {
             1,
             false,
             true,
+        );
+    }
+
+    #[test]
+    fn hir_window_frame_cursors_use_shared_rewind_order() {
+        fn rewind_cursors(sql: &str) -> (WindowCursors, Vec<CursorID>) {
+            let document = analyze_sql(sql);
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let runtime = open_hir_window_buffer(&mut program, &plan);
+            let sequence_start = program.insns.len();
+
+            emit_window_frame_cursor_rewind(&mut program, runtime.cursors);
+
+            let cursors = program.insns[sequence_start..]
+                .iter()
+                .map(|(instruction, _)| {
+                    let Insn::Rewind { cursor_id, .. } = instruction else {
+                        panic!("frame rewind emits only Rewind instructions");
+                    };
+                    *cursor_id
+                })
+                .collect();
+            (runtime.cursors, cursors)
+        }
+
+        let (bounded, bounded_rewinds) = rewind_cursors(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
+        );
+        assert_eq!(
+            bounded_rewinds,
+            vec![
+                bounded.csr_start.expect("bounded start uses a cursor"),
+                bounded.csr_current,
+                bounded.csr_end,
+            ]
+        );
+
+        let (unbounded, unbounded_rewinds) = rewind_cursors("SELECT sum(value) OVER () FROM items");
+        assert_eq!(
+            unbounded_rewinds,
+            vec![unbounded.csr_current, unbounded.csr_end]
         );
     }
 

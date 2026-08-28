@@ -954,6 +954,9 @@ edge enum; runtime routing no longer matches legacy `FrameBoundary` values.
 The crossed-bound check for same-kind bounded frames is shared as well. One
 explicit order-check enum selects the existing `Le`/`Ge` branch, and both HIR
 and legacy frame state can classify that check without carrying expressions.
+First-row frame cursor positioning is shared without allocating a cursor list.
+HIR and legacy lowering rewind the optional start cursor, current cursor, and
+end cursor in the same order.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

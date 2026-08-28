@@ -1353,6 +1353,27 @@ pub struct WindowCursors {
     pub csr_app: Option<CursorID>,
 }
 
+/// Position every cursor that walks the window frame at the first buffered
+/// row. The buffer has just received that row, so the empty target is only a
+/// common landing point for the `Rewind` instructions.
+pub(crate) fn emit_window_frame_cursor_rewind(
+    program: &mut ProgramBuilder,
+    cursors: WindowCursors,
+) {
+    let label_unreachable_empty = program.allocate_label();
+    for cursor_id in cursors
+        .csr_start
+        .into_iter()
+        .chain([cursors.csr_current, cursors.csr_end])
+    {
+        program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: label_unreachable_empty,
+        });
+    }
+    program.preassign_label_to_next_insn(label_unreachable_empty);
+}
+
 /// Open cursors that share one ephemeral window buffer.
 ///
 /// Legacy and HIR lowering decide independently which rows and expressions
@@ -2227,22 +2248,7 @@ impl EmitWindow {
         // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
         // the frame start isn't UNBOUNDED PRECEDING (otherwise the
         // cursor wasn't allocated and AggInverse is a no-op).
-        let label_unreachable_empty = program.allocate_label();
-        if let Some(csr_start) = cursors.csr_start {
-            program.emit_insn(Insn::Rewind {
-                cursor_id: csr_start,
-                pc_if_empty: label_unreachable_empty,
-            });
-        }
-        program.emit_insn(Insn::Rewind {
-            cursor_id: cursors.csr_current,
-            pc_if_empty: label_unreachable_empty,
-        });
-        program.emit_insn(Insn::Rewind {
-            cursor_id: cursors.csr_end,
-            pc_if_empty: label_unreachable_empty,
-        });
-        program.preassign_label_to_next_insn(label_unreachable_empty);
+        emit_window_frame_cursor_rewind(program, cursors);
         // The first row is not added to the totals here. The flush
         // subroutine adds it once at the end of the partition (AGGSTEP)
         // and emits it there (RETURN_ROW).
