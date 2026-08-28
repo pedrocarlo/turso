@@ -926,6 +926,9 @@ passes its resolved key iterator directly into the shared change sequence.
 Legacy and HIR also use one iterator-based gather operation to restore ORDER BY
 term order from deduplicated input slots. Repeated or reordered terms emit
 direct register copies without building an intermediate slot vector.
+Legacy and HIR now allocate current ORDER BY keys plus input and cursor peer
+reference registers through the same frame-gated state. First-row peer seeding
+uses the same copy sequence and preserves the legacy register order.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

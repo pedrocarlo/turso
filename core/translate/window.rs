@@ -864,8 +864,74 @@ impl core::ops::Index<FrameCursor> for CursorPeerValues {
 impl CursorPeerValues {
     /// The register of each cursor that is peer-tracked, skipping the ones
     /// that aren't (`None`).
-    fn allocated(&self) -> impl Iterator<Item = usize> {
+    pub(crate) fn allocated(&self) -> impl Iterator<Item = usize> {
         self.0.into_iter().flatten()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WindowPeerState {
+    pub(crate) key_count: usize,
+    pub(crate) current: Option<usize>,
+    pub(crate) previous_input: Option<usize>,
+    pub(crate) cursors: CursorPeerValues,
+}
+
+pub(crate) fn prepare_window_peer_state(
+    program: &mut ProgramBuilder,
+    key_count: usize,
+    track_peers: bool,
+    moving_start: bool,
+) -> WindowPeerState {
+    WindowPeerState {
+        key_count,
+        current: alloc_optional_registers(program, key_count),
+        previous_input: track_peers
+            .then(|| alloc_optional_registers(program, key_count))
+            .flatten(),
+        // Order matters: this allocates registers, so keep it
+        // Start / Current / End to match `FrameCursor`.
+        cursors: CursorPeerValues([
+            // Start: only when the frame start can move — that is the
+            // only case with a `csr_start` to track.
+            (track_peers && moving_start)
+                .then(|| alloc_optional_registers(program, key_count))
+                .flatten(),
+            track_peers
+                .then(|| alloc_optional_registers(program, key_count))
+                .flatten(),
+            track_peers
+                .then(|| alloc_optional_registers(program, key_count))
+                .flatten(),
+        ]),
+    }
+}
+
+pub(crate) fn emit_window_peer_seed(program: &mut ProgramBuilder, state: WindowPeerState) {
+    let (Some(current), Some(previous_input)) = (state.current, state.previous_input) else {
+        return;
+    };
+
+    // Seed the source-row peer reference and every per-cursor
+    // peer reference with the first row's ORDER BY values.
+    // Mirrors SQLite's init at `window.c:2972-2976` (regNewPeer
+    // → regPeer → s.start.reg / current.reg / end.reg).
+    program.add_comment(
+        program.offset(),
+        "initialize peer-reference registers for new partition",
+    );
+    let extra_amount = state.key_count - 1;
+    program.emit_insn(Insn::Copy {
+        src_reg: current,
+        dst_reg: previous_input,
+        extra_amount,
+    });
+    for cursor in state.cursors.allocated() {
+        program.emit_insn(Insn::Copy {
+            src_reg: previous_input,
+            dst_reg: cursor,
+            extra_amount,
+        });
     }
 }
 
@@ -1552,6 +1618,12 @@ impl EmitWindow {
         }
 
         let input_state = prepare_window_input_state(program, partition_by_len);
+        let peer_state = prepare_window_peer_state(
+            program,
+            order_by_len,
+            window.frame.mode != turso_parser::ast::FrameMode::Rows,
+            has_moving_start,
+        );
 
         t_ctx.meta_window = Some(WindowMetadata {
             labels: WindowLabels {
@@ -1567,35 +1639,14 @@ impl EmitWindow {
                 flush_buffer_return_offset: input_state.flush_return,
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
-                new_order_by_columns_start: alloc_optional_registers(program, order_by_len),
+                new_order_by_columns_start: peer_state.current,
                 // Peer tracking only runs under RANGE / GROUPS — under
                 // ROWS a row is never compared against its neighbours to
                 // see if they are peers, so all of these stay `None`.
                 // Mirrors SQLite's `regPeer` allocation gate at
                 // window.c:2892-2896.
-                source_peer_values: if window.frame.mode != turso_parser::ast::FrameMode::Rows {
-                    alloc_optional_registers(program, order_by_len)
-                } else {
-                    None
-                },
-                cursor_peer_values: {
-                    let is_peer_tracked = window.frame.mode != turso_parser::ast::FrameMode::Rows;
-                    // Order matters: this allocates registers, so keep it
-                    // Start / Current / End to match `FrameCursor`.
-                    CursorPeerValues([
-                        // Start: only when the frame start can move — that
-                        // is the only case with a `csr_start` to track.
-                        (is_peer_tracked && has_moving_start)
-                            .then(|| alloc_optional_registers(program, order_by_len))
-                            .flatten(),
-                        is_peer_tracked
-                            .then(|| alloc_optional_registers(program, order_by_len))
-                            .flatten(),
-                        is_peer_tracked
-                            .then(|| alloc_optional_registers(program, order_by_len))
-                            .flatten(),
-                    ])
-                },
+                source_peer_values: peer_state.previous_input,
+                cursor_peer_values: peer_state.cursors,
                 start_offset_reg: match window.frame.start {
                     crate::translate::plan::FrameBoundary::Preceding(_)
                     | crate::translate::plan::FrameBoundary::Following(_) => {
@@ -1707,32 +1758,15 @@ impl EmitWindow {
         });
 
         // --- FIRST ROW OF PARTITION ---
-        if let (Some(new_ob), Some(source_peer_values)) = (
-            registers.new_order_by_columns_start,
-            registers.source_peer_values,
-        ) {
-            // Seed the source-row peer reference and every per-cursor
-            // peer reference with the first row's ORDER BY values.
-            // Mirrors SQLite's init at `window.c:2972-2976` (regNewPeer
-            // → regPeer → s.start.reg / current.reg / end.reg).
-            program.add_comment(
-                program.offset(),
-                "initialize peer-reference registers for new partition",
-            );
-            let n = window.order_by.len() - 1;
-            program.emit_insn(Insn::Copy {
-                src_reg: new_ob,
-                dst_reg: source_peer_values,
-                extra_amount: n,
-            });
-            for peer_reg in registers.cursor_peer_values.allocated() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: source_peer_values,
-                    dst_reg: peer_reg,
-                    extra_amount: n,
-                });
-            }
-        }
+        emit_window_peer_seed(
+            program,
+            WindowPeerState {
+                key_count: window.order_by.len(),
+                current: registers.new_order_by_columns_start,
+                previous_input: registers.source_peer_values,
+                cursors: registers.cursor_peer_values,
+            },
+        );
         program.add_comment(program.offset(), "reset accumulator registers");
         program.emit_insn(Insn::Null {
             dest: registers.acc_start,
