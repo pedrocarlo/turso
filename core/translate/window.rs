@@ -1027,6 +1027,68 @@ pub(crate) struct WindowFrameShape {
     pub(crate) has_exclude: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowFrameOrderCheck {
+    /// A PRECEDING/PRECEDING frame is non-empty when its end offset is no
+    /// greater than its start offset.
+    EndAtOrBeforeStart { start: usize, end: usize },
+    /// A FOLLOWING/FOLLOWING frame is non-empty when its end offset is no
+    /// less than its start offset.
+    EndAtOrAfterStart { start: usize, end: usize },
+}
+
+pub(crate) fn window_frame_order_check(
+    frame: WindowFrameShape,
+    offsets: WindowFrameOffsets,
+) -> Option<WindowFrameOrderCheck> {
+    if frame.mode == FrameMode::Range {
+        return None;
+    }
+    let direction = match (frame.start, frame.end) {
+        (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding) => WindowFrameEdge::Preceding,
+        (WindowFrameEdge::Following, WindowFrameEdge::Following) => WindowFrameEdge::Following,
+        _ => return None,
+    };
+    let WindowFrameOffsets::Both { start, end } = offsets else {
+        unreachable!("same-kind bounded frames carry both offset registers")
+    };
+    Some(match direction {
+        WindowFrameEdge::Preceding => WindowFrameOrderCheck::EndAtOrBeforeStart { start, end },
+        WindowFrameEdge::Following => WindowFrameOrderCheck::EndAtOrAfterStart { start, end },
+        WindowFrameEdge::UnboundedPreceding
+        | WindowFrameEdge::CurrentRow
+        | WindowFrameEdge::UnboundedFollowing => unreachable!("direction was checked above"),
+    })
+}
+
+pub(crate) fn emit_window_nonempty_branch(
+    program: &mut ProgramBuilder,
+    check: WindowFrameOrderCheck,
+    target: BranchOffset,
+) {
+    let flags = crate::vdbe::insn::CmpInsFlags::default();
+    match check {
+        WindowFrameOrderCheck::EndAtOrBeforeStart { start, end } => {
+            program.emit_insn(Insn::Le {
+                lhs: end,
+                rhs: start,
+                target_pc: target,
+                flags,
+                collation: None,
+            });
+        }
+        WindowFrameOrderCheck::EndAtOrAfterStart { start, end } => {
+            program.emit_insn(Insn::Ge {
+                lhs: end,
+                rhs: start,
+                target_pc: target,
+                flags,
+                collation: None,
+            });
+        }
+    }
+}
+
 fn legacy_window_frame_edge(boundary: &crate::translate::plan::FrameBoundary) -> WindowFrameEdge {
     match boundary {
         crate::translate::plan::FrameBoundary::UnboundedPreceding => {
@@ -2112,43 +2174,13 @@ impl EmitWindow {
         // branch — SQLite gets that re-entry for free because its
         // first-row test is `rowid == 1` and ResetSorter restarts the
         // rowids.
-        let same_kind_bounded = frame.mode != FrameMode::Range
-            && matches!(
-                (frame.start, frame.end),
-                (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding)
-                    | (WindowFrameEdge::Following, WindowFrameEdge::Following)
-            );
-        if same_kind_bounded {
-            let start_offset_reg = registers
-                .frame_offsets
-                .start()
-                .expect("same-kind bounded frames carry a start offset");
-            let end_offset_reg = registers
-                .frame_offsets
-                .end()
-                .expect("same-kind bounded frames carry an end offset");
+        if let Some(check) = window_frame_order_check(frame, registers.frame_offsets) {
             let label_frame_valid = program.allocate_label();
             program.add_comment(program.offset(), "empty-frame check");
             // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
             // valid iff end <= start. Mirrors the Ge/Le pick at
             // window.c:2951.
-            if frame.start == WindowFrameEdge::Following {
-                program.emit_insn(Insn::Ge {
-                    lhs: end_offset_reg,
-                    rhs: start_offset_reg,
-                    target_pc: label_frame_valid,
-                    flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
-                });
-            } else {
-                program.emit_insn(Insn::Le {
-                    lhs: end_offset_reg,
-                    rhs: start_offset_reg,
-                    target_pc: label_frame_valid,
-                    flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
-                });
-            }
+            emit_window_nonempty_branch(program, check, label_frame_valid);
             if !frame.has_exclude {
                 emit_window_agg_final(program, window, &registers, &minmax, false);
             }

@@ -36,6 +36,11 @@ use crate::{
 };
 
 #[cfg(test)]
+use crate::translate::window::{
+    emit_window_nonempty_branch, window_frame_order_check, WindowFrameOrderCheck,
+};
+
+#[cfg(test)]
 use crate::translate::window::emit_window_peer_seed;
 
 /// One value stored for a window layer.
@@ -1828,6 +1833,43 @@ mod tests {
                 has_exclude: true,
             }
         );
+    }
+
+    #[test]
+    fn hir_window_frame_order_uses_shared_nonempty_branch() {
+        fn check(frame: &str) -> WindowFrameOrderCheck {
+            let document = analyze_sql(&format!(
+                "SELECT sum(value) OVER (ROWS BETWEEN {frame}) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+            window_frame_order_check(hir_window_frame_shape(&plan.window.frame), offsets)
+                .expect("same-kind bounded frame needs an order check")
+        }
+
+        let preceding = check("2 PRECEDING AND 1 PRECEDING");
+        assert!(matches!(
+            preceding,
+            WindowFrameOrderCheck::EndAtOrBeforeStart { .. }
+        ));
+        let following = check("1 FOLLOWING AND 2 FOLLOWING");
+        assert!(matches!(
+            following,
+            WindowFrameOrderCheck::EndAtOrAfterStart { .. }
+        ));
+
+        let mut program = program();
+        let target = program.allocate_label();
+        emit_window_nonempty_branch(&mut program, preceding, target);
+        emit_window_nonempty_branch(&mut program, following, target);
+        let [preceding_branch, following_branch] = program.insns.as_slice() else {
+            panic!("one branch is emitted for each frame direction");
+        };
+        assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
+        assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
     }
 
     #[test]

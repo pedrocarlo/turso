@@ -951,6 +951,9 @@ runtime loop consumes the same accessors and keeps the existing opcode order.
 Window step, per-operation, output, and flush routing now consume an
 expression-free frame shape. Legacy and HIR map their own bounds into the same
 edge enum; runtime routing no longer matches legacy `FrameBoundary` values.
+The crossed-bound check for same-kind bounded frames is shared as well. One
+explicit order-check enum selects the existing `Le`/`Ge` branch, and both HIR
+and legacy frame state can classify that check without carrying expressions.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
