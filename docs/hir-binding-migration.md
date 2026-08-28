@@ -911,6 +911,9 @@ loop does not call this insertion path yet. HIR window plans also retain the
 exact buffer slot for every PARTITION BY and ORDER BY term. Reused expressions
 share one stored value while repeated terms and their original order remain
 explicit for partition and peer comparisons.
+PARTITION BY terms now retain their analyzed type and collation facts in HIR,
+matching ORDER BY terms instead of discarding those facts during window
+construction.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

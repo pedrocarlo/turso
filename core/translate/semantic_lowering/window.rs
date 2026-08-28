@@ -352,7 +352,7 @@ pub(super) fn plan_hir_window_buffer<'a>(
     let partition_slots = window
         .partition_by
         .iter()
-        .map(|expression| push_reused_column(&mut columns, expression_column(expression)))
+        .map(|term| push_reused_column(&mut columns, expression_column(&term.expr)))
         .collect();
     let order_slots = window
         .order_by

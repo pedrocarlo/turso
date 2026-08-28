@@ -9741,6 +9741,14 @@ mod tests {
         );
         let window = &block.windows[window.index];
         assert_eq!(window.partition_by.len(), 1);
+        assert_eq!(window.partition_by[0].type_fact.storage, Some(Type::Text));
+        assert_eq!(
+            window.partition_by[0]
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value()),
+            Some(crate::translate::collate::CollationSeq::NoCase)
+        );
         assert_eq!(window.order_by.len(), 1);
         assert_eq!(window.order_by[0].order, ast::SortOrder::Desc);
         assert_eq!(window.order_by[0].nulls, Some(ast::NullsOrder::Last));

@@ -473,7 +473,11 @@ impl FunctionWindow {
             partition_by: self
                 .partition_by
                 .into_iter()
-                .map(|value| value.expr)
+                .map(|value| hir::WindowPartitionTerm {
+                    collation: value.collation.value().cloned(),
+                    type_fact: value.type_fact,
+                    expr: value.expr,
+                })
                 .collect(),
             order_by: self
                 .order_by
