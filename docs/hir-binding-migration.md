@@ -900,7 +900,10 @@ Window buffer cursor creation is now shared below the legacy/HIR boundary.
 Both paths can open the same ephemeral table roles in the same order: current,
 write, end, and the optional moving-start and positional-lookup cursors. Legacy
 window initialization uses this helper without changing its frame plan or
-opcode flow. HIR does not open or populate the buffer yet.
+opcode flow. HIR window plans now open this same cursor set from their resolved
+frame and function requirements. Their ephemeral table schema carries only the
+planned record width because expression types, collations, and comparison rules
+remain owned by resolved HIR facts. HIR does not populate the buffer yet.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

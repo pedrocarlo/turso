@@ -5,7 +5,9 @@ use std::ops::ControlFlow;
 use smallvec::SmallVec;
 
 use crate::{
-    function::{AccumulatorFunc, Func},
+    function::{AccumulatorFunc, Func, WindowFunc},
+    schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Type},
+    sync::Arc,
     translate::{
         aggregation::hir_aggregate_function,
         collate::CollationSeq,
@@ -13,9 +15,10 @@ use crate::{
         semantic::hir::{self, ExprVisitor},
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
-            emit_function_inverse_runtime, emit_function_step_runtime,
-            window_function_uses_subtypes, BufferedWindowValue, WindowFunctionRuntime,
-            WindowFunctionRuntimeSpec, WindowStepContext, WindowValueEmitter,
+            emit_function_inverse_runtime, emit_function_step_runtime, open_window_buffer,
+            window_function_uses_subtypes, BufferedWindowValue, WindowBufferRuntime,
+            WindowFunctionRuntime, WindowFunctionRuntimeSpec, WindowStepContext,
+            WindowValueEmitter,
         },
     },
     vdbe::{builder::ProgramBuilder, insn::Insn, CursorID},
@@ -84,6 +87,30 @@ pub(super) struct HirWindowBufferPlan<'a> {
     pub(super) columns: Vec<HirWindowBufferColumn<'a>>,
     pub(super) functions: Vec<HirWindowFunction<'a>>,
     late_inputs: Vec<HirWindowLateInput<'a>>,
+}
+
+impl HirWindowBufferPlan<'_> {
+    fn needs_start_cursor(&self) -> bool {
+        !matches!(
+            self.window.frame.start,
+            hir::WindowFrameBound::UnboundedPreceding
+        )
+    }
+
+    fn needs_app_cursor(&self) -> bool {
+        self.window.frame.exclude.is_some()
+            || self.functions.iter().any(|function| {
+                matches!(
+                    &function.function,
+                    AccumulatorFunc::Window(
+                        WindowFunc::FirstValue
+                            | WindowFunc::NthValue
+                            | WindowFunc::Lag
+                            | WindowFunc::Lead
+                    )
+                )
+            })
+    }
 }
 
 struct WindowCallCollector<'a> {
@@ -429,6 +456,53 @@ pub(super) fn emit_hir_window_input_row(
     Ok(row)
 }
 
+fn hir_window_buffer_table(window: hir::WindowId, column_count: usize) -> Arc<BTreeTable> {
+    // HIR lowering carries type and collation facts separately. These columns
+    // only describe the width of the ephemeral records stored by the cursor.
+    let columns = (0..column_count)
+        .map(|_| {
+            Column::new(
+                None,
+                String::new(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            )
+        })
+        .collect();
+    Arc::new(BTreeTable::new(
+        0,
+        format!(
+            "window_buffer_{}_{}_{}",
+            window.block.query, window.block.index, window.index
+        ),
+        Vec::new(),
+        columns,
+        BTreeCharacteristics::HAS_ROWID,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    ))
+}
+
+/// Open the ephemeral cursor roles required by one resolved HIR window.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn open_hir_window_buffer(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+) -> WindowBufferRuntime {
+    let table = hir_window_buffer_table(plan.window.id, plan.columns.len());
+    open_window_buffer(
+        program,
+        table,
+        plan.needs_start_cursor(),
+        plan.needs_app_cursor(),
+    )
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn prepare_hir_window_runtime<'a>(
     program: &mut ProgramBuilder,
@@ -755,6 +829,51 @@ mod tests {
             }
         );
         assert!(program.insns.is_empty());
+    }
+
+    fn assert_hir_buffer(
+        sql: &str,
+        expected_columns: usize,
+        needs_start_cursor: bool,
+        needs_app_cursor: bool,
+    ) {
+        let document = analyze_sql(sql);
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+
+        let runtime = open_hir_window_buffer(&mut program, &plan);
+
+        assert_eq!(runtime.table.columns().len(), expected_columns);
+        assert!(runtime.table.has_rowid);
+        assert_eq!(runtime.cursors.csr_start.is_some(), needs_start_cursor);
+        assert_eq!(runtime.cursors.csr_app.is_some(), needs_app_cursor);
+    }
+
+    #[test]
+    fn hir_window_buffer_uses_planned_width_and_legacy_cursor_rules() {
+        assert_hir_buffer("SELECT row_number() OVER () FROM items", 0, false, false);
+        assert_hir_buffer(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
+            1,
+            true,
+            false,
+        );
+        assert_hir_buffer(
+            "SELECT nth_value(value, 1) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM items",
+            2,
+            false,
+            true,
+        );
+        assert_hir_buffer(
+            "SELECT sum(value) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+             EXCLUDE CURRENT ROW) FROM items",
+            1,
+            false,
+            true,
+        );
     }
 
     #[test]
