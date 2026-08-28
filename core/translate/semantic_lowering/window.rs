@@ -21,6 +21,7 @@ use crate::{
             WindowStepContext, WindowValueEmitter,
         },
     },
+    types::KeyInfo,
     vdbe::{builder::ProgramBuilder, insn::Insn, CursorID},
     LimboError, Result,
 };
@@ -84,6 +85,44 @@ pub(super) struct HirWindowBufferPlan<'a> {
 }
 
 impl HirWindowBufferPlan<'_> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn partition_key_info(&self) -> impl Iterator<Item = Result<KeyInfo>> + '_ {
+        self.window
+            .partition_by
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let slot = self.partition_slots[*index];
+                !self.partition_slots[..*index].contains(&slot)
+            })
+            .map(|(_, term)| {
+                Ok(KeyInfo {
+                    sort_order: turso_parser::ast::SortOrder::Asc,
+                    collation: term
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value())
+                        .unwrap_or_default(),
+                    nulls_order: None,
+                })
+            })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn order_key_info(&self) -> impl Iterator<Item = Result<KeyInfo>> + '_ {
+        self.window.order_by.iter().map(|term| {
+            Ok(KeyInfo {
+                sort_order: turso_parser::ast::SortOrder::Asc,
+                collation: term
+                    .collation
+                    .as_ref()
+                    .map(|collation| *collation.value())
+                    .unwrap_or_default(),
+                nulls_order: None,
+            })
+        })
+    }
+
     fn needs_start_cursor(&self) -> bool {
         !matches!(
             self.window.frame.start,
@@ -806,6 +845,67 @@ mod tests {
                 .column,
             0
         );
+    }
+
+    #[test]
+    fn hir_window_key_comparison_uses_resolved_collations() {
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (\
+                 PARTITION BY group_id COLLATE nocase, group_id COLLATE nocase \
+                 ORDER BY sort_key, group_id COLLATE nocase\
+             ) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let left = program.alloc_registers(2);
+        let right = program.alloc_registers(2);
+        let equal = program.allocate_label();
+        let different = program.allocate_label();
+
+        crate::translate::window::emit_window_key_compare(
+            &mut program,
+            right,
+            left,
+            plan.order_key_info(),
+            equal,
+            different,
+        )
+        .expect("resolved ORDER BY keys compare");
+
+        let [compare, jump] = program.insns.as_slice() else {
+            panic!("key comparison emits Compare and Jump");
+        };
+        assert!(matches!(
+            &compare.0,
+            Insn::Compare {
+                start_reg_a,
+                start_reg_b,
+                count: 2,
+                key_info,
+            } if *start_reg_a == left
+                && *start_reg_b == right
+                && key_info[0].collation == CollationSeq::Binary
+                && key_info[1].collation == CollationSeq::NoCase
+        ));
+        assert!(matches!(
+            &jump.0,
+            Insn::Jump {
+                target_pc_lt,
+                target_pc_eq,
+                target_pc_gt,
+            } if *target_pc_lt == different
+                && *target_pc_eq == equal
+                && *target_pc_gt == different
+        ));
+
+        let partition_keys = plan
+            .partition_key_info()
+            .collect::<Result<Vec<_>>>()
+            .expect("resolved PARTITION BY keys collect for inspection");
+        assert_eq!(partition_keys.len(), 1);
+        assert_eq!(partition_keys[0].collation, CollationSeq::NoCase);
     }
 
     #[test]

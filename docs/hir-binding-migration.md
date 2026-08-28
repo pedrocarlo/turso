@@ -914,6 +914,9 @@ explicit for partition and peer comparisons.
 PARTITION BY terms now retain their analyzed type and collation facts in HIR,
 matching ORDER BY terms instead of discarding those facts during window
 construction.
+Window key metadata stays iterator-based until `Insn::Compare` requires its
+owned vector. Legacy and HIR partition/peer comparisons use the same compare
+and branch emitter; HIR keys take collations directly from resolved terms.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

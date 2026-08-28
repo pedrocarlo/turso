@@ -1124,22 +1124,48 @@ pub(crate) fn emit_window_buffer_insert(
 /// stepping over a group in `emit_window_op`. `sort_order` and
 /// `nulls_order` are left at their `Insn::Compare` defaults — this check
 /// only asks whether the values are equal, not which one sorts first.
-fn build_order_by_key_info(
-    window: &Window,
-    table_references: &crate::translate::plan::TableReferences,
-) -> crate::Result<Vec<KeyInfo>> {
-    window
-        .order_by
-        .iter()
-        .map(|(expr, _, _)| {
-            let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
-            Ok(KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation,
-                nulls_order: None,
-            })
+fn order_by_key_info<'a>(
+    window: &'a Window,
+    table_references: &'a crate::translate::plan::TableReferences,
+) -> impl Iterator<Item = Result<KeyInfo>> + 'a {
+    window.order_by.iter().map(|(expr, _, _)| {
+        let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+        Ok(KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation,
+            nulls_order: None,
         })
-        .collect()
+    })
+}
+
+/// Compare two consecutive register blocks with the supplied key metadata.
+/// Key metadata stays lazy until `Insn::Compare` needs its owned vector.
+pub(crate) fn emit_window_key_compare(
+    program: &mut ProgramBuilder,
+    left: usize,
+    right: usize,
+    key_info: impl IntoIterator<Item = Result<KeyInfo>>,
+    if_equal: BranchOffset,
+    if_different: BranchOffset,
+) -> Result<()> {
+    let key_info = key_info.into_iter().collect::<Result<Vec<_>>>()?;
+    let count = key_info.len();
+    turso_assert!(count > 0, "window key comparison requires at least one key");
+    // `Insn::Compare` requires `start_reg_a < start_reg_b`; unequal
+    // targets are symmetric, so operand order does not change semantics.
+    let (left, right) = (left.min(right), left.max(right));
+    program.emit_insn(Insn::Compare {
+        start_reg_a: left,
+        start_reg_b: right,
+        count,
+        key_info,
+    });
+    program.emit_insn(Insn::Jump {
+        target_pc_lt: if_different,
+        target_pc_eq: if_equal,
+        target_pc_gt: if_different,
+    });
+    Ok(())
 }
 
 /// Which side of the frame an offset belongs to. Selects the error
@@ -2069,21 +2095,14 @@ fn emit_if_new_peer(
     let reg_new = reg_new.expect("new_order_by_columns_start must exist when ORDER BY is present");
     let reg_old = reg_old.expect("peer reference register must exist when ORDER BY is present");
     let label_new_peer = program.allocate_label();
-    // `Insn::Compare` requires `start_reg_a < start_reg_b`; the Jump
-    // targets are symmetric on lt/gt so operand order doesn't change
-    // the semantics.
-    let (reg_a, reg_b) = (reg_new.min(reg_old), reg_new.max(reg_old));
-    program.emit_insn(Insn::Compare {
-        start_reg_a: reg_a,
-        start_reg_b: reg_b,
-        count: order_by_len,
-        key_info: build_order_by_key_info(window, table_references)?,
-    });
-    program.emit_insn(Insn::Jump {
-        target_pc_lt: label_new_peer,
-        target_pc_eq: target_if_peer,
-        target_pc_gt: label_new_peer,
-    });
+    emit_window_key_compare(
+        program,
+        reg_new,
+        reg_old,
+        order_by_key_info(window, table_references),
+        target_if_peer,
+        label_new_peer,
+    )?;
     program.preassign_label_to_next_insn(label_new_peer);
     program.emit_insn(Insn::Copy {
         src_reg: reg_new,
@@ -2167,18 +2186,7 @@ fn emit_flush_buffer_if_new_partition(
             program.offset(),
             "compare partition keys to detect new partition",
         );
-        let mut compare_key_info = (0..partition_by_len)
-            .map(|_| KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::default(),
-                nulls_order: None,
-            })
-            .collect::<Vec<_>>();
-        for (i, c) in compare_key_info
-            .iter_mut()
-            .enumerate()
-            .take(partition_by_len)
-        {
+        let partition_key_info = (0..partition_by_len).map(|i| {
             // After rewriting, partition_by entries are Expr::Column references to the
             // subquery. Duplicates reference the same column index, so we find the entry
             // that references column i (the i-th unique partition column) to get the
@@ -2188,20 +2196,20 @@ fn emit_flush_buffer_if_new_partition(
                 .iter()
                 .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
                 .unwrap_or(&window.partition_by[i]);
-            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
-            c.collation = maybe_collation.unwrap_or_default();
-        }
-        program.emit_insn(Insn::Compare {
-            start_reg_a: registers.src_columns_start,
-            start_reg_b: reg_partition_start,
-            count: partition_by_len,
-            key_info: compare_key_info,
+            Ok(KeyInfo {
+                sort_order: SortOrder::Asc,
+                collation: get_collseq_from_expr(expr, &plan.table_references)?.unwrap_or_default(),
+                nulls_order: None,
+            })
         });
-        program.emit_insn(Insn::Jump {
-            target_pc_lt: new_partition_label,
-            target_pc_eq: same_partition_label,
-            target_pc_gt: new_partition_label,
-        });
+        emit_window_key_compare(
+            program,
+            registers.src_columns_start,
+            reg_partition_start,
+            partition_key_info,
+            same_partition_label,
+            new_partition_label,
+        )?;
 
         program.preassign_label_to_next_insn(new_partition_label);
         program.add_comment(program.offset(), "detected new partition");
@@ -2565,18 +2573,14 @@ fn emit_window_full_scan(
                         default: None,
                     });
                 }
-                let (reg_a, reg_b) = (current_peer.min(scan_peer), current_peer.max(scan_peer));
-                program.emit_insn(Insn::Compare {
-                    start_reg_a: reg_a,
-                    start_reg_b: reg_b,
-                    count: order_by_len,
-                    key_info: build_order_by_key_info(window, &plan.table_references)?,
-                });
-                program.emit_insn(Insn::Jump {
-                    target_pc_lt: label_step,
-                    target_pc_eq: label_next,
-                    target_pc_gt: label_step,
-                });
+                emit_window_key_compare(
+                    program,
+                    current_peer,
+                    scan_peer,
+                    order_by_key_info(window, &plan.table_references),
+                    label_next,
+                    label_step,
+                )?;
             }
         }
     }
