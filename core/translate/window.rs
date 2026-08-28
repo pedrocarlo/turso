@@ -1169,6 +1169,25 @@ pub(crate) fn emit_window_key_compare(
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct WindowInputState {
+    pub(crate) rowid: usize,
+    pub(crate) previous_partition: Option<usize>,
+    pub(crate) flush_return: usize,
+}
+
+pub(crate) fn prepare_window_input_state(
+    program: &mut ProgramBuilder,
+    partition_key_count: usize,
+) -> WindowInputState {
+    WindowInputState {
+        rowid: program.alloc_registers_and_init_w_null(1),
+        previous_partition: (partition_key_count > 0)
+            .then(|| program.alloc_registers_and_init_w_null(partition_key_count)),
+        flush_return: program.alloc_register(),
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) struct WindowPartitionState {
     pub(crate) previous_keys: usize,
     pub(crate) rowid: usize,
@@ -1514,6 +1533,8 @@ impl EmitWindow {
             )?;
         }
 
+        let input_state = prepare_window_input_state(program, partition_by_len);
+
         t_ctx.meta_window = Some(WindowMetadata {
             labels: WindowLabels {
                 flush_buffer: program.allocate_label(),
@@ -1521,15 +1542,11 @@ impl EmitWindow {
                 window_processing_end: program.allocate_label(),
             },
             registers: WindowRegisters {
-                rowid: program.alloc_registers_and_init_w_null(1),
-                partition_start: if partition_by_len > 0 {
-                    Some(program.alloc_registers_and_init_w_null(partition_by_len))
-                } else {
-                    None
-                },
+                rowid: input_state.rowid,
+                partition_start: input_state.previous_partition,
                 acc_start: reg_acc_start,
                 acc_result_start: reg_acc_result_start,
-                flush_buffer_return_offset: program.alloc_register(),
+                flush_buffer_return_offset: input_state.flush_return,
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
                 new_order_by_columns_start: alloc_optional_registers(program, order_by_len),

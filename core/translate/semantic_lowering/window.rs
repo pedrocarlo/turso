@@ -15,14 +15,15 @@ use crate::{
         semantic::hir::{self, ExprVisitor},
         semantic_lowering::expr::{translate_expr, translate_expr_with_inputs, ExprRegisterInput},
         window::{
-            emit_function_inverse_runtime, emit_function_step_runtime, open_window_buffer,
+            emit_function_inverse_runtime, emit_function_step_runtime,
+            emit_window_partition_change, open_window_buffer, prepare_window_input_state,
             window_function_uses_subtypes, BufferedWindowValue, WindowBufferInput,
             WindowBufferRuntime, WindowFunctionRuntime, WindowFunctionRuntimeSpec,
-            WindowStepContext, WindowValueEmitter,
+            WindowInputState, WindowPartitionState, WindowStepContext, WindowValueEmitter,
         },
     },
     types::KeyInfo,
-    vdbe::{builder::ProgramBuilder, insn::Insn, CursorID},
+    vdbe::{builder::ProgramBuilder, insn::Insn, BranchOffset, CursorID},
     LimboError, Result,
 };
 
@@ -495,6 +496,38 @@ pub(super) fn emit_hir_window_input_row(
     Ok(row)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn prepare_hir_window_input_state(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+) -> WindowInputState {
+    prepare_window_input_state(program, plan.partition_key_info().count())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_partition_change(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    input: WindowBufferInput,
+    state: WindowInputState,
+    flush_buffer: BranchOffset,
+) -> Result<()> {
+    let Some(previous_keys) = state.previous_partition else {
+        return Ok(());
+    };
+    emit_window_partition_change(
+        program,
+        input.start,
+        WindowPartitionState {
+            previous_keys,
+            rowid: state.rowid,
+            flush_return: state.flush_return,
+        },
+        flush_buffer,
+        plan.partition_key_info(),
+    )
+}
+
 fn hir_window_buffer_table(window: hir::WindowId, column_count: usize) -> Arc<BTreeTable> {
     // HIR lowering carries type and collation facts separately. These columns
     // only describe the width of the ephemeral records stored by the cursor.
@@ -917,25 +950,26 @@ mod tests {
             plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
         let mut program = program();
         let current_keys = program.alloc_register();
-        let previous_keys = program.alloc_register();
-        let rowid = program.alloc_register();
-        let flush_return = program.alloc_register();
+        let state = prepare_hir_window_input_state(&mut program, &plan);
+        let previous_keys = state
+            .previous_partition
+            .expect("partition registers are allocated");
+        let sequence_start = program.insns.len();
         let flush_buffer = program.allocate_label();
 
-        crate::translate::window::emit_window_partition_change(
+        emit_hir_window_partition_change(
             &mut program,
-            current_keys,
-            crate::translate::window::WindowPartitionState {
-                previous_keys,
-                rowid,
-                flush_return,
+            &plan,
+            WindowBufferInput {
+                start: current_keys,
+                count: 1,
             },
+            state,
             flush_buffer,
-            plan.partition_key_info(),
         )
         .expect("resolved partition keys drive the shared runtime sequence");
 
-        let [compare, jump, gosub, null, copy] = program.insns.as_slice() else {
+        let [compare, jump, gosub, null, copy] = &program.insns[sequence_start..] else {
             panic!("partition change emits compare, branch, flush, reset, and key copy");
         };
         assert!(matches!(
@@ -962,14 +996,14 @@ mod tests {
             Insn::Gosub {
                 target_pc,
                 return_reg,
-            } if *target_pc == flush_buffer && *return_reg == flush_return
+            } if *target_pc == flush_buffer && *return_reg == state.flush_return
         ));
         assert!(matches!(
             &null.0,
             Insn::Null {
                 dest,
                 dest_end: None,
-            } if *dest == rowid
+            } if *dest == state.rowid
         ));
         assert!(matches!(
             &copy.0,
@@ -979,6 +1013,28 @@ mod tests {
                 extra_amount: 0,
             } if *src_reg == current_keys && *dst_reg == previous_keys
         ));
+    }
+
+    #[test]
+    fn hir_window_without_partition_skips_partition_change() {
+        let document = analyze_sql("SELECT sum(value) OVER () FROM items");
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        let mut program = program();
+        let input = WindowBufferInput {
+            start: program.alloc_registers(plan.columns.len()),
+            count: plan.columns.len(),
+        };
+        let state = prepare_hir_window_input_state(&mut program, &plan);
+        assert!(state.previous_partition.is_none());
+        let sequence_start = program.insns.len();
+        let flush_buffer = program.allocate_label();
+
+        emit_hir_window_partition_change(&mut program, &plan, input, state, flush_buffer)
+            .expect("a window without PARTITION BY needs no comparison");
+
+        assert_eq!(program.insns.len(), sequence_start);
     }
 
     #[test]

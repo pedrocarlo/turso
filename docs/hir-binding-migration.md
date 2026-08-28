@@ -920,6 +920,9 @@ and branch emitter; HIR keys take collations directly from resolved terms.
 The partition-change sequence is shared too: compare keys, flush the previous
 partition, reset rowid, then save the new keys. The emitted key width drives
 the copy without collecting or walking the key iterator a second time.
+Legacy and HIR window input paths now allocate the rowid, saved partition keys,
+and flush return register through the same input state. HIR partition handling
+passes its resolved key iterator directly into the shared change sequence.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
