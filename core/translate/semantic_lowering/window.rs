@@ -2026,6 +2026,143 @@ mod tests {
     }
 
     #[test]
+    fn hir_window_first_row_preserves_legacy_sequence() {
+        use crate::translate::window::{emit_window_first_row_frame, WindowFirstRowFrame};
+
+        for (frame, guard, delay, start_cursor) in [
+            (
+                "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+                Some("ge"),
+                true,
+                true,
+            ),
+            (
+                "ROWS BETWEEN 2 PRECEDING AND 1 PRECEDING",
+                Some("le"),
+                false,
+                true,
+            ),
+            (
+                "RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+                None,
+                false,
+                true,
+            ),
+            (
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                None,
+                false,
+                false,
+            ),
+        ] {
+            let document = analyze_sql(&format!(
+                "SELECT sum(value) OVER (ORDER BY sort_key {frame}) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let runtime = open_hir_window_buffer(&mut program, &plan);
+            let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+            let input = WindowBufferInput {
+                start: program.alloc_registers(plan.columns.len()),
+                count: plan.columns.len(),
+            };
+            let rowid = program.alloc_register();
+            let marker = program.alloc_register();
+            let step_end = program.allocate_label();
+            let sequence_start = program.insns.len();
+            emit_window_first_row_frame(
+                &mut program,
+                WindowFirstRowFrame {
+                    frame: hir_window_frame_shape(&plan.window.frame),
+                    offsets,
+                    cursors: runtime.cursors,
+                    input,
+                    rowid,
+                    table_name: &runtime.table.name,
+                    step_end,
+                },
+                |program, output| {
+                    program.emit_insn(Insn::Integer {
+                        value: match output {
+                            WindowEmptyFrameOutput::Aggregate => 1,
+                            WindowEmptyFrameOutput::Row => 2,
+                        },
+                        dest: marker,
+                    });
+                    Ok(())
+                },
+            )
+            .expect("HIR first-row frame emits");
+
+            let mut expected = vec!["record", "rowid", "insert"];
+            if let Some(branch) = guard {
+                expected.extend([
+                    branch,
+                    "aggregate",
+                    "rewind",
+                    "row",
+                    "reset",
+                    "null",
+                    "jump",
+                ]);
+            }
+            if delay {
+                expected.push("delay");
+            }
+            if start_cursor {
+                expected.push("rewind");
+            }
+            expected.extend(["rewind", "rewind", "jump"]);
+            let mut rewinds = Vec::new();
+            let actual: Vec<_> = program.insns[sequence_start..]
+                .iter()
+                .map(|instruction| match &instruction.0 {
+                    Insn::MakeRecord { .. } => "record",
+                    Insn::NewRowid { .. } => "rowid",
+                    Insn::Insert { cursor, .. } => {
+                        assert_eq!(*cursor, runtime.cursors.csr_write);
+                        "insert"
+                    }
+                    Insn::Ge { .. } => "ge",
+                    Insn::Le { .. } => "le",
+                    Insn::Integer { value: 1, dest } if *dest == marker => "aggregate",
+                    Insn::Integer { value: 2, dest } if *dest == marker => "row",
+                    Insn::Rewind { cursor_id, .. } => {
+                        rewinds.push(*cursor_id);
+                        "rewind"
+                    }
+                    Insn::ResetSorter { .. } => "reset",
+                    Insn::Null { dest, .. } => {
+                        assert_eq!(*dest, rowid);
+                        "null"
+                    }
+                    Insn::Goto { target_pc } => {
+                        assert_eq!(*target_pc, step_end);
+                        "jump"
+                    }
+                    Insn::Subtract { lhs, rhs, dest } => {
+                        assert_eq!(Some(*lhs), offsets.end());
+                        assert_eq!(Some(*rhs), offsets.start());
+                        assert_eq!(*dest, *rhs);
+                        "delay"
+                    }
+                    other => panic!("unexpected first-row instruction: {other:?}"),
+                })
+                .collect();
+            assert_eq!(actual, expected, "{frame}");
+            let mut expected_rewinds = Vec::new();
+            if guard.is_some() {
+                expected_rewinds.push(runtime.cursors.csr_current);
+            }
+            expected_rewinds.extend(runtime.cursors.csr_start);
+            expected_rewinds.extend([runtime.cursors.csr_current, runtime.cursors.csr_end]);
+            assert_eq!(rewinds, expected_rewinds, "{frame}");
+        }
+    }
+
+    #[test]
     fn hir_window_empty_frame_uses_shared_guard_order() {
         let document = analyze_sql(
             "SELECT sum(value) OVER (ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM items",

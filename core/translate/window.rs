@@ -1153,6 +1153,65 @@ pub(crate) fn emit_window_empty_frame_guard(
     Ok(())
 }
 
+/// First-row control flow needs only prepared frame and buffer state.
+pub(crate) struct WindowFirstRowFrame<'a> {
+    pub frame: WindowFrameShape,
+    pub offsets: WindowFrameOffsets,
+    pub cursors: WindowCursors,
+    pub input: WindowBufferInput,
+    pub rowid: usize,
+    pub table_name: &'a str,
+    pub step_end: BranchOffset,
+}
+
+/// Keep first-row insertion and frame positioning identical for HIR and legacy callers.
+pub(crate) fn emit_window_first_row_frame(
+    program: &mut ProgramBuilder,
+    state: WindowFirstRowFrame<'_>,
+    emit_output: impl FnMut(&mut ProgramBuilder, WindowEmptyFrameOutput) -> Result<()>,
+) -> Result<()> {
+    emit_window_buffer_insert(
+        program,
+        &state.cursors,
+        state.input,
+        state.rowid,
+        state.table_name,
+    );
+    // Empty-frame check (window.c:2950-2961): for non-RANGE frames
+    // bounded on both sides by the same kind, crossing bounds make the
+    // frame empty for every row.
+    if let Some(check) = window_frame_order_check(state.frame, state.offsets) {
+        emit_window_empty_frame_guard(
+            program,
+            check,
+            WindowEmptyFrameState {
+                current_cursor: state.cursors.csr_current,
+                rowid: state.rowid,
+                step_end: state.step_end,
+            },
+            emit_output,
+        )?;
+    }
+    // `N FOLLOWING AND M FOLLOWING`: dropping rows off the start
+    // (AGGINVERSE) must lag adding them (AGGSTEP) by M - N rows,
+    // rather than lag emitting the result (RETURN_ROW) by M. So the
+    // start count is set to the difference of the two offsets
+    // (window.c:2962-2965).
+    emit_window_following_start_delay(program, state.frame, state.offsets);
+    // Position each frame cursor at the just-inserted first row.
+    // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
+    // the frame start isn't UNBOUNDED PRECEDING (otherwise the
+    // cursor wasn't allocated and AggInverse is a no-op).
+    emit_window_frame_cursor_rewind(program, state.cursors);
+    // The first row is not added to the totals here. The flush
+    // subroutine adds it once at the end of the partition (AGGSTEP)
+    // and emits it there (RETURN_ROW).
+    program.emit_insn(Insn::Goto {
+        target_pc: state.step_end,
+    });
+    Ok(())
+}
+
 pub(crate) fn emit_window_following_start_delay(
     program: &mut ProgramBuilder,
     frame: WindowFrameShape,
@@ -2252,62 +2311,33 @@ impl EmitWindow {
                 WindowFrameBoundSide::End,
             )?;
         }
-        emit_window_buffer_insert(
+        emit_window_first_row_frame(
             program,
-            &cursors,
-            input,
-            registers.rowid,
-            &buffer_table_name,
-        );
-        // Empty-frame check (window.c:2950-2961): for non-RANGE frames
-        // bounded on both sides by the same kind, crossing bounds make the
-        // frame empty for every row.
-        if let Some(check) = window_frame_order_check(frame, registers.frame_offsets) {
-            emit_window_empty_frame_guard(
-                program,
-                check,
-                WindowEmptyFrameState {
-                    current_cursor: cursors.csr_current,
-                    rowid: registers.rowid,
-                    step_end: label_step_end,
-                },
-                |program, output| match output {
-                    WindowEmptyFrameOutput::Aggregate => {
-                        if !frame.has_exclude {
-                            let meta = t_ctx
-                                .meta_window
-                                .as_ref()
-                                .expect("missing window metadata");
-                            emit_window_aggregate_results(
-                                program,
-                                registers.acc_start,
-                                &meta.functions,
-                                WindowAggregateResultMode::Value,
-                            );
-                        }
-                        Ok(())
+            WindowFirstRowFrame {
+                frame,
+                offsets: registers.frame_offsets,
+                cursors,
+                input,
+                rowid: registers.rowid,
+                table_name: &buffer_table_name,
+                step_end: label_step_end,
+            },
+            |program, output| match output {
+                WindowEmptyFrameOutput::Aggregate => {
+                    if !frame.has_exclude {
+                        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+                        emit_window_aggregate_results(
+                            program,
+                            registers.acc_start,
+                            &meta.functions,
+                            WindowAggregateResultMode::Value,
+                        );
                     }
-                    WindowEmptyFrameOutput::Row => emit_return_one_row(program, t_ctx, plan),
-                },
-            )?;
-        }
-        // `N FOLLOWING AND M FOLLOWING`: dropping rows off the start
-        // (AGGINVERSE) must lag adding them (AGGSTEP) by M - N rows,
-        // rather than lag emitting the result (RETURN_ROW) by M. So the
-        // start count is set to the difference of the two offsets
-        // (window.c:2962-2965).
-        emit_window_following_start_delay(program, frame, registers.frame_offsets);
-        // Position each frame cursor at the just-inserted first row.
-        // Mirrors `window.c:2967-2971` — `csr_start` is rewound only when
-        // the frame start isn't UNBOUNDED PRECEDING (otherwise the
-        // cursor wasn't allocated and AggInverse is a no-op).
-        emit_window_frame_cursor_rewind(program, cursors);
-        // The first row is not added to the totals here. The flush
-        // subroutine adds it once at the end of the partition (AGGSTEP)
-        // and emits it there (RETURN_ROW).
-        program.emit_insn(Insn::Goto {
-            target_pc: label_step_end,
-        });
+                    Ok(())
+                }
+                WindowEmptyFrameOutput::Row => emit_return_one_row(program, t_ctx, plan),
+            },
+        )?;
 
         // --- SUBSEQUENT ROW ---
         program.preassign_label_to_next_insn(label_subsequent);
