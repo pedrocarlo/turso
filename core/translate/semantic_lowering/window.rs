@@ -35,10 +35,14 @@ use crate::{
     LimboError, Result,
 };
 
+use crate::translate::window::{
+    emit_window_aggregate_results, emit_window_first_row_frame, WindowAggregateResultMode,
+    WindowEmptyFrameOutput, WindowFirstRowFrame,
+};
+
 #[cfg(test)]
 use crate::translate::window::{
-    emit_window_aggregate_results, emit_window_empty_frame_guard, emit_window_nonempty_branch,
-    window_frame_order_check, WindowAggregateResultMode, WindowEmptyFrameOutput,
+    emit_window_empty_frame_guard, emit_window_nonempty_branch, window_frame_order_check,
     WindowEmptyFrameState, WindowFrameOrderCheck,
 };
 
@@ -901,6 +905,41 @@ pub(super) fn emit_hir_window_frame_offsets(
     }
 
     Ok(())
+}
+
+/// Rebuild partition offsets before inserting its first row, then use the
+/// shared frame sequence with resolved HIR aggregate results.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_first_row_frame(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    plan: &HirWindowBufferPlan<'_>,
+    state: WindowFirstRowFrame<'_>,
+    accumulator_start: usize,
+    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    mut emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let frame = hir_window_frame_shape(&plan.window.frame);
+    assert_eq!(
+        state.frame, frame,
+        "first-row state must match the HIR frame"
+    );
+    emit_hir_window_frame_offsets(program, document, plan, state.offsets)?;
+    emit_window_first_row_frame(program, state, |program, output| match output {
+        WindowEmptyFrameOutput::Aggregate => {
+            // EXCLUDE frames compute results through their full-frame scan.
+            if !frame.has_exclude {
+                emit_window_aggregate_results(
+                    program,
+                    accumulator_start,
+                    functions,
+                    WindowAggregateResultMode::Value,
+                );
+            }
+            Ok(())
+        }
+        WindowEmptyFrameOutput::Row => emit_row(program),
+    })
 }
 
 struct HirWindowValueEmitter<'document, 'inputs> {
@@ -2027,11 +2066,15 @@ mod tests {
 
     #[test]
     fn hir_window_first_row_preserves_legacy_sequence() {
-        use crate::translate::window::{emit_window_first_row_frame, WindowFirstRowFrame};
-
         for (frame, guard, delay, start_cursor) in [
             (
                 "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+                Some("ge"),
+                true,
+                true,
+            ),
+            (
+                "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING EXCLUDE NO OTHERS",
                 Some("ge"),
                 true,
                 true,
@@ -2063,6 +2106,9 @@ mod tests {
                 .expect("window buffer plans");
             let mut program = program();
             let runtime = open_hir_window_buffer(&mut program, &plan);
+            let functions =
+                prepare_hir_window_runtime(&mut program, &plan).expect("window functions prepare");
+            let accumulator_start = program.alloc_registers(functions.len());
             let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
             let input = WindowBufferInput {
                 start: program.alloc_registers(plan.columns.len()),
@@ -2072,8 +2118,10 @@ mod tests {
             let marker = program.alloc_register();
             let step_end = program.allocate_label();
             let sequence_start = program.insns.len();
-            emit_window_first_row_frame(
+            emit_hir_window_first_row_frame(
                 &mut program,
+                &document,
+                &plan,
                 WindowFirstRowFrame {
                     frame: hir_window_frame_shape(&plan.window.frame),
                     offsets,
@@ -2083,12 +2131,11 @@ mod tests {
                     table_name: &runtime.table.name,
                     step_end,
                 },
-                |program, output| {
+                accumulator_start,
+                &functions,
+                |program| {
                     program.emit_insn(Insn::Integer {
-                        value: match output {
-                            WindowEmptyFrameOutput::Aggregate => 1,
-                            WindowEmptyFrameOutput::Row => 2,
-                        },
+                        value: 2,
                         dest: marker,
                     });
                     Ok(())
@@ -2096,17 +2143,30 @@ mod tests {
             )
             .expect("HIR first-row frame emits");
 
+            let sequence = &program.insns[sequence_start..];
+            let insert_start = sequence
+                .iter()
+                .position(|(instruction, _)| matches!(instruction, Insn::MakeRecord { .. }))
+                .expect("first row is buffered");
+            let mut offset_positions = Vec::new();
+            for register in offsets.start().into_iter().chain(offsets.end()) {
+                let position = sequence.iter().position(|(instruction, _)|
+                    matches!(instruction, Insn::Integer { dest, .. } if *dest == register)
+                ).expect("bounded offset is evaluated");
+                assert!(
+                    position < insert_start,
+                    "offset must precede buffer insertion"
+                );
+                offset_positions.push(position);
+            }
+            assert!(offset_positions.windows(2).all(|pair| pair[0] < pair[1]));
             let mut expected = vec!["record", "rowid", "insert"];
             if let Some(branch) = guard {
-                expected.extend([
-                    branch,
-                    "aggregate",
-                    "rewind",
-                    "row",
-                    "reset",
-                    "null",
-                    "jump",
-                ]);
+                expected.push(branch);
+                if plan.window.frame.exclude.is_none() {
+                    expected.push("aggregate");
+                }
+                expected.extend(["rewind", "row", "reset", "null", "jump"]);
             }
             if delay {
                 expected.push("delay");
@@ -2116,7 +2176,7 @@ mod tests {
             }
             expected.extend(["rewind", "rewind", "jump"]);
             let mut rewinds = Vec::new();
-            let actual: Vec<_> = program.insns[sequence_start..]
+            let actual: Vec<_> = sequence[insert_start..]
                 .iter()
                 .map(|instruction| match &instruction.0 {
                     Insn::MakeRecord { .. } => "record",
@@ -2127,7 +2187,13 @@ mod tests {
                     }
                     Insn::Ge { .. } => "ge",
                     Insn::Le { .. } => "le",
-                    Insn::Integer { value: 1, dest } if *dest == marker => "aggregate",
+                    Insn::AggValue {
+                        acc_reg, dest_reg, ..
+                    } => {
+                        assert_eq!(*acc_reg, accumulator_start);
+                        assert_eq!(*dest_reg, functions[0].result_register());
+                        "aggregate"
+                    }
                     Insn::Integer { value: 2, dest } if *dest == marker => "row",
                     Insn::Rewind { cursor_id, .. } => {
                         rewinds.push(*cursor_id);

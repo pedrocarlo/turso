@@ -973,6 +973,9 @@ rewind, and final jump now share one emitter. It accepts prepared frame state
 and the existing aggregate/row phase callback; HIR tests exercise the sequence
 without a resolver or table references. Production HIR frame-loop wiring remains
 a later checkpoint.
+The HIR first-row adapter now evaluates partition offsets before insertion and
+supplies resolved aggregate results to that sequence. EXCLUDE frames retain
+full-frame result evaluation; row output remains a callback after cursor rewind.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
