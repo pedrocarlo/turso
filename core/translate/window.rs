@@ -2419,7 +2419,7 @@ impl EmitWindow {
                     let label_done = program.allocate_label();
                     let label_loop = program.allocate_label();
                     program.preassign_label_to_next_insn(label_loop);
-                    emit_window_range_test(
+                    emit_legacy_window_range_test(
                         program,
                         plan,
                         RangeCmp::Ge,
@@ -2523,7 +2523,7 @@ impl EmitWindow {
                 });
                 let range_done = range_loop.map(|_| program.allocate_label());
                 if let Some(label_done) = range_done {
-                    emit_window_range_test(
+                    emit_legacy_window_range_test(
                         program,
                         plan,
                         RangeCmp::Ge,
@@ -3057,7 +3057,7 @@ fn emit_window_full_scan(
 /// built `Insn::Ge { .. }`. `emit_range_cmp` turns it into the real
 /// instruction at the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RangeCmp {
+pub(crate) enum RangeCmp {
     Lt,
     Le,
     Gt,
@@ -3106,15 +3106,16 @@ fn emit_range_cmp(
     program.emit_insn(insn);
 }
 
-/// Emit the value comparison a numeric RANGE offset turns on: jump to
-/// `target_pc` when the two cursors' ORDER BY values, with `offset`
-/// applied, satisfy `op`. Ascending order compares `csr1.value + offset`
-/// against `csr2.value` — for `RANGE BETWEEN 10 PRECEDING`, this is what
-/// decides whether a trailing row is still within 10 of the current one.
-/// Descending order subtracts the offset and flips `op` instead.
-/// Non-numeric values skip the arithmetic, and an explicit NULLS
-/// FIRST/LAST is handled first. Mirrors SQLite's `windowCodeRangeTest`.
-fn emit_window_range_test(
+/// Resolved buffer column and ordering rules for a bounded RANGE comparison.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowRangeKey {
+    pub(crate) column: usize,
+    pub(crate) sort_order: SortOrder,
+    pub(crate) nulls_order: Option<turso_parser::ast::NullsOrder>,
+    pub(crate) collation: CollationSeq,
+}
+
+fn emit_legacy_window_range_test(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
     op: RangeCmp,
@@ -3130,22 +3131,48 @@ fn emit_window_range_test(
     let Expr::Column { column, .. } = order_expr else {
         unreachable!("window ORDER BY expressions are buffer columns after rewrite");
     };
+    let key = WindowRangeKey {
+        column: *column,
+        sort_order: *sort_order,
+        nulls_order: *nulls_order,
+        collation: get_collseq_from_expr(order_expr, &plan.table_references)?.unwrap_or_default(),
+    };
+    emit_window_range_test(program, key, op, csr1, offset_reg, csr2, target_pc)
+}
+
+/// Emit the value comparison a numeric RANGE offset turns on: jump to
+/// `target_pc` when the two cursors' ORDER BY values, with `offset`
+/// applied, satisfy `op`. Ascending order compares `csr1.value + offset`
+/// against `csr2.value` — for `RANGE BETWEEN 10 PRECEDING`, this is what
+/// decides whether a trailing row is still within 10 of the current one.
+/// Descending order subtracts the offset and flips `op` instead.
+/// Non-numeric values skip the arithmetic, and an explicit NULLS
+/// FIRST/LAST is handled first. Mirrors SQLite's `windowCodeRangeTest`.
+pub(crate) fn emit_window_range_test(
+    program: &mut ProgramBuilder,
+    key: WindowRangeKey,
+    op: RangeCmp,
+    csr1: CursorID,
+    offset_reg: usize,
+    csr2: CursorID,
+    target_pc: BranchOffset,
+) -> Result<()> {
     let reg1 = program.alloc_register();
     let reg2 = program.alloc_register();
     program.emit_insn(Insn::Column {
         cursor_id: csr1,
-        column: *column,
+        column: key.column,
         dest: reg1,
         default: None,
     });
     program.emit_insn(Insn::Column {
         cursor_id: csr2,
-        column: *column,
+        column: key.column,
         dest: reg2,
         default: None,
     });
 
-    let (op, subtract) = if *sort_order == SortOrder::Desc {
+    let (op, subtract) = if key.sort_order == SortOrder::Desc {
         (
             match op {
                 RangeCmp::Ge => RangeCmp::Le,
@@ -3158,9 +3185,9 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    let collation = get_collseq_from_expr(order_expr, &plan.table_references)?.unwrap_or_default();
+    let collation = key.collation;
     let big_null = matches!(
-        (sort_order, nulls_order),
+        (key.sort_order, key.nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
             | (SortOrder::Desc, Some(turso_parser::ast::NullsOrder::First))
     );
@@ -3340,7 +3367,7 @@ fn emit_window_op(
             match op {
                 WindowOp::AggInverse => {
                     if frame.start == WindowFrameEdge::Following {
-                        emit_window_range_test(
+                        emit_legacy_window_range_test(
                             program,
                             plan,
                             RangeCmp::Le,
@@ -3350,7 +3377,7 @@ fn emit_window_op(
                             label_done,
                         )?;
                     } else {
-                        emit_window_range_test(
+                        emit_legacy_window_range_test(
                             program,
                             plan,
                             RangeCmp::Ge,
@@ -3361,7 +3388,7 @@ fn emit_window_op(
                         )?;
                     }
                 }
-                WindowOp::AggStep => emit_window_range_test(
+                WindowOp::AggStep => emit_legacy_window_range_test(
                     program,
                     plan,
                     RangeCmp::Gt,

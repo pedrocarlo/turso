@@ -905,6 +905,43 @@ pub(super) fn emit_hir_window_frame_offsets(
     Ok(())
 }
 
+/// Compare buffered RANGE keys using the order and collation frozen in HIR.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_range_test(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    comparison: crate::translate::window::RangeCmp,
+    first: CursorID,
+    offset: usize,
+    second: CursorID,
+    target: BranchOffset,
+) -> Result<()> {
+    let [term] = plan.window.order_by.as_slice() else {
+        unreachable!("RANGE offsets require exactly one ORDER BY expression");
+    };
+    let [column] = plan.order_slots.as_slice() else {
+        unreachable!("RANGE offsets require exactly one ORDER BY buffer slot");
+    };
+    crate::translate::window::emit_window_range_test(
+        program,
+        crate::translate::window::WindowRangeKey {
+            column: *column,
+            sort_order: term.order,
+            nulls_order: term.nulls,
+            collation: term
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value())
+                .unwrap_or_default(),
+        },
+        comparison,
+        first,
+        offset,
+        second,
+        target,
+    )
+}
+
 /// Use resolved ORDER BY metadata for the shared later-row peer check.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn emit_hir_window_subsequent_row(
@@ -2111,6 +2148,162 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_range_comparison_preserves_ordering_and_numeric_guards() {
+        use crate::translate::window::RangeCmp;
+        for (order, descending) in [("ASC", false), ("DESC", true)] {
+            for nulls in ["", "NULLS FIRST", "NULLS LAST"] {
+                let document = analyze_sql(&format!(
+                    "SELECT sum(value) OVER (PARTITION BY group_id \
+                     ORDER BY sort_key COLLATE nocase {order} {nulls} \
+                     RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items"
+                ));
+                let (query, block) = root_query(&document);
+                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                    .expect("window buffer plans");
+                assert_eq!(
+                    plan.order_slots,
+                    [1],
+                    "ORDER BY follows a distinct partition key"
+                );
+                for (comparison, descending_comparison) in [
+                    (RangeCmp::Lt, RangeCmp::Gt),
+                    (RangeCmp::Le, RangeCmp::Ge),
+                    (RangeCmp::Gt, RangeCmp::Lt),
+                    (RangeCmp::Ge, RangeCmp::Le),
+                ] {
+                    let mut program = program();
+                    let first = buffer_cursor(&mut program, plan.columns.len());
+                    let second = buffer_cursor(&mut program, plan.columns.len());
+                    let offset = program.alloc_register();
+                    let target = program.allocate_label();
+                    emit_hir_window_range_test(
+                        &mut program,
+                        &plan,
+                        comparison,
+                        first,
+                        offset,
+                        second,
+                        target,
+                    )
+                    .expect("resolved RANGE key emits");
+                    let instructions = &program.insns;
+                    let Insn::Column {
+                        cursor_id,
+                        column: 1,
+                        dest: lhs,
+                        ..
+                    } = instructions[0].0
+                    else {
+                        panic!("first cursor reads the resolved buffer slot");
+                    };
+                    assert_eq!(cursor_id, first);
+                    let Insn::Column {
+                        cursor_id,
+                        column: 1,
+                        dest: rhs,
+                        ..
+                    } = instructions[1].0
+                    else {
+                        panic!("second cursor reads the same resolved buffer slot");
+                    };
+                    assert_eq!(cursor_id, second);
+                    let big_null = (descending && nulls == "NULLS FIRST")
+                        || (!descending && nulls == "NULLS LAST");
+                    assert_eq!(
+                        matches!(instructions[2].0, Insn::NotNull { reg, .. } if reg == lhs),
+                        big_null
+                    );
+
+                    let arithmetic = instructions
+                        .iter()
+                        .position(|(instruction, _)| {
+                            matches!(instruction, Insn::Add { .. } | Insn::Subtract { .. })
+                        })
+                        .expect("numeric offset arithmetic is emitted");
+                    let (left, right, dest) = match instructions[arithmetic].0 {
+                        Insn::Subtract { lhs, rhs, dest } if descending => (lhs, rhs, dest),
+                        Insn::Add { lhs, rhs, dest } if !descending => (lhs, rhs, dest),
+                        _ => panic!("DESC subtracts offsets; ASC adds them"),
+                    };
+                    assert_eq!((left, right, dest), (lhs, offset, lhs));
+                    let numeric_guard = instructions.iter().position(|(instruction, _)|
+                        matches!(instruction, Insn::String8 { value, .. } if value.is_empty())
+                    ).expect("text/blob arithmetic guard exists");
+                    assert!(numeric_guard < arithmetic);
+                    let Insn::String8 { dest: empty, .. } = instructions[numeric_guard].0 else {
+                        unreachable!()
+                    };
+                    assert!(matches!(instructions[numeric_guard + 1].0, Insn::Ge {
+                        lhs: guard_lhs, rhs: guard_rhs, collation: None, ..
+                    } if guard_lhs == lhs && guard_rhs == empty));
+
+                    let expected = if descending {
+                        descending_comparison
+                    } else {
+                        comparison
+                    };
+                    let comparisons: Vec<_> = instructions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, (instruction, _))| {
+                            let (op, left, right, pc, flags, collation) = match instruction {
+                                Insn::Lt {
+                                    lhs,
+                                    rhs,
+                                    target_pc,
+                                    flags,
+                                    collation,
+                                } => (RangeCmp::Lt, lhs, rhs, target_pc, flags, collation),
+                                Insn::Le {
+                                    lhs,
+                                    rhs,
+                                    target_pc,
+                                    flags,
+                                    collation,
+                                } => (RangeCmp::Le, lhs, rhs, target_pc, flags, collation),
+                                Insn::Gt {
+                                    lhs,
+                                    rhs,
+                                    target_pc,
+                                    flags,
+                                    collation,
+                                } => (RangeCmp::Gt, lhs, rhs, target_pc, flags, collation),
+                                Insn::Ge {
+                                    lhs,
+                                    rhs,
+                                    target_pc,
+                                    flags,
+                                    collation,
+                                } => (RangeCmp::Ge, lhs, rhs, target_pc, flags, collation),
+                                _ => return None,
+                            };
+                            if *pc != target {
+                                return None;
+                            }
+                            assert_eq!((op, *left, *right), (expected, lhs, rhs));
+                            assert_eq!(*collation, Some(CollationSeq::NoCase));
+                            Some((position, flags.has_nulleq()))
+                        })
+                        .collect();
+                    let early = comparison == RangeCmp::Ge;
+                    assert_eq!(comparisons.len(), if early { 2 } else { 1 });
+                    if early {
+                        assert!(comparisons[0].0 < arithmetic);
+                        assert!(!comparisons[0].1);
+                    }
+                    let final_comparison = comparisons.last().unwrap();
+                    assert!(final_comparison.0 > arithmetic);
+                    assert!(final_comparison.1, "final comparison retains NULL equality");
+                    program.preassign_label_to_next_insn(target);
+                    program
+                        .resolve_labels()
+                        .expect("all RANGE branch targets resolve");
+                }
+            }
+        }
     }
 
     #[test]
