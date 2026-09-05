@@ -1212,6 +1212,48 @@ pub(crate) fn emit_window_first_row_frame(
     Ok(())
 }
 
+/// Buffer a later partition row before deciding whether its peer group changed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_subsequent_row(
+    program: &mut ProgramBuilder,
+    cursors: WindowCursors,
+    input: WindowBufferInput,
+    rowid: usize,
+    table_name: &str,
+    mode: FrameMode,
+    peers: WindowPeerState,
+    key_info: impl IntoIterator<Item = Result<KeyInfo>>,
+    step_end: BranchOffset,
+) -> Result<()> {
+    emit_window_buffer_insert(program, &cursors, input, rowid, table_name);
+
+    // Under RANGE / GROUPS, a row with the same ORDER BY values as the
+    // previous one (its peer) is only buffered for now: adding rows to
+    // the totals and emitting results both wait until the next group
+    // begins, and then handle the whole buffered group in one go. With
+    // no ORDER BY the whole partition is a single group, so every row
+    // waits and the end-of-partition flush does the work. Mirrors
+    // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
+    // unconditional jump when there's no ORDER BY, window.c:2076).
+    if mode != FrameMode::Rows {
+        program.add_comment(
+            program.offset(),
+            "peer of previous row: buffer only, handle at group end",
+        );
+        emit_window_peer_change(
+            program,
+            WindowPeerComparison::from_registers(
+                peers.key_count,
+                peers.current,
+                peers.previous_input,
+            ),
+            key_info,
+            step_end,
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn emit_window_following_start_delay(
     program: &mut ProgramBuilder,
     frame: WindowFrameShape,
@@ -2341,38 +2383,22 @@ impl EmitWindow {
 
         // --- SUBSEQUENT ROW ---
         program.preassign_label_to_next_insn(label_subsequent);
-        emit_window_buffer_insert(
+        emit_window_subsequent_row(
             program,
-            &cursors,
+            cursors,
             input,
             registers.rowid,
             &buffer_table_name,
-        );
-
-        // Under RANGE / GROUPS, a row with the same ORDER BY values as the
-        // previous one (its peer) is only buffered for now: adding rows to
-        // the totals and emitting results both wait until the next group
-        // begins, and then handle the whole buffered group in one go. With
-        // no ORDER BY the whole partition is a single group, so every row
-        // waits and the end-of-partition flush does the work. Mirrors
-        // SQLite's `windowIfNewPeer` call at window.c:2984-2986 (an
-        // unconditional jump when there's no ORDER BY, window.c:2076).
-        if frame.mode != FrameMode::Rows {
-            program.add_comment(
-                program.offset(),
-                "peer of previous row: buffer only, handle at group end",
-            );
-            emit_window_peer_change(
-                program,
-                WindowPeerComparison::from_registers(
-                    window.order_by.len(),
-                    registers.new_order_by_columns_start,
-                    registers.source_peer_values,
-                ),
-                order_by_key_info(window, &plan.table_references),
-                label_step_end,
-            )?;
-        }
+            frame.mode,
+            WindowPeerState {
+                key_count: window.order_by.len(),
+                current: registers.new_order_by_columns_start,
+                previous_input: registers.source_peer_values,
+                cursors: registers.cursor_peer_values,
+            },
+            order_by_key_info(window, &plan.table_references),
+            label_step_end,
+        )?;
 
         // Pick the order to run the three operations in, based on the
         // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`

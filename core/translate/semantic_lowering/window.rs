@@ -37,7 +37,8 @@ use crate::{
 
 use crate::translate::window::{
     emit_window_aggregate_results, emit_window_first_row_frame, emit_window_peer_seed,
-    WindowAggregateResultMode, WindowEmptyFrameOutput, WindowFirstRowFrame,
+    emit_window_subsequent_row, WindowAggregateResultMode, WindowEmptyFrameOutput,
+    WindowFirstRowFrame,
 };
 
 #[cfg(test)]
@@ -902,6 +903,30 @@ pub(super) fn emit_hir_window_frame_offsets(
     }
 
     Ok(())
+}
+
+/// Use resolved ORDER BY metadata for the shared later-row peer check.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_subsequent_row(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    buffer: &WindowBufferRuntime,
+    input: WindowBufferInput,
+    rowid: usize,
+    peers: WindowPeerState,
+    step_end: BranchOffset,
+) -> Result<()> {
+    emit_window_subsequent_row(
+        program,
+        buffer.cursors,
+        input,
+        rowid,
+        &buffer.table.name,
+        plan.window.frame.mode,
+        peers,
+        plan.order_key_info(),
+        step_end,
+    )
 }
 
 /// Initialize each partition in legacy order before its first buffered row.
@@ -2086,6 +2111,79 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_subsequent_row_buffers_before_peer_check() {
+        for mode in ["ROWS", "RANGE", "GROUPS"] {
+            for order in ["", "ORDER BY sort_key COLLATE nocase"] {
+                let document = analyze_sql(&format!(
+                    "SELECT sum(value) OVER ({order} {mode} \
+                     BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM items"
+                ));
+                let (query, block) = root_query(&document);
+                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                    .expect("window buffer plans");
+                let mut program = program();
+                let buffer = open_hir_window_buffer(&mut program, &plan);
+                let peers = prepare_hir_window_peer_state(&mut program, &plan);
+                let input = WindowBufferInput {
+                    start: program.alloc_registers(plan.columns.len()),
+                    count: plan.columns.len(),
+                };
+                let rowid = program.alloc_register();
+                let step_end = program.allocate_label();
+                let start = program.insns.len();
+                emit_hir_window_subsequent_row(
+                    &mut program,
+                    &plan,
+                    &buffer,
+                    input,
+                    rowid,
+                    peers,
+                    step_end,
+                )
+                .expect("subsequent row emits");
+
+                let [record, next_rowid, insert, rest @ ..] = &program.insns[start..] else {
+                    panic!("subsequent row must insert before its peer check");
+                };
+                assert!(matches!(record.0, Insn::MakeRecord { start_reg, count, .. }
+                    if start_reg as usize == input.start && count as usize == input.count));
+                assert!(
+                    matches!(next_rowid.0, Insn::NewRowid { cursor, rowid_reg, .. }
+                    if cursor == buffer.cursors.csr_write && rowid_reg == rowid)
+                );
+                assert!(matches!(insert.0, Insn::Insert { cursor, key_reg, .. }
+                    if cursor == buffer.cursors.csr_write && key_reg == rowid));
+                if mode == "ROWS" {
+                    assert!(peers.previous_input.is_none());
+                    assert!(rest.is_empty(), "ROWS never compares peers");
+                } else if order.is_empty() {
+                    let [jump] = rest else {
+                        panic!("without ORDER BY every row stays buffered until flush");
+                    };
+                    assert!(matches!(jump.0, Insn::Goto { target_pc } if target_pc == step_end));
+                } else {
+                    let [compare, jump, save] = rest else {
+                        panic!("peer comparison must follow insertion");
+                    };
+                    assert!(matches!(&compare.0, Insn::Compare {
+                        start_reg_a, start_reg_b, count: 1, key_info,
+                    } if Some(*start_reg_a) == peers.current
+                        && Some(*start_reg_b) == peers.previous_input
+                        && key_info[0].collation == CollationSeq::NoCase));
+                    assert!(
+                        matches!(jump.0, Insn::Jump { target_pc_eq, target_pc_lt, target_pc_gt }
+                        if target_pc_eq == step_end && target_pc_lt == target_pc_gt && target_pc_lt != step_end)
+                    );
+                    assert!(
+                        matches!(save.0, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+                        if Some(src_reg) == peers.current && Some(dst_reg) == peers.previous_input)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
