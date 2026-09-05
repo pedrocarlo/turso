@@ -905,6 +905,31 @@ pub(super) fn emit_hir_window_frame_offsets(
     Ok(())
 }
 
+/// Keep operation countdowns and RANGE retry labels shared with legacy lowering.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn emit_hir_window_offset_gate(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    op: crate::translate::window::WindowOp,
+    countdown: Option<usize>,
+    current_cursor: CursorID,
+    operation_cursor: CursorID,
+    done: BranchOffset,
+) -> Result<Option<BranchOffset>> {
+    crate::translate::window::emit_window_offset_gate(
+        program,
+        hir_window_frame_shape(&plan.window.frame),
+        op,
+        countdown,
+        current_cursor,
+        operation_cursor,
+        done,
+        |program, comparison, first, offset, second, target| {
+            emit_hir_window_range_test(program, plan, comparison, first, offset, second, target)
+        },
+    )
+}
+
 /// Compare buffered RANGE keys using the order and collation frozen in HIR.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn emit_hir_window_range_test(
@@ -2148,6 +2173,141 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_offset_gate_skips_missing_offsets_and_uses_countdowns() {
+        use crate::translate::window::WindowOp;
+        for mode in ["ROWS", "GROUPS", "RANGE"] {
+            let document = analyze_sql(&format!(
+                "SELECT sum(value) OVER ({mode} \
+                 BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
+                let mut program = program();
+                let current = buffer_cursor(&mut program, 1);
+                let operation = buffer_cursor(&mut program, 1);
+                let done = program.allocate_label();
+                let countdown = program.alloc_register();
+                assert!(emit_hir_window_offset_gate(
+                    &mut program,
+                    &plan,
+                    op,
+                    None,
+                    current,
+                    operation,
+                    done,
+                )
+                .expect("missing offset needs no gate")
+                .is_none());
+                assert!(program.insns.is_empty());
+                if mode != "RANGE" {
+                    assert!(emit_hir_window_offset_gate(
+                        &mut program,
+                        &plan,
+                        op,
+                        Some(countdown),
+                        current,
+                        operation,
+                        done,
+                    )
+                    .expect("countdown emits")
+                    .is_none());
+                    let [instruction] = program.insns.as_slice() else {
+                        panic!("ROWS/GROUPS gates emit one countdown instruction");
+                    };
+                    assert!(
+                        matches!(instruction.0, Insn::IfPos { reg, target_pc, decrement_by: 1 }
+                        if reg == countdown && target_pc == done)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hir_window_offset_gate_selects_range_comparison_and_retry_target() {
+        use crate::translate::window::{RangeCmp, WindowOp};
+        for (frame, op, expected, current_first) in [
+            (
+                "1 PRECEDING AND CURRENT ROW",
+                WindowOp::AggStep,
+                RangeCmp::Gt,
+                false,
+            ),
+            (
+                "1 PRECEDING AND CURRENT ROW",
+                WindowOp::AggInverse,
+                RangeCmp::Ge,
+                false,
+            ),
+            (
+                "1 FOLLOWING AND 2 FOLLOWING",
+                WindowOp::AggInverse,
+                RangeCmp::Le,
+                true,
+            ),
+        ] {
+            let document = analyze_sql(&format!(
+                "SELECT sum(value) OVER (ORDER BY sort_key RANGE BETWEEN {frame}) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let current = buffer_cursor(&mut program, plan.columns.len());
+            let operation = buffer_cursor(&mut program, plan.columns.len());
+            let offset = program.alloc_register();
+            let done = program.allocate_label();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: offset,
+            });
+            let start = program.insns.len();
+            let retry = emit_hir_window_offset_gate(
+                &mut program,
+                &plan,
+                op,
+                Some(offset),
+                current,
+                operation,
+                done,
+            )
+            .expect("RANGE gate emits")
+            .expect("RANGE returns a retry label");
+            let instructions = &program.insns[start..];
+            let (first, second) = if current_first {
+                (current, operation)
+            } else {
+                (operation, current)
+            };
+            assert!(
+                matches!(instructions[0].0, Insn::Column { cursor_id, .. } if cursor_id == first)
+            );
+            assert!(
+                matches!(instructions[1].0, Insn::Column { cursor_id, .. } if cursor_id == second)
+            );
+            let (actual, target) = match instructions.last().unwrap().0 {
+                Insn::Gt { target_pc, .. } => (RangeCmp::Gt, target_pc),
+                Insn::Ge { target_pc, .. } => (RangeCmp::Ge, target_pc),
+                Insn::Le { target_pc, .. } => (RangeCmp::Le, target_pc),
+                _ => panic!("RANGE gate ends with its boundary comparison"),
+            };
+            assert_eq!((actual, target), (expected, done));
+            assert!(!instructions
+                .iter()
+                .any(|(instruction, _)| matches!(instruction, Insn::IfPos { .. })));
+            program.emit_insn(Insn::Goto { target_pc: retry });
+            program.preassign_label_to_next_insn(done);
+            program
+                .resolve_labels()
+                .expect("RANGE retry and done labels resolve");
+            assert!(matches!(program.insns.last().unwrap().0,
+                Insn::Goto { target_pc: BranchOffset::Offset(position) } if position as usize == start));
+        }
     }
 
     #[test]

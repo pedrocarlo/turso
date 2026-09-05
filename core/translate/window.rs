@@ -2712,7 +2712,7 @@ fn emit_load_order_by_columns(
 /// with it, then moves that cursor on. Mirror SQLite's `WINDOW_AGGSTEP`,
 /// `WINDOW_RETURN_ROW`, and `WINDOW_AGGINVERSE` (`window.c:1765-1773`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowOp {
+pub(crate) enum WindowOp {
     /// A new row has joined the frame. Read it from `csr_end`, add it to
     /// every function's running total (xStep), then move `csr_end` on.
     AggStep,
@@ -3284,6 +3284,82 @@ pub(crate) fn emit_window_range_test(
     Ok(())
 }
 
+/// Gate one frame operation with its countdown or RANGE value boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_offset_gate(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    op: WindowOp,
+    countdown_reg: Option<usize>,
+    current_cursor: CursorID,
+    cursor_for_op: CursorID,
+    label_done: BranchOffset,
+    emit_range: impl FnOnce(
+        &mut ProgramBuilder,
+        RangeCmp,
+        CursorID,
+        usize,
+        CursorID,
+        BranchOffset,
+    ) -> Result<()>,
+) -> Result<Option<BranchOffset>> {
+    // ROWS/GROUPS offsets use a countdown. RANGE offsets instead compare
+    // ORDER BY values and loop back after each peer group until the cursor
+    // reaches the value boundary.
+    let range_loop_start = if let Some(reg) = countdown_reg {
+        if frame.mode == FrameMode::Range {
+            let label = program.allocate_label();
+            program.preassign_label_to_next_insn(label);
+            match op {
+                WindowOp::AggInverse => {
+                    if frame.start == WindowFrameEdge::Following {
+                        emit_range(
+                            program,
+                            RangeCmp::Le,
+                            current_cursor,
+                            reg,
+                            cursor_for_op,
+                            label_done,
+                        )?;
+                    } else {
+                        emit_range(
+                            program,
+                            RangeCmp::Ge,
+                            cursor_for_op,
+                            reg,
+                            current_cursor,
+                            label_done,
+                        )?;
+                    }
+                }
+                WindowOp::AggStep => emit_range(
+                    program,
+                    RangeCmp::Gt,
+                    cursor_for_op,
+                    reg,
+                    current_cursor,
+                    label_done,
+                )?,
+                WindowOp::ReturnRow => {
+                    unreachable!("RANGE offsets never gate RETURN_ROW directly")
+                }
+            }
+            Some(label)
+        } else {
+            program.emit_insn(Insn::IfPos {
+                reg,
+                target_pc: label_done,
+                decrement_by: 1,
+            });
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(range_loop_start)
+}
+
 /// Emit one of the three operations that move the frame forward — add a
 /// row to the totals (AGGSTEP), emit a row's result (RETURN_ROW), or
 /// remove a row from the totals (AGGINVERSE). Mirrors SQLite's
@@ -3357,62 +3433,18 @@ fn emit_window_op(
         ),
     };
 
-    // ROWS/GROUPS offsets use a countdown. RANGE offsets instead compare
-    // ORDER BY values and loop back after each peer group until the cursor
-    // reaches the value boundary.
-    let range_loop_start = if let Some(reg) = countdown_reg {
-        if frame_mode == turso_parser::ast::FrameMode::Range {
-            let label = program.allocate_label();
-            program.preassign_label_to_next_insn(label);
-            match op {
-                WindowOp::AggInverse => {
-                    if frame.start == WindowFrameEdge::Following {
-                        emit_legacy_window_range_test(
-                            program,
-                            plan,
-                            RangeCmp::Le,
-                            cursors.csr_current,
-                            reg,
-                            cursor_for_op,
-                            label_done,
-                        )?;
-                    } else {
-                        emit_legacy_window_range_test(
-                            program,
-                            plan,
-                            RangeCmp::Ge,
-                            cursor_for_op,
-                            reg,
-                            cursors.csr_current,
-                            label_done,
-                        )?;
-                    }
-                }
-                WindowOp::AggStep => emit_legacy_window_range_test(
-                    program,
-                    plan,
-                    RangeCmp::Gt,
-                    cursor_for_op,
-                    reg,
-                    cursors.csr_current,
-                    label_done,
-                )?,
-                WindowOp::ReturnRow => {
-                    unreachable!("RANGE offsets never gate RETURN_ROW directly")
-                }
-            }
-            Some(label)
-        } else {
-            program.emit_insn(Insn::IfPos {
-                reg,
-                target_pc: label_done,
-                decrement_by: 1,
-            });
-            None
-        }
-    } else {
-        None
-    };
+    let range_loop_start = emit_window_offset_gate(
+        program,
+        frame,
+        op,
+        countdown_reg,
+        cursors.csr_current,
+        cursor_for_op,
+        label_done,
+        |program, comparison, first, offset, second, target| {
+            emit_legacy_window_range_test(program, plan, comparison, first, offset, second, target)
+        },
+    )?;
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
