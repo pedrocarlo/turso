@@ -976,6 +976,9 @@ a later checkpoint.
 The HIR first-row adapter now evaluates partition offsets before insertion and
 supplies resolved aggregate results to that sequence. EXCLUDE frames retain
 full-frame result evaluation; row output remains a callback after cursor rewind.
+HIR first-row initialization now composes peer-reference seeding, accumulator
+and frame-counter reset, and that frame adapter in legacy order. Prepared peer,
+tracking, function, and buffer state are reused across partition entries.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

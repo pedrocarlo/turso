@@ -36,8 +36,8 @@ use crate::{
 };
 
 use crate::translate::window::{
-    emit_window_aggregate_results, emit_window_first_row_frame, WindowAggregateResultMode,
-    WindowEmptyFrameOutput, WindowFirstRowFrame,
+    emit_window_aggregate_results, emit_window_first_row_frame, emit_window_peer_seed,
+    WindowAggregateResultMode, WindowEmptyFrameOutput, WindowFirstRowFrame,
 };
 
 #[cfg(test)]
@@ -50,9 +50,6 @@ use crate::translate::window::{
 use crate::translate::window::{
     emit_window_following_start_delay, emit_window_frame_cursor_rewind, WindowCursors,
 };
-
-#[cfg(test)]
-use crate::translate::window::emit_window_peer_seed;
 
 /// One value stored for a window layer.
 ///
@@ -905,6 +902,33 @@ pub(super) fn emit_hir_window_frame_offsets(
     }
 
     Ok(())
+}
+
+/// Initialize each partition in legacy order before its first buffered row.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_first_row(
+    program: &mut ProgramBuilder,
+    document: &hir::HirDocument,
+    plan: &HirWindowBufferPlan<'_>,
+    state: WindowFirstRowFrame<'_>,
+    peers: WindowPeerState,
+    frame_tracking: WindowFrameTracking,
+    accumulator_start: usize,
+    functions: &[WindowFunctionRuntime<&hir::Expr>],
+    emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    emit_window_peer_seed(program, peers);
+    emit_hir_window_partition_reset(program, accumulator_start, functions, frame_tracking);
+    emit_hir_window_first_row_frame(
+        program,
+        document,
+        plan,
+        state,
+        accumulator_start,
+        functions,
+        emit_row,
+    )
 }
 
 /// Rebuild partition offsets before inserting its first row, then use the
@@ -2062,6 +2086,109 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_first_row_initializes_each_partition_in_legacy_order() {
+        for function in ["min(value)", "first_value(value)"] {
+            let document = analyze_sql(&format!(
+                "SELECT {function} OVER (ORDER BY sort_key \
+                 GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                .expect("window buffer plans");
+            let mut program = program();
+            let runtime = open_hir_window_buffer(&mut program, &plan);
+            let functions =
+                prepare_hir_window_runtime(&mut program, &plan).expect("window functions prepare");
+            let accumulator_start = program.alloc_registers(functions.len());
+            let peers = prepare_hir_window_peer_state(&mut program, &plan);
+            let tracking = prepare_hir_window_frame_tracking(&mut program, &plan);
+            let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+            let input = WindowBufferInput {
+                start: program.alloc_registers(plan.columns.len()),
+                count: plan.columns.len(),
+            };
+            let rowid = program.alloc_register();
+            let step_end = program.allocate_label();
+
+            for _ in 0..2 {
+                let start = program.insns.len();
+                emit_hir_window_first_row(
+                    &mut program,
+                    &document,
+                    &plan,
+                    WindowFirstRowFrame {
+                        frame: hir_window_frame_shape(&plan.window.frame),
+                        offsets,
+                        cursors: runtime.cursors,
+                        input,
+                        rowid,
+                        table_name: &runtime.table.name,
+                        step_end,
+                    },
+                    peers,
+                    tracking,
+                    accumulator_start,
+                    &functions,
+                    |_| panic!("mixed frame bounds have no empty-frame output callback"),
+                )
+                .expect("first-row initialization emits");
+
+                let instructions = &program.insns[start..];
+                let first_offset = instructions
+                    .iter()
+                    .position(|(instruction, _)| {
+                        matches!(
+                            instruction, Insn::Integer { value: 1, dest }
+                                if Some(*dest) == offsets.start()
+                        )
+                    })
+                    .expect("start offset is rebuilt");
+                let peer_count = 1 + peers.cursors.allocated().count();
+                let (seed, reset) = instructions[..first_offset].split_at(peer_count);
+                assert!(
+                    matches!(seed[0].0, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+                    if Some(src_reg) == peers.current && Some(dst_reg) == peers.previous_input)
+                );
+                for (instruction, destination) in seed[1..].iter().zip(peers.cursors.allocated()) {
+                    assert!(
+                        matches!(instruction.0, Insn::Copy { src_reg, dst_reg, extra_amount: 0 }
+                        if Some(src_reg) == peers.previous_input && dst_reg == destination)
+                    );
+                }
+                assert!(
+                    matches!(reset[0].0, Insn::Null { dest, dest_end: Some(end) }
+                    if dest == accumulator_start && end == accumulator_start + functions.len() - 1)
+                );
+                match tracking {
+                    WindowFrameTracking::Positional { counters } => {
+                        assert_eq!(reset.len(), 3);
+                        assert!(
+                            matches!(reset[1].0, Insn::Integer { value: 0, dest } if dest == counters)
+                        );
+                        assert!(
+                            matches!(reset[2].0, Insn::Integer { value: 0, dest } if dest == counters + 1)
+                        );
+                    }
+                    WindowFrameTracking::None => {
+                        assert!(functions[0].has_minmax_state());
+                        assert_eq!(reset.len(), 3);
+                        assert!(matches!(reset[1].0, Insn::ResetSorter { .. }));
+                        assert!(matches!(reset[2].0, Insn::Integer { value: 0, .. }));
+                    }
+                    WindowFrameTracking::Excluded { .. } => panic!("test has no EXCLUDE clause"),
+                }
+                let record = instructions
+                    .iter()
+                    .position(|(instruction, _)| matches!(instruction, Insn::MakeRecord { .. }))
+                    .expect("first row is buffered");
+                assert!(first_offset < record);
+                assert!(matches!(instructions.last().unwrap().0,
+                    Insn::Goto { target_pc } if target_pc == step_end));
+            }
+        }
     }
 
     #[test]
