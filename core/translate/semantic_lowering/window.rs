@@ -905,6 +905,33 @@ pub(super) fn emit_hir_window_frame_offsets(
     Ok(())
 }
 
+/// Guard RANGE cursors using the resolved frame and prepared buffer state.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_range_cursor_guards(
+    program: &mut ProgramBuilder,
+    plan: &HirWindowBufferPlan<'_>,
+    op: crate::translate::window::WindowOp,
+    countdown: Option<usize>,
+    operation_cursor: CursorID,
+    end_cursor: CursorID,
+    newest_rowid: usize,
+    in_flush: bool,
+    done: BranchOffset,
+) {
+    crate::translate::window::emit_window_range_cursor_guards(
+        program,
+        hir_window_frame_shape(&plan.window.frame),
+        op,
+        countdown,
+        operation_cursor,
+        end_cursor,
+        newest_rowid,
+        in_flush,
+        done,
+    );
+}
+
 /// Keep operation countdowns and RANGE retry labels shared with legacy lowering.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn emit_hir_window_offset_gate(
@@ -2173,6 +2200,94 @@ mod tests {
         };
         assert!(matches!(preceding_branch.0, Insn::Le { target_pc, .. } if target_pc == target));
         assert!(matches!(following_branch.0, Insn::Ge { target_pc, .. } if target_pc == target));
+    }
+
+    #[test]
+    fn hir_window_range_cursor_guards_preserve_bounds_and_flush_behavior() {
+        use crate::translate::window::WindowOp;
+        for mode in ["ROWS", "GROUPS", "RANGE"] {
+            for bounds in [
+                "2 PRECEDING AND 1 PRECEDING",
+                "1 FOLLOWING AND 2 FOLLOWING",
+                "1 PRECEDING AND 1 FOLLOWING",
+                "UNBOUNDED PRECEDING AND CURRENT ROW",
+            ] {
+                let document = analyze_sql(&format!(
+                    "SELECT sum(value) OVER (ORDER BY sort_key {mode} BETWEEN {bounds}) FROM items"
+                ));
+                let (query, block) = root_query(&document);
+                let plan = plan_hir_window_buffer(query, block, block.windows[0].id)
+                    .expect("window buffer plans");
+                for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
+                    for in_flush in [false, true] {
+                        for has_offset in [false, true] {
+                            let mut program = program();
+                            let operation = buffer_cursor(&mut program, 1);
+                            let end = buffer_cursor(&mut program, 1);
+                            let newest = program.alloc_register();
+                            let offset = program.alloc_register();
+                            let done = program.allocate_label();
+                            emit_hir_window_range_cursor_guards(
+                                &mut program,
+                                &plan,
+                                op,
+                                has_offset.then_some(offset),
+                                operation,
+                                end,
+                                newest,
+                                in_flush,
+                                done,
+                            );
+                            let guarded = mode == "RANGE"
+                                && has_offset
+                                && matches!(
+                                    bounds,
+                                    "2 PRECEDING AND 1 PRECEDING" | "1 FOLLOWING AND 2 FOLLOWING"
+                                );
+                            let count = if guarded && op == WindowOp::AggInverse {
+                                3
+                            } else if guarded && op == WindowOp::AggStep && !in_flush {
+                                2
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                program.insns.len(),
+                                count,
+                                "{mode} {bounds} {op:?} flush={in_flush} offset={has_offset}"
+                            );
+                            if count == 0 {
+                                continue;
+                            }
+                            let Insn::RowId {
+                                cursor_id,
+                                dest: lhs_reg,
+                            } = program.insns[0].0
+                            else {
+                                panic!("guard reads operation cursor first");
+                            };
+                            assert_eq!(cursor_id, operation);
+                            let rhs_reg = if count == 3 {
+                                let Insn::RowId { cursor_id, dest } = program.insns[1].0 else {
+                                    panic!("inverse guard reads end cursor second");
+                                };
+                                assert_eq!(cursor_id, end);
+                                assert_ne!(dest, lhs_reg);
+                                dest
+                            } else {
+                                newest
+                            };
+                            assert!(matches!(&program.insns[count - 1].0,
+                                Insn::Ge { lhs, rhs, target_pc, flags, collation }
+                                if *lhs == lhs_reg && *rhs == rhs_reg && *target_pc == done
+                                    && !flags.has_nulleq() && !flags.has_jump_if_null()
+                                    && collation.is_none()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

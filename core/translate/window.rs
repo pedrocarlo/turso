@@ -3284,6 +3284,70 @@ pub(crate) fn emit_window_range_test(
     Ok(())
 }
 
+/// Keep bounded RANGE cursors behind the frame end and newest input row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_range_cursor_guards(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    op: WindowOp,
+    countdown_reg: Option<usize>,
+    cursor_for_op: CursorID,
+    end_cursor: CursorID,
+    newest_rowid: usize,
+    in_flush: bool,
+    label_done: BranchOffset,
+) {
+    // For same-kind RANGE offsets, keep the frame-start cursor at or before
+    // the frame-end cursor. While the source is still producing rows, also
+    // keep csr_end at or before the newest buffered row. During flush SQLite
+    // clears its source-rowid register, disabling the latter guard.
+    let same_kind_range_offsets = frame.mode == FrameMode::Range
+        && countdown_reg.is_some()
+        && matches!(
+            (frame.start, frame.end),
+            (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding)
+                | (WindowFrameEdge::Following, WindowFrameEdge::Following)
+        );
+    if same_kind_range_offsets {
+        match op {
+            WindowOp::AggInverse => {
+                let start_rowid = program.alloc_register();
+                let end_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: cursor_for_op,
+                    dest: start_rowid,
+                });
+                program.emit_insn(Insn::RowId {
+                    cursor_id: end_cursor,
+                    dest: end_rowid,
+                });
+                program.emit_insn(Insn::Ge {
+                    lhs: start_rowid,
+                    rhs: end_rowid,
+                    target_pc: label_done,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            WindowOp::AggStep if !in_flush => {
+                let end_rowid = program.alloc_register();
+                program.emit_insn(Insn::RowId {
+                    cursor_id: cursor_for_op,
+                    dest: end_rowid,
+                });
+                program.emit_insn(Insn::Ge {
+                    lhs: end_rowid,
+                    rhs: newest_rowid,
+                    target_pc: label_done,
+                    flags: crate::vdbe::insn::CmpInsFlags::default(),
+                    collation: None,
+                });
+            }
+            WindowOp::AggStep | WindowOp::ReturnRow => {}
+        }
+    }
+}
+
 /// Gate one frame operation with its countdown or RANGE value boundary.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_window_offset_gate(
@@ -3461,55 +3525,17 @@ fn emit_window_op(
     let label_continue = program.allocate_label();
     program.preassign_label_to_next_insn(label_continue);
 
-    // For same-kind RANGE offsets, keep the frame-start cursor at or before
-    // the frame-end cursor. While the source is still producing rows, also
-    // keep csr_end at or before the newest buffered row. During flush SQLite
-    // clears its source-rowid register, disabling the latter guard.
-    let same_kind_range_offsets = frame_mode == FrameMode::Range
-        && countdown_reg.is_some()
-        && matches!(
-            (frame.start, frame.end),
-            (WindowFrameEdge::Preceding, WindowFrameEdge::Preceding)
-                | (WindowFrameEdge::Following, WindowFrameEdge::Following)
-        );
-    if same_kind_range_offsets {
-        match op {
-            WindowOp::AggInverse => {
-                let start_rowid = program.alloc_register();
-                let end_rowid = program.alloc_register();
-                program.emit_insn(Insn::RowId {
-                    cursor_id: cursor_for_op,
-                    dest: start_rowid,
-                });
-                program.emit_insn(Insn::RowId {
-                    cursor_id: cursors.csr_end,
-                    dest: end_rowid,
-                });
-                program.emit_insn(Insn::Ge {
-                    lhs: start_rowid,
-                    rhs: end_rowid,
-                    target_pc: label_done,
-                    flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
-                });
-            }
-            WindowOp::AggStep if !in_flush => {
-                let end_rowid = program.alloc_register();
-                program.emit_insn(Insn::RowId {
-                    cursor_id: cursor_for_op,
-                    dest: end_rowid,
-                });
-                program.emit_insn(Insn::Ge {
-                    lhs: end_rowid,
-                    rhs: registers.rowid,
-                    target_pc: label_done,
-                    flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
-                });
-            }
-            WindowOp::AggStep | WindowOp::ReturnRow => {}
-        }
-    }
+    emit_window_range_cursor_guards(
+        program,
+        frame,
+        op,
+        countdown_reg,
+        cursor_for_op,
+        cursors.csr_end,
+        registers.rowid,
+        in_flush,
+        label_done,
+    );
 
     match op {
         WindowOp::AggStep => {
