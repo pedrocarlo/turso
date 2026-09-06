@@ -61,6 +61,8 @@ use crate::translate::window::{
 #[derive(Debug, Clone, Copy)]
 pub(super) enum HirWindowBufferColumn<'a> {
     Evaluate(&'a hir::Expr),
+    /// ORDER BY can need the stored custom value instead of its decoded form.
+    Encoded(&'a hir::Expr),
     Source {
         expression: &'a hir::Expr,
         reference: hir::ColumnRef,
@@ -70,7 +72,9 @@ pub(super) enum HirWindowBufferColumn<'a> {
 impl<'a> HirWindowBufferColumn<'a> {
     fn expression(&self) -> &'a hir::Expr {
         match self {
-            Self::Evaluate(expression) | Self::Source { expression, .. } => expression,
+            Self::Evaluate(expression)
+            | Self::Encoded(expression)
+            | Self::Source { expression, .. } => expression,
         }
     }
 }
@@ -296,6 +300,10 @@ fn columns_are_equivalent(
     right: &HirWindowBufferColumn<'_>,
 ) -> bool {
     match (left, right) {
+        (HirWindowBufferColumn::Encoded(left), HirWindowBufferColumn::Encoded(right)) => {
+            left.equivalent(right)
+        }
+        (HirWindowBufferColumn::Encoded(_), _) | (_, HirWindowBufferColumn::Encoded(_)) => false,
         (
             HirWindowBufferColumn::Source {
                 reference: left, ..
@@ -333,6 +341,21 @@ fn push_reused_column<'a>(
     let index = columns.len();
     columns.push(column);
     index
+}
+
+/// Append a terminal value needed after the source cursor has advanced.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn push_hir_window_output_column<'a>(
+    plan: &mut HirWindowBufferPlan<'a>,
+    expression: &'a hir::Expr,
+    encoded: bool,
+) -> usize {
+    let column = if encoded {
+        HirWindowBufferColumn::Encoded(expression)
+    } else {
+        expression_column(expression)
+    };
+    push_reused_column(&mut plan.columns, column)
 }
 
 fn expression_column(expression: &hir::Expr) -> HirWindowBufferColumn<'_> {
@@ -525,7 +548,13 @@ pub(super) fn emit_hir_window_input_row(
         count: plan.columns.len(),
     };
     for (offset, column) in plan.columns.iter().enumerate() {
-        translate_expr(program, document, column.expression(), row.start + offset)?;
+        let previous = program.flags.suppress_custom_type_decode();
+        if matches!(column, HirWindowBufferColumn::Encoded(_)) {
+            program.flags.set_suppress_custom_type_decode(true);
+        }
+        let result = translate_expr(program, document, column.expression(), row.start + offset);
+        program.flags.set_suppress_custom_type_decode(previous);
+        result?;
     }
     Ok(row)
 }
@@ -1606,7 +1635,7 @@ mod tests {
         match column {
             HirWindowBufferColumn::Source { reference, .. }
             | HirWindowBufferColumn::Evaluate(hir::Expr::Column(reference)) => Some(*reference),
-            HirWindowBufferColumn::Evaluate(_) => None,
+            HirWindowBufferColumn::Evaluate(_) | HirWindowBufferColumn::Encoded(_) => None,
         }
     }
 

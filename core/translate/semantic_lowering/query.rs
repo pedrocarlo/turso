@@ -114,6 +114,180 @@ struct HirRowInputs<'a> {
     sort_keys: &'a [super::expr::ExprRegisterInput<'a>],
 }
 
+/// Each terminal keeps its exact HIR node identity, even when equivalent nodes
+/// share a buffer column. Scalars above these terminals still run at output time.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Default)]
+struct HirWindowOutputPlan<'a> {
+    columns: Vec<usize>,
+    values: Vec<(&'a hir::Expr, usize)>,
+    sort_keys: Vec<(&'a hir::Expr, usize)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct HirWindowOutputRegisters<'a> {
+    start: usize,
+    values: Vec<super::expr::ExprRegisterInput<'a>>,
+    sort_keys: Vec<super::expr::ExprRegisterInput<'a>>,
+}
+
+impl<'a> HirWindowOutputPlan<'a> {
+    /// Row-result preparation reads `columns` into this contiguous register range.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn prepare_registers(&self, program: &mut ProgramBuilder) -> HirWindowOutputRegisters<'a> {
+        let start = program.alloc_registers(self.columns.len());
+        let bind = |entries: &[(&'a hir::Expr, usize)]| {
+            entries
+                .iter()
+                .map(|(expr, slot)| super::expr::ExprRegisterInput::new(expr, start + slot))
+                .collect()
+        };
+        HirWindowOutputRegisters {
+            start,
+            values: bind(&self.values),
+            sort_keys: bind(&self.sort_keys),
+        }
+    }
+}
+
+impl HirWindowOutputRegisters<'_> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn row_inputs(&self) -> HirRowInputs<'_> {
+        HirRowInputs {
+            values: &self.values,
+            sort_keys: &self.sort_keys,
+        }
+    }
+}
+
+struct HirWindowOutputCollector<'plan, 'expr> {
+    buffer: &'plan mut super::window::HirWindowBufferPlan<'expr>,
+    columns: &'plan mut Vec<usize>,
+    inputs: &'plan mut Vec<(&'expr hir::Expr, usize)>,
+    encoded: bool,
+}
+
+impl HirWindowOutputCollector<'_, '_> {
+    fn is_terminal(expression: &hir::Expr) -> bool {
+        matches!(
+            expression,
+            hir::Expr::Column(_)
+                | hir::Expr::RowId(_)
+                | hir::Expr::Subquery(_)
+                | hir::Expr::Function(hir::FunctionCall {
+                    evaluation: hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. },
+                    ..
+                })
+        )
+    }
+}
+
+impl<'expr> hir::ExprVisitor<'expr> for HirWindowOutputCollector<'_, 'expr> {
+    type Context = ();
+    type Output = ();
+    type Error = LimboError;
+
+    fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        if Self::is_terminal(expression) {
+            None
+        } else {
+            expression.child(index)
+        }
+    }
+
+    fn pre_order(
+        &mut self,
+        _parent: &'expr hir::Expr,
+        _context: &mut (),
+        _index: usize,
+        _child: &'expr hir::Expr,
+    ) -> Result<std::ops::ControlFlow<(), ()>> {
+        Ok(std::ops::ControlFlow::Continue(()))
+    }
+
+    fn post_order(
+        &mut self,
+        expression: &'expr hir::Expr,
+        _context: (),
+        _children: &[()],
+    ) -> Result<()> {
+        if !Self::is_terminal(expression) {
+            return Ok(());
+        }
+        if let hir::Expr::Function(hir::FunctionCall {
+            evaluation: hir::FunctionEvaluation::Window { window, .. },
+            ..
+        }) = expression
+        {
+            if *window == self.buffer.window.id {
+                return Ok(());
+            }
+        }
+        let column =
+            super::window::push_hir_window_output_column(self.buffer, expression, self.encoded);
+        let slot = self
+            .columns
+            .iter()
+            .position(|existing| *existing == column)
+            .unwrap_or_else(|| {
+                let slot = self.columns.len();
+                self.columns.push(column);
+                slot
+            });
+        self.inputs.push((expression, slot));
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn plan_hir_window_output_inputs<'a>(
+    query: &'a hir::Query,
+    block: &'a hir::QueryBlock,
+    buffer: &mut super::window::HirWindowBufferPlan<'a>,
+) -> Result<HirWindowOutputPlan<'a>> {
+    if buffer.window.id.block != block.id {
+        return Err(LimboError::InternalError(
+            "HIR window output belongs to a different query block".into(),
+        ));
+    }
+    let mut plan = HirWindowOutputPlan::default();
+    for output in &block.outputs {
+        output.expr.walk(
+            (),
+            &mut HirWindowOutputCollector {
+                buffer,
+                columns: &mut plan.columns,
+                inputs: &mut plan.values,
+                encoded: false,
+            },
+        )?;
+    }
+    for term in &query.order_by {
+        let encoded = term
+            .type_fact
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.custom())
+            .is_some_and(|custom| custom.value().decode().is_some());
+        let expression = match hir_order_output_position(block, &term.expr) {
+            Some(output) if encoded => &block.outputs[output].expr,
+            Some(_) => continue, // The sorter copies an already evaluated SELECT output.
+            None => &term.expr,
+        };
+        expression.walk(
+            (),
+            &mut HirWindowOutputCollector {
+                buffer,
+                columns: &mut plan.columns,
+                inputs: &mut plan.sort_keys,
+                encoded,
+            },
+        )?;
+    }
+    Ok(plan)
+}
+
 struct HirAggregateRuntime<'a> {
     call: &'a hir::FunctionCall,
     accumulator: usize,
@@ -5312,6 +5486,170 @@ mod tests {
                 .message(),
             "function argument facts do not match argument count"
         );
+    }
+
+    #[test]
+    fn planned_window_inputs_feed_select_and_order_by_from_the_buffer() {
+        use super::super::window::{open_hir_window_buffer, plan_hir_window_buffer};
+        let document = analyze_sql(rowid_items_schema(),
+            "SELECT DISTINCT sum(value) OVER () + value, value + 1 FROM items ORDER BY id + value LIMIT 2 OFFSET 1");
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert_eq!(
+            buffer.columns.len(),
+            2,
+            "SELECT reuses the window argument; ORDER BY adds id"
+        );
+        assert_eq!(inputs.columns.len(), 2);
+        assert_eq!(inputs.values.len(), 2);
+        assert_eq!(inputs.values[0].1, inputs.values[1].1);
+        assert!(
+            !std::ptr::eq(inputs.values[0].0, inputs.values[1].0),
+            "each occurrence keeps its own substitution"
+        );
+        let mut program = program();
+        let runtime = open_hir_window_buffer(&mut program, &buffer);
+        let registers = inputs.prepare_registers(&mut program);
+        let result = program.alloc_register();
+        program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
+        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        let distinct = initialize_hir_distinct(&mut program, block).unwrap();
+        let done = program.allocate_label();
+        let output_label = program.allocate_label();
+        let output_return = program.alloc_register();
+        let limit = initialize_limit(&mut program, &document, query.limit.as_ref(), done).unwrap();
+        let read_start = program.insns.len();
+        crate::translate::window::emit_window_row_results(
+            &mut program,
+            runtime.cursors.csr_current,
+            inputs.columns.iter().copied(),
+            registers.start,
+            false,
+            output_label,
+            output_return,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        program.emit_insn(Insn::Goto { target_pc: done });
+        emit_hir_window_output_subroutine(
+            &mut program,
+            &document,
+            block,
+            &HirRowOutput {
+                target: HirRowTarget::Sorter(&sorter),
+                distinct: distinct.as_ref(),
+            },
+            &registers.row_inputs(),
+            output_label,
+            output_return,
+        )
+        .expect("no source bindings needed after buffering");
+        let output_end = program.insns.len();
+        emit_hir_sorted_rows(
+            &mut program,
+            block,
+            &sorter,
+            &QueryDestination::ResultRows,
+            limit,
+            done,
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(done);
+        program.resolve_labels().unwrap();
+        assert!(program.insns[read_start..output_end]
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::SorterInsert { .. })));
+        for (insn, _) in &program.insns[read_start..output_end] {
+            if let Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } = insn {
+                assert_eq!(*cursor_id, runtime.cursors.csr_current);
+            }
+        }
+    }
+
+    #[test]
+    fn window_input_planning_stops_at_aggregates_subqueries_and_other_windows() {
+        use super::super::window::plan_hir_window_buffer;
+        for sql in [
+            "SELECT row_number() OVER (), sum(value), (SELECT value FROM items LIMIT 1) FROM items",
+            "SELECT row_number() OVER (), sum(value) OVER (ORDER BY id), random() FROM items",
+        ] {
+            let document = analyze_sql(rowid_items_schema(), sql);
+            let query = document.query(root_query(&document)).unwrap();
+            let block = &query.blocks[0];
+            let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+            let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+            let expected = if block.windows.len() == 1 { 2 } else { 1 };
+            assert_eq!(inputs.values.len(), expected);
+            assert_eq!(buffer.columns.len(), expected);
+            assert!(std::ptr::eq(inputs.values[0].0, &block.outputs[1].expr));
+            assert!(inputs
+                .values
+                .iter()
+                .all(|(expr, _)| !matches!(expr, hir::Expr::Column(_))));
+        }
+        let document = analyze_sql(
+            rowid_items_schema(),
+            "SELECT row_number() OVER (), random() FROM items",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert!(
+            inputs.columns.is_empty(),
+            "current window and volatile scalar stay at output"
+        );
+    }
+
+    #[test]
+    fn planned_custom_window_inputs_encode_sort_keys_and_decode_select_values() {
+        use super::super::window::{
+            emit_hir_window_input_row, plan_hir_window_buffer, HirWindowBufferColumn,
+        };
+        let (document, schema) = analyze_sql_with_schema(
+            ordered_custom_items_schema(),
+            "SELECT value, row_number() OVER () FROM items ORDER BY value",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut buffer = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let inputs = plan_hir_window_output_inputs(query, block, &mut buffer).unwrap();
+        assert_eq!(buffer.columns.len(), 2);
+        assert_ne!(inputs.values[0].1, inputs.sort_keys[0].1);
+        assert!(matches!(
+            buffer.columns[1],
+            HirWindowBufferColumn::Encoded(_)
+        ));
+        let hir::Expr::Column(reference) = block.outputs[0].expr else {
+            panic!("column output");
+        };
+        let mut program = program();
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(
+            schema.get_btree_table("items").unwrap(),
+        ));
+        program.bind_source(
+            reference.source,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        let row = emit_hir_window_input_row(&mut program, &document, &buffer).unwrap();
+        assert!(!program.flags.suppress_custom_type_decode());
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Divide { dest, .. } if *dest == row.start)));
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Divide { dest, .. } if *dest == row.start + 1)));
+        assert!(program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Column { dest, .. } if *dest == row.start + 1)));
     }
 
     #[test]

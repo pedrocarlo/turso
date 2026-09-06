@@ -1012,8 +1012,15 @@ sorter, and LIMIT/OFFSET emission. DISTINCT and OFFSET skips return to the windo
 loop; direct LIMIT exits through the query's done label. Sorted output applies
 LIMIT/OFFSET when draining. Separate sort-input mappings preserve encoded custom
 keys independently of decoded SELECT values. Row-dependent expressions stay
-inside the subroutine. Planning the buffered outer expressions and production
-entry-point wiring remain later checkpoints.
+inside the subroutine. Outer-input planning now walks SELECT and ORDER BY HIR,
+retaining columns, rowids, aggregates, subqueries, and other-window results in
+buffer slots.
+Current-window calls keep their computed result bindings; scalar expressions
+remain at output time. Equivalent terminals reuse slots while every exact HIR
+node gets a register mapping. Encoded sort terminals use separate slots and
+source emission suppresses custom decoding only for those slots. Prepared
+registers feed shared row-result reads and the HIR output subroutine.
+Source-row ordering and production entry-point wiring remain later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
