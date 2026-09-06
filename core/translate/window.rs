@@ -2275,266 +2275,351 @@ impl EmitWindow {
         };
         let buffer_table_name = meta.buffer_table_name.clone();
 
-        emit_load_order_by_columns(program, window, &registers, input)?;
-        emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
-
-        // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
-        // first Insert of this partition. That tells the two branches apart:
-        // the first row of a partition needs one-time setup, while every
-        // later row just adds itself to the totals (AGGSTEP) and emits a
-        // result (RETURN_ROW).
-        let label_subsequent = program.allocate_label();
-        let label_step_end = program.allocate_label();
-        program.emit_insn(Insn::NotNull {
-            reg: registers.rowid,
-            target_pc: label_subsequent,
-        });
-
-        // --- FIRST ROW OF PARTITION ---
-        emit_window_peer_seed(
+        emit_window_buffer_step(
             program,
-            WindowPeerState {
-                key_count: window.order_by.len(),
-                current: registers.new_order_by_columns_start,
-                previous_input: registers.source_peer_values,
-                cursors: registers.cursor_peer_values,
-            },
-        );
-        emit_window_partition_reset(
-            program,
-            registers.acc_start,
-            &meta.functions,
-            registers.frame_tracking,
-        );
-        // The same register holds the offset for every partition, and the
-        // IfPos delays decrement it as they run. Re-evaluate it here at the
-        // start of each partition: setting it just once up front would
-        // leave the decremented (wrong) value in place from the second
-        // partition on. Mirrors SQLite's `regStart` init at `window.c:2942`.
-        if let Some(start_offset_reg) = registers.frame_offsets.start() {
-            let offset_expr = match &window.frame.start {
-                crate::translate::plan::FrameBoundary::Preceding(expr)
-                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
-                _ => unreachable!(
+            frame,
+            cursors,
+            registers.frame_offsets,
+            registers.rowid,
+            |program, phase| match phase {
+                WindowStreamPhase::PrepareInput => {
+                    emit_load_order_by_columns(program, window, &registers, input)?;
+                    emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)
+                }
+                WindowStreamPhase::FirstRow {
+                    step_end: label_step_end,
+                } => {
+                    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+                    // --- FIRST ROW OF PARTITION ---
+                    emit_window_peer_seed(
+                        program,
+                        WindowPeerState {
+                            key_count: window.order_by.len(),
+                            current: registers.new_order_by_columns_start,
+                            previous_input: registers.source_peer_values,
+                            cursors: registers.cursor_peer_values,
+                        },
+                    );
+                    emit_window_partition_reset(
+                        program,
+                        registers.acc_start,
+                        &meta.functions,
+                        registers.frame_tracking,
+                    );
+                    // The same register holds the offset for every partition, and the
+                    // IfPos delays decrement it as they run. Re-evaluate it here at the
+                    // start of each partition: setting it just once up front would
+                    // leave the decremented (wrong) value in place from the second
+                    // partition on. Mirrors SQLite's `regStart` init at `window.c:2942`.
+                    if let Some(start_offset_reg) = registers.frame_offsets.start() {
+                        let offset_expr = match &window.frame.start {
+                            crate::translate::plan::FrameBoundary::Preceding(expr)
+                            | crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                            _ => unreachable!(
                     "start_offset_reg is only allocated when frame.start is Preceding/Following"
                 ),
-            };
-            emit_legacy_window_frame_offset(
-                program,
-                plan,
-                &t_ctx.resolver,
-                offset_expr,
-                start_offset_reg,
-                frame.mode,
-                WindowFrameBoundSide::Start,
-            )?;
-        }
-        if let Some(end_offset_reg) = registers.frame_offsets.end() {
-            let offset_expr = match &window.frame.end {
-                crate::translate::plan::FrameBoundary::Preceding(expr)
-                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
-                _ => unreachable!(
+                        };
+                        emit_legacy_window_frame_offset(
+                            program,
+                            plan,
+                            &t_ctx.resolver,
+                            offset_expr,
+                            start_offset_reg,
+                            frame.mode,
+                            WindowFrameBoundSide::Start,
+                        )?;
+                    }
+                    if let Some(end_offset_reg) = registers.frame_offsets.end() {
+                        let offset_expr = match &window.frame.end {
+                            crate::translate::plan::FrameBoundary::Preceding(expr)
+                            | crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                            _ => unreachable!(
                     "end_offset_reg is only allocated when frame.end is Preceding/Following"
                 ),
-            };
-            emit_legacy_window_frame_offset(
-                program,
-                plan,
-                &t_ctx.resolver,
-                offset_expr,
-                end_offset_reg,
-                frame.mode,
-                WindowFrameBoundSide::End,
-            )?;
-        }
-        emit_window_first_row_frame(
-            program,
-            WindowFirstRowFrame {
-                frame,
-                offsets: registers.frame_offsets,
-                cursors,
-                input,
-                rowid: registers.rowid,
-                table_name: &buffer_table_name,
-                step_end: label_step_end,
-            },
-            |program, output| match output {
-                WindowEmptyFrameOutput::Aggregate => {
-                    if !frame.has_exclude {
-                        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-                        emit_window_aggregate_results(
+                        };
+                        emit_legacy_window_frame_offset(
                             program,
-                            registers.acc_start,
-                            &meta.functions,
-                            WindowAggregateResultMode::Value,
-                        );
+                            plan,
+                            &t_ctx.resolver,
+                            offset_expr,
+                            end_offset_reg,
+                            frame.mode,
+                            WindowFrameBoundSide::End,
+                        )?;
                     }
+                    emit_window_first_row_frame(
+                        program,
+                        WindowFirstRowFrame {
+                            frame,
+                            offsets: registers.frame_offsets,
+                            cursors,
+                            input,
+                            rowid: registers.rowid,
+                            table_name: &buffer_table_name,
+                            step_end: label_step_end,
+                        },
+                        |program, output| match output {
+                            WindowEmptyFrameOutput::Aggregate => {
+                                if !frame.has_exclude {
+                                    let meta = t_ctx
+                                        .meta_window
+                                        .as_ref()
+                                        .expect("missing window metadata");
+                                    emit_window_aggregate_results(
+                                        program,
+                                        registers.acc_start,
+                                        &meta.functions,
+                                        WindowAggregateResultMode::Value,
+                                    );
+                                }
+                                Ok(())
+                            }
+                            WindowEmptyFrameOutput::Row => {
+                                emit_return_one_row(program, t_ctx, plan)
+                            }
+                        },
+                    )?;
+
                     Ok(())
                 }
-                WindowEmptyFrameOutput::Row => emit_return_one_row(program, t_ctx, plan),
-            },
-        )?;
+                WindowStreamPhase::SubsequentRow {
+                    step_end: label_step_end,
+                } => {
+                    emit_window_subsequent_row(
+                        program,
+                        cursors,
+                        input,
+                        registers.rowid,
+                        &buffer_table_name,
+                        frame.mode,
+                        WindowPeerState {
+                            key_count: window.order_by.len(),
+                            current: registers.new_order_by_columns_start,
+                            previous_input: registers.source_peer_values,
+                            cursors: registers.cursor_peer_values,
+                        },
+                        order_by_key_info(window, &plan.table_references),
+                        label_step_end,
+                    )?;
 
-        // --- SUBSEQUENT ROW ---
-        program.preassign_label_to_next_insn(label_subsequent);
-        emit_window_subsequent_row(
+                    Ok(())
+                }
+                WindowStreamPhase::Operation { op, countdown } => {
+                    emit_window_op(program, t_ctx, plan, op, countdown, None, false)
+                }
+            },
+            |program, comparison, first, offset, second, target| {
+                emit_legacy_window_range_test(
+                    program, plan, comparison, first, offset, second, target,
+                )
+            },
+        )
+    }
+}
+
+/// Representation-specific work at each point in the streaming loop.
+pub(crate) enum WindowStreamPhase {
+    PrepareInput,
+    FirstRow {
+        step_end: BranchOffset,
+    },
+    SubsequentRow {
+        step_end: BranchOffset,
+    },
+    Operation {
+        op: WindowOp,
+        countdown: Option<usize>,
+    },
+}
+
+/// Buffer one input row and run frame operations in legacy order.
+pub(crate) fn emit_window_buffer_step(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    cursors: WindowCursors,
+    offsets: WindowFrameOffsets,
+    rowid: usize,
+    mut emit_phase: impl FnMut(&mut ProgramBuilder, WindowStreamPhase) -> Result<()>,
+    mut emit_range: impl FnMut(
+        &mut ProgramBuilder,
+        RangeCmp,
+        CursorID,
+        usize,
+        CursorID,
+        BranchOffset,
+    ) -> Result<()>,
+) -> Result<()> {
+    emit_phase(program, WindowStreamPhase::PrepareInput)?;
+    let label_subsequent = program.allocate_label();
+    let label_step_end = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: rowid,
+        target_pc: label_subsequent,
+    });
+    emit_phase(
+        program,
+        WindowStreamPhase::FirstRow {
+            step_end: label_step_end,
+        },
+    )?;
+    program.preassign_label_to_next_insn(label_subsequent);
+    emit_phase(
+        program,
+        WindowStreamPhase::SubsequentRow {
+            step_end: label_step_end,
+        },
+    )?;
+    // Pick the order to run the three operations in, based on the
+    // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
+    // cases (window.c:2987-3037).
+    let is_range = frame.mode == FrameMode::Range;
+    let end_is_unbounded = frame.end == WindowFrameEdge::UnboundedFollowing;
+    if frame.start == WindowFrameEdge::Following {
+        // Pattern A — the frame starts after the current row (`<expr>
+        // FOLLOWING` start), e.g. `ROWS BETWEEN 1 FOLLOWING AND 3
+        // FOLLOWING` (window.c:2987-3002). Every row is added to the
+        // totals as soon as we reach it (AGGSTEP, no delay). Producing
+        // a row's result waits until we have read M more rows past it
+        // (M = the end offset); dropping rows that have fallen off the
+        // start waits a further N rows (N = the start offset).
+        emit_phase(
             program,
-            cursors,
-            input,
-            registers.rowid,
-            &buffer_table_name,
-            frame.mode,
-            WindowPeerState {
-                key_count: window.order_by.len(),
-                current: registers.new_order_by_columns_start,
-                previous_input: registers.source_peer_values,
-                cursors: registers.cursor_peer_values,
+            WindowStreamPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: None,
             },
-            order_by_key_info(window, &plan.table_references),
-            label_step_end,
         )?;
-
-        // Pick the order to run the three operations in, based on the
-        // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
-        // cases (window.c:2987-3037).
-        let is_range = frame.mode == FrameMode::Range;
-        let end_is_unbounded = frame.end == WindowFrameEdge::UnboundedFollowing;
-        if frame.start == WindowFrameEdge::Following {
-            // Pattern A — the frame starts after the current row (`<expr>
-            // FOLLOWING` start), e.g. `ROWS BETWEEN 1 FOLLOWING AND 3
-            // FOLLOWING` (window.c:2987-3002). Every row is added to the
-            // totals as soon as we reach it (AGGSTEP, no delay). Producing
-            // a row's result waits until we have read M more rows past it
-            // (M = the end offset); dropping rows that have fallen off the
-            // start waits a further N rows (N = the start offset).
-            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
-            if !end_is_unbounded {
-                if is_range {
-                    let label_done = program.allocate_label();
-                    let label_loop = program.allocate_label();
-                    program.preassign_label_to_next_insn(label_loop);
-                    emit_legacy_window_range_test(
-                        program,
-                        plan,
-                        RangeCmp::Ge,
-                        cursors.csr_current,
-                        registers
-                            .frame_offsets
-                            .end()
-                            .expect("bounded RANGE end has an offset register"),
-                        cursors.csr_end,
-                        label_done,
-                    )?;
-                    emit_window_op(
-                        program,
-                        t_ctx,
-                        plan,
-                        WindowOp::AggInverse,
-                        registers.frame_offsets.start(),
-                        None,
-                        false,
-                    )?;
-                    emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
-                    program.emit_insn(Insn::Goto {
-                        target_pc: label_loop,
-                    });
-                    program.preassign_label_to_next_insn(label_done);
-                } else {
-                    emit_window_op(
-                        program,
-                        t_ctx,
-                        plan,
-                        WindowOp::ReturnRow,
-                        registers.frame_offsets.end(),
-                        None,
-                        false,
-                    )?;
-                    emit_window_op(
-                        program,
-                        t_ctx,
-                        plan,
-                        WindowOp::AggInverse,
-                        registers.frame_offsets.start(),
-                        None,
-                        false,
-                    )?;
-                }
-            }
-        } else if frame.end == WindowFrameEdge::Preceding {
-            // Pattern B — the frame ends before the current row (`<expr>
-            // PRECEDING` end), e.g. `ROWS BETWEEN UNBOUNDED PRECEDING AND
-            // 2 PRECEDING` (window.c:3004-3009). A row's result can be
-            // produced right away (RETURN_ROW, no delay). Adding rows to
-            // the totals waits M rows (M = the end offset), because the
-            // last row of the frame sits M rows behind the current one.
-            emit_window_op(
-                program,
-                t_ctx,
-                plan,
-                WindowOp::AggStep,
-                registers.frame_offsets.end(),
-                None,
-                false,
-            )?;
-            // When a RANGE frame has both bounds PRECEDING, drop rows off
-            // the start (AGGINVERSE) before producing the result
-            // (RETURN_ROW). Both cursors already sit behind the current
-            // row; this order stops the start cursor from moving past the
-            // end cursor when the two offsets differ. SQLite's `bRPS` at
-            // window.c:3005.
-            let inverse_before_return = is_range && frame.start == WindowFrameEdge::Preceding;
-            if inverse_before_return {
-                emit_window_op(
+        if !end_is_unbounded {
+            if is_range {
+                let label_done = program.allocate_label();
+                let label_loop = program.allocate_label();
+                program.preassign_label_to_next_insn(label_loop);
+                emit_range(
                     program,
-                    t_ctx,
-                    plan,
-                    WindowOp::AggInverse,
-                    registers.frame_offsets.start(),
-                    None,
-                    false,
+                    RangeCmp::Ge,
+                    cursors.csr_current,
+                    offsets
+                        .end()
+                        .expect("bounded RANGE end has an offset register"),
+                    cursors.csr_end,
+                    label_done,
                 )?;
-            }
-            emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
-            if !inverse_before_return {
-                emit_window_op(
+                emit_phase(
                     program,
-                    t_ctx,
-                    plan,
-                    WindowOp::AggInverse,
-                    registers.frame_offsets.start(),
-                    None,
-                    false,
+                    WindowStreamPhase::Operation {
+                        op: WindowOp::AggInverse,
+                        countdown: offsets.start(),
+                    },
                 )?;
-            }
-        } else {
-            // Pattern C — everything else (window.c:3010-3037).
-            emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, false)?;
-            if !end_is_unbounded {
-                let range_loop = (is_range && registers.frame_offsets.end().is_some()).then(|| {
-                    let label = program.allocate_label();
-                    program.preassign_label_to_next_insn(label);
-                    label
+                emit_phase(
+                    program,
+                    WindowStreamPhase::Operation {
+                        op: WindowOp::ReturnRow,
+                        countdown: None,
+                    },
+                )?;
+                program.emit_insn(Insn::Goto {
+                    target_pc: label_loop,
                 });
-                let range_done = range_loop.map(|_| program.allocate_label());
-                if let Some(label_done) = range_done {
-                    emit_legacy_window_range_test(
-                        program,
-                        plan,
-                        RangeCmp::Ge,
-                        cursors.csr_current,
-                        registers.frame_offsets.end().expect("checked above"),
-                        cursors.csr_end,
-                        label_done,
-                    )?;
-                }
-                // A `<expr> FOLLOWING` end delays both producing the
-                // result (RETURN_ROW) and dropping rows off the start
-                // (AGGINVERSE) by M rows. The per-op delays inside
-                // `emit_window_op` hold back one op at a time; this one
-                // skips both together. SQLite emits it inline at
-                // window.c:3028-3034.
-                let label_skip_pair = (!is_range)
-                    .then_some(registers.frame_offsets.end())
+                program.preassign_label_to_next_insn(label_done);
+            } else {
+                emit_phase(
+                    program,
+                    WindowStreamPhase::Operation {
+                        op: WindowOp::ReturnRow,
+                        countdown: offsets.end(),
+                    },
+                )?;
+                emit_phase(
+                    program,
+                    WindowStreamPhase::Operation {
+                        op: WindowOp::AggInverse,
+                        countdown: offsets.start(),
+                    },
+                )?;
+            }
+        }
+    } else if frame.end == WindowFrameEdge::Preceding {
+        // Pattern B — the frame ends before the current row (`<expr>
+        // PRECEDING` end), e.g. `ROWS BETWEEN UNBOUNDED PRECEDING AND
+        // 2 PRECEDING` (window.c:3004-3009). A row's result can be
+        // produced right away (RETURN_ROW, no delay). Adding rows to
+        // the totals waits M rows (M = the end offset), because the
+        // last row of the frame sits M rows behind the current one.
+        emit_phase(
+            program,
+            WindowStreamPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: offsets.end(),
+            },
+        )?;
+        // When a RANGE frame has both bounds PRECEDING, drop rows off
+        // the start (AGGINVERSE) before producing the result
+        // (RETURN_ROW). Both cursors already sit behind the current
+        // row; this order stops the start cursor from moving past the
+        // end cursor when the two offsets differ. SQLite's `bRPS` at
+        // window.c:3005.
+        let inverse_before_return = is_range && frame.start == WindowFrameEdge::Preceding;
+        if inverse_before_return {
+            emit_phase(
+                program,
+                WindowStreamPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: offsets.start(),
+                },
+            )?;
+        }
+        emit_phase(
+            program,
+            WindowStreamPhase::Operation {
+                op: WindowOp::ReturnRow,
+                countdown: None,
+            },
+        )?;
+        if !inverse_before_return {
+            emit_phase(
+                program,
+                WindowStreamPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: offsets.start(),
+                },
+            )?;
+        }
+    } else {
+        // Pattern C — everything else (window.c:3010-3037).
+        emit_phase(
+            program,
+            WindowStreamPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: None,
+            },
+        )?;
+        if !end_is_unbounded {
+            let range_loop = (is_range && offsets.end().is_some()).then(|| {
+                let label = program.allocate_label();
+                program.preassign_label_to_next_insn(label);
+                label
+            });
+            let range_done = range_loop.map(|_| program.allocate_label());
+            if let Some(label_done) = range_done {
+                emit_range(
+                    program,
+                    RangeCmp::Ge,
+                    cursors.csr_current,
+                    offsets.end().expect("checked above"),
+                    cursors.csr_end,
+                    label_done,
+                )?;
+            }
+            // A `<expr> FOLLOWING` end delays both producing the
+            // result (RETURN_ROW) and dropping rows off the start
+            // (AGGINVERSE) by M rows. The per-op delays inside
+            // `emit_window_op` hold back one op at a time; this one
+            // skips both together. SQLite emits it inline at
+            // window.c:3028-3034.
+            let label_skip_pair =
+                (!is_range)
+                    .then_some(offsets.end())
                     .flatten()
                     .map(|end_offset_reg| {
                         let label = program.allocate_label();
@@ -2545,40 +2630,43 @@ impl EmitWindow {
                         });
                         label
                     });
-                emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, false)?;
-                // AGGINVERSE does nothing for an UNBOUNDED PRECEDING start
-                // — no row ever leaves the frame, so `emit_window_op`
-                // early-returns (window.c:2252-2257). For an `N PRECEDING`
-                // start it holds off until the frame has grown to N+1 rows,
-                // then drops one row for each new row that joins
-                // (window.c:3032-3033).
-                emit_window_op(
-                    program,
-                    t_ctx,
-                    plan,
-                    WindowOp::AggInverse,
-                    registers.frame_offsets.start(),
-                    None,
-                    false,
-                )?;
-                if let Some(range_loop) = range_loop {
-                    program.emit_insn(Insn::Goto {
-                        target_pc: range_loop,
-                    });
-                    program.preassign_label_to_next_insn(
-                        range_done.expect("range loop and done labels are paired"),
-                    );
-                }
-                if let Some(label) = label_skip_pair {
-                    program.preassign_label_to_next_insn(label);
-                }
+            emit_phase(
+                program,
+                WindowStreamPhase::Operation {
+                    op: WindowOp::ReturnRow,
+                    countdown: None,
+                },
+            )?;
+            // AGGINVERSE does nothing for an UNBOUNDED PRECEDING start
+            // — no row ever leaves the frame, so `emit_window_op`
+            // early-returns (window.c:2252-2257). For an `N PRECEDING`
+            // start it holds off until the frame has grown to N+1 rows,
+            // then drops one row for each new row that joins
+            // (window.c:3032-3033).
+            emit_phase(
+                program,
+                WindowStreamPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: offsets.start(),
+                },
+            )?;
+            if let Some(range_loop) = range_loop {
+                program.emit_insn(Insn::Goto {
+                    target_pc: range_loop,
+                });
+                program.preassign_label_to_next_insn(
+                    range_done.expect("range loop and done labels are paired"),
+                );
+            }
+            if let Some(label) = label_skip_pair {
+                program.preassign_label_to_next_insn(label);
             }
         }
-
-        program.preassign_label_to_next_insn(label_step_end);
-
-        Ok(())
     }
+
+    program.preassign_label_to_next_insn(label_step_end);
+
+    Ok(())
 }
 
 fn alloc_optional_registers(program: &mut ProgramBuilder, count: usize) -> Option<usize> {
@@ -4640,6 +4728,49 @@ pub fn emit_window_flush(
     let cursors = meta.cursors;
     let frame = meta.frame;
 
+    emit_window_partition_flush(
+        program,
+        frame,
+        cursors,
+        registers.frame_offsets,
+        registers.frame_tracking,
+        registers.flush_buffer_return_offset,
+        labels.flush_buffer,
+        labels.window_processing_end,
+        |program, phase| match phase {
+            WindowFlushPhase::Operation {
+                op,
+                countdown,
+                break_on_eof,
+            } => emit_window_op(program, t_ctx, plan, op, countdown, break_on_eof, true),
+            WindowFlushPhase::OutputSubroutine => emit_row_output_subroutine(program, t_ctx, plan),
+        },
+    )
+}
+
+/// Work supplied by the legacy or HIR adapter during partition flush.
+pub(crate) enum WindowFlushPhase {
+    Operation {
+        op: WindowOp,
+        countdown: Option<usize>,
+        break_on_eof: Option<BranchOffset>,
+    },
+    OutputSubroutine,
+}
+
+/// Finish pending frame operations, reset the buffer, and return from a partition flush.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_partition_flush(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    cursors: WindowCursors,
+    offsets: WindowFrameOffsets,
+    tracking: WindowFrameTracking,
+    flush_return: usize,
+    flush_entry: BranchOffset,
+    processing_end: BranchOffset,
+    mut emit_phase: impl FnMut(&mut ProgramBuilder, WindowFlushPhase) -> Result<()>,
+) -> Result<()> {
     let label_empty = program.allocate_label();
     let label_break = program.allocate_label();
 
@@ -4647,12 +4778,12 @@ pub fn emit_window_flush(
     // register so the trailing Return falls through past this subroutine.
     program.add_comment(program.offset(), "return remaining buffered rows");
     program.emit_insn(Insn::Null {
-        dest: registers.flush_buffer_return_offset,
+        dest: flush_return,
         dest_end: None,
     });
 
     // Subroutine entry: partition boundary Gosub lands here.
-    program.preassign_label_to_next_insn(labels.flush_buffer);
+    program.preassign_label_to_next_insn(flush_entry);
 
     // Detect empty partition. Rewind csr_write sets its position to the
     // first row and jumps to label_empty when the table is empty; csr_write
@@ -4674,29 +4805,34 @@ pub fn emit_window_flush(
         // be output — a single RETURN_ROW with no delay and no loop. The
         // final AGGSTEP keeps its delay count: any rows the frame end
         // never reached must stay out of the totals.
-        emit_window_op(
+        emit_phase(
             program,
-            t_ctx,
-            plan,
-            WindowOp::AggStep,
-            registers.frame_offsets.end(),
-            None,
-            true,
+            WindowFlushPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: offsets.end(),
+                break_on_eof: None,
+            },
         )?;
         let inverse_before_return =
             frame.mode == FrameMode::Range && frame.start == WindowFrameEdge::Preceding;
         if inverse_before_return {
-            emit_window_op(
+            emit_phase(
                 program,
-                t_ctx,
-                plan,
-                WindowOp::AggInverse,
-                registers.frame_offsets.start(),
-                None,
-                true,
+                WindowFlushPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: offsets.start(),
+                    break_on_eof: None,
+                },
             )?;
         }
-        emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, true)?;
+        emit_phase(
+            program,
+            WindowFlushPhase::Operation {
+                op: WindowOp::ReturnRow,
+                countdown: None,
+                break_on_eof: None,
+            },
+        )?;
     } else if frame.start == WindowFrameEdge::Following {
         // Pattern A flush (window.c:3057-3084): two-stage loop.
         //
@@ -4722,57 +4858,57 @@ pub fn emit_window_flush(
         // pick up whatever the main loop left unfinished. Once AGGINVERSE
         // runs out of rows (csr_start hits EOF), the second loop emits the
         // rows that remain, with the totals now final.
-        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
+        emit_phase(
+            program,
+            WindowFlushPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: None,
+                break_on_eof: None,
+            },
+        )?;
         let (return_row_countdown, agg_inverse_countdown) = if frame.mode == FrameMode::Range {
-            (None, registers.frame_offsets.start())
+            (None, offsets.start())
         } else if frame.end == WindowFrameEdge::UnboundedFollowing {
-            (registers.frame_offsets.start(), None)
+            (offsets.start(), None)
         } else {
-            (
-                registers.frame_offsets.end(),
-                registers.frame_offsets.start(),
-            )
+            (offsets.end(), offsets.start())
         };
         let label_after_inverse_eof = program.allocate_label();
         let label_loop_1 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_1);
         if frame.mode == FrameMode::Range {
-            emit_window_op(
+            emit_phase(
                 program,
-                t_ctx,
-                plan,
-                WindowOp::AggInverse,
-                agg_inverse_countdown,
-                Some(label_after_inverse_eof),
-                true,
+                WindowFlushPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: agg_inverse_countdown,
+                    break_on_eof: Some(label_after_inverse_eof),
+                },
             )?;
-            emit_window_op(
+            emit_phase(
                 program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                return_row_countdown,
-                Some(label_break),
-                true,
+                WindowFlushPhase::Operation {
+                    op: WindowOp::ReturnRow,
+                    countdown: return_row_countdown,
+                    break_on_eof: Some(label_break),
+                },
             )?;
         } else {
-            emit_window_op(
+            emit_phase(
                 program,
-                t_ctx,
-                plan,
-                WindowOp::ReturnRow,
-                return_row_countdown,
-                Some(label_break),
-                true,
+                WindowFlushPhase::Operation {
+                    op: WindowOp::ReturnRow,
+                    countdown: return_row_countdown,
+                    break_on_eof: Some(label_break),
+                },
             )?;
-            emit_window_op(
+            emit_phase(
                 program,
-                t_ctx,
-                plan,
-                WindowOp::AggInverse,
-                agg_inverse_countdown,
-                Some(label_after_inverse_eof),
-                true,
+                WindowFlushPhase::Operation {
+                    op: WindowOp::AggInverse,
+                    countdown: agg_inverse_countdown,
+                    break_on_eof: Some(label_after_inverse_eof),
+                },
             )?;
         }
         program.emit_insn(Insn::Goto {
@@ -4782,14 +4918,13 @@ pub fn emit_window_flush(
         program.preassign_label_to_next_insn(label_after_inverse_eof);
         let label_loop_2 = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_2);
-        emit_window_op(
+        emit_phase(
             program,
-            t_ctx,
-            plan,
-            WindowOp::ReturnRow,
-            None,
-            Some(label_break),
-            true,
+            WindowFlushPhase::Operation {
+                op: WindowOp::ReturnRow,
+                countdown: None,
+                break_on_eof: Some(label_break),
+            },
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: label_loop_2,
@@ -4809,26 +4944,31 @@ pub fn emit_window_flush(
         // delay count and csr_start moves forward one row for each row
         // emitted; for `N PRECEDING` the delay count lets the frame grow
         // to N+1 rows before csr_start starts moving.
-        emit_window_op(program, t_ctx, plan, WindowOp::AggStep, None, None, true)?;
+        emit_phase(
+            program,
+            WindowFlushPhase::Operation {
+                op: WindowOp::AggStep,
+                countdown: None,
+                break_on_eof: None,
+            },
+        )?;
         let label_loop_start = program.allocate_label();
         program.preassign_label_to_next_insn(label_loop_start);
-        emit_window_op(
+        emit_phase(
             program,
-            t_ctx,
-            plan,
-            WindowOp::ReturnRow,
-            None,
-            Some(label_break),
-            true,
+            WindowFlushPhase::Operation {
+                op: WindowOp::ReturnRow,
+                countdown: None,
+                break_on_eof: Some(label_break),
+            },
         )?;
-        emit_window_op(
+        emit_phase(
             program,
-            t_ctx,
-            plan,
-            WindowOp::AggInverse,
-            registers.frame_offsets.start(),
-            None,
-            true,
+            WindowFlushPhase::Operation {
+                op: WindowOp::AggInverse,
+                countdown: offsets.start(),
+                break_on_eof: None,
+            },
         )?;
         program.emit_insn(Insn::Goto {
             target_pc: label_loop_start,
@@ -4844,7 +4984,7 @@ pub fn emit_window_flush(
     if let WindowFrameTracking::Excluded {
         start_rowid: frame_start_rowid,
         end_rowid: frame_end_rowid,
-    } = registers.frame_tracking
+    } = tracking
     {
         program.emit_insn(Insn::Integer {
             value: 1,
@@ -4856,19 +4996,19 @@ pub fn emit_window_flush(
         });
     }
     program.emit_insn(Insn::Return {
-        return_reg: registers.flush_buffer_return_offset,
+        return_reg: flush_return,
         can_fallthrough: true,
     });
 
     // The fallthrough entry (end of source) continues past the Return;
     // jump over the row-output subroutine body that follows.
     program.emit_insn(Insn::Goto {
-        target_pc: labels.window_processing_end,
+        target_pc: processing_end,
     });
 
-    emit_row_output_subroutine(program, t_ctx, plan)?;
+    emit_phase(program, WindowFlushPhase::OutputSubroutine)?;
 
-    program.preassign_label_to_next_insn(labels.window_processing_end);
+    program.preassign_label_to_next_insn(processing_end);
 
     Ok(())
 }

@@ -1020,6 +1020,151 @@ pub(super) fn emit_hir_window_operation<'a>(
     )
 }
 
+/// Buffer one prepared HIR input row, flushing old partitions before inserting it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_buffer_step<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    accumulator_start: usize,
+    buffer: &WindowBufferRuntime,
+    input: WindowBufferInput,
+    state: WindowInputState,
+    peers: WindowPeerState,
+    offsets: WindowFrameOffsets,
+    tracking: WindowFrameTracking,
+    labels: crate::translate::window::WindowLabels,
+    custom_types_enabled: bool,
+    mut emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    use crate::translate::window::{emit_window_buffer_step, WindowStreamPhase};
+    let frame = hir_window_frame_shape(&plan.window.frame);
+    emit_window_buffer_step(
+        program,
+        frame,
+        buffer.cursors,
+        offsets,
+        state.rowid,
+        |program, phase| match phase {
+            WindowStreamPhase::PrepareInput => {
+                if let Some(current) = peers.current {
+                    emit_hir_window_order_keys(program, plan, input, current)?;
+                }
+                emit_hir_window_partition_change(program, plan, input, state, labels.flush_buffer)
+            }
+            WindowStreamPhase::FirstRow { step_end } => emit_hir_window_first_row(
+                program,
+                document,
+                plan,
+                WindowFirstRowFrame {
+                    frame,
+                    offsets,
+                    cursors: buffer.cursors,
+                    input,
+                    rowid: state.rowid,
+                    table_name: &buffer.table.name,
+                    step_end,
+                },
+                peers,
+                tracking,
+                accumulator_start,
+                functions,
+                &mut emit_row,
+            ),
+            WindowStreamPhase::SubsequentRow { step_end } => emit_hir_window_subsequent_row(
+                program,
+                plan,
+                buffer,
+                input,
+                state.rowid,
+                peers,
+                step_end,
+            ),
+            WindowStreamPhase::Operation { op, countdown } => emit_hir_window_operation(
+                program,
+                document,
+                plan,
+                functions,
+                accumulator_start,
+                buffer.cursors,
+                peers,
+                tracking,
+                state.rowid,
+                buffer.table.name.clone(),
+                op,
+                countdown,
+                None,
+                false,
+                custom_types_enabled,
+                &mut emit_row,
+            ),
+        },
+        |program, comparison, first, offset, second, target| {
+            emit_hir_window_range_test(program, plan, comparison, first, offset, second, target)
+        },
+    )
+}
+
+/// Finish a HIR partition through the same frame loops as legacy lowering.
+/// The caller emits the outer SELECT output subroutine at the supplied phase.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_partition_flush<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    accumulator_start: usize,
+    buffer: &WindowBufferRuntime,
+    state: WindowInputState,
+    peers: WindowPeerState,
+    offsets: WindowFrameOffsets,
+    tracking: WindowFrameTracking,
+    labels: crate::translate::window::WindowLabels,
+    custom_types_enabled: bool,
+    mut emit_row: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+    mut emit_output_subroutine: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    use crate::translate::window::{emit_window_partition_flush, WindowFlushPhase};
+    emit_window_partition_flush(
+        program,
+        hir_window_frame_shape(&plan.window.frame),
+        buffer.cursors,
+        offsets,
+        tracking,
+        state.flush_return,
+        labels.flush_buffer,
+        labels.window_processing_end,
+        |program, phase| match phase {
+            WindowFlushPhase::Operation {
+                op,
+                countdown,
+                break_on_eof,
+            } => emit_hir_window_operation(
+                program,
+                document,
+                plan,
+                functions,
+                accumulator_start,
+                buffer.cursors,
+                peers,
+                tracking,
+                state.rowid,
+                buffer.table.name.clone(),
+                op,
+                countdown,
+                break_on_eof,
+                true,
+                custom_types_enabled,
+                &mut emit_row,
+            ),
+            WindowFlushPhase::OutputSubroutine => emit_output_subroutine(program),
+        },
+    )
+}
+
 /// Prepare one HIR output row from buffer slots and resolved window functions.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -3398,6 +3543,382 @@ mod tests {
             function.arguments.as_slice(),
             [BufferedWindowValue::Recompute(hir::Expr::Function(_))]
         ));
+    }
+
+    #[test]
+    fn hir_window_stream_and_flush_preserve_operation_patterns() {
+        use crate::translate::window::{
+            emit_window_buffer_step, emit_window_partition_flush, WindowFlushPhase,
+            WindowOp::{AggInverse, AggStep, ReturnRow},
+            WindowStreamPhase,
+        };
+        for mode in ["ROWS", "GROUPS", "RANGE"] {
+            for bounds in [
+                "UNBOUNDED PRECEDING AND CURRENT ROW",
+                "2 PRECEDING AND 1 PRECEDING",
+                "UNBOUNDED PRECEDING AND 1 PRECEDING",
+                "1 FOLLOWING AND 2 FOLLOWING",
+                "1 FOLLOWING AND UNBOUNDED FOLLOWING",
+                "1 PRECEDING AND 2 FOLLOWING",
+                "CURRENT ROW AND UNBOUNDED FOLLOWING",
+            ] {
+                let document = analyze_sql(&format!(
+                    "SELECT sum(value) OVER (ORDER BY sort_key {mode} BETWEEN {bounds}) FROM items"
+                ));
+                let (query, block) = root_query(&document);
+                let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                let frame = hir_window_frame_shape(&plan.window.frame);
+                let mut program = program();
+                let buffer = open_hir_window_buffer(&mut program, &plan);
+                let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+                let rowid = program.alloc_register();
+                let marker = program.alloc_register();
+                let mut stream = Vec::new();
+                let mut phases = Vec::new();
+                let start = program.insns.len();
+                emit_window_buffer_step(
+                    &mut program,
+                    frame,
+                    buffer.cursors,
+                    offsets,
+                    rowid,
+                    |program, phase| {
+                        match phase {
+                            WindowStreamPhase::PrepareInput => phases.push(0),
+                            WindowStreamPhase::FirstRow { step_end } => {
+                                phases.push(1);
+                                program.emit_insn(Insn::Goto {
+                                    target_pc: step_end,
+                                });
+                            }
+                            WindowStreamPhase::SubsequentRow { .. } => phases.push(2),
+                            WindowStreamPhase::Operation { op, countdown } => {
+                                stream.push((op, countdown))
+                            }
+                        }
+                        program.emit_insn(Insn::Integer {
+                            value: 99,
+                            dest: marker,
+                        });
+                        Ok(())
+                    },
+                    |program, comparison, first, offset, second, target| {
+                        emit_hir_window_range_test(
+                            program, &plan, comparison, first, offset, second, target,
+                        )
+                    },
+                )
+                .unwrap();
+                assert_eq!(phases, [0, 1, 2]);
+                let range = mode == "RANGE";
+                let following = frame.start == WindowFrameEdge::Following;
+                let preceding = frame.end == WindowFrameEdge::Preceding;
+                let unbounded_end = frame.end == WindowFrameEdge::UnboundedFollowing;
+                let inverse_first = range && frame.start == WindowFrameEdge::Preceding;
+                let expected_stream = if unbounded_end {
+                    vec![(AggStep, None)]
+                } else if following && range {
+                    vec![
+                        (AggStep, None),
+                        (AggInverse, offsets.start()),
+                        (ReturnRow, None),
+                    ]
+                } else if following {
+                    vec![
+                        (AggStep, None),
+                        (ReturnRow, offsets.end()),
+                        (AggInverse, offsets.start()),
+                    ]
+                } else if preceding && inverse_first {
+                    vec![
+                        (AggStep, offsets.end()),
+                        (AggInverse, offsets.start()),
+                        (ReturnRow, None),
+                    ]
+                } else {
+                    vec![
+                        (AggStep, if preceding { offsets.end() } else { None }),
+                        (ReturnRow, None),
+                        (AggInverse, offsets.start()),
+                    ]
+                };
+                assert_eq!(stream, expected_stream, "stream {mode} {bounds}");
+                let stream_end = program.insns.len();
+                program.resolve_labels().unwrap();
+                assert!(program.insns[start..stream_end].iter().any(|(insn, _)| matches!(insn,
+                    Insn::Goto { target_pc: BranchOffset::Offset(target) } if *target as usize == stream_end)));
+                let pair_delay =
+                    !range && !following && !preceding && !unbounded_end && offsets.end().is_some();
+                assert_eq!(
+                    program.insns[start..stream_end]
+                        .iter()
+                        .filter(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+                        .count(),
+                    usize::from(pair_delay)
+                );
+
+                let flush_entry = program.allocate_label();
+                let processing_end = program.allocate_label();
+                let flush_return = program.alloc_register();
+                let mut flush = Vec::new();
+                let mut output_bodies = 0;
+                let flush_start = program.insns.len();
+                emit_window_partition_flush(
+                    &mut program,
+                    frame,
+                    buffer.cursors,
+                    offsets,
+                    WindowFrameTracking::None,
+                    flush_return,
+                    flush_entry,
+                    processing_end,
+                    |program, phase| {
+                        match phase {
+                            WindowFlushPhase::Operation {
+                                op,
+                                countdown,
+                                break_on_eof,
+                            } => {
+                                flush.push((op, countdown, break_on_eof));
+                                if let Some(target_pc) = break_on_eof {
+                                    program.emit_insn(Insn::Goto { target_pc });
+                                }
+                            }
+                            WindowFlushPhase::OutputSubroutine => output_bodies += 1,
+                        }
+                        program.emit_insn(Insn::Integer {
+                            value: 99,
+                            dest: marker,
+                        });
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                let expected_flush = if preceding {
+                    let mut calls = vec![(AggStep, offsets.end())];
+                    if inverse_first {
+                        calls.push((AggInverse, offsets.start()));
+                    }
+                    calls.push((ReturnRow, None));
+                    calls
+                } else if following && range {
+                    vec![
+                        (AggStep, None),
+                        (AggInverse, offsets.start()),
+                        (ReturnRow, None),
+                        (ReturnRow, None),
+                    ]
+                } else if following {
+                    vec![
+                        (AggStep, None),
+                        (
+                            ReturnRow,
+                            if unbounded_end {
+                                offsets.start()
+                            } else {
+                                offsets.end()
+                            },
+                        ),
+                        (
+                            AggInverse,
+                            if unbounded_end { None } else { offsets.start() },
+                        ),
+                        (ReturnRow, None),
+                    ]
+                } else {
+                    vec![
+                        (AggStep, None),
+                        (ReturnRow, None),
+                        (AggInverse, offsets.start()),
+                    ]
+                };
+                assert_eq!(
+                    flush
+                        .iter()
+                        .map(|(op, offset, _)| (*op, *offset))
+                        .collect::<Vec<_>>(),
+                    expected_flush,
+                    "flush {mode} {bounds}"
+                );
+                assert_eq!(output_bodies, 1);
+                if preceding {
+                    assert!(flush.iter().all(|(_, _, target)| target.is_none()));
+                } else {
+                    assert!(flush
+                        .iter()
+                        .filter(|(op, _, _)| *op == ReturnRow)
+                        .all(|(_, _, target)| target.is_some()));
+                    if following {
+                        let inverse = flush.iter().find(|(op, _, _)| *op == AggInverse).unwrap().2;
+                        let returns: Vec<_> = flush
+                            .iter()
+                            .filter(|(op, _, _)| *op == ReturnRow)
+                            .map(|(_, _, target)| *target)
+                            .collect();
+                        assert_eq!(returns[0], returns[1]);
+                        assert_ne!(inverse, returns[0]);
+                    }
+                }
+                program.resolve_labels().unwrap();
+                assert!(
+                    matches!(program.insns[flush_start].0, Insn::Null { dest, .. } if dest == flush_return)
+                );
+                assert!(
+                    matches!(program.insns[flush_start + 1].0, Insn::Rewind { cursor_id, .. } if cursor_id == buffer.cursors.csr_write)
+                );
+                let reset = program.insns[flush_start..]
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::ResetSorter { .. }))
+                    .unwrap()
+                    + flush_start;
+                assert!(
+                    matches!(program.insns[reset + 1].0, Insn::Return { return_reg, can_fallthrough: true } if return_reg == flush_return)
+                );
+                assert!(
+                    matches!(program.insns[reset + 2].0, Insn::Goto { target_pc: BranchOffset::Offset(target) } if target as usize == program.insns.len())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hir_window_stream_and_flush_compose_buffer_operations_and_row_results() {
+        use crate::translate::window::WindowLabels;
+        for frame in [
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+            "GROUPS BETWEEN 2 PRECEDING AND 1 PRECEDING",
+            "RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING",
+            "RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+            "RANGE BETWEEN 1 PRECEDING AND 2 FOLLOWING",
+            "ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING",
+            "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES",
+        ] {
+            for function in ["sum(value)", "nth_value(value, 2)"] {
+                let document = analyze_sql(&format!("SELECT {function} OVER (PARTITION BY group_id ORDER BY sort_key {frame}) FROM items"));
+                let (query, block) = root_query(&document);
+                let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                let mut program = program();
+                let buffer = open_hir_window_buffer(&mut program, &plan);
+                let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
+                let accumulators = program.alloc_registers(functions.len());
+                let state = prepare_hir_window_input_state(&mut program, &plan);
+                let peers = prepare_hir_window_peer_state(&mut program, &plan);
+                let offsets = prepare_hir_window_frame_offsets(&mut program, &plan);
+                let tracking = prepare_hir_window_frame_tracking(&mut program, &plan);
+                let input = WindowBufferInput {
+                    start: program.alloc_registers(plan.columns.len()),
+                    count: plan.columns.len(),
+                };
+                let output = program.alloc_register();
+                let output_return = program.alloc_register();
+                let labels = WindowLabels {
+                    flush_buffer: program.allocate_label(),
+                    row_output: program.allocate_label(),
+                    window_processing_end: program.allocate_label(),
+                };
+                let start = program.insns.len();
+                let emit_row = |program: &mut ProgramBuilder| {
+                    emit_hir_window_row_results(
+                        program,
+                        &document,
+                        &plan,
+                        &functions,
+                        buffer.cursors,
+                        tracking,
+                        accumulators,
+                        &[0],
+                        output,
+                        labels.row_output,
+                        output_return,
+                        true,
+                    )
+                };
+                emit_hir_window_buffer_step(
+                    &mut program,
+                    &document,
+                    &plan,
+                    &functions,
+                    accumulators,
+                    &buffer,
+                    input,
+                    state,
+                    peers,
+                    offsets,
+                    tracking,
+                    labels,
+                    true,
+                    emit_row,
+                )
+                .unwrap();
+                let flush_start = program.insns.len();
+                let mut output_position = 0;
+                emit_hir_window_partition_flush(
+                    &mut program,
+                    &document,
+                    &plan,
+                    &functions,
+                    accumulators,
+                    &buffer,
+                    state,
+                    peers,
+                    offsets,
+                    tracking,
+                    labels,
+                    true,
+                    emit_row,
+                    |program| {
+                        program.preassign_label_to_next_insn(labels.row_output);
+                        output_position = program.insns.len();
+                        program.emit_insn(Insn::Return {
+                            return_reg: output_return,
+                            can_fallthrough: false,
+                        });
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                program.resolve_labels().unwrap();
+                let first_insert = (start..flush_start)
+                    .find(|&i| matches!(program.insns[i].0, Insn::Insert { .. }))
+                    .unwrap();
+                assert!(program.insns[start..first_insert]
+                    .iter()
+                    .any(|(insn, _)| matches!(insn,
+                    Insn::Gosub { target_pc: BranchOffset::Offset(target), return_reg }
+                    if *target as usize == flush_start + 1 && *return_reg == state.flush_return)));
+                assert_eq!(
+                    program.insns[start..flush_start]
+                        .iter()
+                        .filter(|(insn, _)| matches!(insn, Insn::Insert { .. }))
+                        .count(),
+                    2
+                );
+                assert!(program.insns[start..].iter().any(|(insn, _)| matches!(insn, Insn::Gosub { target_pc: BranchOffset::Offset(target), return_reg }
+                    if *target as usize == output_position && *return_reg == output_return)));
+                let reset = (flush_start..output_position)
+                    .find(|&i| matches!(program.insns[i].0, Insn::ResetSorter { .. }))
+                    .unwrap();
+                let after_reset = if let WindowFrameTracking::Excluded {
+                    start_rowid,
+                    end_rowid,
+                } = tracking
+                {
+                    assert!(
+                        matches!(program.insns[reset + 1].0, Insn::Integer { value: 1, dest } if dest == start_rowid)
+                    );
+                    assert!(
+                        matches!(program.insns[reset + 2].0, Insn::Integer { value: 0, dest } if dest == end_rowid)
+                    );
+                    reset + 3
+                } else {
+                    reset + 1
+                };
+                assert!(
+                    matches!(program.insns[after_reset].0, Insn::Return { return_reg, can_fallthrough: true } if return_reg == state.flush_return)
+                );
+            }
+        }
     }
 
     fn emit_test_window_results(

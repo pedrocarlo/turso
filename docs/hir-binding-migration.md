@@ -1000,8 +1000,14 @@ nth_value and lag / lead lookups, EXCLUDE frame scans, and the output Gosub.
 HIR supplies planned buffer slots, prepared function result registers, resolved
 peer keys, and HIR aggregate emission for scan rows. The HIR row-result adapter
 can serve as the operation loop's output callback, including EXCLUDE scans.
-The outer SELECT output subroutine and production frame-loop wiring remain
-later checkpoints.
+Streaming and partition-flush control flow now share the legacy frame-pattern
+branches. HIR adapters compose partition checks, first-row initialization,
+subsequent insertion, operation loops, and row-result callbacks. Flush preserves
+its partition-boundary and end-of-source entries, EOF exits, buffer reset,
+EXCLUDE rowid reset, and jump over the output subroutine. Tests lower these
+pieces together using resolved HIR for ROWS, GROUPS, RANGE, and EXCLUDE frames.
+The outer SELECT output subroutine remains caller-supplied. Production entry
+point wiring remains a later checkpoint.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
