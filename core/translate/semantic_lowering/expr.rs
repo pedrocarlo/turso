@@ -4425,10 +4425,21 @@ pub(crate) fn translate_expr_no_constant_opt(
     expression: &hir::Expr,
     target: usize,
 ) -> Result<usize> {
+    translate_expr_with_inputs_no_constant_opt(program, document, expression, target, &[])
+}
+
+/// Keep register-dependent expressions inside the row or subroutine using them.
+pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
+    program: &mut ProgramBuilder,
+    document: &'expr hir::HirDocument,
+    expression: &'expr hir::Expr,
+    target: usize,
+    inputs: &[ExprRegisterInput<'expr>],
+) -> Result<usize> {
     let first_new_span = program.constant_spans_next_idx();
-    let result = translate_expr(program, document, expression, target)?;
+    let result = translate_expr_with_inputs(program, document, expression, target, inputs);
     program.constant_spans_invalidate_after(first_new_span);
-    Ok(result)
+    result
 }
 
 /// Apply bound schema calls to a value already stored in `target`.

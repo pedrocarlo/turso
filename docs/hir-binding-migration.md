@@ -1006,8 +1006,14 @@ subsequent insertion, operation loops, and row-result callbacks. Flush preserves
 its partition-boundary and end-of-source entries, EOF exits, buffer reset,
 EXCLUDE rowid reset, and jump over the output subroutine. Tests lower these
 pieces together using resolved HIR for ROWS, GROUPS, RANGE, and EXCLUDE frames.
-The outer SELECT output subroutine remains caller-supplied. Production entry
-point wiring remains a later checkpoint.
+The HIR SELECT output subroutine now evaluates expressions from supplied buffer
+registers and bound window results, then reuses SELECT DISTINCT, destination,
+sorter, and LIMIT/OFFSET emission. DISTINCT and OFFSET skips return to the window
+loop; direct LIMIT exits through the query's done label. Sorted output applies
+LIMIT/OFFSET when draining. Separate sort-input mappings preserve encoded custom
+keys independently of decoded SELECT values. Row-dependent expressions stay
+inside the subroutine. Planning the buffered outer expressions and production
+entry-point wiring remain later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

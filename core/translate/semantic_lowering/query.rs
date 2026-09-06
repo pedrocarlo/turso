@@ -106,6 +106,14 @@ struct HirRowOutput<'a> {
     distinct: Option<&'a HirDistinctOutput>,
 }
 
+/// Values supplied by a buffered row. Sort inputs are prepared separately because
+/// custom ORDER BY keys can need encoded values while SELECT needs decoded ones.
+#[derive(Default)]
+struct HirRowInputs<'a> {
+    values: &'a [super::expr::ExprRegisterInput<'a>],
+    sort_keys: &'a [super::expr::ExprRegisterInput<'a>],
+}
+
 struct HirAggregateRuntime<'a> {
     call: &'a hir::FunctionCall,
     accumulator: usize,
@@ -4122,6 +4130,7 @@ fn emit_hir_sorter_insert(
     outputs: &[hir::Output],
     output_start: usize,
     sorter: &HirSorterOutput<'_>,
+    inputs: &[super::expr::ExprRegisterInput<'_>],
 ) -> Result<()> {
     for (key, (term, source)) in sorter.order_by.iter().zip(&sorter.key_sources).enumerate() {
         let target = sorter.row + key;
@@ -4137,10 +4146,16 @@ fn emit_hir_sorter_insert(
                 &outputs[*output].expr,
                 &term.type_fact,
                 target,
+                inputs,
             )?,
-            HirSortKeySource::Expression => {
-                emit_hir_sort_key(program, document, &term.expr, &term.type_fact, target)?
-            }
+            HirSortKeySource::Expression => emit_hir_sort_key(
+                program,
+                document,
+                &term.expr,
+                &term.type_fact,
+                target,
+                inputs,
+            )?,
         }
     }
     for (output, column) in sorter.output_columns.iter().enumerate() {
@@ -4169,6 +4184,7 @@ fn emit_hir_sort_key(
     expression: &hir::Expr,
     type_fact: &hir::TypeFact,
     target: usize,
+    inputs: &[super::expr::ExprRegisterInput<'_>],
 ) -> Result<()> {
     let suppress_decode = type_fact
         .declared
@@ -4178,7 +4194,9 @@ fn emit_hir_sort_key(
     if suppress_decode {
         program.flags.set_suppress_custom_type_decode(true);
     }
-    let result = super::expr::translate_expr_no_constant_opt(program, document, expression, target);
+    let result = super::expr::translate_expr_with_inputs_no_constant_opt(
+        program, document, expression, target, inputs,
+    );
     if suppress_decode {
         program.flags.set_suppress_custom_type_decode(false);
     }
@@ -4450,6 +4468,29 @@ fn emit_query_row<'expr>(
     start: usize,
     skip_row: BranchOffset,
 ) -> Result<()> {
+    emit_query_row_with_inputs(
+        program,
+        document,
+        output,
+        outputs,
+        expressions,
+        start,
+        skip_row,
+        &HirRowInputs::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_query_row_with_inputs<'expr>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    output: &HirRowOutput<'_>,
+    outputs: &[hir::Output],
+    expressions: impl ExactSizeIterator<Item = &'expr hir::Expr>,
+    start: usize,
+    skip_row: BranchOffset,
+    inputs: &HirRowInputs<'_>,
+) -> Result<()> {
     if expressions.len() != outputs.len() {
         return Err(LimboError::InternalError(format!(
             "HIR row width {} does not match output width {}",
@@ -4463,11 +4504,12 @@ fn emit_query_row<'expr>(
         }
     } else {
         for (position, expression) in expressions.enumerate() {
-            super::expr::translate_expr_no_constant_opt(
+            super::expr::translate_expr_with_inputs_no_constant_opt(
                 program,
                 document,
                 expression,
                 start + position,
+                inputs.values,
             )?;
             program.bind_output(outputs[position].id, start + position);
         }
@@ -4505,9 +4547,44 @@ fn emit_query_row<'expr>(
             );
         }
         HirRowTarget::Sorter(sorter) => {
-            emit_hir_sorter_insert(program, document, outputs, start, sorter)?;
+            emit_hir_sorter_insert(program, document, outputs, start, sorter, inputs.sort_keys)?;
         }
     }
+    Ok(())
+}
+
+/// Emit once; every window RETURN_ROW calls this after preparing buffered inputs
+/// and binding computed window results. DISTINCT and OFFSET skips return to the
+/// window loop, while a satisfied direct LIMIT exits through the output target.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn emit_hir_window_output_subroutine(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    block: &hir::QueryBlock,
+    output: &HirRowOutput<'_>,
+    inputs: &HirRowInputs<'_>,
+    output_label: BranchOffset,
+    output_return: usize,
+) -> Result<()> {
+    program.preassign_label_to_next_insn(output_label);
+    let skip_row = program.allocate_label();
+    let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+    emit_query_row_with_inputs(
+        program,
+        document,
+        output,
+        &block.outputs,
+        block.outputs.iter().map(|output| &output.expr),
+        start,
+        skip_row,
+        inputs,
+    )?;
+    program.preassign_label_to_next_insn(skip_row);
+    program.emit_insn(Insn::Return {
+        return_reg: output_return,
+        can_fallthrough: false,
+    });
     Ok(())
 }
 
@@ -5235,6 +5312,199 @@ mod tests {
                 .message(),
             "function argument facts do not match argument count"
         );
+    }
+
+    #[test]
+    fn window_output_uses_buffered_values_and_returns_after_skipped_rows() {
+        for ordered in [false, true] {
+            let order = if ordered { " ORDER BY id + 2" } else { "" };
+            let document = analyze_sql(
+                rowid_items_schema(),
+                &format!(
+                    "SELECT DISTINCT sum(value) OVER () + 1, value COLLATE nocase \
+                          FROM items{order} LIMIT 2 OFFSET 1"
+                ),
+            );
+            let query = document.query(root_query(&document)).unwrap();
+            let block = &query.blocks[0];
+            let mut program = program();
+            let done = program.allocate_label();
+            let label = program.allocate_label();
+            let return_reg = program.alloc_register();
+            let buffered = program.alloc_register();
+            let result = program.alloc_register();
+            let key = program.alloc_register();
+            program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), result);
+            let distinct = initialize_hir_distinct(&mut program, block).unwrap();
+            let sorter =
+                ordered.then(|| initialize_hir_sorter(&mut program, query, block).unwrap());
+            let limit =
+                initialize_limit(&mut program, &document, query.limit.as_ref(), done).unwrap();
+            let output = HirRowOutput {
+                target: match &sorter {
+                    Some(sorter) => HirRowTarget::Sorter(sorter),
+                    None => HirRowTarget::Direct {
+                        destination: &QueryDestination::ResultRows,
+                        limit,
+                        done,
+                    },
+                },
+                distinct: distinct.as_ref(),
+            };
+            let values = [super::super::expr::ExprRegisterInput::new(
+                &block.outputs[1].expr,
+                buffered,
+            )];
+            let keys: Vec<_> = query
+                .order_by
+                .iter()
+                .map(|term| super::super::expr::ExprRegisterInput::new(&term.expr, key))
+                .collect();
+            program.emit_insn(Insn::Gosub {
+                target_pc: label,
+                return_reg,
+            });
+            program.emit_insn(Insn::Goto { target_pc: done });
+            let start = program.insns.len();
+            let constant_spans = program.constant_spans.len();
+            emit_hir_window_output_subroutine(
+                &mut program,
+                &document,
+                block,
+                &output,
+                &HirRowInputs {
+                    values: &values,
+                    sort_keys: &keys,
+                },
+                label,
+                return_reg,
+            )
+            .expect("window output lowers without original source cursor bindings");
+            assert_eq!(
+                program.constant_spans.len(),
+                constant_spans,
+                "row expressions cannot be hoisted outside the output subroutine"
+            );
+            let return_position = program.insns.len() - 1;
+            if let Some(sorter) = &sorter {
+                emit_hir_sorted_rows(
+                    &mut program,
+                    block,
+                    sorter,
+                    &QueryDestination::ResultRows,
+                    limit,
+                    done,
+                )
+                .unwrap();
+            }
+            program.preassign_label_to_next_insn(done);
+            program.resolve_labels().unwrap();
+            let insns = &program.insns[start..];
+            for source in [buffered, result] {
+                assert!(insns.iter().any(|(insn, _)| matches!(insn,
+                    Insn::Copy { src_reg, .. } if *src_reg == source)));
+            }
+            let distinct_position = insns
+                .iter()
+                .position(|(insn, _)| match insn {
+                    Insn::HashDistinct { data } => {
+                        assert_eq!(data.collations[1], CollationSeq::NoCase);
+                        assert_eq!(
+                            data.target_pc,
+                            BranchOffset::Offset(return_position.try_into().unwrap())
+                        );
+                        true
+                    }
+                    _ => false,
+                })
+                .unwrap();
+            let offset_position = insns
+                .iter()
+                .position(|(insn, _)| matches!(insn, Insn::IfPos { .. }))
+                .unwrap();
+            assert!(distinct_position < offset_position);
+            assert!(matches!(program.insns[return_position].0,
+                Insn::Return { return_reg: actual, can_fallthrough: false } if actual == return_reg));
+            if ordered {
+                assert!(insns.iter().any(
+                    |(insn, _)| matches!(insn, Insn::Copy { src_reg, .. } if *src_reg == key)
+                ));
+                let sort = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::SorterSort { .. }))
+                    .unwrap();
+                let insert = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::SorterInsert { .. }))
+                    .unwrap();
+                assert!(distinct_position < insert && insert < sort && sort < offset_position);
+            } else {
+                assert!(matches!(insns[offset_position].0,
+                    Insn::IfPos { target_pc, .. } if target_pc == BranchOffset::Offset(return_position.try_into().unwrap())));
+                let row = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::ResultRow { .. }))
+                    .unwrap();
+                let limit = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::DecrJumpZero { .. }))
+                    .unwrap();
+                assert!(offset_position < row && row < limit);
+            }
+        }
+    }
+
+    #[test]
+    fn window_output_keeps_encoded_sort_keys_separate_from_decoded_values() {
+        let document = analyze_sql(
+            ordered_custom_items_schema(),
+            "SELECT value, row_number() OVER () FROM items ORDER BY value",
+        );
+        let query = document.query(root_query(&document)).unwrap();
+        let block = &query.blocks[0];
+        let mut program = program();
+        let sorter = initialize_hir_sorter(&mut program, query, block).unwrap();
+        assert!(matches!(
+            sorter.key_sources[0],
+            HirSortKeySource::EncodedOutput(0)
+        ));
+        let decoded = program.alloc_register();
+        let encoded = program.alloc_register();
+        let window_result = program.alloc_register();
+        program.bind_window_result(hir::WindowFunctionId::new(block.id, 0), window_result);
+        let values = [super::super::expr::ExprRegisterInput::new(
+            &block.outputs[0].expr,
+            decoded,
+        )];
+        let keys = [super::super::expr::ExprRegisterInput::new(
+            &block.outputs[0].expr,
+            encoded,
+        )];
+        let label = program.allocate_label();
+        let return_reg = program.alloc_register();
+        let start = program.insns.len();
+        emit_hir_window_output_subroutine(
+            &mut program,
+            &document,
+            block,
+            &HirRowOutput {
+                target: HirRowTarget::Sorter(&sorter),
+                distinct: None,
+            },
+            &HirRowInputs {
+                values: &values,
+                sort_keys: &keys,
+            },
+            label,
+            return_reg,
+        )
+        .unwrap();
+        let insns = &program.insns[start..];
+        assert!(insns.iter().any(|(insn, _)| matches!(insn,
+            Insn::Copy { src_reg, dst_reg, .. } if *src_reg == encoded && *dst_reg == sorter.row)));
+        assert!(insns.iter().any(|(insn, _)| matches!(insn,
+            Insn::Copy { src_reg, .. } if *src_reg == decoded)));
+        assert!(!program.flags.suppress_custom_type_decode());
     }
 
     #[test]
