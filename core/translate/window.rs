@@ -3284,6 +3284,43 @@ pub(crate) fn emit_window_range_test(
     Ok(())
 }
 
+/// Update frame bounds around one aggregate step or inverse.
+/// EXCLUDE defers aggregation until output; positional counters advance after aggregation.
+pub(crate) fn emit_window_tracked_aggregate(
+    program: &mut ProgramBuilder,
+    tracking: WindowFrameTracking,
+    op: WindowOp,
+    emit_aggregate: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let inverse = match op {
+        WindowOp::AggStep => false,
+        WindowOp::AggInverse => true,
+        WindowOp::ReturnRow => unreachable!("RETURN_ROW does not update frame tracking"),
+    };
+    match tracking {
+        WindowFrameTracking::Excluded {
+            start_rowid,
+            end_rowid,
+        } => {
+            program.emit_insn(Insn::AddImm {
+                register: if inverse { start_rowid } else { end_rowid },
+                value: 1,
+            });
+        }
+        WindowFrameTracking::Positional { counters } => {
+            emit_aggregate(program)?;
+            // Start is the buffer index minus one; end is the buffer index.
+            // Mirrors SQLite windowAggStep's regApp+1-bInverse increment.
+            program.emit_insn(Insn::AddImm {
+                register: counters + usize::from(!inverse),
+                value: 1,
+            });
+        }
+        WindowFrameTracking::None => emit_aggregate(program)?,
+    }
+    Ok(())
+}
+
 /// Keep bounded RANGE cursors behind the frame end and newest input row.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_window_range_cursor_guards(
@@ -3538,59 +3575,21 @@ fn emit_window_op(
     );
 
     match op {
-        WindowOp::AggStep => {
-            match registers.frame_tracking {
-                WindowFrameTracking::Excluded { end_rowid, .. } => {
-                    program.emit_insn(Insn::AddImm {
-                        register: end_rowid,
-                        value: 1,
-                    });
-                }
-                WindowFrameTracking::Positional { counters } => {
-                    emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-                    // Count the row just added to the frame. This runs once
-                    // for every row stepped, so after AGGSTEP has stepped over
-                    // a whole peer group the counter holds the frame end's
-                    // position in the buffer — the row first_value / nth_value
-                    // seek to. Mirrors SQLite's `OP_AddImm regApp+1` inside
-                    // `windowAggStep` (window.c:1726).
-                    program.emit_insn(Insn::AddImm {
-                        register: counters + 1,
-                        value: 1,
-                    });
-                }
-                WindowFrameTracking::None => {
-                    emit_function_step(program, t_ctx, plan, cursors.csr_end)?;
-                }
-            }
+        WindowOp::AggStep | WindowOp::AggInverse => {
+            emit_window_tracked_aggregate(
+                program,
+                registers.frame_tracking,
+                op,
+                |program| match op {
+                    WindowOp::AggStep => emit_function_step(program, t_ctx, plan, cursors.csr_end),
+                    WindowOp::AggInverse => emit_function_inverse(program, t_ctx, plan),
+                    WindowOp::ReturnRow => {
+                        unreachable!("RETURN_ROW does not update frame tracking")
+                    }
+                },
+            )?;
         }
-        WindowOp::ReturnRow => {
-            emit_return_one_row(program, t_ctx, plan)?;
-        }
-        WindowOp::AggInverse => {
-            match registers.frame_tracking {
-                WindowFrameTracking::Excluded { start_rowid, .. } => {
-                    program.emit_insn(Insn::AddImm {
-                        register: start_rowid,
-                        value: 1,
-                    });
-                }
-                WindowFrameTracking::Positional { counters } => {
-                    emit_function_inverse(program, t_ctx, plan)?;
-                    // Count the row that just left the frame; the counter is the
-                    // frame start's buffer index minus one. Mirrors SQLite's
-                    // `OP_AddImm regApp+0` inside `windowAggStep`
-                    // (window.c:1726, `regApp+1-bInverse`).
-                    program.emit_insn(Insn::AddImm {
-                        register: counters,
-                        value: 1,
-                    });
-                }
-                WindowFrameTracking::None => {
-                    emit_function_inverse(program, t_ctx, plan)?;
-                }
-            }
-        }
+        WindowOp::ReturnRow => emit_return_one_row(program, t_ctx, plan)?,
     }
 
     // Delete the row we are done with (SQLite window.c:2346,

@@ -3189,6 +3189,89 @@ mod tests {
     }
 
     #[test]
+    fn hir_window_tracking_defers_excluded_aggregates_and_counts_after_aggregation() {
+        use crate::translate::window::{emit_window_tracked_aggregate, WindowOp};
+        let document = analyze_sql(
+            "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
+        );
+        let (query, block) = root_query(&document);
+        let plan =
+            plan_hir_window_buffer(query, block, block.windows[0].id).expect("window buffer plans");
+        for op in [WindowOp::AggStep, WindowOp::AggInverse] {
+            for kind in 0..3 {
+                let mut program = program();
+                let functions = prepare_hir_window_runtime(&mut program, &plan)
+                    .expect("window runtime prepares");
+                let cursor = buffer_cursor(&mut program, plan.columns.len());
+                let accumulators = program.alloc_registers(functions.len());
+                let counters = program.alloc_registers(2);
+                let tracking = match kind {
+                    0 => WindowFrameTracking::None,
+                    1 => WindowFrameTracking::Positional { counters },
+                    _ => WindowFrameTracking::Excluded {
+                        start_rowid: counters,
+                        end_rowid: counters + 1,
+                    },
+                };
+                let start = program.insns.len();
+                let mut called = false;
+                emit_window_tracked_aggregate(&mut program, tracking, op, |program| {
+                    called = true;
+                    if op == WindowOp::AggStep {
+                        emit_hir_window_step(
+                            program,
+                            &document,
+                            &plan,
+                            &functions,
+                            WindowStepContext {
+                                accumulator_registers_start: accumulators,
+                                read_cursor: cursor,
+                                current_cursor: cursor,
+                                has_exclude: false,
+                                custom_types_enabled: true,
+                            },
+                        )
+                    } else {
+                        emit_hir_window_inverse(
+                            program,
+                            &document,
+                            &plan,
+                            &functions,
+                            accumulators,
+                            cursor,
+                        )
+                    }
+                })
+                .expect("tracked HIR aggregate emits");
+                let insns = &program.insns[start..];
+                assert_eq!(called, kind != 2);
+                let aggregates = insns
+                    .iter()
+                    .filter(|(insn, _)| match op {
+                        WindowOp::AggStep => matches!(insn, Insn::AggStep { .. }),
+                        WindowOp::AggInverse => matches!(insn, Insn::AggInverse { .. }),
+                        WindowOp::ReturnRow => unreachable!(),
+                    })
+                    .count();
+                assert_eq!(aggregates, usize::from(kind != 2));
+                if kind == 0 {
+                    assert!(!insns
+                        .iter()
+                        .any(|(insn, _)| matches!(insn, Insn::AddImm { .. })));
+                } else {
+                    assert!(
+                        matches!(insns.last().unwrap().0, Insn::AddImm { register, value: 1 }
+                        if register == counters + usize::from(op == WindowOp::AggStep))
+                    );
+                    if kind == 2 {
+                        assert_eq!(insns.len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hir_window_step_reads_direct_argument_and_filter_columns() {
         let document = analyze_sql(
             "SELECT sum(value) FILTER (WHERE keep) OVER window_frame FROM items \
