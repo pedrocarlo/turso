@@ -989,6 +989,15 @@ Operation offset gates now share countdown emission and RANGE comparison
 selection. Missing offsets emit nothing; ROWS/GROUPS keep their decrementing
 `IfPos`, while HIR and legacy RANGE gates return the same retry-label position
 and preserve operation-specific cursor order and boundary comparisons.
+Window operations now share the complete control flow: unbounded-inverse no-op,
+offset gates, aggregate-result reads, RANGE cursor guards, tracked step/inverse,
+row deletion, cursor advance, EOF exits, peer repeats, and RANGE retry branches.
+Legacy and HIR adapters supply aggregate/output and key emitters. HIR deletion
+uses resolved frame facts and literal offsets with legacy integer truncation;
+its peer checks read planned buffer slots and resolved collations directly.
+The HIR operation adapter still takes row output as a callback, including any
+EXCLUDE frame scan. Complete output lowering and production frame-loop wiring
+remain later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,

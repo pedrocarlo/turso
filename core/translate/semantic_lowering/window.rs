@@ -905,6 +905,121 @@ pub(super) fn emit_hir_window_frame_offsets(
     Ok(())
 }
 
+/// Choose deletion from HIR literals without converting expressions to legacy AST.
+#[cfg_attr(not(test), allow(dead_code))]
+fn hir_window_delete_op(
+    plan: &HirWindowBufferPlan<'_>,
+) -> Option<crate::translate::window::WindowOp> {
+    let positive = |bound: &hir::WindowFrameBound| match bound {
+        hir::WindowFrameBound::Preceding(expr) | hir::WindowFrameBound::Following(expr) => {
+            matches!(expr.as_ref(), hir::Expr::Literal(turso_parser::ast::Literal::Numeric(value))
+                if crate::translate::window::window_numeric_offset_gt_zero(value))
+        }
+        _ => false,
+    };
+    crate::translate::window::window_delete_op_for_frame(
+        hir_window_frame_shape(&plan.window.frame),
+        plan.needs_app_cursor(),
+        positive(&plan.window.frame.start),
+        plan.window.frame.end.as_ref().is_some_and(positive),
+    )
+}
+
+/// Run shared operation control flow with HIR aggregate and key emitters.
+/// The caller supplies output lowering, including any EXCLUDE frame scan.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_operation<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    accumulator_start: usize,
+    cursors: crate::translate::window::WindowCursors,
+    peers: WindowPeerState,
+    tracking: WindowFrameTracking,
+    newest_rowid: usize,
+    buffer_table_name: String,
+    op: crate::translate::window::WindowOp,
+    countdown: Option<usize>,
+    break_on_eof: Option<BranchOffset>,
+    in_flush: bool,
+    custom_types_enabled: bool,
+    mut emit_output: impl FnMut(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    use crate::translate::window::{WindowOp, WindowOperationPhase};
+    crate::translate::window::emit_window_operation(
+        program,
+        hir_window_frame_shape(&plan.window.frame),
+        cursors,
+        peers.cursors,
+        tracking,
+        newest_rowid,
+        buffer_table_name,
+        hir_window_delete_op(plan),
+        op,
+        countdown,
+        break_on_eof,
+        in_flush,
+        |program, phase| match phase {
+            WindowOperationPhase::ReadAggregateResults => {
+                emit_window_aggregate_results(
+                    program,
+                    accumulator_start,
+                    functions,
+                    WindowAggregateResultMode::Value,
+                );
+                Ok(())
+            }
+            WindowOperationPhase::Apply(WindowOp::AggStep) => emit_hir_window_step(
+                program,
+                document,
+                plan,
+                functions,
+                WindowStepContext {
+                    accumulator_registers_start: accumulator_start,
+                    read_cursor: cursors.csr_end,
+                    current_cursor: cursors.csr_current,
+                    has_exclude: plan.window.frame.exclude.is_some(),
+                    custom_types_enabled,
+                },
+            ),
+            WindowOperationPhase::Apply(WindowOp::AggInverse) => emit_hir_window_inverse(
+                program,
+                document,
+                plan,
+                functions,
+                accumulator_start,
+                cursors.csr_start.expect("moving frame needs start cursor"),
+            ),
+            WindowOperationPhase::Apply(WindowOp::ReturnRow) => emit_output(program),
+        },
+        |program, comparison, first, offset, second, target| {
+            emit_hir_window_range_test(program, plan, comparison, first, offset, second, target)
+        },
+        |program, cursor, previous, repeat| {
+            let count = plan.order_slots.len();
+            let current = (count > 0).then(|| {
+                let current = program.alloc_registers(count);
+                let emitted = emit_window_cursor_keys(
+                    program,
+                    cursor,
+                    plan.order_slots.iter().copied(),
+                    current,
+                );
+                assert_eq!(emitted, count, "window peer key width changed");
+                current
+            });
+            emit_window_peer_change(
+                program,
+                WindowPeerComparison::from_registers(count, current, previous),
+                plan.order_key_info(),
+                repeat,
+            )
+        },
+    )
+}
+
 /// Guard RANGE cursors using the resolved frame and prepared buffer state.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -3186,6 +3301,339 @@ mod tests {
             function.arguments.as_slice(),
             [BufferedWindowValue::Recompute(hir::Expr::Function(_))]
         ));
+    }
+
+    #[test]
+    fn hir_window_deletion_preserves_offset_and_buffer_retention_rules() {
+        use crate::translate::window::WindowOp::{AggInverse, AggStep, ReturnRow};
+        for (function, frame, expected) in [
+            (
+                "sum(value)",
+                "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+                Some(ReturnRow),
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN 0 FOLLOWING AND 2 FOLLOWING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN 0.5 FOLLOWING AND 2 FOLLOWING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN 1.5 FOLLOWING AND 2 FOLLOWING",
+                Some(ReturnRow),
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN (1 + 1) FOLLOWING AND 3 FOLLOWING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+                Some(AggStep),
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND 0 PRECEDING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                Some(ReturnRow),
+            ),
+            (
+                "first_value(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                None,
+            ),
+            (
+                "nth_value(value, 2)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                None,
+            ),
+            (
+                "lag(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                None,
+            ),
+            (
+                "lead(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW",
+                None,
+            ),
+            (
+                "sum(value)",
+                "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING",
+                Some(AggInverse),
+            ),
+            (
+                "first_value(value)",
+                "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+                Some(AggInverse),
+            ),
+        ] {
+            let document = analyze_sql(&format!(
+                "SELECT {function} OVER (ORDER BY sort_key {frame}) FROM items"
+            ));
+            let (query, block) = root_query(&document);
+            let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+            assert_eq!(hir_window_delete_op(&plan), expected, "{function} {frame}");
+        }
+    }
+
+    #[test]
+    fn hir_window_operation_preserves_cursor_and_peer_branch_order() {
+        use crate::translate::window::{FrameCursor, WindowOp};
+        for mode in ["ROWS", "GROUPS", "RANGE"] {
+            for ordered in [false, true] {
+                for exclude in [false, true] {
+                    let order = if ordered {
+                        "ORDER BY sort_key COLLATE nocase"
+                    } else {
+                        ""
+                    };
+                    let exclusion = if exclude { "EXCLUDE CURRENT ROW" } else { "" };
+                    let bounds = if mode == "RANGE" && !ordered {
+                        "CURRENT ROW AND CURRENT ROW"
+                    } else {
+                        "1 PRECEDING AND 1 FOLLOWING"
+                    };
+                    let document = analyze_sql(&format!(
+                        "SELECT sum(value) OVER ({order} {mode} BETWEEN {bounds} {exclusion}) FROM items"
+                    ));
+                    let (query, block) = root_query(&document);
+                    let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+                    for op in [WindowOp::AggStep, WindowOp::AggInverse, WindowOp::ReturnRow] {
+                        for flush in [false, true] {
+                            let mut program = program();
+                            let functions =
+                                prepare_hir_window_runtime(&mut program, &plan).unwrap();
+                            let accumulators = program.alloc_registers(functions.len());
+                            let peers = prepare_hir_window_peer_state(&mut program, &plan);
+                            let tracking = prepare_hir_window_frame_tracking(&mut program, &plan);
+                            let rowid = program.alloc_register();
+                            let marker = program.alloc_register();
+                            let offset = program.alloc_register();
+                            let cursors = WindowCursors {
+                                csr_write: buffer_cursor(&mut program, plan.columns.len()),
+                                csr_current: buffer_cursor(&mut program, plan.columns.len()),
+                                csr_end: buffer_cursor(&mut program, plan.columns.len()),
+                                csr_start: Some(buffer_cursor(&mut program, plan.columns.len())),
+                                csr_app: None,
+                            };
+                            let cursor = match op {
+                                WindowOp::AggStep => cursors.csr_end,
+                                WindowOp::AggInverse => cursors.csr_start.unwrap(),
+                                WindowOp::ReturnRow => cursors.csr_current,
+                            };
+                            let eof = (flush && op == WindowOp::ReturnRow)
+                                .then(|| program.allocate_label());
+                            let countdown =
+                                (ordered && op != WindowOp::ReturnRow).then_some(offset);
+                            // Labels anchor to a preceding instruction, as in a full program.
+                            program.emit_insn(Insn::Integer {
+                                value: 1,
+                                dest: offset,
+                            });
+                            let start = program.insns.len();
+                            let mut output_position = None;
+                            emit_hir_window_operation(
+                                &mut program,
+                                &document,
+                                &plan,
+                                &functions,
+                                accumulators,
+                                cursors,
+                                peers,
+                                tracking,
+                                rowid,
+                                "window_test".into(),
+                                op,
+                                countdown,
+                                eof,
+                                flush,
+                                true,
+                                |program| {
+                                    output_position = Some(program.insns.len());
+                                    program.emit_insn(Insn::Integer {
+                                        value: 777,
+                                        dest: marker,
+                                    });
+                                    Ok(())
+                                },
+                            )
+                            .unwrap();
+                            let done = program.insns.len();
+                            // Separate EOF from done so resolving labels checks the actual destination.
+                            program.emit_insn(Insn::Integer {
+                                value: 888,
+                                dest: marker,
+                            });
+                            if let Some(eof) = eof {
+                                program.preassign_label_to_next_insn(eof);
+                            }
+                            let eof_position = program.insns.len();
+                            program.resolve_labels().unwrap();
+                            let next = (start..done)
+                                .find(|&i| matches!(program.insns[i].0, Insn::Next { .. }))
+                                .unwrap();
+                            let has_peers = mode != "ROWS";
+                            let after_next = next + 1 + usize::from(eof.is_some() || has_peers);
+                            assert!(
+                                matches!(program.insns[next].0, Insn::Next { cursor_id, pc_if_next: BranchOffset::Offset(target), fullscan: false }
+                                if cursor_id == cursor && target as usize == after_next)
+                            );
+                            if eof.is_some() || has_peers {
+                                let expected = if eof.is_some() { eof_position } else { done };
+                                assert!(
+                                    matches!(program.insns[next + 1].0, Insn::Goto { target_pc: BranchOffset::Offset(target) } if target as usize == expected)
+                                );
+                            }
+                            let deletes: Vec<_> = (start..done)
+                                .filter(|&i| matches!(program.insns[i].0, Insn::Delete { .. }))
+                                .collect();
+                            assert_eq!(deletes.len(), usize::from(op == WindowOp::AggInverse));
+                            if let Some(&delete) = deletes.first() {
+                                assert_eq!(delete + 1, next);
+                                assert!(
+                                    matches!(&program.insns[delete].0, Insn::Delete { cursor_id, table_name, is_part_of_update: false }
+                                    if *cursor_id == cursor && table_name == "window_test")
+                                );
+                            }
+                            assert_eq!(output_position.is_some(), op == WindowOp::ReturnRow);
+                            if let Some(output) = output_position {
+                                assert!(output < next);
+                                assert_eq!(
+                                    (start..output)
+                                        .filter(|&i| matches!(
+                                            program.insns[i].0,
+                                            Insn::AggValue { .. }
+                                        ))
+                                        .count(),
+                                    usize::from(!exclude)
+                                );
+                            }
+                            if has_peers && ordered {
+                                let previous = peers.cursors[match op {
+                                    WindowOp::AggStep => FrameCursor::End,
+                                    WindowOp::AggInverse => FrameCursor::Start,
+                                    WindowOp::ReturnRow => FrameCursor::Current,
+                                }]
+                                .unwrap();
+                                assert!(
+                                    matches!(program.insns[after_next].0, Insn::Column { cursor_id, column, .. }
+                                    if cursor_id == cursor && column == plan.order_slots[0])
+                                );
+                                assert!(program.insns[after_next..done].iter().any(|(insn, _)| matches!(insn, Insn::Copy { dst_reg, .. } if *dst_reg == previous)));
+                                let (equal, different) = program.insns[after_next..done]
+                                    .iter()
+                                    .find_map(|(insn, _)| match insn {
+                                        Insn::Jump {
+                                            target_pc_eq: BranchOffset::Offset(equal),
+                                            target_pc_lt: BranchOffset::Offset(less),
+                                            target_pc_gt: BranchOffset::Offset(greater),
+                                        } => {
+                                            assert_eq!(less, greater);
+                                            Some((*equal as usize, *less as usize))
+                                        }
+                                        _ => None,
+                                    })
+                                    .expect("peer comparison branches on equality");
+                                assert!(equal >= start && equal < next);
+                                assert!(different > after_next && different < done);
+                                if let Some(output) = output_position {
+                                    assert_eq!(
+                                        equal, output,
+                                        "peer repeat must skip aggregate result reads"
+                                    );
+                                }
+                                if countdown.is_some() {
+                                    assert!(equal > start, "peer repeat must skip the offset gate");
+                                }
+                            } else if has_peers {
+                                assert!(
+                                    matches!(program.insns[after_next].0, Insn::Goto { target_pc: BranchOffset::Offset(target) } if (target as usize) < next)
+                                );
+                            }
+                            if mode == "RANGE" && countdown.is_some() {
+                                assert!(
+                                    matches!(program.insns[done - 1].0, Insn::Goto { target_pc: BranchOffset::Offset(target) } if target as usize == start),
+                                    "{mode} ordered={ordered} exclude={exclude} {op:?} flush={flush} start={start} done={done}: {:?}",
+                                    &program.insns[start..done]
+                                );
+                            } else if countdown.is_some() {
+                                assert!(
+                                    matches!(program.insns[start].0, Insn::IfPos { reg, target_pc: BranchOffset::Offset(target), decrement_by: 1 }
+                                    if reg == offset && target as usize == done)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hir_window_unbounded_inverse_emits_nothing_without_start_cursor() {
+        use crate::translate::window::WindowOp;
+        let document = analyze_sql("SELECT sum(value) OVER () FROM items");
+        let (query, block) = root_query(&document);
+        let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let mut program = program();
+        let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
+        let accumulators = program.alloc_registers(functions.len());
+        let peers = prepare_hir_window_peer_state(&mut program, &plan);
+        let cursor = buffer_cursor(&mut program, plan.columns.len());
+        let rowid = program.alloc_register();
+        let start = program.insns.len();
+        emit_hir_window_operation(
+            &mut program,
+            &document,
+            &plan,
+            &functions,
+            accumulators,
+            WindowCursors {
+                csr_write: cursor,
+                csr_current: cursor,
+                csr_end: cursor,
+                csr_start: None,
+                csr_app: None,
+            },
+            peers,
+            WindowFrameTracking::None,
+            rowid,
+            "window_test".into(),
+            WindowOp::AggInverse,
+            None,
+            None,
+            false,
+            true,
+            |_| panic!("unbounded inverse cannot emit output"),
+        )
+        .unwrap();
+        assert_eq!(program.insns.len(), start);
     }
 
     #[test]

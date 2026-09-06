@@ -2746,22 +2746,35 @@ pub(crate) enum WindowOp {
 ///   are deleted, and those functions only ever look up rows still in it.
 fn window_delete_op(window: &Window) -> Option<WindowOp> {
     use crate::translate::plan::FrameBoundary;
-    let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
-    match &window.frame.start {
-        FrameBoundary::Following(expr) => {
-            (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::ReturnRow)
-        }
-        FrameBoundary::UnboundedPreceding => {
-            if window_cache_frame(window) {
+    window_delete_op_for_frame(
+        legacy_window_frame_shape(&window.frame),
+        window_cache_frame(window),
+        matches!(&window.frame.start, FrameBoundary::Following(expr) if window_expr_gt_zero(expr)),
+        matches!(&window.frame.end, FrameBoundary::Preceding(expr) if window_expr_gt_zero(expr)),
+    )
+}
+
+/// Choose when a buffered row is no longer needed, using resolved frame facts.
+pub(crate) fn window_delete_op_for_frame(
+    frame: WindowFrameShape,
+    must_keep_rows: bool,
+    start_gt_zero: bool,
+    end_gt_zero: bool,
+) -> Option<WindowOp> {
+    let is_range = frame.mode == FrameMode::Range;
+    match frame.start {
+        WindowFrameEdge::Following => (!is_range && start_gt_zero).then_some(WindowOp::ReturnRow),
+        WindowFrameEdge::UnboundedPreceding => {
+            if must_keep_rows {
                 None
-            } else if let FrameBoundary::Preceding(expr) = &window.frame.end {
-                (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::AggStep)
+            } else if frame.end == WindowFrameEdge::Preceding {
+                (!is_range && end_gt_zero).then_some(WindowOp::AggStep)
             } else {
                 Some(WindowOp::ReturnRow)
             }
         }
-        FrameBoundary::CurrentRow | FrameBoundary::Preceding(_) => Some(WindowOp::AggInverse),
-        FrameBoundary::UnboundedFollowing => {
+        WindowFrameEdge::CurrentRow | WindowFrameEdge::Preceding => Some(WindowOp::AggInverse),
+        WindowFrameEdge::UnboundedFollowing => {
             unreachable!("UNBOUNDED FOLLOWING can never be a frame start")
         }
     }
@@ -2796,15 +2809,16 @@ fn window_cache_frame(window: &Window) -> bool {
 /// changes results. Mirrors SQLite's `windowExprGtZero`
 /// (window.c:2439-2449).
 fn window_expr_gt_zero(expr: &Expr) -> bool {
-    if let Expr::Literal(turso_parser::ast::Literal::Numeric(s)) = expr {
-        if let Ok(n) = s.parse::<i64>() {
-            return n > 0;
-        }
-        if let Ok(f) = s.parse::<f64>() {
-            // Matches sqlite3_value_int's cast-to-integer semantics:
-            // 0 < f < 1 truncates to 0, which is not > 0.
-            return f as i64 > 0;
-        }
+    matches!(expr, Expr::Literal(turso_parser::ast::Literal::Numeric(s)) if window_numeric_offset_gt_zero(s))
+}
+
+/// Match legacy integer truncation when deciding whether an offset permits deletion.
+pub(crate) fn window_numeric_offset_gt_zero(value: &str) -> bool {
+    if let Ok(n) = value.parse::<i64>() {
+        return n > 0;
+    }
+    if let Ok(f) = value.parse::<f64>() {
+        return f as i64 > 0;
     }
     false
 }
@@ -3493,13 +3507,104 @@ fn emit_window_op(
     let cursors = meta.cursors;
     let frame = meta.frame;
     let buffer_table_name = meta.buffer_table_name.clone();
-    let order_by_len = window.order_by.len();
-    let frame_mode = frame.mode;
+    emit_window_operation(
+        program,
+        frame,
+        cursors,
+        registers.cursor_peer_values,
+        registers.frame_tracking,
+        registers.rowid,
+        buffer_table_name,
+        window_delete_op(window),
+        op,
+        countdown_reg,
+        break_on_eof,
+        in_flush,
+        |program, phase| match phase {
+            WindowOperationPhase::ReadAggregateResults => {
+                let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+                emit_window_aggregate_results(
+                    program,
+                    registers.acc_start,
+                    &meta.functions,
+                    WindowAggregateResultMode::Value,
+                );
+                Ok(())
+            }
+            WindowOperationPhase::Apply(WindowOp::AggStep) => {
+                emit_function_step(program, t_ctx, plan, cursors.csr_end)
+            }
+            WindowOperationPhase::Apply(WindowOp::AggInverse) => {
+                emit_function_inverse(program, t_ctx, plan)
+            }
+            WindowOperationPhase::Apply(WindowOp::ReturnRow) => {
+                emit_return_one_row(program, t_ctx, plan)
+            }
+        },
+        |program, comparison, first, offset, second, target| {
+            emit_legacy_window_range_test(program, plan, comparison, first, offset, second, target)
+        },
+        |program, cursor, previous, repeat| {
+            let order_by_len = window.order_by.len();
+            let temp_start = (order_by_len > 0).then(|| {
+                let temp_start = program.alloc_registers(order_by_len);
+                let count = emit_window_cursor_keys(
+                    program,
+                    cursor,
+                    window_order_by_columns(window),
+                    temp_start,
+                );
+                turso_assert!(count == order_by_len, "window peer key width changed");
+                temp_start
+            });
+            emit_window_peer_change(
+                program,
+                WindowPeerComparison::from_registers(order_by_len, temp_start, previous),
+                order_by_key_info(window, &plan.table_references),
+                repeat,
+            )
+        },
+    )
+}
+
+/// Work supplied by the legacy or HIR adapter at each operation phase.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WindowOperationPhase {
+    ReadAggregateResults,
+    Apply(WindowOp),
+}
+
+/// Shared frame-operation branches, cursor movement, and peer-group loops.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_operation(
+    program: &mut ProgramBuilder,
+    frame: WindowFrameShape,
+    cursors: WindowCursors,
+    peer_values: CursorPeerValues,
+    tracking: WindowFrameTracking,
+    newest_rowid: usize,
+    buffer_table_name: String,
+    delete_after: Option<WindowOp>,
+    op: WindowOp,
+    countdown_reg: Option<usize>,
+    break_on_eof: Option<BranchOffset>,
+    in_flush: bool,
+    mut emit_phase: impl FnMut(&mut ProgramBuilder, WindowOperationPhase) -> Result<()>,
+    emit_range: impl FnOnce(
+        &mut ProgramBuilder,
+        RangeCmp,
+        CursorID,
+        usize,
+        CursorID,
+        BranchOffset,
+    ) -> Result<()>,
+    emit_peers: impl FnOnce(&mut ProgramBuilder, CursorID, Option<usize>, BranchOffset) -> Result<()>,
+) -> Result<()> {
     // Under RANGE / GROUPS frames one advance steps over every row with
     // equal ORDER BY values (a peer group); with no ORDER BY every row
     // counts as equal, so it runs to the end of the partition. Mirrors
     // SQLite's `WindowCodeArg.eFrmType != TK_ROWS` test (window.c:2247).
-    let b_peer = frame_mode != turso_parser::ast::FrameMode::Rows;
+    let b_peer = frame.mode != turso_parser::ast::FrameMode::Rows;
 
     // AGGINVERSE does nothing when the frame starts at UNBOUNDED
     // PRECEDING: no row ever leaves the frame. Mirrors SQLite's early
@@ -3518,19 +3623,13 @@ fn emit_window_op(
     // SQLite's switch at `window.c:2315-2344` plus the reg pickup at
     // `window.c:2317-2336`.
     let (cursor_for_op, peer_ref_reg) = match op {
-        WindowOp::AggStep => (
-            cursors.csr_end,
-            registers.cursor_peer_values[FrameCursor::End],
-        ),
-        WindowOp::ReturnRow => (
-            cursors.csr_current,
-            registers.cursor_peer_values[FrameCursor::Current],
-        ),
+        WindowOp::AggStep => (cursors.csr_end, peer_values[FrameCursor::End]),
+        WindowOp::ReturnRow => (cursors.csr_current, peer_values[FrameCursor::Current]),
         WindowOp::AggInverse => (
             cursors
                 .csr_start
                 .expect("AggInverse can only be emitted when the window has a moving frame start"),
-            registers.cursor_peer_values[FrameCursor::Start],
+            peer_values[FrameCursor::Start],
         ),
     };
 
@@ -3542,21 +3641,13 @@ fn emit_window_op(
         cursors.csr_current,
         cursor_for_op,
         label_done,
-        |program, comparison, first, offset, second, target| {
-            emit_legacy_window_range_test(program, plan, comparison, first, offset, second, target)
-        },
+        emit_range,
     )?;
 
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) && !frame.has_exclude {
-        let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-        emit_window_aggregate_results(
-            program,
-            registers.acc_start,
-            &meta.functions,
-            WindowAggregateResultMode::Value,
-        );
+        emit_phase(program, WindowOperationPhase::ReadAggregateResults)?;
     }
 
     let label_continue = program.allocate_label();
@@ -3569,32 +3660,23 @@ fn emit_window_op(
         countdown_reg,
         cursor_for_op,
         cursors.csr_end,
-        registers.rowid,
+        newest_rowid,
         in_flush,
         label_done,
     );
 
     match op {
         WindowOp::AggStep | WindowOp::AggInverse => {
-            emit_window_tracked_aggregate(
-                program,
-                registers.frame_tracking,
-                op,
-                |program| match op {
-                    WindowOp::AggStep => emit_function_step(program, t_ctx, plan, cursors.csr_end),
-                    WindowOp::AggInverse => emit_function_inverse(program, t_ctx, plan),
-                    WindowOp::ReturnRow => {
-                        unreachable!("RETURN_ROW does not update frame tracking")
-                    }
-                },
-            )?;
+            emit_window_tracked_aggregate(program, tracking, op, |program| {
+                emit_phase(program, WindowOperationPhase::Apply(op))
+            })?;
         }
-        WindowOp::ReturnRow => emit_return_one_row(program, t_ctx, plan)?,
+        WindowOp::ReturnRow => emit_phase(program, WindowOperationPhase::Apply(op))?,
     }
 
     // Delete the row we are done with (SQLite window.c:2346,
     // `if( op==p->eDelete ) OP_Delete`), before advancing the cursor past it.
-    if window_delete_op(window) == Some(op) {
+    if delete_after == Some(op) {
         program.emit_insn(Insn::Delete {
             cursor_id: cursor_for_op,
             table_name: buffer_table_name,
@@ -3639,23 +3721,7 @@ fn emit_window_op(
         // SQLite's `windowReadPeerValues` +
         // `windowIfNewPeer` tail (window.c:2363-2369); with no ORDER BY the
         // whole partition is one group, so this just loops to EOF.
-        let temp_start = (order_by_len > 0).then(|| {
-            let temp_start = program.alloc_registers(order_by_len);
-            let count = emit_window_cursor_keys(
-                program,
-                cursor_for_op,
-                window_order_by_columns(window),
-                temp_start,
-            );
-            turso_assert!(count == order_by_len, "window peer key width changed");
-            temp_start
-        });
-        emit_window_peer_change(
-            program,
-            WindowPeerComparison::from_registers(order_by_len, temp_start, peer_ref_reg),
-            order_by_key_info(window, &plan.table_references),
-            label_continue,
-        )?;
+        emit_peers(program, cursor_for_op, peer_ref_reg, label_continue)?;
     }
 
     if let Some(range_loop_start) = range_loop_start {
