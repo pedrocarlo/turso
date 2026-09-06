@@ -1020,6 +1020,103 @@ pub(super) fn emit_hir_window_operation<'a>(
     )
 }
 
+/// Prepare one HIR output row from buffer slots and resolved window functions.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_hir_window_row_results<'a>(
+    program: &mut ProgramBuilder,
+    document: &'a hir::HirDocument,
+    plan: &HirWindowBufferPlan<'a>,
+    functions: &[WindowFunctionRuntime<&'a hir::Expr>],
+    cursors: crate::translate::window::WindowCursors,
+    tracking: WindowFrameTracking,
+    accumulator_start: usize,
+    output_slots: &[usize],
+    result_start: usize,
+    output_label: BranchOffset,
+    output_return: usize,
+    custom_types_enabled: bool,
+) -> Result<()> {
+    use crate::translate::window::{
+        emit_first_value_nth_value_lookup_runtime, emit_lag_lead_lookup_runtime,
+        emit_window_full_scan_runtime, emit_window_key_compare, emit_window_row_results,
+        WindowRowResultPhase, WindowScanPhase,
+    };
+    emit_window_row_results(
+        program,
+        cursors.csr_current,
+        output_slots.iter().copied(),
+        result_start,
+        plan.window.frame.exclude.is_some(),
+        output_label,
+        output_return,
+        |program, phase| match phase {
+            WindowRowResultPhase::FirstNth => {
+                emit_first_value_nth_value_lookup_runtime(program, functions, cursors, tracking)
+            }
+            WindowRowResultPhase::LagLead => {
+                emit_lag_lead_lookup_runtime(program, functions, cursors)
+            }
+            WindowRowResultPhase::FullScan => emit_window_full_scan_runtime(
+                program,
+                cursors,
+                tracking,
+                accumulator_start,
+                functions.len(),
+                plan.window
+                    .frame
+                    .exclude
+                    .as_ref()
+                    .expect("full scan requires EXCLUDE"),
+                plan.order_slots.len(),
+                |program, cursor, target| {
+                    emit_window_cursor_keys(
+                        program,
+                        cursor,
+                        plan.order_slots.iter().copied(),
+                        target,
+                    )
+                },
+                |program, left, right, equal, different| {
+                    emit_window_key_compare(
+                        program,
+                        left,
+                        right,
+                        plan.order_key_info(),
+                        equal,
+                        different,
+                    )
+                    .map(|_| ())
+                },
+                |program, phase| match phase {
+                    WindowScanPhase::Step(cursor) => emit_hir_window_step(
+                        program,
+                        document,
+                        plan,
+                        functions,
+                        WindowStepContext {
+                            accumulator_registers_start: accumulator_start,
+                            read_cursor: cursor,
+                            current_cursor: cursors.csr_current,
+                            has_exclude: true,
+                            custom_types_enabled,
+                        },
+                    ),
+                    WindowScanPhase::Finalize => {
+                        emit_window_aggregate_results(
+                            program,
+                            accumulator_start,
+                            functions,
+                            WindowAggregateResultMode::Finalize,
+                        );
+                        Ok(())
+                    }
+                },
+            ),
+        },
+    )
+}
+
 /// Guard RANGE cursors using the resolved frame and prepared buffer state.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -3301,6 +3398,337 @@ mod tests {
             function.arguments.as_slice(),
             [BufferedWindowValue::Recompute(hir::Expr::Function(_))]
         ));
+    }
+
+    fn emit_test_window_results(
+        sql: &str,
+    ) -> (
+        ProgramBuilder,
+        WindowCursors,
+        WindowFrameTracking,
+        Vec<usize>,
+    ) {
+        use crate::translate::window::WindowOp;
+        let document = analyze_sql(sql);
+        let (query, block) = root_query(&document);
+        let plan = plan_hir_window_buffer(query, block, block.windows[0].id).unwrap();
+        let mut program = program();
+        let functions = prepare_hir_window_runtime(&mut program, &plan).unwrap();
+        let results = functions
+            .iter()
+            .map(|function| function.result_register())
+            .collect();
+        let accumulators = program.alloc_registers(functions.len());
+        let tracking = prepare_hir_window_frame_tracking(&mut program, &plan);
+        let peers = prepare_hir_window_peer_state(&mut program, &plan);
+        let rowid = program.alloc_register();
+        let output_start = program.alloc_registers(2);
+        let output_return = program.alloc_register();
+        let output_label = program.allocate_label();
+        let cursors = WindowCursors {
+            csr_write: buffer_cursor(&mut program, plan.columns.len()),
+            csr_current: buffer_cursor(&mut program, plan.columns.len()),
+            csr_end: buffer_cursor(&mut program, plan.columns.len()),
+            csr_start: plan
+                .needs_start_cursor()
+                .then(|| buffer_cursor(&mut program, plan.columns.len())),
+            csr_app: plan
+                .needs_app_cursor()
+                .then(|| buffer_cursor(&mut program, plan.columns.len())),
+        };
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: rowid,
+        });
+        emit_hir_window_operation(
+            &mut program,
+            &document,
+            &plan,
+            &functions,
+            accumulators,
+            cursors,
+            peers,
+            tracking,
+            rowid,
+            "window_test".into(),
+            WindowOp::ReturnRow,
+            None,
+            None,
+            false,
+            true,
+            |program| {
+                emit_hir_window_row_results(
+                    program,
+                    &document,
+                    &plan,
+                    &functions,
+                    cursors,
+                    tracking,
+                    accumulators,
+                    &[0, 0],
+                    output_start,
+                    output_label,
+                    output_return,
+                    true,
+                )
+            },
+        )
+        .unwrap();
+        program.preassign_label_to_next_insn(output_label);
+        let output_position = program.insns.len();
+        program.emit_insn(Insn::Return {
+            return_reg: output_return,
+            can_fallthrough: false,
+        });
+        program.resolve_labels().unwrap();
+        let call = program
+            .insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Gosub { .. }))
+            .unwrap();
+        assert!(
+            matches!(program.insns[call].0, Insn::Gosub { target_pc: BranchOffset::Offset(target), return_reg }
+            if target as usize == output_position && return_reg == output_return)
+        );
+        assert!(
+            matches!(program.insns[call + 1].0, Insn::Next { cursor_id, .. } if cursor_id == cursors.csr_current)
+        );
+        for dest in [output_start, output_start + 1] {
+            assert!(program.insns[..call].iter().any(|(insn, _)| matches!(insn,
+                Insn::Column { cursor_id, column: 0, dest: actual, .. }
+                if *cursor_id == cursors.csr_current && *actual == dest)));
+        }
+        (program, cursors, tracking, results)
+    }
+
+    #[test]
+    fn hir_window_row_results_preserve_positional_seek_and_default_rules() {
+        for function in [
+            "first_value(value)",
+            "nth_value(value, keep)",
+            "lag(value)",
+            "lead(value)",
+            "lag(value, keep)",
+            "lead(value, keep, group_id)",
+        ] {
+            let (program, cursors, tracking, results) = emit_test_window_results(&format!(
+                "SELECT {function} OVER (ORDER BY sort_key ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items"
+            ));
+            let result = results[0];
+            let insns = &program.insns;
+            let seek = insns
+                .iter()
+                .position(|(insn, _)| matches!(insn, Insn::SeekRowid { .. }))
+                .unwrap();
+            let (target_reg, miss) = match insns[seek].0 {
+                Insn::SeekRowid {
+                    cursor_id,
+                    src_reg,
+                    target_pc: BranchOffset::Offset(miss),
+                } => {
+                    assert_eq!(Some(cursor_id), cursors.csr_app);
+                    (src_reg, miss as usize)
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(insns[seek + 1].0, Insn::Column { cursor_id, dest, .. }
+                if Some(cursor_id) == cursors.csr_app && dest == result)
+            );
+            if function.starts_with("first_value") || function.starts_with("nth_value") {
+                let WindowFrameTracking::Positional { counters } = tracking else {
+                    panic!("positional counters required");
+                };
+                assert!(insns[..seek]
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::Add { lhs, rhs, dest }
+                    if *lhs == target_reg && *rhs == counters && *dest == target_reg)));
+                let past = match insns[seek - 1].0 {
+                    Insn::Gt {
+                        lhs,
+                        rhs,
+                        target_pc: BranchOffset::Offset(past),
+                        ..
+                    } => {
+                        assert_eq!((lhs, rhs), (target_reg, counters + 1));
+                        past as usize
+                    }
+                    _ => panic!("frame end checked before seek"),
+                };
+                assert!(matches!(&insns[miss].0, Insn::Halt { description, .. }
+                    if description == "first_value/nth_value could not find a saved row within its frame"));
+                assert!(past > miss, "past frame end skips missing-row error");
+                assert_eq!(
+                    insns
+                        .iter()
+                        .filter(|(insn, _)| matches!(insn, Insn::MustBeInt { .. }))
+                        .count(),
+                    usize::from(function.starts_with("nth_value"))
+                );
+                if function.starts_with("nth_value") {
+                    assert!(insns[..seek].iter().any(|(insn, _)| matches!(insn, Insn::Halt { description, .. }
+                        if description == "second argument to nth_value must be a positive integer")));
+                }
+            } else {
+                assert_eq!(
+                    miss,
+                    seek + 2,
+                    "seek miss retains default and skips target read"
+                );
+                if function == "lag(value)" || function == "lead(value)" {
+                    let expected = if function.starts_with("lead") { 1 } else { -1 };
+                    assert!(matches!(insns[seek - 1].0, Insn::AddImm { register, value }
+                        if register == target_reg && value == expected));
+                } else if function.starts_with("lead") {
+                    assert!(
+                        matches!(insns[seek - 1].0, Insn::Add { lhs, dest, .. } if lhs == target_reg && dest == target_reg)
+                    );
+                } else {
+                    assert!(
+                        matches!(insns[seek - 1].0, Insn::Subtract { lhs, dest, .. } if lhs == target_reg && dest == target_reg)
+                    );
+                }
+                if function.contains("group_id") {
+                    assert!(insns[..seek].iter().any(
+                        |(insn, _)| matches!(insn, Insn::Column { cursor_id, dest, .. }
+                        if *cursor_id == cursors.csr_current && *dest == result)
+                    ));
+                } else {
+                    assert!(insns[..seek].iter().any(
+                        |(insn, _)| matches!(insn, Insn::Null { dest, .. } if *dest == result)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hir_window_exclude_scans_preserve_peer_filter_and_finalize_order() {
+        for exclusion in ["NO OTHERS", "CURRENT ROW", "GROUP", "TIES"] {
+            for ordered in [false, true] {
+                let order = if ordered {
+                    "ORDER BY sort_key COLLATE nocase"
+                } else {
+                    ""
+                };
+                let (program, cursors, tracking, _) = emit_test_window_results(&format!(
+                    "SELECT sum(value) FILTER (WHERE keep) OVER w FROM items WINDOW w AS ({order} ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE {exclusion})"
+                ));
+                let WindowFrameTracking::Excluded {
+                    start_rowid,
+                    end_rowid,
+                } = tracking
+                else {
+                    panic!("EXCLUDE trackers required");
+                };
+                let insns = &program.insns;
+                let scan = cursors.csr_app.unwrap();
+                let seek = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::SeekGE { .. }))
+                    .unwrap();
+                assert!(
+                    matches!(insns[seek].0, Insn::SeekGE { cursor_id, start_reg, .. } if cursor_id == scan && start_reg == start_rowid)
+                );
+                assert!(matches!(insns[seek + 2].0, Insn::Gt { rhs, .. } if rhs == end_rowid));
+                let step = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+                    .unwrap();
+                let next = insns.iter().position(|(insn, _)| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == scan)).unwrap();
+                let final_result = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::AggFinal { .. }))
+                    .unwrap();
+                let output = insns
+                    .iter()
+                    .position(|(insn, _)| matches!(insn, Insn::Gosub { .. }))
+                    .unwrap();
+                assert!(seek < step && step < next && next < final_result && final_result < output);
+                assert!(!insns.iter().any(|(insn, _)| matches!(
+                    insn,
+                    Insn::AggValue { .. } | Insn::SeekRowid { .. }
+                )));
+                assert!(insns[seek..step]
+                    .iter()
+                    .any(|(insn, _)| matches!(insn, Insn::IfNot { .. })));
+                let peer_check = ordered && matches!(exclusion, "GROUP" | "TIES");
+                assert_eq!(
+                    insns
+                        .iter()
+                        .filter(|(insn, _)| matches!(insn, Insn::Compare { .. }))
+                        .count(),
+                    usize::from(peer_check)
+                );
+                if matches!(exclusion, "CURRENT ROW" | "TIES") {
+                    let target = insns[seek..step]
+                        .iter()
+                        .find_map(|(insn, _)| match insn {
+                            Insn::Eq {
+                                target_pc: BranchOffset::Offset(target),
+                                ..
+                            } => Some(*target as usize),
+                            _ => None,
+                        })
+                        .expect("current row checked by rowid");
+                    if exclusion == "CURRENT ROW" {
+                        assert_eq!(target, next);
+                    } else {
+                        assert!(target > seek && target < step);
+                    }
+                }
+                if !ordered && matches!(exclusion, "GROUP" | "TIES") {
+                    assert!(insns[seek..step].iter().any(|(insn, _)| matches!(insn, Insn::Goto { target_pc: BranchOffset::Offset(target) } if *target as usize == next)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hir_window_exclude_nth_value_reads_n_from_output_row() {
+        let (program, cursors, _, _) = emit_test_window_results(
+            "SELECT nth_value(value, keep) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) FROM items",
+        );
+        let scan = cursors.csr_app.unwrap();
+        let insns = &program.insns;
+        let seek = insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::SeekGE { .. }))
+            .unwrap();
+        let next = insns
+            .iter()
+            .position(
+                |(insn, _)| matches!(insn, Insn::Next { cursor_id, .. } if *cursor_id == scan),
+            )
+            .unwrap();
+        // The value follows the scan; N stays fixed on the row being output.
+        assert!(insns[seek..next].iter().any(|(insn, _)| matches!(insn, Insn::Column { cursor_id, column: 0, .. } if *cursor_id == scan)));
+        assert!(insns[seek..next].iter().any(|(insn, _)| matches!(insn, Insn::Column { cursor_id, column: 1, .. } if *cursor_id == cursors.csr_current)));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn hir_window_exclude_recomputes_json_arguments_on_scan_cursor() {
+        let (program, cursors, _, _) = emit_test_window_results(
+            "SELECT json_group_array(json_array(value)) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM items",
+        );
+        let scan = cursors.csr_app.unwrap();
+        let insns = &program.insns;
+        let function = insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::Function { .. }))
+            .unwrap();
+        let step = insns
+            .iter()
+            .position(|(insn, _)| matches!(insn, Insn::AggStep { .. }))
+            .unwrap();
+        assert!(function < step);
+        assert!(insns[..function]
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Column { cursor_id, .. } if *cursor_id == scan)));
+        assert!(insns[step..]
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::AggFinal { .. })));
     }
 
     #[test]

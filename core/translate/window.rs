@@ -1451,11 +1451,6 @@ pub struct WindowRegisters {
     /// function's running total. AGGSTEP folds a row into these as it joins
     /// the frame; AGGINVERSE takes one back out as it leaves.
     pub acc_start: usize,
-    /// Start of a block of registers, one per window function, holding the
-    /// value to output for the current row. For aggregates this is worked
-    /// out from the running total (AggValue). Ranking functions like
-    /// row_number() have no running total and simply keep their value here.
-    pub acc_result_start: usize,
     /// The return address the flush subroutine jumps back to once it has
     /// finished emptying the buffer.
     pub flush_buffer_return_offset: usize,
@@ -2181,7 +2176,6 @@ impl EmitWindow {
                 rowid: input_state.rowid,
                 partition_start: input_state.previous_partition,
                 acc_start: reg_acc_start,
-                acc_result_start: reg_acc_result_start,
                 flush_buffer_return_offset: input_state.flush_return,
                 src_columns_start: reg_src_columns_start,
                 result_columns_start: reg_col_start,
@@ -2930,10 +2924,75 @@ fn emit_window_full_scan(
         .exclude
         .as_ref()
         .expect("full frame scan requires an explicit EXCLUDE clause");
+    let function_count = window.functions.len();
+    emit_window_full_scan_runtime(
+        program,
+        cursors,
+        registers.frame_tracking,
+        registers.acc_start,
+        function_count,
+        exclude,
+        window.order_by.len(),
+        |program, cursor, target| {
+            emit_window_cursor_keys(program, cursor, window_order_by_columns(window), target)
+        },
+        |program, left, right, equal, different| {
+            emit_window_key_compare(
+                program,
+                left,
+                right,
+                order_by_key_info(window, &plan.table_references),
+                equal,
+                different,
+            )
+            .map(|_| ())
+        },
+        |program, phase| match phase {
+            WindowScanPhase::Step(cursor) => emit_function_step(program, t_ctx, plan, cursor),
+            WindowScanPhase::Finalize => {
+                let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
+                emit_window_aggregate_results(
+                    program,
+                    registers.acc_start,
+                    &meta.functions,
+                    WindowAggregateResultMode::Finalize,
+                );
+                Ok(())
+            }
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WindowScanPhase {
+    Step(CursorID),
+    Finalize,
+}
+
+/// Recompute one output row's aggregates over the included frame rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_full_scan_runtime(
+    program: &mut ProgramBuilder,
+    cursors: WindowCursors,
+    tracking: WindowFrameTracking,
+    accumulator_start: usize,
+    function_count: usize,
+    exclude: &turso_parser::ast::FrameExclude,
+    order_by_len: usize,
+    mut emit_keys: impl FnMut(&mut ProgramBuilder, CursorID, usize) -> usize,
+    emit_compare: impl FnOnce(
+        &mut ProgramBuilder,
+        usize,
+        usize,
+        BranchOffset,
+        BranchOffset,
+    ) -> Result<()>,
+    mut emit_phase: impl FnMut(&mut ProgramBuilder, WindowScanPhase) -> Result<()>,
+) -> Result<()> {
     let WindowFrameTracking::Excluded {
         start_rowid: frame_start_rowid,
         end_rowid: frame_end_rowid,
-    } = registers.frame_tracking
+    } = tracking
     else {
         panic!("EXCLUDE frame requires rowid trackers");
     };
@@ -2952,24 +3011,18 @@ fn emit_window_full_scan(
         exclude,
         turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties
     );
-    let order_by_len = window.order_by.len();
     let current_peer =
         (compare_peers && order_by_len > 0).then(|| program.alloc_registers(order_by_len));
     let scan_peer =
         (compare_peers && order_by_len > 0).then(|| program.alloc_registers(order_by_len));
     if let Some(current_peer) = current_peer {
-        let count = emit_window_cursor_keys(
-            program,
-            cursors.csr_current,
-            window_order_by_columns(window),
-            current_peer,
-        );
+        let count = emit_keys(program, cursors.csr_current, current_peer);
         turso_assert!(count == order_by_len, "window peer key width changed");
     }
 
     program.emit_insn(Insn::Null {
-        dest: registers.acc_start,
-        dest_end: Some(registers.acc_start + window.functions.len() - 1),
+        dest: accumulator_start,
+        dest_end: Some(accumulator_start + function_count - 1),
     });
 
     let label_break = program.allocate_label();
@@ -3026,27 +3079,15 @@ fn emit_window_full_scan(
             } else {
                 let current_peer = current_peer.expect("allocated above");
                 let scan_peer = scan_peer.expect("allocated above");
-                let count = emit_window_cursor_keys(
-                    program,
-                    scan_cursor,
-                    window_order_by_columns(window),
-                    scan_peer,
-                );
+                let count = emit_keys(program, scan_cursor, scan_peer);
                 turso_assert!(count == order_by_len, "window peer key width changed");
-                emit_window_key_compare(
-                    program,
-                    current_peer,
-                    scan_peer,
-                    order_by_key_info(window, &plan.table_references),
-                    label_next,
-                    label_step,
-                )?;
+                emit_compare(program, current_peer, scan_peer, label_next, label_step)?;
             }
         }
     }
 
     program.preassign_label_to_next_insn(label_step);
-    emit_function_step(program, t_ctx, plan, scan_cursor)?;
+    emit_phase(program, WindowScanPhase::Step(scan_cursor))?;
     program.preassign_label_to_next_insn(label_next);
     program.emit_insn(Insn::Next {
         cursor_id: scan_cursor,
@@ -3054,13 +3095,7 @@ fn emit_window_full_scan(
         fullscan: false,
     });
     program.preassign_label_to_next_insn(label_break);
-    let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-    emit_window_aggregate_results(
-        program,
-        registers.acc_start,
-        &meta.functions,
-        WindowAggregateResultMode::Finalize,
-    );
+    emit_phase(program, WindowScanPhase::Finalize)?;
     Ok(())
 }
 
@@ -4135,22 +4170,33 @@ pub(crate) fn emit_function_inverse_runtime<E>(
 /// `csr_app` is a separate cursor (a duplicate of `csr_current`) used only
 /// for these lookups, so moving it doesn't disturb the three frame
 /// cursors. The result goes into the function's result register
-/// (`acc_result_start + i`); later, when the SELECT output is built, the
+/// stored in its prepared runtime; later, when the SELECT output is built, the
 /// expression cache points the function's value at that register.
-fn emit_lag_lead_lookup(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
-) -> Result<()> {
+fn emit_lag_lead_lookup(program: &mut ProgramBuilder, t_ctx: &TranslateCtx) -> Result<()> {
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-    let window = plan.window.as_ref().expect("missing window");
-    let registers = meta.registers;
-    let cursors = meta.cursors;
-    let acc_result_start = registers.acc_result_start;
+    emit_lag_lead_lookup_runtime(program, &meta.functions, meta.cursors)
+}
+
+/// Positional lookup arguments are materialized once in the window buffer.
+fn window_lookup_column<E>(argument: &BufferedWindowValue<E>) -> usize {
+    match argument {
+        BufferedWindowValue::Column(column) => *column,
+        BufferedWindowValue::Recompute(_) => {
+            unreachable!("positional lookup requires a buffered column")
+        }
+    }
+}
+
+/// Read lag/lead values by row position, retaining defaults when the seek misses.
+pub(crate) fn emit_lag_lead_lookup_runtime<E>(
+    program: &mut ProgramBuilder,
+    functions: &[WindowFunctionRuntime<E>],
+    cursors: WindowCursors,
+) -> Result<()> {
     let csr_current = cursors.csr_current;
 
-    for (i, func) in window.functions.iter().enumerate() {
-        let is_lead = match &func.func {
+    for func in functions {
+        let is_lead = match &func.function {
             AccumulatorFunc::Window(WindowFunc::Lag) => false,
             AccumulatorFunc::Window(WindowFunc::Lead) => true,
             _ => continue,
@@ -4158,19 +4204,10 @@ fn emit_lag_lead_lookup(
         let csr_app = cursors
             .csr_app
             .expect("csr_app must exist when a window contains lag / lead");
-        let result_reg = acc_result_start + i;
+        let result_reg = func.result_register;
 
-        let args: Vec<&Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
-            _ => unreachable!("lag / lead are always Expr::FunctionCall"),
-        };
-
-        let arg0_col = match args.first() {
-            Some(Expr::Column { column, .. }) => *column,
-            other => unreachable!(
-                "lag/lead arg[0] must be a buffer column reference after planner rewrite, got {other:?}"
-            ),
-        };
+        let args = &func.arguments;
+        let arg0_col = window_lookup_column(args.first().expect("lookup needs a value"));
 
         // Default value first: NULL when nArg < 3, else read arg[2] from csr_current.
         if args.len() < 3 {
@@ -4178,18 +4215,13 @@ fn emit_lag_lead_lookup(
                 dest: result_reg,
                 dest_end: None,
             });
-        } else if let Expr::Column { column, .. } = args[2] {
+        } else {
             program.emit_insn(Insn::Column {
                 cursor_id: csr_current,
-                column: *column,
+                column: window_lookup_column(&args[2]),
                 dest: result_reg,
                 default: None,
             });
-        } else {
-            unreachable!(
-                "lag/lead arg[2] must be a buffer column reference after planner rewrite, got {:?}",
-                args[2]
-            );
         }
 
         // tmp = rowid(csr_current) ± offset.
@@ -4205,12 +4237,7 @@ fn emit_lag_lead_lookup(
                 value: if is_lead { 1 } else { -1 },
             });
         } else {
-            let offset_col = match args[1] {
-                Expr::Column { column, .. } => *column,
-                other => unreachable!(
-                    "lag/lead arg[1] must be a buffer column reference after planner rewrite, got {other:?}"
-                ),
-            };
+            let offset_col = window_lookup_column(&args[1]);
             let offset_reg = program.alloc_register();
             program.emit_insn(Insn::Column {
                 cursor_id: csr_current,
@@ -4276,18 +4303,28 @@ fn emit_lag_lead_lookup(
 /// ```
 fn emit_first_value_nth_value_lookup(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: &SelectPlan,
+    t_ctx: &TranslateCtx,
 ) -> Result<()> {
     let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
-    let window = plan.window.as_ref().expect("missing window");
-    let registers = meta.registers;
-    let cursors = meta.cursors;
-    let acc_result_start = registers.acc_result_start;
+    emit_first_value_nth_value_lookup_runtime(
+        program,
+        &meta.functions,
+        meta.cursors,
+        meta.registers.frame_tracking,
+    )
+}
+
+/// Read first/nth values within the tracked frame, preserving bounds and N checks.
+pub(crate) fn emit_first_value_nth_value_lookup_runtime<E>(
+    program: &mut ProgramBuilder,
+    functions: &[WindowFunctionRuntime<E>],
+    cursors: WindowCursors,
+    tracking: WindowFrameTracking,
+) -> Result<()> {
     let csr_current = cursors.csr_current;
 
-    for (i, func) in window.functions.iter().enumerate() {
-        let is_nth = match &func.func {
+    for func in functions {
+        let is_nth = match &func.function {
             AccumulatorFunc::Window(WindowFunc::FirstValue) => false,
             AccumulatorFunc::Window(WindowFunc::NthValue) => true,
             _ => continue,
@@ -4295,19 +4332,10 @@ fn emit_first_value_nth_value_lookup(
         let csr_app = cursors
             .csr_app
             .expect("csr_app must exist when a window contains first_value or nth_value");
-        let result_reg = acc_result_start + i;
+        let result_reg = func.result_register;
 
-        let args: Vec<&Expr> = match func.current_expr() {
-            Expr::FunctionCall { args, .. } => args.iter().map(|a| a.as_ref()).collect(),
-            _ => unreachable!("first_value / nth_value are always Expr::FunctionCall"),
-        };
-        let arg_value_col = match args.first() {
-            Some(Expr::Column { column, .. }) => *column,
-            other => unreachable!(
-                "first_value/nth_value arg[0] must be a subquery column ref \
-                 after planner rewrite, got {other:?}"
-            ),
-        };
+        let args = &func.arguments;
+        let arg_value_col = window_lookup_column(args.first().expect("lookup needs a value"));
 
         // Default result: NULL (stays NULL on seek miss or N past frame end).
         program.emit_insn(Insn::Null {
@@ -4320,13 +4348,7 @@ fn emit_first_value_nth_value_lookup(
         // ROWS BETWEEN N PRECEDING AND CURRENT ROW it tracks csr_start.
         let target_reg = program.alloc_register();
         if is_nth {
-            let n_col = match args.get(1) {
-                Some(Expr::Column { column, .. }) => *column,
-                other => unreachable!(
-                    "nth_value arg[1] must be a subquery column ref \
-                     after planner rewrite, got {other:?}"
-                ),
-            };
+            let n_col = window_lookup_column(args.get(1).expect("nth_value needs N"));
             program.emit_insn(Insn::Column {
                 cursor_id: csr_current,
                 column: n_col,
@@ -4378,7 +4400,7 @@ fn emit_first_value_nth_value_lookup(
         // `OP_Add tmpReg, regApp` at window.c:1949.
         let WindowFrameTracking::Positional {
             counters: frame_counters,
-        } = registers.frame_tracking
+        } = tracking
         else {
             panic!("positional frame tracking must exist for first_value/nth_value");
         };
@@ -4460,20 +4482,58 @@ fn emit_return_one_row(
     let cursors = meta.cursors;
     let expressions_referencing_subquery = meta.expressions_referencing_subquery.clone();
 
-    for (i, (_, col_idx)) in expressions_referencing_subquery.iter().enumerate() {
-        let reg_result = registers.result_columns_start + i;
-        program.emit_column_or_rowid(cursors.csr_current, *col_idx, reg_result);
+    let has_exclude = meta.frame.has_exclude;
+    emit_window_row_results(
+        program,
+        cursors.csr_current,
+        expressions_referencing_subquery
+            .iter()
+            .map(|(_, column)| *column),
+        registers.result_columns_start,
+        has_exclude,
+        labels.row_output,
+        registers.row_output_return,
+        |program, phase| match phase {
+            WindowRowResultPhase::FullScan => emit_window_full_scan(program, t_ctx, plan),
+            WindowRowResultPhase::FirstNth => emit_first_value_nth_value_lookup(program, t_ctx),
+            WindowRowResultPhase::LagLead => emit_lag_lead_lookup(program, t_ctx),
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WindowRowResultPhase {
+    FullScan,
+    FirstNth,
+    LagLead,
+}
+
+/// Fill buffered outputs and function results before calling the output subroutine.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_window_row_results(
+    program: &mut ProgramBuilder,
+    current_cursor: CursorID,
+    columns: impl IntoIterator<Item = usize>,
+    result_start: usize,
+    has_exclude: bool,
+    output_label: BranchOffset,
+    output_return: usize,
+    mut emit_results: impl FnMut(&mut ProgramBuilder, WindowRowResultPhase) -> Result<()>,
+) -> Result<()> {
+    for (i, col_idx) in columns.into_iter().enumerate() {
+        let reg_result = result_start + i;
+        program.emit_column_or_rowid(current_cursor, col_idx, reg_result);
     }
 
-    if meta.frame.has_exclude {
-        emit_window_full_scan(program, t_ctx, plan)?;
+    if has_exclude {
+        emit_results(program, WindowRowResultPhase::FullScan)?;
     } else {
         // Per-row lookups for functions whose value is computed at output
         // time (first_value / nth_value / lag / lead). Each writes the
         // function's value register before the outer query reads it via
         // `emit_select_result`'s expression-cache lookup.
-        emit_first_value_nth_value_lookup(program, t_ctx, plan)?;
-        emit_lag_lead_lookup(program, t_ctx, plan)?;
+        emit_results(program, WindowRowResultPhase::FirstNth)?;
+        emit_results(program, WindowRowResultPhase::LagLead)?;
     }
 
     // The select-result / sorter-insert code is a shared subroutine —
@@ -4483,8 +4543,8 @@ fn emit_return_one_row(
     // one address. Mirrors SQLite's `OP_Gosub regGosub, addrGosub` at the
     // end of `windowReturnOneRow` (window.c:1988).
     program.emit_insn(Insn::Gosub {
-        target_pc: labels.row_output,
-        return_reg: registers.row_output_return,
+        target_pc: output_label,
+        return_reg: output_return,
     });
 
     Ok(())

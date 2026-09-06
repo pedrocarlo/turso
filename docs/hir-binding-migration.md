@@ -995,9 +995,13 @@ row deletion, cursor advance, EOF exits, peer repeats, and RANGE retry branches.
 Legacy and HIR adapters supply aggregate/output and key emitters. HIR deletion
 uses resolved frame facts and literal offsets with legacy integer truncation;
 its peer checks read planned buffer slots and resolved collations directly.
-The HIR operation adapter still takes row output as a callback, including any
-EXCLUDE frame scan. Complete output lowering and production frame-loop wiring
-remain later checkpoints.
+Per-row result preparation now shares buffered output reads, first_value /
+nth_value and lag / lead lookups, EXCLUDE frame scans, and the output Gosub.
+HIR supplies planned buffer slots, prepared function result registers, resolved
+peer keys, and HIR aggregate emission for scan rows. The HIR row-result adapter
+can serve as the operation loop's output callback, including EXCLUDE scans.
+The outer SELECT output subroutine and production frame-loop wiring remain
+later checkpoints.
 
 The supported SELECT path now reaches ordinary non-recursive CTEs, derived
 `FROM` sources, and parenthesized FROM groups, plus correlated scalar, `EXISTS`,
