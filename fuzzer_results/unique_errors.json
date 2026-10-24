@@ -1,0 +1,200 @@
+[
+  {
+    "id": 1,
+    "category": "Corrupt database - Index entry not found",
+    "error_type": "Turso errored but SQLite succeeded",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "4000", "-n", "300"],
+    "seed": 4000,
+    "error_message": "Corrupt database: IdxDelete: no matching index entry found for key",
+    "sql": "UPDATE brave_ficticia SET inquisitive_quiya = CAST(-1731901342667618015 AS REAL), ngb30il5in2 = IIF(loyal_correa IS NOT NULL, -6555626486804263018, loyal_correa IS NOT NULL) || loyal_correa IS NOT NULL",
+    "description": "Database corruption error when updating table with indexed columns. The index entry cannot be found for deletion during UPDATE operation."
+  },
+  {
+    "id": 2,
+    "category": "Arithmetic overflow with datatype mismatch on INSERT",
+    "error_type": "Turso errored but SQLite succeeded",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "1000", "-n", "300"],
+    "seed": 1000,
+    "error_message": "Runtime error: datatype mismatch",
+    "sql": "INSERT INTO grqa4q_ (yk0y2c2eoa___, competitive_hungary, faithful_adams, willing_artnoose, q8ujy2b_780_72_q_fw_, x___f__1g) VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618, ...)",
+    "description": "Turso rejects INSERT with arithmetic expression that overflows (multiplication followed by modulo) while SQLite accepts it. The result type becomes Real in Turso but should be Integer."
+  },
+  {
+    "id": 3,
+    "category": "Integer overflow error in SELECT",
+    "error_type": "Turso errored but SQLite succeeded",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "81", "-n", "300"],
+    "seed": 81,
+    "error_message": "Runtime error: integer overflow",
+    "sql": "SELECT competitive_escauriza NOT IN (SELECT shining_qruz FROM energetic_committe WHERE ...) ORDER BY shining_qruz IS NOT NULL ASC, competitive_escauriza ASC, shining_qruz - EXISTS (...) ASC LIMIT 319",
+    "description": "Turso throws integer overflow error in SELECT expressions while SQLite handles it gracefully."
+  },
+  {
+    "id": 4,
+    "category": "Type mismatch - Real vs Integer storage",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "4", "-n", "300"],
+    "seed": 4,
+    "error_message": "Row set mismatch: Only in Turso: Real(...), Only in SQLite: Integer(...)",
+    "sql": "SELECT inquisitive_sw, g0bdx_gck_hvz0_z478tt_1_91_38, v_15_k2 FROM friendly_souchy WHERE v_15_k2 > g0bdx_gck_hvz0_z478tt_1_91_38",
+    "description": "Turso stores a large integer value as Real (-8.621241729834359e18) while SQLite stores it as Integer (-8621241729834358784). Type affinity handling difference."
+  },
+  {
+    "id": 5,
+    "category": "Aggregate with IFNULL returning wrong value",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "1", "-n", "300"],
+    "seed": 1,
+    "error_message": "Row set mismatch with SUM and IFNULL",
+    "sql": "SELECT SUM(vivacious_kteer IS NULL), IFNULL(vivacious_kteer, NULL), vivacious_kteer IS NULL, vivacious_kteer FROM z3qx2_mh___r_p3g60y WHERE vivacious_kteer = -8621151351159618134 AND vivacious_kteer > IIF(-2473403854070034109, 5607199848556143233, -8511678804072944087) ORDER BY ...",
+    "description": "Turso returns Integer(1) for column while SQLite returns Null. Appears to be related to how IFNULL and aggregate functions interact with empty result sets or filtered rows."
+  },
+  {
+    "id": 6,
+    "category": "IN subquery returns Null instead of Integer",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "23", "-n", "300"],
+    "seed": 23,
+    "error_message": "Row set mismatch: Turso returns Null, SQLite returns Integer(0) for IN expression",
+    "sql": "SELECT -wa_dmf___41i9s_p425_4n_hq9_0__o IN (SELECT wa_dmf___41i9s_p425_4n_hq9_0__o FROM lovely_bowlegs ORDER BY ...), wa_dmf___41i9s_p425_4n_hq9_0__o, NULL, NULL FROM lovely_bowlegs",
+    "description": "Negation operator combined with IN subquery expression returns Null in Turso but Integer(0) in SQLite when the subquery contains text values."
+  },
+  {
+    "id": 7,
+    "category": "NOT IN subquery with multiple values returns wrong result",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "15", "-n", "300"],
+    "seed": 15,
+    "error_message": "Row set mismatch: NOT IN subquery returns Integer(0) in Turso but Null in SQLite",
+    "sql": "SELECT 8348292952143881696, EXISTS (...), COUNT(organized_freeman), open_minded_malet NOT IN (SELECT flexible_bowman FROM courageous_sessions ORDER BY ...), bo_z0ki9dh_ FROM courageous_sessions WHERE ...",
+    "description": "NOT IN subquery expression evaluation differs. Turso returns Integer(0) where SQLite returns Null when the subquery involves NULL values."
+  },
+  {
+    "id": 8,
+    "category": "Scalar subquery returns wrong column type identifier",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "17", "-n", "300"],
+    "seed": 17,
+    "error_message": "Row set mismatch: Turso returns Text('integer'), SQLite returns actual text value",
+    "sql": "SELECT 6302551087863204235, GROUP_CONCAT('...'), (SELECT y_9c_0 FROM incredible_mtt ORDER BY ROUND(y_9c_0 IS NULL) ASC, ... LIMIT 601), NULL FROM relaxed_brossa WHERE ...",
+    "description": "Scalar subquery in SELECT returns the string 'integer' (possibly a type name) instead of the actual column value."
+  },
+  {
+    "id": 9,
+    "category": "Missing rows with SUBSTR negative arguments",
+    "error_type": "SQLite returned rows but Turso returned no rows",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "41", "-n", "300"],
+    "seed": 41,
+    "error_message": "SQLite returned 2 rows but Turso returned no rows",
+    "sql": "SELECT NULL FROM b0y7lyq8_vt WHERE pff8dm7b != SUBSTR(pff8dm7b, -5480088922088919410, -7234700575451815944) AND pff8dm7b = (pff8dm7b) ORDER BY ...",
+    "description": "SUBSTR function with large negative start and length arguments causes different behavior. Turso returns no rows while SQLite returns rows."
+  },
+  {
+    "id": 10,
+    "category": "Integer value stored as Real in table",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "66", "-n", "300"],
+    "seed": 66,
+    "error_message": "Row set mismatch: Turso has Integer(1), SQLite has Integer(-210842827200)",
+    "sql": "SELECT * FROM ample_abra",
+    "description": "After a series of operations, an integer column contains Integer(1) in Turso but Integer(-210842827200) in SQLite - completely different values suggesting data corruption or computation error during INSERT/UPDATE."
+  },
+  {
+    "id": 11,
+    "category": "Arithmetic overflow returns Null instead of Real",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "62", "-n", "300"],
+    "seed": 62,
+    "error_message": "Row set mismatch: Turso returns Null, SQLite returns Real for arithmetic expression",
+    "sql": "SELECT -3210520868191894934, COUNT(optimistic_diamant) - optimistic_diamant * 1846760913840447834, IFNULL(optimistic_diamant, optimistic_diamant), -optimistic_diamant FROM fearless_brubaker ORDER BY ...",
+    "description": "Arithmetic expression involving COUNT and multiplication that overflows returns Null in Turso but a large Real number in SQLite."
+  },
+  {
+    "id": 12,
+    "category": "PRINTF function output mismatch",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "82", "-n", "300"],
+    "seed": 82,
+    "error_message": "Row set mismatch with PRINTF: different binary output",
+    "sql": "SELECT NULL, IFNULL(...), NULL, PRINTF(brilliant_parvulescu, ...) FROM insightful_yuanpei ORDER BY ...",
+    "description": "PRINTF function produces different output. Turso outputs additional null bytes in the result string compared to SQLite."
+  },
+  {
+    "id": 13,
+    "category": "CASE WHEN with COUNT aggregate returns Null",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "115", "-n", "300"],
+    "seed": 115,
+    "error_message": "Row set mismatch: CASE WHEN COUNT(...) returns Null in Turso but actual value in SQLite",
+    "sql": "SELECT shining_wark, shining_wark, CASE WHEN COUNT(shining_wark NOT IN (...)) THEN shining_wark WHEN SIGN(shining_wark) THEN 6171460472339937216 END, ... FROM patient_guillaume WHERE ...",
+    "description": "CASE expression with COUNT aggregate as condition evaluates incorrectly. Turso returns Null where SQLite returns the THEN branch value."
+  },
+  {
+    "id": 14,
+    "category": "CASE WHEN IS NOT NULL condition evaluates incorrectly",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "78", "-n", "300"],
+    "seed": 78,
+    "error_message": "Row set mismatch: Different CASE branch selected",
+    "sql": "SELECT CASE WHEN -3256183998437163206 THEN -7262473254803697716 ... END, CASE WHEN excellent_socialists IS NOT NULL THEN -2260641074725488577 ... ELSE 7774671315150310041 END, ...",
+    "description": "CASE WHEN with IS NOT NULL condition selects different branch. Turso selects ELSE branch (7774671315150310041) while SQLite selects WHEN branch (-2260641074725488577)."
+  },
+  {
+    "id": 15,
+    "category": "AVG aggregate with non-aggregate column returns wrong row",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "119", "-n", "300"],
+    "seed": 119,
+    "error_message": "Row set mismatch: Different non-aggregate column value returned with AVG",
+    "sql": "SELECT AVG(vibrant_barclay), NULL, vibrant_barclay FROM knowledgeable_hough ORDER BY MAX(...) ASC",
+    "description": "When using AVG aggregate with a non-aggregate column, Turso returns a different row's value for the non-aggregate column than SQLite does."
+  },
+  {
+    "id": 16,
+    "category": "GROUP_CONCAT with aggregate returns wrong non-aggregate column",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "142", "-n", "300"],
+    "seed": 142,
+    "error_message": "Row set mismatch: Non-aggregate column is Null in Turso but has value in SQLite",
+    "sql": "SELECT GROUP_CONCAT(focused_commie00 IN (SELECT focused_commie00 FROM faithful_sociale)), focused_commie00 FROM faithful_sociale ORDER BY focused_commie00 DESC, ...",
+    "description": "Non-aggregate column in SELECT with GROUP_CONCAT returns Null in Turso but actual value in SQLite."
+  },
+  {
+    "id": 17,
+    "category": "Scalar subquery with ORDER BY returns wrong value in SELECT list",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "135", "-n", "300"],
+    "seed": 135,
+    "error_message": "Row set mismatch: Scalar subquery in SELECT returns value vs Null",
+    "sql": "SELECT ..., (SELECT insightful_romanos FROM personable_front ORDER BY insightful_romanos IS NOT NULL + insightful_romanos IS NULL DESC LIMIT 569) FROM personable_front ORDER BY ...",
+    "description": "Scalar subquery in SELECT list returns actual text value in Turso but Null in SQLite when ORDER BY is involved."
+  },
+  {
+    "id": 18,
+    "category": "IN subquery with type coercion returns Null vs Integer",
+    "error_type": "Row set mismatch",
+    "command": "cargo run --bin differential_fuzzer",
+    "args": ["--seed", "145", "-n", "300"],
+    "seed": 145,
+    "error_message": "Row set mismatch: col IN (SELECT ...) returns Null in Turso but Integer(0) in SQLite",
+    "sql": "SELECT kind_isa IN (SELECT kir0k6lw_w8hth4___0__plie_7_4_n FROM open_minded_imrie), considerate_klito IS NOT NULL, ... FROM open_minded_imrie",
+    "description": "IN expression with subquery involving different column types returns Null in Turso but Integer(0) in SQLite across all rows."
+  }
+]
